@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-system"
+version = "0.1.0"
+description = "LangGraph 기반 동적 supervisor 에이전트 시스템"
+readme = "README.md"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_system"]

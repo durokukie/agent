@@ -1,0 +1,25 @@
+# 설계 및 로컬 작업 문서
+docs/
+superpowers/
+.superpowers/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+
+# 환경 설정과 로컬 실행 데이터
+.env
+!.env.example
+*.sqlite
+*.sqlite3
+
+# 편집기와 운영체제
+.DS_Store
+.idea/
+.vscode/
