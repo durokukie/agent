@@ -100,9 +100,11 @@ SQLite는 WAL, foreign key, busy timeout을 모든 애플리케이션 연결과 
 저장한다. 여러 offset이 섞인 시각 기반 목록은 복원한 timezone-aware `datetime`의 실제
 instant와 안정적인 식별자로 정렬한다.
 
-Dispatcher claim은 `BEGIN IMMEDIATE` transaction 안에서 eligibility와 만료 lease를 실제
+Dispatcher claim은 notification 전용 topic만 선택하며 `BEGIN IMMEDIATE` transaction 안에서 eligibility와 만료 lease를 실제
 UTC instant로 비교하고 token CAS로 owner를 결합한다. 전달 실패는 Task를 변경하지 않고
-attempt, 안정적인 오류 code와 다음 시각을 기록한다. Task event는 update/delete trigger로
+attempt, 안정적인 오류 code와 다음 시각을 기록한다. `PROCESSING` 전이와 확정은 lease 전용
+interface로만 허용한다. 0004 upgrade는 lease가 없던 기존 `PROCESSING` row를 retry 가능한
+`PENDING`으로 복구한다. Task event는 update/delete trigger로
 append-only를 DB에서도 강제한다. app table은
 Alembic만 생성·변경하며 `MetaData.create_all()`을 migration 대체 수단으로 사용하지
 않는다. LangGraph가 소유한 checkpoint table은 Alembic metadata와 app migration에

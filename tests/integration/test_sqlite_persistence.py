@@ -146,6 +146,71 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(decision_table, ("approval_decisions",))
         self.assertEqual(command_table, ("runtime_commands",))
 
+    def test_upgrades_legacy_processing_outbox_to_recoverable_pending(self) -> None:
+        """Lease column이 없던 PROCESSING row가 영구 고착되는 migration 버그를 잡는다."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            alembic_command.upgrade(
+                _alembic_config(database_path),
+                "0003_runtime_commands",
+            )
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "task-legacy-processing",
+                        "기존 요청",
+                        "RECEIVED",
+                        1,
+                        None,
+                        NOW.isoformat(),
+                        NOW.isoformat(),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO outbox_events (
+                        outbox_id, task_id, topic, payload_json, status,
+                        attempt_count, created_at, updated_at, last_error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "legacy-processing",
+                        "task-legacy-processing",
+                        "task.status_changed",
+                        '{"task_id":"task-legacy-processing"}',
+                        "PROCESSING",
+                        2,
+                        NOW.isoformat(),
+                        NOW.isoformat(),
+                        None,
+                    ),
+                )
+
+            upgrade_database(database_path)
+
+            with sqlite3.connect(database_path) as connection:
+                migrated = connection.execute(
+                    """
+                    SELECT status, last_error, next_attempt_at, lease_token,
+                           lease_expires_at
+                    FROM outbox_events WHERE outbox_id = ?
+                    """,
+                    ("legacy-processing",),
+                ).fetchone()
+
+        self.assertEqual(
+            migrated,
+            (
+                "PENDING",
+                "notification_lease_recovered",
+                NOW.isoformat(),
+                None,
+                None,
+            ),
+        )
+
     def test_upgrades_from_a_repo_layout_free_package_and_has_no_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temporary_root = Path(directory)
@@ -449,7 +514,7 @@ class TaskStoreTests(unittest.TestCase):
                 ):
                     connection.execute(statement)
 
-    def test_transitions_outbox_with_an_optimistic_status_and_attempt_count(
+    def test_rejects_public_processing_transition_without_a_lease(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -464,57 +529,18 @@ class TaskStoreTests(unittest.TestCase):
                         "outbox-1", "task.received", {"task_id": "task-1"}, NOW
                     ),
                 )
-                processing = store.transition_outbox(
-                    "outbox-1",
-                    expected_status=OutboxStatus.PENDING,
-                    target=OutboxStatus.PROCESSING,
-                    at=NOW + timedelta(seconds=1),
-                )
-                with self.assertRaises(OptimisticConcurrencyError):
+                with self.assertRaises(InvalidOutboxTransitionError):
                     store.transition_outbox(
                         "outbox-1",
                         expected_status=OutboxStatus.PENDING,
                         target=OutboxStatus.PROCESSING,
-                        at=NOW + timedelta(seconds=2),
+                        at=NOW + timedelta(seconds=3),
                     )
-                failed = store.transition_outbox(
-                    "outbox-1",
-                    expected_status=OutboxStatus.PROCESSING,
-                    target=OutboxStatus.FAILED,
-                    at=NOW + timedelta(seconds=2),
-                    last_error="timeout",
-                )
-                pending = store.transition_outbox(
-                    "outbox-1",
-                    expected_status=OutboxStatus.FAILED,
-                    target=OutboxStatus.PENDING,
-                    at=NOW + timedelta(seconds=3),
-                )
-                processing_again = store.transition_outbox(
-                    "outbox-1",
-                    expected_status=OutboxStatus.PENDING,
-                    target=OutboxStatus.PROCESSING,
-                    at=NOW + timedelta(seconds=4),
-                )
-                delivered = store.transition_outbox(
-                    "outbox-1",
-                    expected_status=OutboxStatus.PROCESSING,
-                    target=OutboxStatus.DELIVERED,
-                    at=NOW + timedelta(seconds=5),
-                )
-                with self.assertRaises(InvalidOutboxTransitionError):
-                    store.transition_outbox(
-                        "outbox-1",
-                        expected_status=OutboxStatus.DELIVERED,
-                        target=OutboxStatus.PENDING,
-                        at=NOW + timedelta(seconds=6),
-                    )
+                persisted = store.list_outbox()[0]
 
-        self.assertEqual(processing.attempt_count, 1)
-        self.assertEqual(failed.last_error, "timeout")
-        self.assertEqual(pending.status, OutboxStatus.PENDING)
-        self.assertEqual(processing_again.attempt_count, 2)
-        self.assertEqual(delivered.status, OutboxStatus.DELIVERED)
+        self.assertEqual(persisted.status, OutboxStatus.PENDING)
+        self.assertEqual(persisted.attempt_count, 0)
+        self.assertIsNone(persisted.lease_token)
 
 
 class MixedOffsetOrderingTests(unittest.TestCase):

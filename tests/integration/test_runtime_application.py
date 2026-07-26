@@ -187,6 +187,24 @@ class _DelayedEnqueueApplication(RuntimeApplication):
         await super()._enqueue_durable(work)  # type: ignore[arg-type]
 
 
+class _FailingNotificationLifecycle:
+    """Drain과 stop 오류 뒤에도 runtime 자원 정리를 검증하는 fake."""
+
+    def __init__(self) -> None:
+        self.started = False
+        self.stop_called = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def drain(self) -> None:
+        raise RuntimeError("notification-drain-failed")
+
+    async def stop(self) -> None:
+        self.stop_called = True
+        raise RuntimeError("notification-stop-failed")
+
+
 class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
     """SQLite authority와 queue dispatch를 application interface에서 검증한다."""
 
@@ -410,6 +428,39 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.gather(self.application.stop(), self.application.stop())
 
+        self.assertEqual(close_calls, 1)
+
+    async def test_notification_shutdown_errors_still_close_owned_resources(
+        self,
+    ) -> None:
+        """Dispatcher drain/stop 오류가 checkpointer/store close를 건너뛰는 버그를 잡는다."""
+
+        await self.application.stop()
+        notification = _FailingNotificationLifecycle()
+        close_calls = 0
+
+        def close_resources() -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+        self.application = RuntimeApplication(
+            store=self.store,
+            orchestrator=self.orchestrator,
+            queue_capacity=2,
+            worker_count=1,
+            clock=lambda: NOW,
+            id_factory=lambda: "unused",
+            notification_dispatcher=notification,  # type: ignore[arg-type]
+            close_resources=close_resources,
+        )
+        await self.application.start()
+
+        with self.assertRaisesRegex(RuntimeError, "notification-drain-failed"):
+            await self.application.stop()
+        await self.application.stop()
+
+        self.assertTrue(notification.started)
+        self.assertTrue(notification.stop_called)
         self.assertEqual(close_calls, 1)
 
     async def test_other_worker_completion_does_not_retry_a_poison_command(

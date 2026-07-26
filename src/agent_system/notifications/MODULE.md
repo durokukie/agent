@@ -19,8 +19,9 @@ adapter나 SQLite 구현을 알지 않게 한다.
 
 Runtime composition root는 outbox adapter와 sender를 주입해 dispatcher를 만들고
 `start()`, `stop()`, `drain()` 수명을 소유한다. Sender는 `send(notification)`만 구현하며
-Task, WorkflowRun, ORM row를 받지 않는다. Outbox adapter는 eligible item claim, 성공
-확정, 실패 기록만 제공한다.
+Task, WorkflowRun, ORM row를 받지 않는다. 실제 sender는 `notification_id`를 외부 channel의
+idempotency key로 사용하고 cancellation을 지연 없이 따라야 한다. Outbox adapter는 eligible
+item claim, 성공 확정, 실패 기록만 제공한다.
 
 ## 의존성과 허용된 import 방향
 
@@ -30,23 +31,27 @@ model 또는 Agent 구현을 import하지 않는다. Runtime은 이 모듈의 �
 
 ## 데이터 및 제어 흐름
 
-Dispatcher는 현재 시각 기준으로 전달 가능한 한 건을 lease와 함께 claim한다. Claim에
+Dispatcher는 notification 전용 topic에서 현재 시각 기준으로 전달 가능한 한 건을 lease와
+함께 claim한다. Claim에
 성공하면 payload를 `Notification`으로 복원해 sender에 전달하고, 성공은 delivered로
 확정한다. 실패는 안정적인 오류 code와 다음 eligibility를 기록하며 Task 상태는 변경하지
-않는다. 같은 dispatcher의 worker와 여러 dispatcher가 동시에 실행되어도 SQLite CAS로 한
-lease만 소유한다.
+않는다. Malformed payload는 안정적인 오류와 backoff를 기록하고 polling을 계속한다. 같은
+dispatcher의 worker와 여러 dispatcher가 동시에 실행되어도 SQLite CAS로 한 lease만 소유한다.
 
 ## 설계 결정과 제약사항
 
 Payload는 알림 ID, Task ID/version/status, channel, 발생 시각과 제한된 metadata만 가진다.
 원본 webhook, provider 예외 문자열, 비밀정보는 포함하지 않는다. Backoff는 상한이 있는
-지수 증가이며 in-process wakeup은 내구성의 근거가 아니다. 재시작 시 persisted
+지수 증가이며 sender timeout은 lease보다 짧아야 한다. Timeout은 sender를 취소하고 lease
+안에서 실패를 기록하며 stale finalize는 다른 owner의 결과를 덮어쓰지 않는다. In-process
+wakeup은 내구성의 근거가 아니다. 재시작 시 persisted
 `next_attempt_at`과 만료 lease가 복구의 authority다.
 
 ## 테스트 전략
 
-불변 wire 값 검증, logging/fake sender, 전달 성공과 실패, backoff eligibility,
-dispatcher 경쟁, lease 만료 복구, stop/drain과 재시작 retry를 실제 임시 SQLite outbox
+불변 wire 값의 deep copy, logging/fake sender, 전달 성공과 실패, backoff eligibility,
+dispatcher 경쟁, slow sender timeout, stale finalize, lease 만료 복구, malformed/legacy topic,
+stop/drain과 재시작 retry를 실제 임시 SQLite outbox
 adapter와 함께 검증한다. 외부 network는 사용하지 않는다.
 
 ## 변경 시 문서 갱신 조건

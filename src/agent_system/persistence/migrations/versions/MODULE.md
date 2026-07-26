@@ -10,7 +10,8 @@ Task, event, WorkflowRun, AgentRun, Approval, request idempotency와 outbox tabl
 `0001_initial`, 승인·거절 `ApprovalResponse`와 exact successor/failure를 decision key 및
 Task binding에 결합하는 `0002_approval_decisions`, START/APPROVAL/CANCEL 의도와
 PENDING/COMPLETED 실행 상태를 보존하는 `0003_runtime_commands`, outbox의 Task version
-dedupe·retry eligibility·lease·delivery 시각을 추가하는 `0004_notification_outbox`를 포함한다.
+dedupe·retry eligibility·lease·delivery 시각을 추가하고 기존 lease-less `PROCESSING` row를
+`PENDING`으로 복구하는 `0004_notification_outbox`를 포함한다.
 
 ## 공개 인터페이스와 사용 방법
 

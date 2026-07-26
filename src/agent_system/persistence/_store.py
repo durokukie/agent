@@ -1341,6 +1341,7 @@ class SQLiteStore:
         now: datetime,
         lease_duration: timedelta,
         lease_token: str,
+        topic: str | None = None,
     ) -> OutboxMessage | None:
         """가장 오래된 eligible outbox 한 건을 lease CAS로 claim한다."""
 
@@ -1349,6 +1350,8 @@ class SQLiteStore:
             raise InvalidPersistenceValueError("lease_duration은 양수여야 합니다.")
         if not isinstance(lease_token, str) or not lease_token.strip():
             raise InvalidPersistenceValueError("lease_token은 비어 있을 수 없습니다.")
+        if topic is not None and (not isinstance(topic, str) or not topic.strip()):
+            raise InvalidPersistenceValueError("topic은 비어 있을 수 없습니다.")
         expires_at = now + lease_duration
         active_statuses = {
             OutboxStatus.PENDING.value,
@@ -1356,11 +1359,10 @@ class SQLiteStore:
             OutboxStatus.PROCESSING.value,
         }
         with self._session() as session, session.begin():
-            candidates = tuple(
-                session.scalars(
-                    select(OutboxRow).where(OutboxRow.status.in_(active_statuses))
-                )
-            )
+            statement = select(OutboxRow).where(OutboxRow.status.in_(active_statuses))
+            if topic is not None:
+                statement = statement.where(OutboxRow.topic == topic)
+            candidates = tuple(session.scalars(statement))
             eligible = [
                 row for row in candidates if self._outbox_is_eligible(row, now=now)
             ]
@@ -1503,11 +1505,13 @@ class SQLiteStore:
     ) -> OutboxMessage:
         """outbox snapshot을 허용된 다음 상태로 optimistic하게 전이한다."""
 
+        if OutboxStatus.PROCESSING in {expected_status, target}:
+            raise InvalidOutboxTransitionError(
+                "PROCESSING 전이와 확정은 lease claim interface를 사용해야 합니다."
+            )
         allowed = {
-            OutboxStatus.PENDING: frozenset({OutboxStatus.PROCESSING}),
-            OutboxStatus.PROCESSING: frozenset(
-                {OutboxStatus.DELIVERED, OutboxStatus.FAILED}
-            ),
+            OutboxStatus.PENDING: frozenset(),
+            OutboxStatus.PROCESSING: frozenset(),
             OutboxStatus.FAILED: frozenset({OutboxStatus.PENDING}),
             OutboxStatus.DELIVERED: frozenset(),
         }

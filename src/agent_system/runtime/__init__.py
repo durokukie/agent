@@ -909,6 +909,7 @@ class RuntimeApplication:
             if self._closed:
                 return
             self._stopping = True
+            failure: BaseException | None = None
             if self._started:
                 wakeups = tuple(self._retry_wakeups.values())
                 for wakeup in wakeups:
@@ -916,17 +917,42 @@ class RuntimeApplication:
                 if wakeups:
                     await asyncio.gather(*wakeups, return_exceptions=True)
                 self._retry_wakeups.clear()
-                await self.drain()
+                try:
+                    await self.drain()
+                except BaseException as error:  # noqa: BLE001 - 정리 완료 뒤 최초 오류를 반환한다.
+                    failure = error
                 for _worker in self._workers:
                     await self._queue.put(None)
-                await asyncio.gather(*self._workers)
+                worker_results = await asyncio.gather(
+                    *self._workers,
+                    return_exceptions=True,
+                )
+                if failure is None:
+                    failure = next(
+                        (
+                            result
+                            for result in worker_results
+                            if isinstance(result, BaseException)
+                        ),
+                        None,
+                    )
                 self._workers.clear()
                 self._started = False
             if self._notification_dispatcher is not None:
-                await self._notification_dispatcher.stop()
+                try:
+                    await self._notification_dispatcher.stop()
+                except BaseException as error:  # noqa: BLE001 - 정리 완료 뒤 최초 오류를 반환한다.
+                    if failure is None:
+                        failure = error
             if self._close_resources is not None:
-                await asyncio.to_thread(self._close_resources)
+                try:
+                    await asyncio.to_thread(self._close_resources)
+                except BaseException as error:  # noqa: BLE001 - 정리 완료 뒤 최초 오류를 반환한다.
+                    if failure is None:
+                        failure = error
             self._closed = True
+            if failure is not None:
+                raise failure
 
     async def drain(self) -> None:
         """현재 queue와 active child 실행이 모두 끝날 때까지 기다린다."""

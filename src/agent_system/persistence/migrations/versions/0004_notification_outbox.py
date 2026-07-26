@@ -44,6 +44,11 @@ def upgrade() -> None:
         "UPDATE outbox_events SET next_attempt_at = created_at "
         "WHERE next_attempt_at IS NULL"
     )
+    op.execute(
+        "UPDATE outbox_events "
+        "SET status = 'PENDING', last_error = 'notification_lease_recovered' "
+        "WHERE status = 'PROCESSING' AND lease_token IS NULL"
+    )
     with op.batch_alter_table("outbox_events") as batch:
         batch.alter_column(
             "next_attempt_at",

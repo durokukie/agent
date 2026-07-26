@@ -74,7 +74,8 @@ drain한다. durable commit과 enqueue 사이에 stop이 시작된 명령은 SQL
 다음 startup에서 복구되며, worker sentinel 뒤에는 새 work를 enqueue하지 않는다. lifecycle
 lock은 동시 stop의 sentinel과 소유 자원 close를 정확히 한 번만 수행한다. durable
 command와 command row 없는 recovery가 함께 밀릴 때는 매 worker 완료마다 pump 우선순위를
-번갈아 적용해 한쪽의 지속적인 starvation을 막는다.
+번갈아 적용해 한쪽의 지속적인 starvation을 막는다. Notification drain 또는 stop이 실패해도
+worker 종료와 checkpointer/store close를 수행한 뒤 최초 lifecycle 오류를 호출자에게 반환한다.
 
 ## 테스트 전략
 

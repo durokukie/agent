@@ -63,6 +63,30 @@ class NotificationValueTests(unittest.TestCase):
             notification,
         )
 
+    def test_deeply_isolates_nested_metadata_from_input_and_output_mutation(
+        self,
+    ) -> None:
+        """Nested dict/list alias가 불변 Notification payload를 뒤에서 바꾸는 버그를 잡는다."""
+
+        source = {"approval": {"steps": ["inspect", "restart"]}}
+        notification = Notification(
+            notification_id="notification:task-1:4",
+            task_id="task-1",
+            task_version=4,
+            status="WAITING_APPROVAL",
+            channel=NotificationChannel.OPERATIONS,
+            occurred_at=NOW,
+            metadata=source,
+        )
+        source["approval"]["steps"].append("leaked")
+        first_payload = notification.to_payload()
+        first_payload["metadata"]["approval"]["steps"].append("output-leak")
+
+        self.assertEqual(
+            notification.to_payload()["metadata"],
+            {"approval": {"steps": ["inspect", "restart"]}},
+        )
+
     def test_rejects_invalid_wire_values(self) -> None:
         """Naive 시각이나 bool version이 sender 경계까지 통과하는 버그를 잡는다."""
 

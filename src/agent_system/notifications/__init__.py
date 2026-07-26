@@ -22,9 +22,40 @@ class NotificationDeliveryError(RuntimeError):
     """Sender가 알림을 전달하지 못했음을 나타내는 안정적인 오류."""
 
 
+class NotificationLeaseLostError(RuntimeError):
+    """전달 중 outbox lease가 다른 dispatcher로 넘어갔음을 나타낸다."""
+
+
 def _require_text(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name}는 비어 있을 수 없습니다.")
+    return value
+
+
+def _freeze_json(value: object) -> object:
+    """JSON 호환 metadata를 재귀 복사해 불변 값으로 바꾼다."""
+
+    if isinstance(value, Mapping):
+        copied: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("metadata key는 비어 있지 않은 문자열이어야 합니다.")
+            copied[key] = _freeze_json(item)
+        return MappingProxyType(copied)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError("metadata는 JSON 호환 값이어야 합니다.")
+
+
+def _thaw_json(value: object) -> object:
+    """불변 metadata를 alias 없는 JSON 호환 값으로 복사한다."""
+
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
     return value
 
 
@@ -60,10 +91,9 @@ class Notification:
             raise ValueError("occurred_at에는 timezone-aware datetime이 필요합니다.")
         if not isinstance(self.metadata, Mapping):
             raise TypeError("metadata는 mapping이어야 합니다.")
-        metadata = dict(self.metadata)
-        if any(not isinstance(key, str) or not key.strip() for key in metadata):
-            raise ValueError("metadata key는 비어 있지 않은 문자열이어야 합니다.")
-        object.__setattr__(self, "metadata", MappingProxyType(metadata))
+        frozen = _freeze_json(self.metadata)
+        assert isinstance(frozen, Mapping)
+        object.__setattr__(self, "metadata", frozen)
 
     def to_payload(self) -> dict[str, object]:
         """Persistence와 sender 사이의 안정적인 JSON object를 반환한다."""
@@ -75,7 +105,7 @@ class Notification:
             "status": self.status,
             "channel": self.channel.value,
             "occurred_at": self.occurred_at.isoformat(),
-            "metadata": dict(self.metadata),
+            "metadata": _thaw_json(self.metadata),
         }
 
     @classmethod
@@ -107,7 +137,11 @@ class NotificationSender(Protocol):
     """외부 알림 전달 구현이 만족할 작은 async interface."""
 
     async def send(self, notification: Notification) -> None:
-        """알림 한 건을 전달하거나 NotificationDeliveryError를 발생시킨다."""
+        """알림 한 건을 전달한다.
+
+        실제 channel adapter는 crash 후 재전달에도 외부 effect가 중복되지 않도록
+        ``notification.notification_id``를 idempotency key로 사용해야 한다.
+        """
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,12 +243,17 @@ class NotificationDispatcher:
         clock: Callable[[], datetime],
         id_factory: Callable[[], str],
         lease_duration: timedelta = timedelta(seconds=30),
+        send_timeout: timedelta = timedelta(seconds=20),
         base_retry_delay: timedelta = timedelta(seconds=30),
         max_retry_delay: timedelta = timedelta(minutes=5),
         poll_interval: float = 1.0,
     ) -> None:
         if lease_duration <= timedelta(0):
             raise ValueError("lease_duration은 양수여야 합니다.")
+        if send_timeout <= timedelta(0) or send_timeout >= lease_duration:
+            raise ValueError(
+                "send_timeout은 0보다 크고 lease_duration보다 작아야 합니다."
+            )
         if base_retry_delay <= timedelta(0):
             raise ValueError("base_retry_delay는 양수여야 합니다.")
         if max_retry_delay < base_retry_delay:
@@ -226,6 +265,7 @@ class NotificationDispatcher:
         self._clock = clock
         self._id_factory = id_factory
         self._lease_duration = lease_duration
+        self._send_timeout = send_timeout
         self._base_retry_delay = base_retry_delay
         self._max_retry_delay = max_retry_delay
         self._poll_interval = float(poll_interval)
@@ -277,22 +317,37 @@ class NotificationDispatcher:
             if claim is None:
                 return False
             try:
-                await self._sender.send(claim.notification)
+                await asyncio.wait_for(
+                    self._sender.send(claim.notification),
+                    timeout=self._send_timeout.total_seconds(),
+                )
             except Exception:  # noqa: BLE001 - provider 오류 원문은 저장하지 않는다.
                 failed_at = self._clock()
-                await self._outbox.mark_failed(
-                    claim,
-                    error_code="notification_delivery_failed",
-                    at=failed_at,
-                    next_attempt_at=failed_at + self._retry_delay(claim.attempt_count),
-                )
+                try:
+                    await self._outbox.mark_failed(
+                        claim,
+                        error_code="notification_delivery_failed",
+                        at=failed_at,
+                        next_attempt_at=(
+                            failed_at + self._retry_delay(claim.attempt_count)
+                        ),
+                    )
+                except NotificationLeaseLostError:
+                    pass
             else:
-                await self._outbox.mark_delivered(claim, at=self._clock())
+                try:
+                    await self._outbox.mark_delivered(claim, at=self._clock())
+                except NotificationLeaseLostError:
+                    pass
             return True
 
     async def _run(self) -> None:
         while not self._stop_event.is_set():
-            if await self.dispatch_once():
+            try:
+                dispatched = await self.dispatch_once()
+            except Exception:  # noqa: BLE001 - 한 poison row가 polling을 종료하지 않는다.
+                dispatched = False
+            if dispatched:
                 continue
             try:
                 await asyncio.wait_for(
@@ -319,6 +374,7 @@ __all__ = [
     "NotificationClaim",
     "NotificationDeliveryError",
     "NotificationDispatcher",
+    "NotificationLeaseLostError",
     "NotificationOutbox",
     "NotificationSender",
 ]

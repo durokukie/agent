@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -11,7 +13,9 @@ from pathlib import Path
 from agent_system.notifications import (
     FakeNotificationSender,
     Notification,
+    NotificationClaim,
     NotificationDispatcher,
+    NotificationLeaseLostError,
 )
 from agent_system.orchestration import ApprovalResponse, Status, Task
 from agent_system.persistence import (
@@ -37,6 +41,46 @@ NOTIFIED = frozenset(
         Status.CANCELLED,
     }
 )
+
+
+class _BlockingNotificationSender:
+    """Timeout 전에는 반환하지 않고 cancellation을 기록하는 실제 async sender fake."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.attempt_count = 0
+
+    async def send(self, _notification: Notification) -> None:
+        self.attempt_count += 1
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class _StaleFinalizationOutbox:
+    """Sender 성공 직후 lease 소유권을 잃는 경합을 재현한다."""
+
+    def __init__(self, notification: Notification) -> None:
+        self._claim = NotificationClaim(
+            notification=notification,
+            lease_token="stale-lease",
+            attempt_count=1,
+            lease_expires_at=notification.occurred_at + timedelta(seconds=30),
+        )
+
+    async def claim(self, **_kwargs: object) -> NotificationClaim | None:
+        claim, self._claim = self._claim, None
+        return claim
+
+    async def mark_delivered(self, *_args: object, **_kwargs: object) -> None:
+        raise NotificationLeaseLostError("stale")
+
+    async def mark_failed(self, *_args: object, **_kwargs: object) -> None:
+        raise NotificationLeaseLostError("stale")
 
 
 class TransactionalNotificationOutboxTests(unittest.TestCase):
@@ -552,6 +596,157 @@ class NotificationDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(sender.sent), 1)
         self.assertFalse(dispatcher.is_running)
+
+    async def test_ignores_legacy_topics_and_delivers_only_notification_topic(
+        self,
+    ) -> None:
+        """Legacy outbox가 새 notification 앞에서 parse 오류로 worker를 막는 버그를 잡는다."""
+
+        legacy = Task.receive(task_id="task-legacy", input="legacy", at=NOW)
+        self.store.create_task(
+            legacy,
+            event=TaskEventDraft("event:legacy:1", "TASK_RECEIVED", {}, NOW),
+            outbox=OutboxDraft(
+                "legacy-outbox",
+                "task.received",
+                {"task_id": legacy.task_id},
+                NOW,
+            ),
+        )
+        sender = FakeNotificationSender()
+        dispatcher = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=sender,
+            clock=lambda: self.completed.updated_at,
+            id_factory=lambda: "dedicated-topic-lease",
+        )
+
+        self.assertTrue(await dispatcher.dispatch_once())
+        self.assertFalse(await dispatcher.dispatch_once())
+
+        by_id = {message.outbox_id: message for message in self.store.list_outbox()}
+        self.assertEqual(sender.sent[0].status, "COMPLETED")
+        self.assertEqual(by_id["legacy-outbox"].status, OutboxStatus.PENDING)
+        self.assertEqual(by_id["legacy-outbox"].attempt_count, 0)
+
+    async def test_malformed_notification_is_backed_off_without_killing_worker(
+        self,
+    ) -> None:
+        """전용 topic의 malformed payload가 PROCESSING 고착이나 polling 종료를 만드는 버그를 잡는다."""
+
+        # 정상 automatic row를 먼저 전달해 malformed row만 남긴다.
+        first_sender = FakeNotificationSender()
+        first_dispatcher = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=first_sender,
+            clock=lambda: self.completed.updated_at,
+            id_factory=lambda: "normal-lease",
+        )
+        self.assertTrue(await first_dispatcher.dispatch_once())
+        malformed_task = Task.receive(
+            task_id="task-malformed",
+            input="malformed",
+            at=self.completed.updated_at,
+        )
+        self.store.create_task(
+            malformed_task,
+            event=TaskEventDraft(
+                "event:malformed:1",
+                "TASK_RECEIVED",
+                {},
+                malformed_task.updated_at,
+            ),
+            outbox=OutboxDraft(
+                "malformed-notification",
+                "task.status_changed",
+                {"task_id": malformed_task.task_id},
+                malformed_task.updated_at,
+            ),
+        )
+        dispatcher = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=FakeNotificationSender(),
+            clock=lambda: self.completed.updated_at,
+            id_factory=lambda: "malformed-lease",
+            poll_interval=0.01,
+        )
+
+        await dispatcher.start()
+        await asyncio.sleep(0.02)
+        await dispatcher.stop()
+
+        malformed = next(
+            message
+            for message in self.store.list_outbox()
+            if message.outbox_id == "malformed-notification"
+        )
+        self.assertEqual(malformed.status, OutboxStatus.FAILED)
+        self.assertEqual(malformed.last_error, "notification_payload_invalid")
+        self.assertEqual(
+            malformed.next_attempt_at,
+            self.completed.updated_at + timedelta(minutes=5),
+        )
+        self.assertFalse(dispatcher.is_running)
+
+    async def test_sender_timeout_prevents_slow_delivery_from_crossing_lease(
+        self,
+    ) -> None:
+        """느린 sender 중 lease가 만료되어 두 dispatcher가 중복 전송하는 버그를 잡는다."""
+
+        started = time.monotonic()
+        clock = lambda: (
+            self.completed.updated_at + timedelta(seconds=time.monotonic() - started)
+        )
+        slow_sender = _BlockingNotificationSender()
+        competing_sender = FakeNotificationSender()
+        competing_store = SQLiteStore(self.database_path)
+        self.addAsyncCleanup(asyncio.to_thread, competing_store.close)
+        first = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=slow_sender,
+            clock=clock,
+            id_factory=lambda: "slow-owner",
+            lease_duration=timedelta(milliseconds=50),
+            send_timeout=timedelta(milliseconds=20),
+            base_retry_delay=timedelta(milliseconds=100),
+            max_retry_delay=timedelta(milliseconds=100),
+        )
+        second = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(competing_store),
+            sender=competing_sender,
+            clock=clock,
+            id_factory=lambda: "competing-owner",
+            lease_duration=timedelta(milliseconds=50),
+            send_timeout=timedelta(milliseconds=20),
+            base_retry_delay=timedelta(milliseconds=100),
+            max_retry_delay=timedelta(milliseconds=100),
+        )
+
+        self.assertTrue(await first.dispatch_once())
+        await asyncio.sleep(0.06)
+        self.assertFalse(await second.dispatch_once())
+
+        self.assertEqual(slow_sender.attempt_count, 1)
+        self.assertTrue(slow_sender.cancelled.is_set())
+        self.assertEqual(competing_sender.sent, ())
+        failed = self.store.list_outbox()[0]
+        self.assertEqual(failed.status, OutboxStatus.FAILED)
+        self.assertEqual(failed.last_error, "notification_delivery_failed")
+
+    async def test_stale_finalize_isolated_after_sender_success(self) -> None:
+        """다른 owner가 lease를 회수한 뒤 finalize CAS 오류가 dispatcher를 죽이는 버그를 잡는다."""
+
+        notification = Notification.from_payload(self.store.list_outbox()[0].payload)
+        sender = FakeNotificationSender()
+        dispatcher = NotificationDispatcher(
+            outbox=_StaleFinalizationOutbox(notification),
+            sender=sender,
+            clock=lambda: notification.occurred_at,
+            id_factory=lambda: "unused",
+        )
+
+        self.assertTrue(await dispatcher.dispatch_once())
+        self.assertEqual(sender.sent, (notification,))
 
 
 if __name__ == "__main__":
