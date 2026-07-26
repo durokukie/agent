@@ -36,8 +36,11 @@ from ._values import (
 def _alembic_config(database_path: Path) -> Config:
     """주입된 SQLite 파일을 대상으로 하는 Alembic 설정을 만든다."""
 
-    project_root = Path(__file__).resolve().parents[3]
-    config = Config(project_root / "alembic.ini")
+    migration_directory = Path(__file__).resolve().parent / "migrations"
+    config = Config()
+    config.set_main_option(
+        "script_location", str(migration_directory).replace("%", "%%")
+    )
     database_url = URL.create("sqlite", database=str(database_path.resolve()))
     config.set_main_option(
         "sqlalchemy.url",

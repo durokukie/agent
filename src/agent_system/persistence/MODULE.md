@@ -51,6 +51,11 @@ workflow=owner)` 검증을 반드시 거친다.
 checkpointer table과 raw connection의 생성·종료는 이 context가 독립적으로 소유한다.
 반환한 saver는 context 밖에서 사용할 수 없다.
 
+`upgrade_database()`는 저장소 root의 설정 파일에 의존하지 않고 설치된
+`agent_system.persistence` package 안의 `migrations` resource를 기준으로 Alembic
+설정을 조립한다. 따라서 wheel 설치나 package만 복사한 실행 환경에서도 같은 revision을
+적용할 수 있다.
+
 ## 의존성과 허용된 import 방향
 
 `orchestration`의 공개 생명주기 값, SQLAlchemy, Alembic, LangGraph SQLite
@@ -74,7 +79,8 @@ SQLite는 WAL, foreign key, busy timeout을 모든 애플리케이션 연결과 
 `BEGIN IMMEDIATE`와 context manager commit/rollback을 사용하며 외부 model, Agent,
 알림 호출 동안 열어두지 않는다. timezone-aware 시각은 offset을 잃지 않도록 ISO 8601
 문자열로 저장하고 domain snapshot 복원으로 검증한다. JSON은 canonical UTF-8 text로
-저장한다.
+저장한다. 여러 offset이 섞인 시각 기반 목록은 복원한 timezone-aware `datetime`의 실제
+instant와 안정적인 식별자로 정렬한다.
 
 Task event는 update/delete trigger로 append-only를 DB에서도 강제한다. app table은
 Alembic만 생성·변경하며 `MetaData.create_all()`을 migration 대체 수단으로 사용하지
@@ -84,10 +90,11 @@ Alembic만 생성·변경하며 `MetaData.create_all()`을 migration 대체 수�
 
 ## 테스트 전략
 
-임시 파일 SQLite로 빈 DB와 반복 migration, WAL/foreign key/busy timeout, domain
-snapshot fidelity, optimistic rollback, event append-only, request idempotency race,
-Approval replay/conflict와 동시 소비, WorkflowRun/AgentRun 원자 저장·소유 복원,
-outbox 전이, terminal 제외 recovery를 통합 테스트한다. 실제 LangGraph graph를
+임시 파일 SQLite로 빈 DB와 반복 migration, 저장소 layout 없는 package migration 및
+schema drift, WAL/foreign key/busy timeout, domain snapshot fidelity, optimistic
+rollback, event append-only, request idempotency race, Approval replay/conflict와 동시
+소비, WorkflowRun/AgentRun의 정확한 다음 상태 원자 저장·소유 복원, offset 혼합 목록
+정렬, outbox 전이, terminal 제외 recovery를 통합 테스트한다. 실제 LangGraph graph를
 interrupt한 뒤 checkpointer를 닫고 새 connection에서 resume한다. 외부 서비스는
 사용하지 않는다.
 

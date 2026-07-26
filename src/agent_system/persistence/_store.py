@@ -18,7 +18,14 @@ from sqlalchemy import URL, Engine, create_engine, event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from agent_system.orchestration import AgentRun, Approval, Status, Task, WorkflowRun
+from agent_system.orchestration import (
+    AgentRun,
+    Approval,
+    Phase,
+    Status,
+    Task,
+    WorkflowRun,
+)
 
 from ._schema import (
     AgentRunRow,
@@ -794,13 +801,20 @@ class SQLiteStore:
     def list_approvals(self, task_id: str) -> tuple[ApprovalRecord, ...]:
         """Task에 소비된 Approval을 소비 시각 순서로 반환한다."""
 
-        statement = (
-            select(ApprovalRow)
-            .where(ApprovalRow.task_id == task_id)
-            .order_by(ApprovalRow.consumed_at)
-        )
+        statement = select(ApprovalRow).where(ApprovalRow.task_id == task_id)
         with self._session() as session, session.begin():
-            return tuple(_approval_from_row(row) for row in session.scalars(statement))
+            records = tuple(
+                _approval_from_row(row) for row in session.scalars(statement)
+            )
+            return tuple(
+                sorted(
+                    records,
+                    key=lambda record: (
+                        record.consumed_at.astimezone(UTC),
+                        record.approval_id,
+                    ),
+                )
+            )
 
     def list_recovery_candidates(self) -> tuple[RecoveryCandidate, ...]:
         """terminal Task를 제외하고 자동 재개와 승인 대기를 구분한다."""
@@ -812,11 +826,7 @@ class SQLiteStore:
             Status.CANCELLED.value,
             Status.ESCALATED.value,
         }
-        task_statement = (
-            select(TaskRow)
-            .where(TaskRow.status.not_in(terminal_statuses))
-            .order_by(TaskRow.created_at, TaskRow.task_id)
-        )
+        task_statement = select(TaskRow).where(TaskRow.status.not_in(terminal_statuses))
         with self._session() as session, session.begin():
             workflow_by_task = {
                 row.task_id: _workflow_from_row(row)
@@ -843,7 +853,15 @@ class SQLiteStore:
                         ),
                     )
                 )
-            return tuple(candidates)
+            return tuple(
+                sorted(
+                    candidates,
+                    key=lambda candidate: (
+                        candidate.task.created_at.astimezone(UTC),
+                        candidate.task.task_id,
+                    ),
+                )
+            )
 
     def list_outbox(
         self,
@@ -852,11 +870,22 @@ class SQLiteStore:
     ) -> tuple[OutboxMessage, ...]:
         """요청한 상태의 outbox snapshot을 생성 순서로 반환한다."""
 
-        statement = select(OutboxRow).order_by(OutboxRow.created_at)
+        statement = select(OutboxRow)
         if status is not None:
             statement = statement.where(OutboxRow.status == status.value)
         with self._session() as session, session.begin():
-            return tuple(_outbox_from_row(row) for row in session.scalars(statement))
+            messages = tuple(
+                _outbox_from_row(row) for row in session.scalars(statement)
+            )
+            return tuple(
+                sorted(
+                    messages,
+                    key=lambda message: (
+                        message.created_at.astimezone(UTC),
+                        message.outbox_id,
+                    ),
+                )
+            )
 
     def transition_outbox(
         self,
@@ -1011,38 +1040,18 @@ class SQLiteStore:
         candidate: WorkflowRun,
         agent_run: AgentRun,
     ) -> None:
-        """이전 ledger에 정확히 한 issuance만 추가되었는지 검증한다."""
+        """domain 발급 연산의 정확한 두 결과인지 재구성해 검증한다."""
 
-        validated_run = AgentRun.from_snapshot(
-            agent_run.to_snapshot(),
-            workflow=candidate,
+        retry = previous.phase is Phase.VERIFYING and agent_run.phase is Phase.EXECUTING
+        expected_workflow, expected_agent_run = previous.begin_agent_run(
+            agent_run_id=agent_run.agent_run_id,
+            agent_id=agent_run.agent_id,
+            at=agent_run.started_at,
+            retry=retry,
         )
-        if validated_run != agent_run:
+        if candidate != expected_workflow or agent_run != expected_agent_run:
             raise InvalidPersistenceValueError(
-                "AgentRun snapshot 복원이 일치하지 않습니다."
-            )
-        previous_snapshot = previous.to_snapshot()
-        candidate_snapshot = candidate.to_snapshot()
-        previous_issuances = previous_snapshot["agent_run_issuances"]
-        candidate_issuances = candidate_snapshot["agent_run_issuances"]
-        fixed_fields = ("workflow_run_id", "task_id", "task_version", "started_at")
-        if any(
-            previous_snapshot[field] != candidate_snapshot[field]
-            for field in fixed_fields
-        ):
-            raise InvalidPersistenceValueError(
-                "AgentRun 발급은 WorkflowRun identity를 변경할 수 없습니다."
-            )
-        if (
-            not isinstance(previous_issuances, list)
-            or not isinstance(candidate_issuances, list)
-            or candidate_issuances[:-1] != previous_issuances
-            or len(candidate_issuances) != len(previous_issuances) + 1
-            or candidate.budget.limit != previous.budget.limit
-            or candidate.budget.consumed != previous.budget.consumed + 1
-        ):
-            raise InvalidPersistenceValueError(
-                "WorkflowRun에는 정확히 한 새 issuance가 필요합니다."
+                "WorkflowRun과 AgentRun이 정확한 begin_agent_run 결과가 아닙니다."
             )
 
 

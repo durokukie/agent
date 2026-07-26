@@ -12,7 +12,9 @@ Alembic 실행 환경과 `versions` 하위 revision을 포함한다. LangGraph c
 ## 공개 인터페이스와 사용 방법
 
 직접 import하는 공개 Python interface는 없다. `agent_system.persistence`의 migration
-실행 함수가 Alembic configuration과 데이터베이스 경로를 주입한다.
+실행 함수가 설치된 package의 이 디렉터리를 `script_location`으로 지정한 Alembic
+configuration과 데이터베이스 경로를 주입한다. 저장소 root의 설정 파일은 요구하지
+않는다.
 
 ## 의존성과 허용된 import 방향
 
@@ -23,7 +25,8 @@ import하지 않는다.
 ## 데이터 및 제어 흐름
 
 빈 데이터베이스 또는 이전 revision에 `upgrade head`를 적용해 app table과 제약을
-만든다. 현재 head에 반복 적용하면 schema 변경 없이 종료한다.
+만든다. 현재 head에 반복 적용하면 schema 변경 없이 종료한다. 실행 환경은 이 package
+resource의 `env.py`와 `versions`를 직접 사용한다.
 
 ## 설계 결정과 제약사항
 
@@ -33,7 +36,9 @@ app schema와 checkpointer schema의 소유권을 섞지 않는다.
 ## 테스트 전략
 
 임시 빈 파일에 head migration을 적용하고 table, foreign key, index, trigger와 현재
-revision을 검사한다. 같은 파일에 반복 적용해 idempotency를 검증한다.
+revision을 검사한다. 같은 파일에 반복 적용해 idempotency를 검증한다. source package를
+저장소 layout 밖으로 복사한 subprocess에서도 반복 upgrade와 Alembic drift 검사를
+실행한다.
 
 ## 변경 시 문서 갱신 조건
 

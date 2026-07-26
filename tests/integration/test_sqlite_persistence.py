@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict
 
@@ -15,6 +19,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from agent_system.orchestration import (
+    AgentRun,
     AgentRunOwnershipError,
     Approval,
     Phase,
@@ -29,6 +34,7 @@ from agent_system.persistence import (
     IdempotencyConflictError,
     IdempotencyKey,
     InvalidOutboxTransitionError,
+    InvalidPersistenceValueError,
     OptimisticConcurrencyError,
     OutboxDraft,
     OutboxStatus,
@@ -84,6 +90,61 @@ class MigrationTests(unittest.TestCase):
         self.assertTrue(
             any(row[2] == "tasks" and row[3] == "task_id" for row in event_foreign_keys)
         )
+
+    def test_upgrades_from_a_repo_layout_free_package_and_has_no_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            installed_root = temporary_root / "installed"
+            source_package = (
+                Path(__file__).resolve().parents[2] / "src" / "agent_system"
+            )
+            shutil.copytree(
+                source_package,
+                installed_root / "agent_system",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            database_path = temporary_root / "packaged.sqlite3"
+            verification_script = """
+import sqlite3
+import sys
+from pathlib import Path
+
+from alembic import command
+import agent_system.persistence as persistence
+
+database_path = Path(sys.argv[1])
+installed_root = Path(sys.argv[2]).resolve()
+assert Path(persistence.__file__).resolve().is_relative_to(installed_root)
+
+persistence.upgrade_database(database_path)
+persistence.upgrade_database(database_path)
+command.check(persistence._alembic_config(database_path))
+
+with sqlite3.connect(database_path) as connection:
+    revision = connection.execute(
+        "SELECT version_num FROM alembic_version"
+    ).fetchone()
+assert revision == ("0001_initial",)
+"""
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(installed_root)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    verification_script,
+                    str(database_path),
+                    str(installed_root),
+                ],
+                cwd=temporary_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class TaskStoreTests(unittest.TestCase):
@@ -346,6 +407,185 @@ class TaskStoreTests(unittest.TestCase):
         self.assertEqual(delivered.status, OutboxStatus.DELIVERED)
 
 
+class MixedOffsetOrderingTests(unittest.TestCase):
+    """공개 시간순 목록이 offset 문자열이 아니라 UTC instant를 따르는지 검증한다."""
+
+    def test_orders_approval_history_by_consumed_instant(self) -> None:
+        base = datetime(2026, 7, 26, 9, 0, tzinfo=KST)
+        first_approved_at = datetime(2026, 7, 26, 10, 0, tzinfo=KST)
+        first_consumed_at = datetime(2026, 7, 26, 10, 5, tzinfo=KST)
+        second_approved_at = datetime(2026, 7, 26, 2, 0, tzinfo=UTC)
+        second_consumed_at = datetime(2026, 7, 26, 2, 5, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            received = Task.receive(task_id="task-1", input="변경 요청", at=base)
+            running = received.transition(
+                Status.RUNNING,
+                at=base + timedelta(minutes=5),
+            )
+            planned = running.update_plan(
+                "sha256:plan-v1",
+                at=base + timedelta(minutes=10),
+            )
+            waiting = planned.transition(
+                Status.WAITING_APPROVAL,
+                at=base + timedelta(minutes=15),
+            )
+
+            with SQLiteStore(database_path) as store:
+                self._persist_task_snapshots(
+                    store, (received, running, planned, waiting)
+                )
+                first_approval = Approval.grant_for(
+                    waiting,
+                    at=first_approved_at,
+                )
+                first_result = store.apply_approval(
+                    first_approval,
+                    decision_id="decision-early",
+                    resumed_at=first_consumed_at,
+                    event=TaskEventDraft(
+                        "event-first-approval",
+                        "TASK_APPROVED",
+                        {},
+                        first_consumed_at,
+                    ),
+                )
+                replanned = first_result.task.update_plan(
+                    "sha256:plan-v2",
+                    at=first_consumed_at + timedelta(minutes=5),
+                )
+                waiting_again = replanned.transition(
+                    Status.WAITING_APPROVAL,
+                    at=first_consumed_at + timedelta(minutes=10),
+                )
+                store.save_task(
+                    replanned,
+                    expected_version=first_result.task.version,
+                    event=TaskEventDraft(
+                        "event-plan-v2",
+                        "PLAN_UPDATED",
+                        {},
+                        replanned.updated_at,
+                    ),
+                )
+                store.save_task(
+                    waiting_again,
+                    expected_version=replanned.version,
+                    event=TaskEventDraft(
+                        "event-waiting-again",
+                        "WAITING_APPROVAL",
+                        {},
+                        waiting_again.updated_at,
+                    ),
+                )
+                second_approval = Approval.grant_for(
+                    waiting_again,
+                    at=second_approved_at,
+                )
+                store.apply_approval(
+                    second_approval,
+                    decision_id="decision-late",
+                    resumed_at=second_consumed_at,
+                    event=TaskEventDraft(
+                        "event-second-approval",
+                        "TASK_APPROVED",
+                        {},
+                        second_consumed_at,
+                    ),
+                )
+
+                approvals = store.list_approvals("task-1")
+
+        self.assertEqual(
+            [record.decision_id for record in approvals],
+            ["decision-early", "decision-late"],
+        )
+
+    def test_orders_recovery_candidates_by_created_instant(self) -> None:
+        early = datetime(2026, 7, 26, 10, 0, tzinfo=KST)
+        late = datetime(2026, 7, 26, 2, 0, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            early_task = Task.receive(task_id="task-early", input="먼저", at=early)
+            late_task = Task.receive(task_id="task-late", input="나중", at=late)
+            with SQLiteStore(database_path) as store:
+                for task in (early_task, late_task):
+                    store.create_task(
+                        task,
+                        event=TaskEventDraft(
+                            f"event-{task.task_id}",
+                            "TASK_RECEIVED",
+                            {},
+                            task.created_at,
+                        ),
+                    )
+                candidates = store.list_recovery_candidates()
+
+        self.assertEqual(
+            [candidate.task.task_id for candidate in candidates],
+            ["task-early", "task-late"],
+        )
+
+    def test_orders_outbox_by_created_instant(self) -> None:
+        early = datetime(2026, 7, 26, 10, 0, tzinfo=KST)
+        late = datetime(2026, 7, 26, 2, 0, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            with SQLiteStore(database_path) as store:
+                for suffix, created_at in (("early", early), ("late", late)):
+                    task = Task.receive(
+                        task_id=f"task-{suffix}",
+                        input=suffix,
+                        at=created_at,
+                    )
+                    store.create_task(
+                        task,
+                        event=TaskEventDraft(
+                            f"event-{suffix}",
+                            "TASK_RECEIVED",
+                            {},
+                            created_at,
+                        ),
+                        outbox=OutboxDraft(
+                            f"outbox-{suffix}",
+                            "task.received",
+                            {"task_id": task.task_id},
+                            created_at,
+                        ),
+                    )
+                outbox = store.list_outbox()
+
+        self.assertEqual(
+            [message.outbox_id for message in outbox],
+            ["outbox-early", "outbox-late"],
+        )
+
+    @staticmethod
+    def _persist_task_snapshots(
+        store: SQLiteStore,
+        snapshots: tuple[Task, ...],
+    ) -> None:
+        for index, task in enumerate(snapshots, start=1):
+            event = TaskEventDraft(
+                f"event-initial-{index}",
+                f"TASK_{task.status.value}",
+                {},
+                task.updated_at,
+            )
+            if index == 1:
+                store.create_task(task, event=event)
+            else:
+                store.save_task(
+                    task,
+                    expected_version=index - 1,
+                    event=event,
+                )
+
+
 class RunStoreTests(unittest.TestCase):
     """Workflow issuance와 AgentRun history의 원자성과 소유권을 검증한다."""
 
@@ -498,6 +738,81 @@ class RunStoreTests(unittest.TestCase):
 
         self.assertEqual(restored_second, second_workflow)
         self.assertEqual(second_history, ())
+
+    def test_rejects_non_exact_agent_run_successors_without_persisting_history(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            task = Task.receive(task_id="task-1", input="노드 점검", at=NOW)
+            workflow = WorkflowRun.start(
+                workflow_run_id="workflow-1",
+                task=task,
+                max_agent_runs=2,
+                at=NOW,
+            )
+            issued, agent_run = workflow.begin_agent_run(
+                agent_run_id="agent-run-1",
+                agent_id="classifier",
+                at=NOW + timedelta(seconds=1),
+            )
+
+            phase_snapshot = issued.to_snapshot() | {"phase": Phase.ANALYZING.value}
+            forged_workflow_phase = WorkflowRun.from_snapshot(phase_snapshot)
+
+            updated_at_snapshot = issued.to_snapshot() | {
+                "updated_at": (NOW + timedelta(seconds=2)).isoformat()
+            }
+            forged_updated_at = WorkflowRun.from_snapshot(updated_at_snapshot)
+
+            forged_issuance_snapshot = issued.to_snapshot()
+            forged_issuance_snapshot["agent_run_issuances"][0]["phase"] = (
+                Phase.ANALYZING.value
+            )
+            forged_issuance = WorkflowRun.from_snapshot(forged_issuance_snapshot)
+            forged_run_snapshot = agent_run.to_snapshot() | {
+                "phase": Phase.ANALYZING.value
+            }
+            forged_run_phase = AgentRun.from_snapshot(
+                forged_run_snapshot,
+                workflow=forged_issuance,
+            )
+
+            completed_run = agent_run.complete(
+                agent_id="classifier",
+                outcome="SUCCESS",
+                output="완료",
+                at=NOW + timedelta(seconds=2),
+            )
+            invalid_cases = (
+                ("workflow phase", forged_workflow_phase, agent_run),
+                ("workflow updated_at", forged_updated_at, agent_run),
+                ("issuance/run phase", forged_issuance, forged_run_phase),
+                ("completed run", issued, completed_run),
+            )
+
+            with SQLiteStore(database_path) as store:
+                store.create_task(
+                    task,
+                    event=TaskEventDraft("event-1", "TASK_RECEIVED", {}, NOW),
+                )
+                store.create_workflow_run(workflow)
+                for case_name, candidate, candidate_run in invalid_cases:
+                    with (
+                        self.subTest(case_name=case_name),
+                        self.assertRaises(InvalidPersistenceValueError),
+                    ):
+                        store.record_agent_run(
+                            workflow,
+                            candidate,
+                            candidate_run,
+                        )
+                    self.assertEqual(
+                        store.get_workflow_run("workflow-1"),
+                        workflow,
+                    )
+                    self.assertEqual(store.list_agent_runs("workflow-1"), ())
 
     def test_validates_restored_agent_run_against_owning_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
