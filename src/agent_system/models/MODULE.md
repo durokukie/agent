@@ -10,7 +10,7 @@
 
 ## 공개 인터페이스와 사용 방법
 
-runtime은 `ModelSettings.from_env()`로 `MODEL_PROVIDER`, `MODEL_NAME`, `UPSTAGE_API_KEY`, `MODEL_TIMEOUT_SECONDS`, `MODEL_MAX_RETRIES`를 읽고 `create_chat_model()`에 전달한다. factory는 필수 capability를 함께 받아 검증하고 `BaseChatModel`을 반환한다. 외부 I/O가 필요 없는 호출자 테스트에는 고정 응답과 받은 message를 제공하는 `FakeChatModel`을 사용한다.
+runtime은 `ModelSettings.from_env()`로 `MODEL_PROVIDER`, `MODEL_NAME`, `UPSTAGE_API_KEY`, `MODEL_TIMEOUT_SECONDS`, `MODEL_MAX_RETRIES`를 읽고 `create_chat_model()`에 전달한다. factory는 필수 capability를 함께 받아 검증하고 `BaseChatModel`을 반환한다. 외부 I/O가 필요 없는 호출자 테스트에는 고정 응답과 받은 message를 제공하며 sync/async invoke 양쪽에서 동작하는 `FakeChatModel`을 사용한다.
 
 timeout은 `bool`이 아닌 finite 양수이고 retry 횟수는 `bool`을 제외한 0 이상의 정수여야 한다. 잘못된 값은 SDK 생성 전에 항상 `ModelConfigurationError`로 정규화한다. 지원하지 않는 capability는 `UnsupportedModelCapabilityError`로 거부한다.
 

@@ -25,6 +25,7 @@ from agent_system.orchestration import (
     ApprovalResponse,
     ApprovalResumeError,
     FailureCode,
+    FakeApprovalConsumer,
     FakeGovernance,
     FakeRequestClassifier,
     OrchestrationStartError,
@@ -42,7 +43,13 @@ NOW = datetime(2026, 7, 26, 12, 0, tzinfo=UTC)
 class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
     """승인 interrupt가 같은 checkpoint thread에서만 재개된다."""
 
-    def make_service(self) -> tuple[OrchestratorService, FakeAgent]:
+    def make_service(
+        self,
+        *,
+        checkpointer: InMemorySaver | None = None,
+        approval_consumer: FakeApprovalConsumer | None = None,
+        agent: FakeAgent | None = None,
+    ) -> tuple[OrchestratorService, FakeAgent]:
         plan = ActionPlan(summary="서비스를 재시작합니다.", steps=("재시작",))
         classifier = FakeRequestClassifier(
             {
@@ -55,7 +62,7 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
                 )
             }
         )
-        agent = FakeAgent(
+        agent = agent or FakeAgent(
             AgentMetadata("operator", "운영 Agent", "변경 실행"),
             output="재시작 완료",
         )
@@ -64,9 +71,10 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
         service = OrchestratorService(
             classifier=classifier,
             governance=FakeGovernance(approved=True, reason="허용"),
+            approval_consumer=approval_consumer or FakeApprovalConsumer(),
             registry=registry,
             max_agent_runs=2,
-            checkpointer=InMemorySaver(),
+            checkpointer=checkpointer or InMemorySaver(),
             clock=lambda: NOW,
             id_factory=iter(("workflow-approval", "agent-run-1")).__next__,
         )
@@ -82,12 +90,28 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
 
         result = await service.resume(
             thread_id="thread-approval",
-            response=ApprovalResponse.reject(reason="지금은 변경하면 안 됩니다."),
+            response=ApprovalResponse.reject(
+                decision_id="decision-reject",
+                reason="지금은 변경하면 안 됩니다.",
+            ),
         )
 
         self.assertEqual(result.task.status, Status.REJECTED)
         self.assertEqual(result.errors, (FailureCode.HUMAN_REJECTED,))
         self.assertIsNone(result.interrupt)
+        self.assertEqual(agent.received_requests, [])
+
+    async def test_recover_keeps_approval_waiting_without_agent_execution(self) -> None:
+        service, agent = self.make_service()
+        waiting = await service.start(
+            UserTaskInput(task_id="task-waiting", input="서비스를 복구해 주세요."),
+            thread_id="thread-waiting",
+        )
+
+        recovered = await service.recover(thread_id="thread-waiting")
+
+        self.assertEqual(recovered, waiting)
+        self.assertEqual(recovered.task.status, Status.WAITING_APPROVAL)
         self.assertEqual(agent.received_requests, [])
 
     async def test_bound_approval_resumes_and_executes_exactly_once(self) -> None:
@@ -97,10 +121,15 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
             thread_id="thread-approval",
         )
         assert waiting.interrupt is not None
+        self.assertEqual(waiting.interrupt.plan.steps, ("재시작",))
+        self.assertEqual(waiting.interrupt.agent_id, "operator")
+        self.assertEqual(waiting.interrupt.action, ActionKind.MUTATING)
 
         result = await service.resume(
             thread_id="thread-approval",
-            response=ApprovalResponse.approve(waiting.interrupt, at=NOW),
+            response=ApprovalResponse.approve(
+                waiting.interrupt, decision_id="decision-approve", at=NOW
+            ),
         )
 
         self.assertEqual(result.task.status, Status.COMPLETED)
@@ -108,6 +137,17 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.workflow.budget.consumed, 1)
         self.assertEqual(len(result.agent_runs), 1)
         self.assertEqual(len(agent.received_requests), 1)
+        execution_version = result.task.version - 1
+        self.assertEqual(result.workflow.task_version, execution_version)
+        self.assertEqual(result.agent_runs[0].task_version, execution_version)
+        context = agent.received_requests[0].context
+        self.assertEqual(context["approved_plan"], waiting.interrupt.plan.to_snapshot())
+        self.assertEqual(context["plan_hash"], waiting.interrupt.plan_hash)
+        self.assertEqual(context["approval"]["task_version"], waiting.task.version)
+        self.assertEqual(context["routing_action"], ActionKind.MUTATING.value)
+        self.assertEqual(context["routing_agent_id"], "operator")
+        self.assertEqual(context["approved_task_version"], waiting.task.version)
+        self.assertEqual(context["execution_task_version"], execution_version)
 
     async def test_wrong_stale_and_changed_plan_approvals_are_rejected(self) -> None:
         invalid_cases = (
@@ -155,6 +195,7 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
                 result = await service.resume(
                     thread_id=thread_id,
                     response=ApprovalResponse(
+                        decision_id=f"decision-invalid-{index}",
                         accepted=True,
                         approval=make_approval(waiting.interrupt),
                     ),
@@ -171,7 +212,9 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
             thread_id="thread-approval",
         )
         assert waiting.interrupt is not None
-        response = ApprovalResponse.approve(waiting.interrupt, at=NOW)
+        response = ApprovalResponse.approve(
+            waiting.interrupt, decision_id="decision-replay", at=NOW
+        )
         await service.resume(thread_id="thread-approval", response=response)
 
         with self.assertRaises(ApprovalResumeError):
@@ -180,17 +223,29 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent.received_requests), 1)
 
     async def test_concurrent_approval_resume_executes_the_agent_once(self) -> None:
-        service, agent = self.make_service()
-        waiting = await service.start(
+        checkpointer = InMemorySaver()
+        consumer = FakeApprovalConsumer()
+        first_service, agent = self.make_service(
+            checkpointer=checkpointer,
+            approval_consumer=consumer,
+        )
+        second_service, _ = self.make_service(
+            checkpointer=checkpointer,
+            approval_consumer=consumer,
+            agent=agent,
+        )
+        waiting = await first_service.start(
             UserTaskInput(task_id="task-approval", input="서비스를 복구해 주세요."),
             thread_id="thread-approval",
         )
         assert waiting.interrupt is not None
-        response = ApprovalResponse.approve(waiting.interrupt, at=NOW)
+        response = ApprovalResponse.approve(
+            waiting.interrupt, decision_id="decision-concurrent", at=NOW
+        )
 
         results = await asyncio.gather(
-            service.resume(thread_id="thread-approval", response=response),
-            service.resume(thread_id="thread-approval", response=response),
+            first_service.resume(thread_id="thread-approval", response=response),
+            second_service.resume(thread_id="thread-approval", response=response),
             return_exceptions=True,
         )
 
@@ -239,6 +294,23 @@ class _BlockingAgent:
         )
 
 
+class _RecoverableAgent:
+    metadata = AgentMetadata("recoverable", "복구 Agent", "idempotent 실행")
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.agent_run_ids: list[str] = []
+        self.effects = 0
+
+    async def run(self, request: AgentRequest) -> AgentResult:
+        self.agent_run_ids.append(str(request.context["agent_run_id"]))
+        self.started.set()
+        await self.release.wait()
+        self.effects += 1
+        return AgentResult(self.metadata.agent_id, AgentOutcome.SUCCESS, "복구 완료")
+
+
 class AgentIssuanceCheckpointTests(unittest.IsolatedAsyncioTestCase):
     """외부 Agent 호출보다 budget issuance checkpoint가 먼저 기록된다."""
 
@@ -258,6 +330,7 @@ class AgentIssuanceCheckpointTests(unittest.IsolatedAsyncioTestCase):
                 }
             ),
             governance=FakeGovernance(approved=True, reason="허용"),
+            approval_consumer=FakeApprovalConsumer(),
             registry=registry,
             max_agent_runs=1,
             checkpointer=InMemorySaver(),
@@ -314,6 +387,7 @@ class SQLiteCheckpointerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                     service = OrchestratorService(
                         classifier=classifier,
                         governance=FakeGovernance(approved=True, reason="허용"),
+                        approval_consumer=FakeApprovalConsumer(),
                         registry=registry,
                         max_agent_runs=1,
                         checkpointer=saver,
@@ -332,13 +406,75 @@ class SQLiteCheckpointerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                     recovered_service = OrchestratorService(
                         classifier=classifier,
                         governance=FakeGovernance(approved=True, reason="허용"),
+                        approval_consumer=FakeApprovalConsumer(),
                         registry=registry,
                         max_agent_runs=1,
                         checkpointer=reopened_saver,
                         clock=lambda: NOW,
                         id_factory=iter(("unused-recovery-id",)).__next__,
                     )
-                    recovered = await recovered_service.get_result(
+                    recovered = await recovered_service.recover(
                         thread_id="thread-sqlite"
                     )
                     self.assertEqual(recovered, completed)
+
+    async def test_recovers_open_issuance_without_another_budget_slot(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "recovery.db"
+            upgrade_database(database_path)
+            agent = _RecoverableAgent()
+            registry = AgentRegistry()
+            registry.register(agent)
+            classifier = FakeRequestClassifier(
+                {
+                    RequestKind.USER_TASK: RoutingDecision(
+                        RequestKind.USER_TASK,
+                        "recoverable",
+                        ActionKind.READ_ONLY,
+                        "복구",
+                    )
+                }
+            )
+            with SQLiteStore(database_path) as store:
+                with store.open_checkpointer() as saver:
+                    service = OrchestratorService(
+                        classifier=classifier,
+                        governance=FakeGovernance(approved=True, reason="허용"),
+                        approval_consumer=FakeApprovalConsumer(),
+                        registry=registry,
+                        max_agent_runs=2,
+                        checkpointer=saver,
+                        clock=lambda: NOW,
+                        id_factory=iter(
+                            ("workflow-recover", "agent-run-recover")
+                        ).__next__,
+                    )
+                    running = asyncio.create_task(
+                        service.start(
+                            UserTaskInput("task-recover", "복구"),
+                            thread_id="thread-recover",
+                        )
+                    )
+                    await agent.started.wait()
+                    running.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await running
+                agent.release.set()
+                with store.open_checkpointer() as reopened:
+                    recovered_service = OrchestratorService(
+                        classifier=classifier,
+                        governance=FakeGovernance(approved=True, reason="허용"),
+                        approval_consumer=FakeApprovalConsumer(),
+                        registry=registry,
+                        max_agent_runs=2,
+                        checkpointer=reopened,
+                        clock=lambda: NOW,
+                        id_factory=iter(("unused",)).__next__,
+                    )
+                    result = await recovered_service.recover(thread_id="thread-recover")
+
+            self.assertEqual(result.task.status, Status.COMPLETED)
+            self.assertEqual(result.workflow.budget.consumed, 1)
+            self.assertEqual(len(result.agent_runs), 1)
+            self.assertEqual(set(agent.agent_run_ids), {"agent-run-recover"})
+            self.assertEqual(agent.effects, 1)

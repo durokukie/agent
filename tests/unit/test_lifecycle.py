@@ -666,6 +666,40 @@ class WorkflowRunLifecycleTests(unittest.TestCase):
             )
         self.assertEqual(exhausted.to_snapshot(), before_exhaustion)
 
+    def test_rebinds_task_version_before_first_issuance_only(self) -> None:
+        running = Task.receive(task_id="task-rebind", input="변경", at=NOW).transition(
+            Status.RUNNING, at=NOW + timedelta(minutes=1)
+        )
+        workflow = WorkflowRun.start(
+            workflow_run_id="workflow-rebind",
+            task=running,
+            max_agent_runs=2,
+            at=NOW + timedelta(minutes=1),
+        )
+        for phase in (Phase.ANALYZING, Phase.PLANNING, Phase.GOVERNING):
+            workflow = workflow.advance(phase, at=workflow.updated_at)
+        waiting = running.update_plan(
+            "sha256:approved", at=NOW + timedelta(minutes=2)
+        ).transition(Status.WAITING_APPROVAL, at=NOW + timedelta(minutes=3))
+        approval = Approval.grant_for(waiting, at=NOW + timedelta(minutes=4))
+        resumed = waiting.transition(
+            Status.RUNNING,
+            approval=approval,
+            at=NOW + timedelta(minutes=5),
+        )
+
+        rebound = workflow.rebind_task(resumed, at=NOW + timedelta(minutes=5))
+        issued, agent_run = rebound.begin_agent_run(
+            agent_run_id="agent-run-rebound",
+            agent_id="operator",
+            at=NOW + timedelta(minutes=6),
+        )
+
+        self.assertEqual(rebound.task_version, resumed.version)
+        self.assertEqual(agent_run.task_version, resumed.version)
+        with self.assertRaises(InvalidLifecycleValueError):
+            issued.rebind_task(resumed, at=NOW + timedelta(minutes=7))
+
     def test_rejects_invalid_budget_run_identity_and_run_time_reversal(self) -> None:
         invalid_budgets = (
             {"limit": 0},

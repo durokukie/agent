@@ -114,6 +114,7 @@ class FakeChatModel(BaseChatModel):
         self,
         messages: list[BaseMessage],
         stop: list[str] | None = None,
+        run_manager: object | None = None,
         **kwargs: Any,
     ) -> ChatResult:
         self.received_messages.append(list(messages))

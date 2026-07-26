@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from datetime import UTC, datetime
 
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 
 from agent_system.agents import (
@@ -24,9 +28,11 @@ from agent_system.orchestration import (
     ChatModelRequestClassifier,
     ClassificationError,
     FailureCode,
+    FakeApprovalConsumer,
     FakeGovernance,
     FakeRequestClassifier,
     GovernanceDecision,
+    OrchestrationStateError,
     OrchestratorService,
     RequestKind,
     RoutingDecision,
@@ -94,6 +100,39 @@ class _RaisingGovernance:
         routing: RoutingDecision,
     ) -> object:
         raise RuntimeError("governance provider secret")
+
+
+class _AsyncOnlyChatModel(BaseChatModel):
+    response: str
+
+    @property
+    def _llm_type(self) -> str:
+        return "async-only-test"
+
+    def _generate(self, messages: list[BaseMessage], **kwargs: object) -> ChatResult:
+        raise AssertionError("동기 invoke를 호출하면 안 됩니다.")
+
+    async def _agenerate(
+        self, messages: list[BaseMessage], **kwargs: object
+    ) -> ChatResult:
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content=self.response))]
+        )
+
+
+class _FailingAsyncChatModel(_AsyncOnlyChatModel):
+    async def _agenerate(
+        self, messages: list[BaseMessage], **kwargs: object
+    ) -> ChatResult:
+        raise RuntimeError("provider-secret")
+
+
+class _CancelledAsyncChatModel(_AsyncOnlyChatModel):
+    async def _agenerate(
+        self, messages: list[BaseMessage], **kwargs: object
+    ) -> ChatResult:
+        await asyncio.Event().wait()
+        raise AssertionError("취소 뒤에는 도달할 수 없습니다.")
 
 
 class RequestClassifierTests(unittest.IsolatedAsyncioTestCase):
@@ -200,6 +239,40 @@ class RequestClassifierTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
+    async def test_chat_model_classifier_uses_native_async_invocation(self) -> None:
+        classifier = ChatModelRequestClassifier(
+            _AsyncOnlyChatModel(
+                response=(
+                    '{"request_kind":"user_task","agent_id":"reader",'
+                    '"action":"read_only","reason":"조회","plan":null}'
+                )
+            )
+        )
+
+        result = await classifier.classify(UserTaskInput("task-async", "조회"))
+
+        self.assertEqual(result.agent_id, "reader")
+
+    async def test_chat_model_classifier_hides_provider_exception_detail(self) -> None:
+        classifier = ChatModelRequestClassifier(_FailingAsyncChatModel(response=""))
+
+        with self.assertRaises(ClassificationError) as raised:
+            await classifier.classify(UserTaskInput("task-failure", "조회"))
+
+        self.assertNotIn("provider-secret", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+
+    async def test_chat_model_classifier_propagates_cancellation(self) -> None:
+        classifier = ChatModelRequestClassifier(_CancelledAsyncChatModel(response=""))
+        invocation = asyncio.create_task(
+            classifier.classify(UserTaskInput("task-cancel", "조회"))
+        )
+        await asyncio.sleep(0)
+        invocation.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await invocation
+
     def test_public_inputs_reject_empty_identity_and_payload_fields(self) -> None:
         invalid_factories = (
             lambda: UserTaskInput(task_id="", input="요청"),
@@ -227,9 +300,53 @@ class RequestClassifierTests(unittest.IsolatedAsyncioTestCase):
             GovernanceDecision.from_snapshot(
                 {"approved": "false", "reason": "문자열 bool 거부"}
             )
+
+    def test_snapshot_fields_reject_coercible_wrong_types(self) -> None:
+        plan = ActionPlan("변경", ("실행",))
+        mutations = (
+            lambda: ActionPlan.from_snapshot({"summary": 1, "steps": ["실행"]}),
+            lambda: ActionPlan.from_snapshot({"summary": "변경", "steps": ("실행",)}),
+            lambda: RoutingDecision.from_snapshot(
+                {
+                    "request_kind": "user_task",
+                    "agent_id": 1,
+                    "action": "read_only",
+                    "reason": "조회",
+                    "plan": None,
+                }
+            ),
+            lambda: ApprovalResponse.from_snapshot(
+                {
+                    "decision_id": 1,
+                    "accepted": False,
+                    "approval": None,
+                    "reason": "거절",
+                }
+            ),
+        )
+        approval_request = {
+            "kind": "approval_required",
+            "task_id": "task",
+            "task_version": True,
+            "plan_hash": plan.plan_hash,
+            "plan": plan.to_snapshot(),
+            "agent_id": "operator",
+            "action": "mutating",
+        }
+        from agent_system.orchestration import ApprovalRequest
+
+        mutations += (lambda: ApprovalRequest.from_snapshot(approval_request),)
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), self.assertRaises(TypeError):
+                mutation()
         with self.assertRaises(TypeError):
             ApprovalResponse.from_snapshot(
-                {"accepted": "false", "approval": None, "reason": "거절"}
+                {
+                    "decision_id": "decision-bool",
+                    "accepted": "false",
+                    "approval": None,
+                    "reason": "거절",
+                }
             )
 
 
@@ -254,6 +371,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
         service = OrchestratorService(
             classifier=classifier,
             governance=governance,
+            approval_consumer=FakeApprovalConsumer(),
             registry=registry,
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -274,12 +392,54 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent.received_requests[0].task_id, "task-1")
         self.assertEqual(governance.received_requests, [])
 
+    async def test_get_result_normalizes_malformed_checkpoint_state(self) -> None:
+        decision = RoutingDecision(
+            request_kind=RequestKind.USER_TASK,
+            agent_id="reader",
+            action=ActionKind.READ_ONLY,
+            reason="조회",
+        )
+        registry = AgentRegistry()
+        registry.register(FakeAgent(AgentMetadata("reader", "조회", "조회")))
+        saver = InMemorySaver()
+        service = OrchestratorService(
+            classifier=FakeRequestClassifier({RequestKind.USER_TASK: decision}),
+            governance=FakeGovernance(approved=True, reason="허용"),
+            approval_consumer=FakeApprovalConsumer(),
+            registry=registry,
+            max_agent_runs=1,
+            checkpointer=saver,
+            clock=lambda: NOW,
+            id_factory=iter(("workflow-corrupt", "agent-run-corrupt")).__next__,
+        )
+        thread_id = "thread-corrupt"
+        await service.start(UserTaskInput("task-corrupt", "조회"), thread_id=thread_id)
+        snapshot = await service._graph.aget_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        checkpoint_state = dict(snapshot.values)
+        malformed_task = dict(checkpoint_state["task"])
+        malformed_task["version"] = "3"
+        mutations = (
+            {**checkpoint_state, "task": malformed_task},
+            {**checkpoint_state, "agent_runs": ()},
+            {**checkpoint_state, "errors": ()},
+            {**checkpoint_state, "output": 1},
+        )
+        for malformed_state in mutations:
+            with (
+                self.subTest(malformed_state=malformed_state),
+                self.assertRaises(OrchestrationStateError),
+            ):
+                service._result_from_state(malformed_state)
+
     async def test_classifier_exception_fails_without_agent_budget_or_leakage(
         self,
     ) -> None:
         service = OrchestratorService(
             classifier=_RaisingClassifier(),
             governance=FakeGovernance(approved=True, reason="허용"),
+            approval_consumer=FakeApprovalConsumer(),
             registry=AgentRegistry(),
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -321,6 +481,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
         service = OrchestratorService(
             classifier=classifier,
             governance=governance,
+            approval_consumer=FakeApprovalConsumer(),
             registry=registry,
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -366,6 +527,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
         service = OrchestratorService(
             classifier=classifier,
             governance=governance,
+            approval_consumer=FakeApprovalConsumer(),
             registry=registry,
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -395,6 +557,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
         service = OrchestratorService(
             classifier=FakeRequestClassifier({RequestKind.USER_TASK: decision}),
             governance=_RaisingGovernance(),
+            approval_consumer=FakeApprovalConsumer(),
             registry=AgentRegistry(),
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -430,6 +593,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
         service = OrchestratorService(
             classifier=classifier,
             governance=FakeGovernance(approved=True, reason="허용"),
+            approval_consumer=FakeApprovalConsumer(),
             registry=registry,
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -485,6 +649,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
                 service = OrchestratorService(
                     classifier=FakeRequestClassifier({RequestKind.USER_TASK: decision}),
                     governance=FakeGovernance(approved=True, reason="허용"),
+                    approval_consumer=FakeApprovalConsumer(),
                     registry=registry,
                     max_agent_runs=1,
                     checkpointer=InMemorySaver(),
@@ -525,6 +690,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
         service = OrchestratorService(
             classifier=FakeRequestClassifier({RequestKind.USER_TASK: decision}),
             governance=FakeGovernance(approved=True, reason="허용"),
+            approval_consumer=FakeApprovalConsumer(),
             registry=registry,
             max_agent_runs=2,
             checkpointer=InMemorySaver(),

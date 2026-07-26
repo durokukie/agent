@@ -589,6 +589,32 @@ class WorkflowRun:
             )
         return replace(self, phase=target, updated_at=at)
 
+    def rebind_task(self, task: Task, *, at: datetime) -> WorkflowRun:
+        """승인 후 첫 issuance 전에 실행 Task version을 다시 결합한다."""
+
+        _require_not_before(at, self.updated_at, field_name="at")
+        if self.phase is not Phase.GOVERNING:
+            raise InvalidLifecycleValueError(
+                "Task version rebind는 GOVERNING phase에서만 허용됩니다."
+            )
+        if self.budget.consumed or self.agent_run_issuances:
+            raise InvalidLifecycleValueError(
+                "AgentRun issuance 이후에는 Task version을 rebind할 수 없습니다."
+            )
+        if task.task_id != self.task_id:
+            raise InvalidLifecycleValueError(
+                "rebind Task 식별자가 WorkflowRun과 다릅니다."
+            )
+        if (
+            task.status is not Status.RUNNING
+            or task.plan_hash is None
+            or task.version <= self.task_version
+        ):
+            raise InvalidLifecycleValueError(
+                "승인 후 RUNNING plan Task의 최신 version만 rebind할 수 있습니다."
+            )
+        return replace(self, task_version=task.version, updated_at=at)
+
     def begin_agent_run(
         self,
         *,
@@ -914,12 +940,16 @@ from ._graph import (
     ActionKind,
     ActionPlan,
     AlertInput,
+    ApprovalConsumer,
+    ApprovalConsumeResult,
+    ApprovalConsumeStatus,
     ApprovalRequest,
     ApprovalResponse,
     ApprovalResumeError,
     ChatModelRequestClassifier,
     ClassificationError,
     FailureCode,
+    FakeApprovalConsumer,
     FakeGovernance,
     FakeRequestClassifier,
     Governance,
@@ -946,6 +976,9 @@ __all__ = [
     "AgentRunOwnershipError",
     "AlertInput",
     "Approval",
+    "ApprovalConsumeResult",
+    "ApprovalConsumeStatus",
+    "ApprovalConsumer",
     "ApprovalError",
     "ApprovalNotAllowedError",
     "ApprovalRequest",
@@ -958,6 +991,7 @@ __all__ = [
     "ExecutionBudget",
     "ExecutionBudgetExhaustedError",
     "FailureCode",
+    "FakeApprovalConsumer",
     "FakeGovernance",
     "FakeRequestClassifier",
     "Governance",

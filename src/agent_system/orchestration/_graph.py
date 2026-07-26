@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from concurrent.futures import CancelledError as ConcurrentCancelledError
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -37,6 +38,7 @@ from . import (
     AgentRun,
     Approval,
     ApprovalTaskMismatchError,
+    LifecycleError,
     Phase,
     PlanChangedError,
     StaleApprovalError,
@@ -78,6 +80,14 @@ class FailureCode(StrEnum):
     GOVERNANCE_FAILED = "governance_failed"
 
 
+class ApprovalConsumeStatus(StrEnum):
+    """Approval decision의 원자적 소비 결과다."""
+
+    APPLIED = "applied"
+    ALREADY_APPLIED = "already_applied"
+    CONFLICT = "conflict"
+
+
 class ClassificationError(ValueError):
     """Classifier 응답이 호출 또는 schema 검증에 실패했을 때 발생한다."""
 
@@ -103,6 +113,36 @@ def _snapshot_bool(snapshot: Mapping[str, object], field_name: str) -> bool:
     value = snapshot[field_name]
     if not isinstance(value, bool):
         raise TypeError(f"{field_name}은 bool이어야 합니다.")
+    return value
+
+
+def _snapshot_text(snapshot: Mapping[str, object], field_name: str) -> str:
+    value = snapshot[field_name]
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name}은 문자열이어야 합니다.")
+    return value
+
+
+def _snapshot_integer(snapshot: Mapping[str, object], field_name: str) -> int:
+    value = snapshot[field_name]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name}은 정수여야 합니다.")
+    return value
+
+
+def _snapshot_mapping(
+    snapshot: Mapping[str, object], field_name: str
+) -> Mapping[str, object]:
+    value = snapshot[field_name]
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name}은 mapping이어야 합니다.")
+    return value
+
+
+def _snapshot_list(snapshot: Mapping[str, object], field_name: str) -> list[object]:
+    value = snapshot[field_name]
+    if not isinstance(value, list):
+        raise TypeError(f"{field_name}은 list여야 합니다.")
     return value
 
 
@@ -140,7 +180,9 @@ class ActionPlan:
         steps = snapshot["steps"]
         if not isinstance(steps, list):
             raise TypeError("plan steps snapshot은 list여야 합니다.")
-        return cls(summary=str(snapshot["summary"]), steps=tuple(map(str, steps)))
+        if not all(isinstance(step, str) for step in steps):
+            raise TypeError("plan steps 항목은 문자열이어야 합니다.")
+        return cls(summary=_snapshot_text(snapshot, "summary"), steps=tuple(steps))
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,23 +278,24 @@ OrchestratorInput = UserTaskInput | AlertInput | TicketInput
 
 
 def _input_from_snapshot(snapshot: Mapping[str, object]) -> OrchestratorInput:
-    kind = RequestKind(str(snapshot["kind"]))
+    kind = RequestKind(_snapshot_text(snapshot, "kind"))
     if kind is RequestKind.USER_TASK:
         return UserTaskInput(
-            task_id=str(snapshot["task_id"]), input=str(snapshot["input"])
+            task_id=_snapshot_text(snapshot, "task_id"),
+            input=_snapshot_text(snapshot, "input"),
         )
     if kind is RequestKind.ALERT:
         return AlertInput(
-            task_id=str(snapshot["task_id"]),
-            alert_id=str(snapshot["alert_id"]),
-            severity=str(snapshot["severity"]),
-            message=str(snapshot["message"]),
+            task_id=_snapshot_text(snapshot, "task_id"),
+            alert_id=_snapshot_text(snapshot, "alert_id"),
+            severity=_snapshot_text(snapshot, "severity"),
+            message=_snapshot_text(snapshot, "message"),
         )
     return TicketInput(
-        task_id=str(snapshot["task_id"]),
-        ticket_id=str(snapshot["ticket_id"]),
-        subject=str(snapshot["subject"]),
-        description=str(snapshot["description"]),
+        task_id=_snapshot_text(snapshot, "task_id"),
+        ticket_id=_snapshot_text(snapshot, "ticket_id"),
+        subject=_snapshot_text(snapshot, "subject"),
+        description=_snapshot_text(snapshot, "description"),
     )
 
 
@@ -289,13 +332,17 @@ class RoutingDecision:
 
     @classmethod
     def from_snapshot(cls, snapshot: Mapping[str, object]) -> RoutingDecision:
-        plan = snapshot.get("plan")
+        plan = snapshot["plan"]
         return cls(
-            request_kind=RequestKind(str(snapshot["request_kind"])),
-            agent_id=str(snapshot["agent_id"]),
-            action=ActionKind(str(snapshot["action"])),
-            reason=str(snapshot["reason"]),
-            plan=None if plan is None else ActionPlan.from_snapshot(plan),
+            request_kind=RequestKind(_snapshot_text(snapshot, "request_kind")),
+            agent_id=_snapshot_text(snapshot, "agent_id"),
+            action=ActionKind(_snapshot_text(snapshot, "action")),
+            reason=_snapshot_text(snapshot, "reason"),
+            plan=(
+                None
+                if plan is None
+                else ActionPlan.from_snapshot(_snapshot_mapping(snapshot, "plan"))
+            ),
         )
 
 
@@ -360,10 +407,12 @@ class ChatModelRequestClassifier:
             sort_keys=True,
         )
         try:
-            message = await asyncio.to_thread(
-                self._model.invoke,
-                [HumanMessage(content=prompt)],
-            )
+            message = await self._model.ainvoke([HumanMessage(content=prompt)])
+        except (asyncio.CancelledError, ConcurrentCancelledError):
+            raise asyncio.CancelledError from None
+        except Exception:  # noqa: BLE001 - provider 상세를 경계에서 제거한다.
+            raise ClassificationError("Classifier model 호출에 실패했습니다.") from None
+        try:
             if not isinstance(message.content, str):
                 raise ClassificationError("Classifier 응답은 JSON 문자열이어야 합니다.")
             parsed = _RoutingDecisionSchema.model_validate_json(message.content)
@@ -389,10 +438,10 @@ class ChatModelRequestClassifier:
             return decision
         except ClassificationError:
             raise
-        except (ValidationError, ValueError, TypeError) as error:
+        except (ValidationError, ValueError, TypeError):
             raise ClassificationError(
                 "Classifier 응답이 routing schema와 맞지 않습니다."
-            ) from error
+            ) from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,7 +463,7 @@ class GovernanceDecision:
     def from_snapshot(cls, snapshot: Mapping[str, object]) -> GovernanceDecision:
         return cls(
             approved=_snapshot_bool(snapshot, "approved"),
-            reason=str(snapshot["reason"]),
+            reason=_snapshot_text(snapshot, "reason"),
         )
 
 
@@ -451,6 +500,7 @@ class _GraphState(TypedDict, total=False):
     workflow: dict[str, object]
     routing: dict[str, object]
     governance: dict[str, object]
+    approval: dict[str, object]
     agent_runs: list[dict[str, object]]
     output: str | None
     errors: list[str]
@@ -562,7 +612,32 @@ class ApprovalRequest:
     task_id: str
     task_version: int
     plan_hash: str
-    plan_summary: str
+    plan: ActionPlan
+    agent_id: str
+    action: ActionKind
+
+    def __post_init__(self) -> None:
+        _require_text(self.task_id, field_name="approval task_id")
+        if isinstance(self.task_version, bool) or not isinstance(
+            self.task_version, int
+        ):
+            raise TypeError("approval task_version은 정수여야 합니다.")
+        if self.task_version <= 0:
+            raise ValueError("approval task_version은 양수여야 합니다.")
+        _require_text(self.plan_hash, field_name="approval plan_hash")
+        if not isinstance(self.plan, ActionPlan):
+            raise TypeError("approval plan은 ActionPlan이어야 합니다.")
+        _require_text(self.agent_id, field_name="approval agent_id")
+        if not isinstance(self.action, ActionKind):
+            raise TypeError("approval action은 ActionKind여야 합니다.")
+        if self.plan.plan_hash != self.plan_hash:
+            raise ValueError("ApprovalRequest plan과 plan_hash가 일치하지 않습니다.")
+        if self.action is not ActionKind.MUTATING:
+            raise ValueError("ApprovalRequest는 mutating action만 허용합니다.")
+
+    @property
+    def plan_summary(self) -> str:
+        return self.plan.summary
 
     @property
     def binding(self) -> tuple[str, int, str]:
@@ -574,16 +649,22 @@ class ApprovalRequest:
             "task_id": self.task_id,
             "task_version": self.task_version,
             "plan_hash": self.plan_hash,
-            "plan_summary": self.plan_summary,
+            "plan": self.plan.to_snapshot(),
+            "agent_id": self.agent_id,
+            "action": self.action.value,
         }
 
     @classmethod
     def from_snapshot(cls, snapshot: Mapping[str, object]) -> ApprovalRequest:
+        if _snapshot_text(snapshot, "kind") != "approval_required":
+            raise ValueError("ApprovalRequest kind가 올바르지 않습니다.")
         return cls(
-            task_id=str(snapshot["task_id"]),
-            task_version=int(snapshot["task_version"]),
-            plan_hash=str(snapshot["plan_hash"]),
-            plan_summary=str(snapshot["plan_summary"]),
+            task_id=_snapshot_text(snapshot, "task_id"),
+            task_version=_snapshot_integer(snapshot, "task_version"),
+            plan_hash=_snapshot_text(snapshot, "plan_hash"),
+            plan=ActionPlan.from_snapshot(_snapshot_mapping(snapshot, "plan")),
+            agent_id=_snapshot_text(snapshot, "agent_id"),
+            action=ActionKind(_snapshot_text(snapshot, "action")),
         )
 
 
@@ -591,11 +672,17 @@ class ApprovalRequest:
 class ApprovalResponse:
     """사람이 interrupt에 제출하는 승인 또는 거절 결정이다."""
 
+    decision_id: str
     accepted: bool
     approval: Approval | None = None
     reason: str | None = None
 
     def __post_init__(self) -> None:
+        _require_text(self.decision_id, field_name="decision_id")
+        if not isinstance(self.accepted, bool):
+            raise TypeError("accepted는 bool이어야 합니다.")
+        if self.reason is not None:
+            _require_text(self.reason, field_name="approval reason")
         if self.accepted and self.approval is None:
             raise ValueError("승인 응답에는 Approval binding이 필요합니다.")
         if not self.accepted:
@@ -605,16 +692,23 @@ class ApprovalResponse:
                 raise ValueError("거절 응답에는 reason이 필요합니다.")
 
     @classmethod
-    def reject(cls, *, reason: str) -> ApprovalResponse:
+    def reject(cls, *, decision_id: str, reason: str) -> ApprovalResponse:
         """사람의 거절 응답을 만든다."""
 
-        return cls(accepted=False, reason=reason)
+        return cls(decision_id=decision_id, accepted=False, reason=reason)
 
     @classmethod
-    def approve(cls, request: ApprovalRequest, *, at: datetime) -> ApprovalResponse:
+    def approve(
+        cls,
+        request: ApprovalRequest,
+        *,
+        decision_id: str,
+        at: datetime,
+    ) -> ApprovalResponse:
         """interrupt binding과 정확히 일치하는 승인 응답을 만든다."""
 
         return cls(
+            decision_id=decision_id,
             accepted=True,
             approval=Approval(
                 task_id=request.task_id,
@@ -626,6 +720,7 @@ class ApprovalResponse:
 
     def to_snapshot(self) -> dict[str, object]:
         return {
+            "decision_id": self.decision_id,
             "accepted": self.accepted,
             "approval": None if self.approval is None else self.approval.to_snapshot(),
             "reason": self.reason,
@@ -633,12 +728,102 @@ class ApprovalResponse:
 
     @classmethod
     def from_snapshot(cls, snapshot: Mapping[str, object]) -> ApprovalResponse:
-        approval = snapshot.get("approval")
+        approval = snapshot["approval"]
+        reason = snapshot["reason"]
         return cls(
+            decision_id=_snapshot_text(snapshot, "decision_id"),
             accepted=_snapshot_bool(snapshot, "accepted"),
-            approval=None if approval is None else Approval.from_snapshot(approval),
-            reason=None if snapshot.get("reason") is None else str(snapshot["reason"]),
+            approval=(
+                None
+                if approval is None
+                else Approval.from_snapshot(_snapshot_mapping(snapshot, "approval"))
+            ),
+            reason=None if reason is None else _snapshot_text(snapshot, "reason"),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalConsumeResult:
+    """ApprovalConsumer가 저장한 exact Task successor와 소비 상태다."""
+
+    status: ApprovalConsumeStatus
+    task: Task
+    failure: FailureCode | None = None
+
+
+class ApprovalConsumer(Protocol):
+    """Approval decision을 Task binding과 원자적으로 소비한다."""
+
+    async def consume(
+        self,
+        *,
+        task: Task,
+        response: ApprovalResponse,
+        at: datetime,
+    ) -> ApprovalConsumeResult:
+        """정확한 persisted successor 또는 replay/conflict를 반환한다."""
+
+
+class FakeApprovalConsumer:
+    """한 process 안에서 원자적 소비를 재현하는 결정 가능한 adapter다."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._decisions: dict[str, tuple[dict[str, object], ApprovalConsumeResult]] = {}
+        self._bindings: dict[tuple[str, int, str], ApprovalConsumeResult] = {}
+
+    async def consume(
+        self,
+        *,
+        task: Task,
+        response: ApprovalResponse,
+        at: datetime,
+    ) -> ApprovalConsumeResult:
+        async with self._lock:
+            snapshot = response.to_snapshot()
+            previous = self._decisions.get(response.decision_id)
+            if previous is not None:
+                previous_snapshot, result = previous
+                status = (
+                    ApprovalConsumeStatus.ALREADY_APPLIED
+                    if previous_snapshot == snapshot
+                    else ApprovalConsumeStatus.CONFLICT
+                )
+                return ApprovalConsumeResult(status, result.task, result.failure)
+            failure: FailureCode | None = None
+            if not response.accepted:
+                successor = task.transition(Status.REJECTED, at=at)
+                failure = FailureCode.HUMAN_REJECTED
+            else:
+                assert response.approval is not None
+                try:
+                    successor = task.transition(
+                        Status.RUNNING, approval=response.approval, at=at
+                    )
+                except ApprovalTaskMismatchError:
+                    successor = task.transition(Status.REJECTED, at=at)
+                    failure = FailureCode.APPROVAL_TASK_MISMATCH
+                except PlanChangedError:
+                    successor = task.transition(Status.REJECTED, at=at)
+                    failure = FailureCode.APPROVAL_PLAN_CHANGED
+                except StaleApprovalError:
+                    successor = task.transition(Status.REJECTED, at=at)
+                    failure = FailureCode.APPROVAL_STALE
+                binding = response.approval.binding
+                existing = self._bindings.get(binding)
+                if existing is not None:
+                    return ApprovalConsumeResult(
+                        ApprovalConsumeStatus.ALREADY_APPLIED,
+                        existing.task,
+                        existing.failure,
+                    )
+            result = ApprovalConsumeResult(
+                ApprovalConsumeStatus.APPLIED, successor, failure
+            )
+            self._decisions[response.decision_id] = (snapshot, result)
+            if response.approval is not None:
+                self._bindings[response.approval.binding] = result
+            return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -663,6 +848,7 @@ class OrchestratorService:
         *,
         classifier: RequestClassifier,
         governance: Governance,
+        approval_consumer: ApprovalConsumer,
         registry: AgentRegistry,
         max_agent_runs: int,
         checkpointer: BaseCheckpointSaver,
@@ -671,6 +857,7 @@ class OrchestratorService:
     ) -> None:
         self._classifier = classifier
         self._governance = governance
+        self._approval_consumer = approval_consumer
         self._registry = registry
         self._max_agent_runs = max_agent_runs
         self._clock = clock
@@ -803,45 +990,41 @@ class OrchestratorService:
             task_id=task.task_id,
             task_version=task.version,
             plan_hash=task.plan_hash or "",
-            plan_summary=routing.plan.summary,
+            plan=routing.plan,
+            agent_id=routing.agent_id,
+            action=routing.action,
         )
-        response = ApprovalResponse.from_snapshot(
-            interrupt(approval_request.to_snapshot())
-        )
-        if not response.accepted:
-            task = task.transition(Status.REJECTED, at=self._clock())
-            return {
-                "task": task.to_snapshot(),
-                "errors": [FailureCode.HUMAN_REJECTED.value],
-            }
+        payload = interrupt(approval_request.to_snapshot())
+        response = ApprovalResponse.from_snapshot(payload["response"])
+        successor = Task.from_snapshot(payload["successor"])
+        failure_value = payload.get("failure")
+        failure = None if failure_value is None else FailureCode(failure_value)
+        if failure is not None:
+            expected = task.transition(Status.REJECTED, at=successor.updated_at)
+            if successor != expected:
+                raise OrchestrationStateError(
+                    "ApprovalConsumer rejected successor가 정확하지 않습니다."
+                )
+            return {"task": successor.to_snapshot(), "errors": [failure.value]}
         assert response.approval is not None
-        try:
-            task = task.transition(
-                Status.RUNNING,
-                approval=response.approval,
-                at=self._clock(),
+        expected = task.transition(
+            Status.RUNNING,
+            approval=response.approval,
+            at=successor.updated_at,
+        )
+        if successor != expected:
+            raise OrchestrationStateError(
+                "ApprovalConsumer approved successor가 정확하지 않습니다."
             )
-        except ApprovalTaskMismatchError:
-            return self._reject_invalid_approval(
-                task, FailureCode.APPROVAL_TASK_MISMATCH
-            )
-        except PlanChangedError:
-            return self._reject_invalid_approval(
-                task, FailureCode.APPROVAL_PLAN_CHANGED
-            )
-        except StaleApprovalError:
-            return self._reject_invalid_approval(task, FailureCode.APPROVAL_STALE)
+        task = successor
         workflow = WorkflowRun.from_snapshot(state["workflow"])
+        workflow = workflow.rebind_task(task, at=self._clock())
         workflow = workflow.advance(Phase.EXECUTING, at=self._clock())
-        return {"task": task.to_snapshot(), "workflow": workflow.to_snapshot()}
-
-    def _reject_invalid_approval(
-        self,
-        task: Task,
-        failure: FailureCode,
-    ) -> _GraphState:
-        rejected = task.transition(Status.REJECTED, at=self._clock())
-        return {"task": rejected.to_snapshot(), "errors": [failure.value]}
+        return {
+            "task": task.to_snapshot(),
+            "workflow": workflow.to_snapshot(),
+            "approval": response.approval.to_snapshot(),
+        }
 
     @staticmethod
     def _after_approval(state: _GraphState) -> str:
@@ -873,16 +1056,31 @@ class OrchestratorService:
         result: AgentResult | None = None
         try:
             agent = self._registry.get(routing.agent_id)
+            context: dict[str, object] = {
+                "request_kind": request.kind.value,
+                "routing": routing.reason,
+                "routing_action": routing.action.value,
+                "routing_agent_id": routing.agent_id,
+                "execution_task_version": task.version,
+                "agent_run_id": agent_run.agent_run_id,
+                "budget_sequence": agent_run.budget_sequence,
+            }
+            if state.get("approval") is not None:
+                approval = Approval.from_snapshot(state["approval"])
+                assert routing.plan is not None
+                context.update(
+                    {
+                        "approved_plan": routing.plan.to_snapshot(),
+                        "plan_hash": approval.plan_hash,
+                        "approval": approval.to_snapshot(),
+                        "approved_task_version": approval.task_version,
+                    }
+                )
             candidate = await agent.run(
                 AgentRequest(
                     task_id=task.task_id,
                     input=request.text,
-                    context={
-                        "request_kind": request.kind.value,
-                        "routing": routing.reason,
-                        "agent_run_id": agent_run.agent_run_id,
-                        "budget_sequence": agent_run.budget_sequence,
-                    },
+                    context=context,
                 )
             )
         except AgentNotFoundError:
@@ -999,10 +1197,37 @@ class OrchestratorService:
                 raise ApprovalResumeError(
                     "해당 checkpoint thread에 대기 중인 승인이 없습니다."
                 )
-            result = await self._graph.ainvoke(
-                Command(resume=response.to_snapshot()),
-                config=config,
+            try:
+                current_task = Task.from_snapshot(snapshot.values["task"])
+            except (KeyError, TypeError, ValueError, LifecycleError):
+                raise OrchestrationStateError(
+                    "Approval checkpoint state가 올바르지 않습니다."
+                ) from None
+            consumed = await self._approval_consumer.consume(
+                task=current_task,
+                response=response,
+                at=self._clock(),
             )
+            if consumed.status is not ApprovalConsumeStatus.APPLIED:
+                raise ApprovalResumeError(
+                    f"Approval decision을 소비할 수 없습니다: {consumed.status.value}"
+                )
+            resume_payload = {
+                "response": response.to_snapshot(),
+                "successor": consumed.task.to_snapshot(),
+                "failure": (
+                    None if consumed.failure is None else consumed.failure.value
+                ),
+            }
+            try:
+                result = await self._graph.ainvoke(
+                    Command(resume=resume_payload),
+                    config=config,
+                )
+            except (KeyError, TypeError, ValueError, LifecycleError):
+                raise OrchestrationStateError(
+                    "Approval checkpoint state가 올바르지 않습니다."
+                ) from None
             return self._result_from_state(result)
 
     async def get_result(self, *, thread_id: str) -> OrchestrationResult:
@@ -1020,31 +1245,77 @@ class OrchestratorService:
             state["__interrupt__"] = snapshot.interrupts
         return self._result_from_state(state)
 
+    async def recover(self, *, thread_id: str) -> OrchestrationResult:
+        """저장된 non-approval checkpoint의 persisted next node부터 재개한다."""
+
+        _require_text(thread_id, field_name="thread_id")
+        config = {"configurable": {"thread_id": thread_id}}
+        async with self._thread_locks.setdefault(thread_id, asyncio.Lock()):
+            snapshot = await self._graph.aget_state(config)
+            if not snapshot.values:
+                raise OrchestrationStateError(
+                    "해당 checkpoint thread에 orchestration state가 없습니다."
+                )
+            current = dict(snapshot.values)
+            if snapshot.interrupts:
+                current["__interrupt__"] = snapshot.interrupts
+            try:
+                task = Task.from_snapshot(current["task"])
+            except (KeyError, TypeError, ValueError, LifecycleError):
+                raise OrchestrationStateError(
+                    "Checkpoint state가 올바르지 않습니다."
+                ) from None
+            if task.status is Status.WAITING_APPROVAL or not snapshot.next:
+                return self._result_from_state(current)
+            result = await self._graph.ainvoke(None, config=config)
+            return self._result_from_state(result)
+
     @staticmethod
     def _result_from_state(state: Mapping[str, object]) -> OrchestrationResult:
-        workflow = WorkflowRun.from_snapshot(state["workflow"])
-        agent_runs = tuple(
-            AgentRun.from_snapshot(snapshot, workflow=workflow)
-            for snapshot in state.get("agent_runs", [])
-        )
-        return OrchestrationResult(
-            task=Task.from_snapshot(state["task"]),
-            workflow=workflow,
-            routing=(
-                None
-                if state.get("routing") is None
-                else RoutingDecision.from_snapshot(state["routing"])
-            ),
-            governance=(
-                None
-                if state.get("governance") is None
-                else GovernanceDecision.from_snapshot(state["governance"])
-            ),
-            agent_runs=agent_runs,
-            output=state.get("output"),
-            interrupt=OrchestratorService._interrupt_from_state(state),
-            errors=tuple(FailureCode(code) for code in state.get("errors", [])),
-        )
+        try:
+            workflow = WorkflowRun.from_snapshot(_snapshot_mapping(state, "workflow"))
+            agent_run_snapshots = _snapshot_list(state, "agent_runs")
+            agent_runs = tuple(
+                AgentRun.from_snapshot(
+                    _snapshot_mapping({"agent_run": snapshot}, "agent_run"),
+                    workflow=workflow,
+                )
+                for snapshot in agent_run_snapshots
+            )
+            output = state["output"]
+            if output is not None and not isinstance(output, str):
+                raise TypeError("output은 문자열 또는 None이어야 합니다.")
+            error_values = _snapshot_list(state, "errors")
+            if not all(isinstance(code, str) for code in error_values):
+                raise TypeError("errors 항목은 문자열이어야 합니다.")
+            return OrchestrationResult(
+                task=Task.from_snapshot(_snapshot_mapping(state, "task")),
+                workflow=workflow,
+                routing=(
+                    None
+                    if state.get("routing") is None
+                    else RoutingDecision.from_snapshot(
+                        _snapshot_mapping(state, "routing")
+                    )
+                ),
+                governance=(
+                    None
+                    if state.get("governance") is None
+                    else GovernanceDecision.from_snapshot(
+                        _snapshot_mapping(state, "governance")
+                    )
+                ),
+                agent_runs=agent_runs,
+                output=output,
+                interrupt=OrchestratorService._interrupt_from_state(state),
+                errors=tuple(FailureCode(code) for code in error_values),
+            )
+        except OrchestrationStateError:
+            raise
+        except (KeyError, TypeError, ValueError, LifecycleError):
+            raise OrchestrationStateError(
+                "Checkpoint state가 올바르지 않습니다."
+            ) from None
 
     @staticmethod
     def _interrupt_from_state(state: Mapping[str, object]) -> ApprovalRequest | None:
@@ -1058,12 +1329,16 @@ __all__ = [
     "ActionKind",
     "ActionPlan",
     "AlertInput",
+    "ApprovalConsumeResult",
+    "ApprovalConsumeStatus",
+    "ApprovalConsumer",
     "ApprovalRequest",
     "ApprovalResponse",
     "ApprovalResumeError",
     "ChatModelRequestClassifier",
     "ClassificationError",
     "FailureCode",
+    "FakeApprovalConsumer",
     "FakeGovernance",
     "FakeRequestClassifier",
     "Governance",
