@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import unittest
 from datetime import UTC, datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -32,6 +34,7 @@ from agent_system.orchestration import (
     Status,
     UserTaskInput,
 )
+from agent_system.persistence import SQLiteStore, upgrade_database
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=UTC)
 
@@ -176,6 +179,35 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(agent.received_requests), 1)
 
+    async def test_concurrent_approval_resume_executes_the_agent_once(self) -> None:
+        service, agent = self.make_service()
+        waiting = await service.start(
+            UserTaskInput(task_id="task-approval", input="서비스를 복구해 주세요."),
+            thread_id="thread-approval",
+        )
+        assert waiting.interrupt is not None
+        response = ApprovalResponse.approve(waiting.interrupt, at=NOW)
+
+        results = await asyncio.gather(
+            service.resume(thread_id="thread-approval", response=response),
+            service.resume(thread_id="thread-approval", response=response),
+            return_exceptions=True,
+        )
+
+        self.assertEqual(
+            sum(
+                not isinstance(result, BaseException)
+                and result.task.status is Status.COMPLETED
+                for result in results
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(isinstance(result, ApprovalResumeError) for result in results),
+            1,
+        )
+        self.assertEqual(len(agent.received_requests), 1)
+
     async def test_existing_checkpoint_thread_cannot_start_another_task(self) -> None:
         service, _ = self.make_service()
         await service.start(
@@ -249,3 +281,64 @@ class AgentIssuanceCheckpointTests(unittest.IsolatedAsyncioTestCase):
         agent.release.set()
         completed = await running
         self.assertEqual(completed.task.status, Status.COMPLETED)
+
+
+class SQLiteCheckpointerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    """Persistence 공개 checkpointer를 async supervisor에 그대로 주입한다."""
+
+    async def test_async_service_runs_and_reads_after_sync_saver_reconnect(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "orchestrator.db"
+            upgrade_database(database_path)
+            registry = AgentRegistry()
+            registry.register(
+                FakeAgent(
+                    AgentMetadata("reader", "조회 Agent", "상태 조회"),
+                    output="정상",
+                )
+            )
+            classifier = FakeRequestClassifier(
+                {
+                    RequestKind.USER_TASK: RoutingDecision(
+                        request_kind=RequestKind.USER_TASK,
+                        agent_id="reader",
+                        action=ActionKind.READ_ONLY,
+                        reason="상태 조회",
+                    )
+                }
+            )
+            with SQLiteStore(database_path) as store:
+                with store.open_checkpointer() as saver:
+                    service = OrchestratorService(
+                        classifier=classifier,
+                        governance=FakeGovernance(approved=True, reason="허용"),
+                        registry=registry,
+                        max_agent_runs=1,
+                        checkpointer=saver,
+                        clock=lambda: NOW,
+                        id_factory=iter(
+                            ("workflow-sqlite", "agent-run-sqlite")
+                        ).__next__,
+                    )
+                    completed = await service.start(
+                        UserTaskInput(task_id="task-sqlite", input="상태 확인"),
+                        thread_id="thread-sqlite",
+                    )
+                    self.assertEqual(completed.task.status, Status.COMPLETED)
+
+                with store.open_checkpointer() as reopened_saver:
+                    recovered_service = OrchestratorService(
+                        classifier=classifier,
+                        governance=FakeGovernance(approved=True, reason="허용"),
+                        registry=registry,
+                        max_agent_runs=1,
+                        checkpointer=reopened_saver,
+                        clock=lambda: NOW,
+                        id_factory=iter(("unused-recovery-id",)).__next__,
+                    )
+                    recovered = await recovered_service.get_result(
+                        thread_id="thread-sqlite"
+                    )
+                    self.assertEqual(recovered, completed)

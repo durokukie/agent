@@ -1,9 +1,11 @@
-"""Supervisor orchestration 공개 계약을 외부 I/O 없이 검증한다."""
+"""Compiled supervisor orchestration 공개 계약을 fake로 검증한다."""
 
 from __future__ import annotations
 
 import unittest
 from datetime import UTC, datetime
+
+from langgraph.checkpoint.memory import InMemorySaver
 
 from agent_system.agents import (
     AgentMetadata,
@@ -18,11 +20,13 @@ from agent_system.orchestration import (
     ActionKind,
     ActionPlan,
     AlertInput,
+    ApprovalResponse,
     ChatModelRequestClassifier,
     ClassificationError,
     FailureCode,
     FakeGovernance,
     FakeRequestClassifier,
+    GovernanceDecision,
     OrchestratorService,
     RequestKind,
     RoutingDecision,
@@ -49,6 +53,17 @@ class _MismatchedAgent:
             agent_id="another-agent",
             outcome=AgentOutcome.SUCCESS,
             output="잘못된 결과",
+        )
+
+
+class _InvalidOutputAgent:
+    metadata = AgentMetadata("invalid-output", "형식 오류 Agent", "잘못된 출력을 반환")
+
+    async def run(self, request: AgentRequest) -> AgentResult:
+        return AgentResult(
+            agent_id=self.metadata.agent_id,
+            outcome=AgentOutcome.SUCCESS,
+            output=42,  # type: ignore[arg-type]
         )
 
 
@@ -185,6 +200,38 @@ class RequestClassifierTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
+    def test_public_inputs_reject_empty_identity_and_payload_fields(self) -> None:
+        invalid_factories = (
+            lambda: UserTaskInput(task_id="", input="요청"),
+            lambda: UserTaskInput(task_id="task", input=""),
+            lambda: AlertInput(
+                task_id="task",
+                alert_id="",
+                severity="high",
+                message="경보",
+            ),
+            lambda: TicketInput(
+                task_id="task",
+                ticket_id="INC-1",
+                subject="",
+                description="",
+            ),
+        )
+
+        for factory in invalid_factories:
+            with self.subTest(factory=factory), self.assertRaises(ValueError):
+                factory()
+
+    def test_snapshot_boolean_fields_reject_truthy_strings(self) -> None:
+        with self.assertRaises(TypeError):
+            GovernanceDecision.from_snapshot(
+                {"approved": "false", "reason": "문자열 bool 거부"}
+            )
+        with self.assertRaises(TypeError):
+            ApprovalResponse.from_snapshot(
+                {"accepted": "false", "approval": None, "reason": "거절"}
+            )
+
 
 class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
     """Facade가 graph와 domain snapshot을 감춘 채 실행 결과를 반환한다."""
@@ -209,6 +256,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             governance=governance,
             registry=registry,
             max_agent_runs=2,
+            checkpointer=InMemorySaver(),
             clock=lambda: NOW,
             id_factory=iter(("workflow-1", "agent-run-1")).__next__,
         )
@@ -234,6 +282,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             governance=FakeGovernance(approved=True, reason="허용"),
             registry=AgentRegistry(),
             max_agent_runs=2,
+            checkpointer=InMemorySaver(),
             clock=lambda: NOW,
             id_factory=iter(("workflow-classifier-failure",)).__next__,
         )
@@ -274,6 +323,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             governance=governance,
             registry=registry,
             max_agent_runs=2,
+            checkpointer=InMemorySaver(),
             clock=lambda: NOW,
             id_factory=iter(("workflow-mutating",)).__next__,
         )
@@ -318,6 +368,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             governance=governance,
             registry=registry,
             max_agent_runs=2,
+            checkpointer=InMemorySaver(),
             clock=lambda: NOW,
             id_factory=iter(("workflow-rejected",)).__next__,
         )
@@ -346,6 +397,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             governance=_RaisingGovernance(),
             registry=AgentRegistry(),
             max_agent_runs=2,
+            checkpointer=InMemorySaver(),
             clock=lambda: NOW,
             id_factory=iter(("workflow-governance-failure",)).__next__,
         )
@@ -380,6 +432,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             governance=FakeGovernance(approved=True, reason="허용"),
             registry=registry,
             max_agent_runs=2,
+            checkpointer=InMemorySaver(),
             clock=lambda: NOW,
             id_factory=iter(
                 ("workflow-failure", "agent-run-failure-1", "agent-run-failure-2")
@@ -411,6 +464,11 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
         cases = (
             ("broken", _RaisingAgent(), FailureCode.AGENT_EXCEPTION),
             ("mismatch", _MismatchedAgent(), FailureCode.AGENT_RESULT_MISMATCH),
+            (
+                "invalid-output",
+                _InvalidOutputAgent(),
+                FailureCode.AGENT_RESULT_MISMATCH,
+            ),
             ("missing", None, FailureCode.ROUTE_NOT_FOUND),
         )
         for index, (agent_id, agent, expected_error) in enumerate(cases):
@@ -429,6 +487,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
                     governance=FakeGovernance(approved=True, reason="허용"),
                     registry=registry,
                     max_agent_runs=1,
+                    checkpointer=InMemorySaver(),
                     clock=lambda: NOW,
                     id_factory=iter(
                         (f"workflow-error-{index}", f"agent-run-error-{index}")
@@ -468,6 +527,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             governance=FakeGovernance(approved=True, reason="허용"),
             registry=registry,
             max_agent_runs=2,
+            checkpointer=InMemorySaver(),
             clock=lambda: NOW,
             id_factory=iter(
                 ("workflow-retry", "agent-run-retry-1", "agent-run-retry-2")

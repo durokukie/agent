@@ -27,7 +27,7 @@ framework에 독립적인 `Task`, `WorkflowRun`, `AgentRun`, `Approval`, `Execut
 
 외부 입력은 `UserTaskInput`, `AlertInput`, `TicketInput`으로 구분한다. `RequestClassifier`는 추적 가능한 `RoutingDecision(request_kind, agent_id, action, reason, plan)`을 반환한다. `FakeRequestClassifier`는 외부 호출 없는 테스트 adapter다. `ChatModelRequestClassifier`는 주입된 LangChain `BaseChatModel`만 사용하고 응답 JSON을 Pydantic schema로 검증한다. provider SDK는 import하지 않는다. 변경 route에는 canonical SHA-256 hash를 제공하는 `ActionPlan`이 필수이고 read-only route에는 plan을 허용하지 않는다.
 
-`OrchestratorService.start()`는 새 checkpoint thread를 시작하고 terminal 결과 또는 `ApprovalRequest` interrupt가 포함된 `OrchestrationResult`를 반환한다. `resume()`은 같은 thread의 실제 LangGraph interrupt에 `ApprovalResponse`를 `Command`로 전달한다. `get_result()`는 background runner가 실행 중 또는 대기 중 checkpoint를 읽는 조회 seam이다. 이미 사용된 thread의 새 시작, 승인 대기가 없는 thread의 resume, state가 없는 thread 조회는 각각 명시적 오류다. Runtime은 기본 in-memory checkpointer 대신 Task 4 persistence가 공개하는 checkpointer를 주입할 수 있다.
+`OrchestratorService.start()`는 새 checkpoint thread를 시작하고 terminal 결과 또는 `ApprovalRequest` interrupt가 포함된 `OrchestrationResult`를 반환한다. `resume()`은 같은 thread의 실제 LangGraph interrupt에 `ApprovalResponse`를 `Command`로 전달한다. `get_result()`는 background runner가 실행 중 또는 대기 중 checkpoint를 읽는 조회 seam이다. 이미 사용된 thread의 새 시작, 승인 대기가 없는 thread의 resume, state가 없는 thread 조회는 각각 명시적 오류다. Runtime은 checkpointer, UTC clock과 ID factory를 모두 주입하며, Task 4 persistence가 공개하는 checkpointer도 사용할 수 있다. Private compatibility adapter는 `BaseCheckpointSaver`의 async method가 지원되지 않을 때 같은 public sync method를 worker thread에서 호출하므로 orchestration은 `SqliteSaver` 구현을 import하지 않는다.
 
 ## 의존성과 허용된 import 방향
 
@@ -65,9 +65,9 @@ Classifier·Governance·Agent 구현에서 나온 예외 문자열은 결과에 
 
 모든 status·phase 조합을 표 기반 단위 테스트로 검증한다. Approval의 task/version/plan 결합과 deterministic binding, planless Task의 정확한 version 도달 가능성과 planful 반복 갱신, plan 변경, 취소, budget과 AgentRun의 원자적 결합·직접 생성 차단·exact issuance 기반 복원, historical/current 실행 복원, malformed issuance ledger, DST fold, 모든 aggregate의 JSON snapshot 왕복·오류 정규화를 외부 I/O 없이 검증한다.
 
-Supervisor 단위 테스트는 User/Alert/Ticket 분류, ChatModel JSON 검증, dynamic registry routing, read-only 완료, Governance 거절·예외, Agent FAILURE·예외·결과 불일치·missing route, 성공 재시도와 budget 소진 escalation을 fake로 검증한다. Architecture test는 orchestration의 Upstage·SQLite/ORM·FastAPI·Rich import를 금지한다.
+Fake 기반 supervisor service 통합 테스트는 User/Alert/Ticket 분류, ChatModel JSON 검증, dynamic registry routing, read-only 완료, Governance 거절·예외, Agent FAILURE·예외·결과 불일치·missing route, 성공 재시도와 budget 소진 escalation을 검증한다. 단위 architecture test는 orchestration의 Upstage·SQLite/ORM·FastAPI·Rich import를 금지한다.
 
-LangGraph 통합 테스트는 실제 `InMemorySaver`, `interrupt`, `Command`를 사용해 승인 대기, human 거절, stale/wrong/plan-changed approval, 정상 resume, terminal replay 차단과 thread 재사용 차단을 검증한다. Blocking Agent로 외부 호출 전에 open AgentRun issuance가 checkpoint되는 순서도 확인한다.
+LangGraph 통합 테스트는 실제 `InMemorySaver`, `interrupt`, `Command`를 사용해 승인 대기, human 거절, stale/wrong/plan-changed approval, 정상 resume, terminal replay 차단과 thread 재사용 차단을 검증한다. Blocking Agent로 외부 호출 전에 open AgentRun issuance가 checkpoint되는 순서도 확인한다. Persistence 공개 facade의 sync saver를 주입한 async 실행과 연결을 다시 연 뒤의 결과 조회도 임시 SQLite 파일로 검증한다.
 
 Task 4 persistence 통합 테스트는 같은 Approval의 동시·반복 전달에서 `binding`과 Task version을 optimistic transaction으로 비교해 정확히 한 요청만 `WAITING_APPROVAL → RUNNING`을 저장하고 나머지는 stale/idempotent 결과가 되는지 반드시 검증한다. 또한 `begin_agent_run()`이 반환한 issuance 포함 WorkflowRun과 AgentRun을 한 transaction에 함께 저장하고, 저장된 모든 historical/current AgentRun을 해당 WorkflowRun snapshot과 함께 복원하는지 검증한다.
 

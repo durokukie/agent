@@ -6,7 +6,7 @@
 
 ## 포함할 구현
 
-Task/WorkflowRun/AgentRun 생명주기, supervisor 분류·라우팅·Governance·재시도·종료 정책, validation, 변환, registry와 import 방향 테스트를 포함한다.
+Task/WorkflowRun/AgentRun 생명주기, 순수 validation·변환·registry와 import 방향 테스트를 포함한다. Compiled graph를 실행하는 supervisor 테스트는 integration 영역에 둔다.
 
 ## 공개 인터페이스와 사용 방법
 
@@ -26,7 +26,7 @@ Task/WorkflowRun/AgentRun 생명주기, supervisor 분류·라우팅·Governance
 
 ## 테스트 전략
 
-정상, 오류, 경계값과 불변 조건을 독립된 사례로 검증한다. 생명주기 테스트는 모든 status·phase 조합과 Approval 및 budget 경계를 표 기반으로 다룬다. planless Task의 상태별 정확한 version과 planful 반복 갱신을 함께 검증하며, AgentRun은 직접 생성 차단, 여섯 issuance binding 필드의 변이 거부, historical/current 복원과 malformed WorkflowRun issuance snapshot을 검증한다. Supervisor는 fake classifier/Governance/Agent로 read-only·mutating 분기와 모든 retry failure code를 검증하고 AST 기반 architecture test로 concrete provider·저장·전송 adapter import를 차단한다.
+정상, 오류, 경계값과 불변 조건을 독립된 사례로 검증한다. 생명주기 테스트는 모든 status·phase 조합과 Approval 및 budget 경계를 표 기반으로 다룬다. planless Task의 상태별 정확한 version과 planful 반복 갱신을 함께 검증하며, AgentRun은 직접 생성 차단, 여섯 issuance binding 필드의 변이 거부, historical/current 복원과 malformed WorkflowRun issuance snapshot을 검증한다. AST 기반 architecture test는 concrete provider·저장·전송 adapter import를 차단한다.
 
 ## 변경 시 문서 갱신 조건
 

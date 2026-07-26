@@ -6,7 +6,7 @@
 
 ## 포함할 구현
 
-LangGraph graph 연결·interrupt·Command resume·실행 중 issuance checkpoint, SQLite app migration·transaction·checkpoint 재개, runtime 조립과 CLI 실행 테스트를 포함한다.
+LangGraph graph 연결·분류·routing·오류 정책·interrupt·Command resume·실행 중 issuance checkpoint, SQLite app migration·transaction·checkpoint 재개, runtime 조립과 CLI 실행 테스트를 포함한다.
 
 ## 공개 인터페이스와 사용 방법
 
@@ -30,7 +30,10 @@ LangGraph graph 연결·interrupt·Command resume·실행 중 issuance checkpoin
 rollback, event append-only, 멱등성 race, Approval 단일 소비, WorkflowRun/AgentRun
 원자성, outbox와 startup recovery를 검증한다. Supervisor graph는 실제 compiled graph와
 `InMemorySaver`로 승인 binding·거절·resume·replay와 Agent 호출 전 issuance 저장 순서를
-검증한다. SQLite checkpoint는 interrupt 후 연결을 닫고 새 연결에서 재개한다. 이후
+검증한다. Persistence 공개 sync saver를 async supervisor에 주입해 실행하고 새 연결에서
+결과를 복원하는 호환 경로도 검증한다. SQLite checkpoint는 interrupt 후 연결을 닫고 새
+연결에서 재개한다. Fake classifier/Governance/Agent로 read-only·mutating 분기, 입력 종류,
+malformed 결과와 모든 retry failure code를 compiled graph의 공개 facade에서 검증한다. 이후
 runtime 조립과 저장소 오류 경로를 확장한다.
 
 ## 변경 시 문서 갱신 조건

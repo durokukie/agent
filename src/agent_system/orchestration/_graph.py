@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
 from typing import Protocol, TypedDict
-from uuid import uuid4
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import (
+    BaseCheckpointSaver,
+    ChannelVersions,
+    Checkpoint,
+    CheckpointMetadata,
+    CheckpointTuple,
+)
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -94,6 +99,13 @@ def _require_text(value: str, *, field_name: str) -> None:
         raise ValueError(f"{field_name}는 비어 있을 수 없습니다.")
 
 
+def _snapshot_bool(snapshot: Mapping[str, object], field_name: str) -> bool:
+    value = snapshot[field_name]
+    if not isinstance(value, bool):
+        raise TypeError(f"{field_name}은 bool이어야 합니다.")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ActionPlan:
     """승인 binding에 사용하는 변경 불가능한 action plan이다."""
@@ -138,6 +150,10 @@ class UserTaskInput:
     task_id: str
     input: str
 
+    def __post_init__(self) -> None:
+        _require_text(self.task_id, field_name="task_id")
+        _require_text(self.input, field_name="input")
+
     @property
     def kind(self) -> RequestKind:
         return RequestKind.USER_TASK
@@ -158,6 +174,12 @@ class AlertInput:
     alert_id: str
     severity: str
     message: str
+
+    def __post_init__(self) -> None:
+        _require_text(self.task_id, field_name="task_id")
+        _require_text(self.alert_id, field_name="alert_id")
+        _require_text(self.severity, field_name="severity")
+        _require_text(self.message, field_name="message")
 
     @property
     def kind(self) -> RequestKind:
@@ -185,6 +207,12 @@ class TicketInput:
     ticket_id: str
     subject: str
     description: str
+
+    def __post_init__(self) -> None:
+        _require_text(self.task_id, field_name="task_id")
+        _require_text(self.ticket_id, field_name="ticket_id")
+        _require_text(self.subject, field_name="subject")
+        _require_text(self.description, field_name="description")
 
     @property
     def kind(self) -> RequestKind:
@@ -239,6 +267,10 @@ class RoutingDecision:
     plan: ActionPlan | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.request_kind, RequestKind):
+            raise TypeError("request_kind는 RequestKind여야 합니다.")
+        if not isinstance(self.action, ActionKind):
+            raise TypeError("action은 ActionKind여야 합니다.")
         _require_text(self.agent_id, field_name="agent_id")
         _require_text(self.reason, field_name="reason")
         if self.action is ActionKind.MUTATING and self.plan is None:
@@ -380,7 +412,10 @@ class GovernanceDecision:
 
     @classmethod
     def from_snapshot(cls, snapshot: Mapping[str, object]) -> GovernanceDecision:
-        return cls(approved=bool(snapshot["approved"]), reason=str(snapshot["reason"]))
+        return cls(
+            approved=_snapshot_bool(snapshot, "approved"),
+            reason=str(snapshot["reason"]),
+        )
 
 
 class Governance(Protocol):
@@ -419,6 +454,105 @@ class _GraphState(TypedDict, total=False):
     agent_runs: list[dict[str, object]]
     output: str | None
     errors: list[str]
+
+
+class _AsyncCheckpointerAdapter(BaseCheckpointSaver[object]):
+    """동기 saver도 async graph에서 사용할 수 있게 public API만 중계한다."""
+
+    def __init__(self, inner: BaseCheckpointSaver) -> None:
+        super().__init__(serde=inner.serde)
+        self._inner = inner
+
+    @property
+    def config_specs(self) -> list:
+        return self._inner.config_specs
+
+    def get_next_version(self, current: object | None, channel: None) -> object:
+        return self._inner.get_next_version(current, channel)
+
+    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+        try:
+            return await self._inner.aget_tuple(config)
+        except NotImplementedError:
+            return await asyncio.to_thread(self._inner.get_tuple, config)
+
+    async def alist(
+        self,
+        config: RunnableConfig | None,
+        *,
+        filter: dict[str, object] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
+    ) -> AsyncIterator[CheckpointTuple]:
+        try:
+            async for checkpoint in self._inner.alist(
+                config,
+                filter=filter,
+                before=before,
+                limit=limit,
+            ):
+                yield checkpoint
+            return
+        except NotImplementedError:
+            checkpoints = await asyncio.to_thread(
+                lambda: list(
+                    self._inner.list(
+                        config,
+                        filter=filter,
+                        before=before,
+                        limit=limit,
+                    )
+                )
+            )
+        for checkpoint in checkpoints:
+            yield checkpoint
+
+    async def aput(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        try:
+            return await self._inner.aput(
+                config,
+                checkpoint,
+                metadata,
+                new_versions,
+            )
+        except NotImplementedError:
+            return await asyncio.to_thread(
+                self._inner.put,
+                config,
+                checkpoint,
+                metadata,
+                new_versions,
+            )
+
+    async def aput_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, object]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        try:
+            await self._inner.aput_writes(config, writes, task_id, task_path)
+        except NotImplementedError:
+            await asyncio.to_thread(
+                self._inner.put_writes,
+                config,
+                writes,
+                task_id,
+                task_path,
+            )
+
+    async def adelete_thread(self, thread_id: str) -> None:
+        try:
+            await self._inner.adelete_thread(thread_id)
+        except NotImplementedError:
+            await asyncio.to_thread(self._inner.delete_thread, thread_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,7 +635,7 @@ class ApprovalResponse:
     def from_snapshot(cls, snapshot: Mapping[str, object]) -> ApprovalResponse:
         approval = snapshot.get("approval")
         return cls(
-            accepted=bool(snapshot["accepted"]),
+            accepted=_snapshot_bool(snapshot, "accepted"),
             approval=None if approval is None else Approval.from_snapshot(approval),
             reason=None if snapshot.get("reason") is None else str(snapshot["reason"]),
         )
@@ -531,9 +665,9 @@ class OrchestratorService:
         governance: Governance,
         registry: AgentRegistry,
         max_agent_runs: int,
-        checkpointer: BaseCheckpointSaver | None = None,
-        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
-        id_factory: Callable[[], str] = lambda: str(uuid4()),
+        checkpointer: BaseCheckpointSaver,
+        clock: Callable[[], datetime],
+        id_factory: Callable[[], str],
     ) -> None:
         self._classifier = classifier
         self._governance = governance
@@ -541,9 +675,9 @@ class OrchestratorService:
         self._max_agent_runs = max_agent_runs
         self._clock = clock
         self._id_factory = id_factory
-        self._graph = self._build_graph().compile(
-            checkpointer=checkpointer or InMemorySaver()
-        )
+        self._thread_locks: dict[str, asyncio.Lock] = {}
+        graph_checkpointer = _AsyncCheckpointerAdapter(checkpointer)
+        self._graph = self._build_graph().compile(checkpointer=graph_checkpointer)
 
     def _build_graph(self) -> StateGraph[_GraphState]:
         graph = StateGraph(_GraphState)
@@ -760,6 +894,7 @@ class OrchestratorService:
                 not isinstance(candidate, AgentResult)
                 or candidate.agent_id != routing.agent_id
                 or not isinstance(candidate.outcome, AgentOutcome)
+                or not isinstance(candidate.output, str)
             ):
                 failure = FailureCode.AGENT_RESULT_MISMATCH
             elif candidate.outcome is AgentOutcome.FAILURE:
@@ -819,33 +954,34 @@ class OrchestratorService:
 
         _require_text(thread_id, field_name="thread_id")
         config = {"configurable": {"thread_id": thread_id}}
-        checkpoint = await self._graph.aget_state(config)
-        if checkpoint.values:
-            raise OrchestrationStartError(
-                "이미 orchestration 실행이 존재하는 checkpoint thread입니다."
+        async with self._thread_locks.setdefault(thread_id, asyncio.Lock()):
+            checkpoint = await self._graph.aget_state(config)
+            if checkpoint.values:
+                raise OrchestrationStartError(
+                    "이미 orchestration 실행이 존재하는 checkpoint thread입니다."
+                )
+            now = self._clock()
+            task = Task.receive(task_id=request.task_id, input=request.text, at=now)
+            task = task.transition(Status.RUNNING, at=self._clock())
+            workflow = WorkflowRun.start(
+                workflow_run_id=self._id_factory(),
+                task=task,
+                max_agent_runs=self._max_agent_runs,
+                at=self._clock(),
             )
-        now = self._clock()
-        task = Task.receive(task_id=request.task_id, input=request.text, at=now)
-        task = task.transition(Status.RUNNING, at=self._clock())
-        workflow = WorkflowRun.start(
-            workflow_run_id=self._id_factory(),
-            task=task,
-            max_agent_runs=self._max_agent_runs,
-            at=self._clock(),
-        )
-        state: _GraphState = {
-            "request": request.to_snapshot(),
-            "task": task.to_snapshot(),
-            "workflow": workflow.to_snapshot(),
-            "agent_runs": [],
-            "output": None,
-            "errors": [],
-        }
-        result = await self._graph.ainvoke(
-            state,
-            config=config,
-        )
-        return self._result_from_state(result)
+            state: _GraphState = {
+                "request": request.to_snapshot(),
+                "task": task.to_snapshot(),
+                "workflow": workflow.to_snapshot(),
+                "agent_runs": [],
+                "output": None,
+                "errors": [],
+            }
+            result = await self._graph.ainvoke(
+                state,
+                config=config,
+            )
+            return self._result_from_state(result)
 
     async def resume(
         self,
@@ -857,16 +993,17 @@ class OrchestratorService:
 
         _require_text(thread_id, field_name="thread_id")
         config = {"configurable": {"thread_id": thread_id}}
-        snapshot = await self._graph.aget_state(config)
-        if "approval" not in snapshot.next or not snapshot.interrupts:
-            raise ApprovalResumeError(
-                "해당 checkpoint thread에 대기 중인 승인이 없습니다."
+        async with self._thread_locks.setdefault(thread_id, asyncio.Lock()):
+            snapshot = await self._graph.aget_state(config)
+            if "approval" not in snapshot.next or not snapshot.interrupts:
+                raise ApprovalResumeError(
+                    "해당 checkpoint thread에 대기 중인 승인이 없습니다."
+                )
+            result = await self._graph.ainvoke(
+                Command(resume=response.to_snapshot()),
+                config=config,
             )
-        result = await self._graph.ainvoke(
-            Command(resume=response.to_snapshot()),
-            config=config,
-        )
-        return self._result_from_state(result)
+            return self._result_from_state(result)
 
     async def get_result(self, *, thread_id: str) -> OrchestrationResult:
         """background runner가 checkpoint의 현재 공개 결과를 조회한다."""
