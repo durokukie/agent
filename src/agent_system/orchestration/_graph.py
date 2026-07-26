@@ -765,6 +765,38 @@ class ApprovalConsumeResult:
     task: Task
     failure: FailureCode | None = None
 
+    def __post_init__(self) -> None:
+        if type(self.status) is not ApprovalConsumeStatus:
+            raise TypeError("status는 ApprovalConsumeStatus여야 합니다.")
+        if type(self.task) is not Task:
+            raise TypeError("task는 Task여야 합니다.")
+        approval_failures = {
+            FailureCode.HUMAN_REJECTED,
+            FailureCode.APPROVAL_TASK_MISMATCH,
+            FailureCode.APPROVAL_PLAN_CHANGED,
+            FailureCode.APPROVAL_STALE,
+        }
+        if self.failure is not None and (
+            type(self.failure) is not FailureCode
+            or self.failure not in approval_failures
+        ):
+            raise TypeError("failure는 approval FailureCode여야 합니다.")
+        if self.status is ApprovalConsumeStatus.CONFLICT:
+            if (
+                self.task.status is not Status.WAITING_APPROVAL
+                or self.failure is not None
+            ):
+                raise ValueError(
+                    "CONFLICT 결과는 현재 WAITING_APPROVAL Task만 반환해야 합니다."
+                )
+            return
+        if self.task.status is Status.RUNNING and self.failure is not None:
+            raise ValueError("RUNNING successor에는 approval failure가 없어야 합니다.")
+        if self.task.status is Status.REJECTED and self.failure is None:
+            raise ValueError("REJECTED successor에는 approval failure가 필요합니다.")
+        if self.task.status not in {Status.RUNNING, Status.REJECTED}:
+            raise ValueError("Approval successor는 RUNNING 또는 REJECTED여야 합니다.")
+
 
 class ApprovalConsumer(Protocol):
     """Approval decision을 Task binding과 원자적으로 소비한다."""
@@ -806,6 +838,8 @@ class FakeApprovalConsumer:
                     if previous_snapshot == snapshot
                     else ApprovalConsumeStatus.CONFLICT
                 )
+                if status is ApprovalConsumeStatus.CONFLICT:
+                    return ApprovalConsumeResult(status, task)
                 return ApprovalConsumeResult(status, result.task, result.failure)
             failure: FailureCode | None = None
             if not response.accepted:
@@ -829,11 +863,9 @@ class FakeApprovalConsumer:
                 binding = response.approval.binding
                 existing = self._bindings.get(binding)
                 if existing is not None:
-                    _, existing_result = existing
                     return ApprovalConsumeResult(
                         ApprovalConsumeStatus.CONFLICT,
-                        existing_result.task,
-                        existing_result.failure,
+                        task,
                     )
             result = ApprovalConsumeResult(
                 ApprovalConsumeStatus.APPLIED, successor, failure
@@ -854,17 +886,17 @@ class ExecutionClaimResult:
     status: ExecutionClaimStatus
 
     def __post_init__(self) -> None:
-        if not isinstance(self.status, ExecutionClaimStatus):
+        if type(self.status) is not ExecutionClaimStatus:
             raise TypeError("status는 ExecutionClaimStatus여야 합니다.")
 
 
 class ExecutionCoordinator(Protocol):
-    """열린 AgentRun의 process-local 복구 실행권을 조정한다."""
+    """process-local orchestration 실행권을 stable key로 조정한다."""
 
-    async def claim(self, *, thread_id: str, agent_run_id: str) -> ExecutionClaimResult:
-        """thread와 AgentRun에 결합된 실행권 획득 결과를 반환한다."""
+    async def claim(self, *, thread_id: str, claim_key: str) -> ExecutionClaimResult:
+        """thread와 stable key에 결합된 실행권 획득 결과를 반환한다."""
 
-    async def release(self, *, thread_id: str, agent_run_id: str) -> None:
+    async def release(self, *, thread_id: str, claim_key: str) -> None:
         """획득했던 실행권을 해제한다."""
 
 
@@ -875,17 +907,17 @@ class FakeExecutionCoordinator:
         self._lock = asyncio.Lock()
         self._claims: set[tuple[str, str]] = set()
 
-    async def claim(self, *, thread_id: str, agent_run_id: str) -> ExecutionClaimResult:
-        key = (thread_id, agent_run_id)
+    async def claim(self, *, thread_id: str, claim_key: str) -> ExecutionClaimResult:
+        key = (thread_id, claim_key)
         async with self._lock:
             if key in self._claims:
                 return ExecutionClaimResult(ExecutionClaimStatus.BUSY)
             self._claims.add(key)
             return ExecutionClaimResult(ExecutionClaimStatus.CLAIMED)
 
-    async def release(self, *, thread_id: str, agent_run_id: str) -> None:
+    async def release(self, *, thread_id: str, claim_key: str) -> None:
         async with self._lock:
-            self._claims.discard((thread_id, agent_run_id))
+            self._claims.discard((thread_id, claim_key))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1265,7 +1297,7 @@ class OrchestratorService:
             try:
                 claim = await self._execution_coordinator.claim(
                     thread_id=thread_id,
-                    agent_run_id=f"approval:{response.decision_id}",
+                    claim_key=f"approval:{response.decision_id}",
                 )
             except asyncio.CancelledError:
                 raise
@@ -1273,10 +1305,7 @@ class OrchestratorService:
                 raise OrchestrationDependencyError(
                     "ExecutionCoordinator claim에 실패했습니다."
                 ) from None
-            if not isinstance(claim, ExecutionClaimResult):
-                raise OrchestrationDependencyError(
-                    "ExecutionCoordinator가 잘못된 claim 결과를 반환했습니다."
-                )
+            claim = self._validate_execution_claim_result(claim)
             if claim.status is ExecutionClaimStatus.BUSY:
                 raise ApprovalResumeError(
                     "다른 runner가 같은 Approval을 재개하고 있습니다."
@@ -1306,10 +1335,7 @@ class OrchestratorService:
                     raise OrchestrationDependencyError(
                         "ApprovalConsumer 호출에 실패했습니다."
                     ) from None
-                if not isinstance(consumed, ApprovalConsumeResult):
-                    raise OrchestrationDependencyError(
-                        "ApprovalConsumer가 잘못된 결과를 반환했습니다."
-                    )
+                consumed = self._validate_approval_consume_result(consumed)
                 if consumed.status not in {
                     ApprovalConsumeStatus.APPLIED,
                     ApprovalConsumeStatus.ALREADY_APPLIED,
@@ -1385,7 +1411,6 @@ class OrchestratorService:
                 or not snapshot.next
             ):
                 return current_result
-            claim_key: tuple[str, str] | None = None
             if "call_agent" in snapshot.next:
                 if not current_result.agent_runs:
                     raise OrchestrationStateError(
@@ -1396,51 +1421,46 @@ class OrchestratorService:
                     raise OrchestrationStateError(
                         "완료된 AgentRun은 call_agent에서 복구할 수 없습니다."
                     )
-                try:
-                    claim = await self._execution_coordinator.claim(
-                        thread_id=thread_id,
-                        agent_run_id=agent_run.agent_run_id,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - seam 상세를 경계에서 제거한다.
-                    raise OrchestrationDependencyError(
-                        "ExecutionCoordinator claim에 실패했습니다."
-                    ) from None
-                if not isinstance(claim, ExecutionClaimResult):
-                    raise OrchestrationDependencyError(
-                        "ExecutionCoordinator가 잘못된 claim 결과를 반환했습니다."
-                    )
-                if claim.status is ExecutionClaimStatus.BUSY:
-                    raise OrchestrationRecoveryError(
-                        "다른 runner가 같은 AgentRun을 복구하고 있습니다."
-                    )
-                if claim.status is not ExecutionClaimStatus.CLAIMED:
-                    raise OrchestrationDependencyError(
-                        "ExecutionCoordinator가 잘못된 claim 결과를 반환했습니다."
-                    )
-                claim_key = thread_id, agent_run.agent_run_id
+            recovery_claim_id = f"recovery:{thread_id}"
+            try:
+                claim = await self._execution_coordinator.claim(
+                    thread_id=thread_id,
+                    claim_key=recovery_claim_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - seam 상세를 경계에서 제거한다.
+                raise OrchestrationDependencyError(
+                    "ExecutionCoordinator claim에 실패했습니다."
+                ) from None
+            claim = self._validate_execution_claim_result(claim)
+            if claim.status is ExecutionClaimStatus.BUSY:
+                raise OrchestrationRecoveryError(
+                    "다른 runner가 같은 thread를 복구하고 있습니다."
+                )
+            if claim.status is not ExecutionClaimStatus.CLAIMED:
+                raise OrchestrationDependencyError(
+                    "ExecutionCoordinator가 잘못된 claim 결과를 반환했습니다."
+                )
+            claim_key = thread_id, recovery_claim_id
             try:
                 result = await self._graph.ainvoke(None, config=config)
             except asyncio.CancelledError:
-                if claim_key is not None:
-                    await self._release_after_cancellation(*claim_key)
+                await self._release_after_cancellation(*claim_key)
                 raise
             except Exception:  # noqa: BLE001 - checkpoint parse 오류를 정규화한다.
-                if claim_key is not None:
-                    await self._release_execution_claim(*claim_key)
+                await self._release_execution_claim(*claim_key)
                 raise OrchestrationStateError(
                     "Checkpoint state를 복구할 수 없습니다."
                 ) from None
-            if claim_key is not None:
-                await self._release_execution_claim(*claim_key)
+            await self._release_execution_claim(*claim_key)
             return self._result_from_state(result)
 
-    async def _release_execution_claim(self, thread_id: str, agent_run_id: str) -> None:
+    async def _release_execution_claim(self, thread_id: str, claim_key: str) -> None:
         try:
             await self._execution_coordinator.release(
                 thread_id=thread_id,
-                agent_run_id=agent_run_id,
+                claim_key=claim_key,
             )
         except asyncio.CancelledError:
             raise
@@ -1449,14 +1469,40 @@ class OrchestratorService:
                 "ExecutionCoordinator release에 실패했습니다."
             ) from None
 
-    async def _release_after_cancellation(
-        self, thread_id: str, agent_run_id: str
-    ) -> None:
+    @staticmethod
+    def _validate_approval_consume_result(
+        candidate: object,
+    ) -> ApprovalConsumeResult:
+        try:
+            if type(candidate) is not ApprovalConsumeResult:
+                raise TypeError
+            return ApprovalConsumeResult(
+                status=candidate.status,
+                task=candidate.task,
+                failure=candidate.failure,
+            )
+        except Exception:  # noqa: BLE001 - collaborator 결과를 경계에서 검증한다.
+            raise OrchestrationDependencyError(
+                "ApprovalConsumer가 잘못된 결과를 반환했습니다."
+            ) from None
+
+    @staticmethod
+    def _validate_execution_claim_result(candidate: object) -> ExecutionClaimResult:
+        try:
+            if type(candidate) is not ExecutionClaimResult:
+                raise TypeError
+            return ExecutionClaimResult(status=candidate.status)
+        except Exception:  # noqa: BLE001 - collaborator 결과를 경계에서 검증한다.
+            raise OrchestrationDependencyError(
+                "ExecutionCoordinator가 잘못된 claim 결과를 반환했습니다."
+            ) from None
+
+    async def _release_after_cancellation(self, thread_id: str, claim_key: str) -> None:
         try:
             await asyncio.shield(
                 self._execution_coordinator.release(
                     thread_id=thread_id,
-                    agent_run_id=agent_run_id,
+                    claim_key=claim_key,
                 )
             )
         except BaseException:  # noqa: BLE001 - 원래 cancellation을 보존한다.
