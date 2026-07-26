@@ -12,7 +12,11 @@
 
 `AgentMetadata`는 안정적인 `agent_id`, 표시 이름, 설명을 제공한다. `AgentRequest`는 `task_id`, 입력 문자열, 필수 `idempotency_key`, 선택 context를 전달하고, `AgentResult`는 실행 agent ID, `AgentOutcome`, 출력 문자열을 반환한다. `idempotency_key`는 비어 있지 않은 문자열이며 orchestration이 발급한 `agent_run_id`와 같다. 모든 Agent adapter는 같은 key로 반복된 호출의 외부 effect를 중복 적용하지 않아야 한다. 실패 사유도 출력 문자열에 담아 호출자가 결과 형식을 일관되게 처리한다.
 
-`Agent`는 `metadata`와 `async run(request)`를 요구하는 구조적 Protocol이다. `AgentRegistry.register()`는 ID를 하나만 등록하고 중복 시 `DuplicateAgentIdError`를 발생시킨다. `get()`은 미등록 ID에 `AgentNotFoundError`를 발생시킨다. `FakeAgent`는 고정된 결과를 반환하고 받은 요청을 기록하는 결정 가능한 테스트 adapter다.
+`Agent`는 `metadata`와 `async run(request)`를 요구하는 구조적 Protocol이다. `run()`은
+호출 Task의 cancellation을 삼키지 않고 `CancelledError`를 신속하게 다시 전파해야 한다.
+`AgentRegistry.register()`는 ID를 하나만 등록하고 중복 시 `DuplicateAgentIdError`를 발생시킨다.
+`get()`은 미등록 ID에 `AgentNotFoundError`를 발생시킨다. `FakeAgent`는 고정된 결과를 반환하고
+받은 요청을 기록하는 결정 가능한 테스트 adapter다.
 
 Agent 구현이 한 번 반환하는 결과와 orchestration의 `AgentRun`은 구분한다. `AgentRun`은 task/workflow/phase와 호출 시각, 완료 결과를 연결하는 orchestration 소유 실행 이력이며 Agent의 공개 interface에 포함되지 않는다. 따라서 agents 모듈은 `AgentRun`을 import하거나 생성하지 않는다.
 
@@ -26,7 +30,12 @@ runtime이 구현체를 registry에 등록하고, registry가 요청된 agent ad
 
 ## 설계 결정과 제약사항
 
-설정형 agent, 자체 LangGraph agent, 향후 원격 adapter는 모두 같은 구조적 Protocol을 만족해야 한다. registry는 조회만 담당하며 실행 정책이나 구현 종류를 알지 못한다. 기본 `EchoAgent`는 외부 I/O 없이 입력을 그대로 반환하는 최소 참조 구현이다.
+설정형 agent, 자체 LangGraph agent, 향후 원격 adapter는 모두 같은 구조적 Protocol을 만족해야
+한다. cancellation을 무시하거나 무기한 blocking I/O를 수행하는 adapter는 계약 위반이며 같은
+Python event loop 안에서 강제로 종료할 수 없다. 운영 환경은 graceful shutdown deadline 뒤
+process supervisor의 hard-kill로 이 경계를 닫는다. registry는 조회만 담당하며 실행 정책이나
+구현 종류를 알지 못한다. 기본 `EchoAgent`는 외부 I/O 없이 입력을 그대로 반환하는 최소 참조
+구현이다.
 
 ## 테스트 전략
 
@@ -34,4 +43,5 @@ runtime이 구현체를 registry에 등록하고, registry가 요청된 agent ad
 
 ## 변경 시 문서 갱신 조건
 
-공통 인터페이스, 요청·결과 필드, metadata, registry 동작, agent 종류 또는 Agent 호출 결과와 `AgentRun` 사이의 책임 경계가 바뀔 때 갱신한다.
+공통 인터페이스, 요청·결과 필드, metadata, cancellation 협조 조건, registry 동작, agent 종류
+또는 Agent 호출 결과와 `AgentRun` 사이의 책임 경계가 바뀔 때 갱신한다.

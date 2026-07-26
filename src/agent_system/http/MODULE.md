@@ -48,7 +48,9 @@ runtime이 persistence authority에서 만든 공개 snapshot을 직렬화한다
 완료·오류·timeout·재-cancellation 어느 경우에도 최초 startup 오류와 traceback을 primary로
 보존한다. Deadline 뒤에는 cancel을 요청하되 완료를 무기한 기다리지 않고, strong registry와
 done callback으로 늦은 cleanup의 예외를 회수한다. Cleanup 상세는 외부 오류에 노출하지 않고
-일반화된 note만 추가한다.
+일반화된 note만 추가한다. 실제 `RuntimeApplication`은 자체 shutdown grace 안에 cooperative
+worker와 소유 자원을 정리하므로 정상 runtime의 startup 실패 경로에서는 global cleanup
+registry가 비워진다. 비협조 adapter의 최종 종료 경계는 HTTP가 아니라 process supervisor다.
 
 ## 설계 결정과 제약사항
 
@@ -63,6 +65,8 @@ HTTP adapter는 Rich 출력이나 색상 설정을 사용하지 않는다.
 오류 보존을 runtime fake로 검증한다. Cancellation-resistant cleanup은 짧은 grace period를
 설정한 subprocess에서 deadline 안에 원래 cancellation을 반환하는지 검증한다. 임시
 SQLite·compiled graph를 이용한 핵심 수직 통합 경로를 분리하고 외부 API는 호출하지 않는다.
+Notification startup이 실패한 실제 `RuntimeApplication`도 bounded cleanup을 완료하고 HTTP의
+global cleanup Task를 남기지 않는지 검증한다.
 
 ## 변경 시 문서 갱신 조건
 

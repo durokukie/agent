@@ -57,7 +57,10 @@ callback과 completion clock replay, OpenAPI 409/503 계약과
 결정 가능한 runtime fake로 검증한다.
 Cancellation-resistant awaitable과 startup cleanup이 timeout 취소를 무시하는 경우는 subprocess
 deadline으로 기존 hang을 재현하고 hard watchdog이 bounded 실패/원래 cancellation을 반환한 뒤
-orphan을 회수하는지 검증한다.
+orphan을 회수하는지 검증한다. Subprocess의 외부 안전망은 느린 CI에서도 내부의 짧은 deadline
+검증과 경합하지 않도록 10초를 사용한다. 실제 runtime의 cooperative blocked orchestration을
+실행 중인 worker는 stop cancellation 때 grace 안에 취소되며 notification과 소유 자원을 닫고,
+notification startup 실패 뒤 HTTP global cleanup registry도 비워지는지 확인한다.
 
 End-to-end 수용 테스트는 FastAPI ASGI → bounded runtime → compiled LangGraph → SQLite
 journal/checkpointer/outbox → fake notification sender를 실제로 연결한다. 변경 Alert의 승인

@@ -48,8 +48,11 @@ backoff를 기다리지 않는 명시적 재시도이고, 다른 worker의 완�
 command를 다시 실행하지 않는다. 조회는 SQLite의
 Task, event, workflow와 AgentRun에서 승인·결과 metadata를 조립한다. 시작 시 terminal을
 제외한 recovery 후보를 읽어 `RECEIVED`는 재시작하고, 승인 대기는 사람 입력을 기다리며,
-나머지는 Task ID checkpoint에서 복구한다. 종료는 queue와 notification outbox를 drain하고
-dispatcher를 중단한 뒤 checkpointer와 store를 각각 한 번 닫는다.
+나머지는 Task ID checkpoint에서 복구한다. 정상 종료는 queue와 notification outbox를
+drain하고 dispatcher를 중단한 뒤 checkpointer와 store를 각각 한 번 닫는다. `stop()` 호출자가
+취소되면 active child, retry wakeup과 worker를 모두 취소하고 단계별 10초 grace 안에서 완료를
+기다린다. 이어 dispatcher와 persistence close를 같은 bounded best-effort 방식으로 시도한 뒤
+cleanup 오류가 아닌 원래 `CancelledError`를 보존한다.
 
 ## 설계 결정과 제약사항
 
@@ -78,16 +81,27 @@ command와 command row 없는 recovery가 함께 밀릴 때는 매 worker 완료
 번갈아 적용해 한쪽의 지속적인 starvation을 막는다. Notification drain 또는 stop이 실패해도
 worker 종료와 checkpointer/store close를 수행한 뒤 최초 lifecycle 오류를 호출자에게 반환한다.
 
+`TaskApplication.stop()`과 runtime이 호출하는 Agent·notification·resource adapter는
+cancellation-cooperative해야 한다. Runtime은 외부 cancellation 때 각 shutdown 단계의 대기를
+기본 10초로 제한하지만, cancellation을 삼키는 coroutine이나 종료되지 않는 native blocking
+I/O를 동일 event loop에서 강제 정지할 수는 없다. 이런 구현은 adapter 계약 위반이며 운영
+process supervisor가 전체 graceful shutdown deadline 뒤 hard-kill을 수행해야 한다. Grace를
+넘긴 Python Task는 완료까지 강하게 보관하고 늦은 예외를 회수하되 application은 닫힌 상태로
+전환한다.
+
 ## 테스트 전략
 
 임시 SQLite와 orchestration fake로 durable-before-queue, webhook replay/conflict, recovery,
 승인·거절, 취소, 자원 종료를 검증한다. 실제 FastAPI ASGI, compiled LangGraph, SQLite
 checkpointer와 fake classifier/Governance/Agent를 함께 사용해 read-only 완료, 사람 승인,
 취소와 durable journal replay를 수직 통합 테스트한다. Notification sender 성공·실패와
-재시작 retry, dispatcher 수명도 실제 SQLite outbox로 검증한다.
+재시작 retry, dispatcher 수명도 실제 SQLite outbox로 검증한다. 실제 worker가
+cancellation-aware blocked Agent를 실행하는 동안 `stop()` 호출자를 취소해 active 실행 취소,
+bounded cleanup, notification/resource 정리와 원래 cancellation 보존을 검증한다.
 
 ## 변경 시 문서 갱신 조건
 
 application 계약, 조립 대상, queue/recovery 정책, Task thread identity, journal/승인 adapter,
-멱등성 namespace, notification sender/dispatcher 조립, 자원 수명 또는 runtime import
+멱등성 namespace, shutdown grace와 cancellation 계약, notification sender/dispatcher 조립,
+자원 수명 또는 runtime import
 방향이 바뀔 때 갱신한다.

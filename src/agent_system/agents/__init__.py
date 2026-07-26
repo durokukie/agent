@@ -65,7 +65,11 @@ class Agent(Protocol):
         """Agent의 안정적인 식별 정보다."""
 
     async def run(self, request: AgentRequest) -> AgentResult:
-        """표준 요청을 실행하고 표준 결과를 반환한다."""
+        """표준 요청을 실행하고 표준 결과를 반환한다.
+
+        호출 Task가 취소되면 ``CancelledError``를 즉시 다시 전파해야 한다. 취소를
+        무시하는 구현은 runtime shutdown 계약을 위반한다.
+        """
 
 
 class AgentRegistryError(Exception):

@@ -751,7 +751,7 @@ class HardWatchdogTests(unittest.IsolatedAsyncioTestCase):
             check=True,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=10,
         )
 
         self.assertEqual(completed.stdout.strip(), "hard-watchdog-bounded")

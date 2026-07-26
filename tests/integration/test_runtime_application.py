@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import httpx
 
+import agent_system.http as http_module
 from agent_system.agents import AgentMetadata, AgentRegistry, FakeAgent
 from agent_system.config import RuntimeSettings
 from agent_system.http import create_app
@@ -203,6 +204,51 @@ class _FailingNotificationLifecycle:
     async def stop(self) -> None:
         self.stop_called = True
         raise RuntimeError("notification-stop-failed")
+
+
+class _CancellationAwareBlockingOrchestrator(_RecordingOrchestrator):
+    """외부 stop cancellation이 active Agent 실행까지 도달하는지 기록한다."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def start(
+        self,
+        request: object,
+        *,
+        thread_id: str,
+        initial_task: Task,
+    ) -> None:
+        await super().start(request, thread_id=thread_id, initial_task=initial_task)
+        self.entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+class _RecordingNotificationLifecycle:
+    """Runtime cancellation cleanup의 dispatcher stop 호출을 기록한다."""
+
+    def __init__(self, *, start_error: BaseException | None = None) -> None:
+        self.start_error = start_error
+        self.started = False
+        self.stop_calls = 0
+
+    async def start(self) -> None:
+        self.started = True
+        if self.start_error is not None:
+            raise self.start_error
+
+    async def drain(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
 
 
 class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
@@ -462,6 +508,94 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(notification.started)
         self.assertTrue(notification.stop_called)
         self.assertEqual(close_calls, 1)
+
+    async def test_cancelled_stop_cancels_cooperative_work_and_closes_owned_resources(
+        self,
+    ) -> None:
+        """Stop cancellation이 active worker를 남기거나 자원 cleanup을 건너뛰면 실패한다."""
+
+        await self.application.stop()
+        orchestrator = _CancellationAwareBlockingOrchestrator()
+        notification = _RecordingNotificationLifecycle()
+        close_calls = 0
+
+        def close_resources() -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+        application = RuntimeApplication(
+            store=self.store,
+            orchestrator=orchestrator,
+            queue_capacity=1,
+            worker_count=1,
+            clock=lambda: NOW,
+            id_factory=lambda: "cancelled-stop-task",
+            notification_dispatcher=notification,  # type: ignore[arg-type]
+            close_resources=close_resources,
+            shutdown_grace_seconds=0.2,
+        )
+        self.application = application
+        await application.start()
+        await application.submit(
+            Submission(SubmissionKind.USER_TASK, {"input": "blocked work"})
+        )
+        await orchestrator.entered.wait()
+
+        stopping = asyncio.create_task(application.stop())
+        await asyncio.sleep(0)
+        stopping.cancel("caller-stop")
+        try:
+            done, pending = await asyncio.wait({stopping}, timeout=1)
+            self.assertEqual(pending, set())
+            self.assertEqual(done, {stopping})
+            with self.assertRaises(asyncio.CancelledError) as raised:
+                stopping.result()
+
+            self.assertEqual(raised.exception.args, ("caller-stop",))
+            self.assertTrue(orchestrator.cancelled.is_set())
+            self.assertEqual(notification.stop_calls, 1)
+            self.assertEqual(close_calls, 1)
+            with self.assertRaises(RuntimeError):
+                await application.start()
+        finally:
+            orchestrator.release.set()
+            await application.stop()
+
+    async def test_http_startup_failure_finishes_bounded_runtime_cleanup_tracking(
+        self,
+    ) -> None:
+        """HTTP startup cleanup 뒤 runtime 자원이나 global cleanup Task가 남으면 실패한다."""
+
+        await self.application.stop()
+        start_error = RuntimeError("notification-start-failed")
+        notification = _RecordingNotificationLifecycle(start_error=start_error)
+        close_calls = 0
+
+        def close_resources() -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+        application = RuntimeApplication(
+            store=self.store,
+            orchestrator=self.orchestrator,
+            queue_capacity=1,
+            worker_count=1,
+            clock=lambda: NOW,
+            id_factory=lambda: "unused",
+            notification_dispatcher=notification,  # type: ignore[arg-type]
+            close_resources=close_resources,
+        )
+        self.application = application
+        lifespan = create_app(application).router.lifespan_context(None)
+
+        with self.assertRaises(RuntimeError) as raised:
+            await lifespan.__aenter__()
+        await asyncio.sleep(0)
+
+        self.assertIs(raised.exception, start_error)
+        self.assertEqual(notification.stop_calls, 1)
+        self.assertEqual(close_calls, 1)
+        self.assertEqual(http_module._STARTUP_CLEANUP_TASKS, set())
 
     async def test_other_worker_completion_does_not_retry_a_poison_command(
         self,
