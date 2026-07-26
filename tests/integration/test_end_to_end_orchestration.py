@@ -6,8 +6,10 @@ import asyncio
 import tempfile
 import threading
 import unittest
+from collections.abc import Awaitable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TypeVar
 
 import httpx
 
@@ -37,6 +39,23 @@ from agent_system.persistence import OutboxStatus, SQLiteStore
 from agent_system.runtime import RuntimeApplication, build_runtime
 
 NOW = datetime(2026, 7, 27, 3, 0, tzinfo=UTC)
+E2E_TIMEOUT_SECONDS = 10.0
+_T = TypeVar("_T")
+
+
+async def _await_bounded(operation: str, awaitable: Awaitable[_T]) -> _T:
+    """E2E 비동기 경계의 hang을 operation 이름이 있는 실패로 바꾼다."""
+
+    timeout_scope = asyncio.timeout(E2E_TIMEOUT_SECONDS)
+    try:
+        async with timeout_scope:
+            return await awaitable
+    except TimeoutError as error:
+        if not timeout_scope.expired():
+            raise
+        raise AssertionError(
+            f"{operation}이 {E2E_TIMEOUT_SECONDS:g}초 안에 끝나지 않았습니다."
+        ) from error
 
 
 class _StepClock:
@@ -76,9 +95,11 @@ class _RuntimeSession:
         self.web = create_app(application)
         self._lifespan = self.web.router.lifespan_context(self.web)
         self.client: httpx.AsyncClient | None = None
+        self._lifespan_entered = False
 
     async def open(self) -> _RuntimeSession:
-        await self._lifespan.__aenter__()
+        await _await_bounded("FastAPI lifespan startup", self._lifespan.__aenter__())
+        self._lifespan_entered = True
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=self.web),
             base_url="http://test",
@@ -86,10 +107,36 @@ class _RuntimeSession:
         return self
 
     async def close(self) -> None:
+        primary_error: BaseException | None = None
         if self.client is not None:
-            await self.client.aclose()
+            client = self.client
             self.client = None
-        await self._lifespan.__aexit__(None, None, None)
+            try:
+                await _await_bounded("ASGI HTTP client 종료", client.aclose())
+            except BaseException as error:  # noqa: BLE001 - lifespan 정리까지 계속한다.
+                primary_error = error
+        if self._lifespan_entered:
+            self._lifespan_entered = False
+            try:
+                await _await_bounded(
+                    "FastAPI lifespan shutdown",
+                    self._lifespan.__aexit__(None, None, None),
+                )
+            except BaseException as error:  # noqa: BLE001 - 앞선 정리 오류를 보존한다.
+                if primary_error is None:
+                    primary_error = error
+                else:
+                    primary_error.add_note("FastAPI lifespan 정리도 실패했습니다.")
+        if primary_error is not None:
+            raise primary_error
+
+    async def drain(self, stage: str) -> None:
+        """Runtime queue와 notification outbox를 stage별 timeout 안에 비운다."""
+
+        await _await_bounded(
+            f"{stage} runtime/outbox drain",
+            self.application.drain(),
+        )
 
 
 class _CrashAfterEffectAgent:
@@ -115,7 +162,10 @@ class _CrashAfterEffectAgent:
         if request.idempotency_key not in self.effects:
             self.effects.append(request.idempotency_key)
             self.entered.set()
-            await self.release_crash.wait()
+            await _await_bounded(
+                "Crash Agent release gate",
+                self.release_crash.wait(),
+            )
             raise asyncio.CancelledError
         return AgentResult(
             agent_id=self.metadata.agent_id,
@@ -133,9 +183,27 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.sessions: list[_RuntimeSession] = []
 
     async def asyncTearDown(self) -> None:
+        primary_error: BaseException | None = None
         while self.sessions:
-            await self.sessions.pop().close()
-        self.directory.cleanup()
+            try:
+                await _await_bounded(
+                    "E2E session teardown",
+                    self.sessions.pop().close(),
+                )
+            except BaseException as error:  # noqa: BLE001 - 남은 session도 정리한다.
+                if primary_error is None:
+                    primary_error = error
+                else:
+                    primary_error.add_note("다른 E2E session 정리도 실패했습니다.")
+        try:
+            self.directory.cleanup()
+        except BaseException as error:  # noqa: BLE001 - async 정리 오류를 primary로 보존한다.
+            if primary_error is None:
+                primary_error = error
+            else:
+                primary_error.add_note("임시 SQLite 디렉터리 정리도 실패했습니다.")
+        if primary_error is not None:
+            raise primary_error
 
     def _settings(self, *, max_agent_runs: int = 2) -> RuntimeSettings:
         return RuntimeSettings(
@@ -189,13 +257,16 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     async def _submit_alert(session: _RuntimeSession, alert_id: str) -> str:
         assert session.client is not None
-        response = await session.client.post(
-            "/v1/webhooks/alerts",
-            json={
-                "alert_id": alert_id,
-                "severity": "critical",
-                "message": "checkout 서비스가 응답하지 않습니다.",
-            },
+        response = await _await_bounded(
+            "Alert webhook POST",
+            session.client.post(
+                "/v1/webhooks/alerts",
+                json={
+                    "alert_id": alert_id,
+                    "severity": "critical",
+                    "message": "checkout 서비스가 응답하지 않습니다.",
+                },
+            ),
         )
         if response.status_code != 202:
             raise AssertionError(response.text)
@@ -204,7 +275,10 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     async def _get_task(session: _RuntimeSession, task_id: str) -> dict[str, object]:
         assert session.client is not None
-        response = await session.client.get(f"/v1/tasks/{task_id}")
+        response = await _await_bounded(
+            "Task GET",
+            session.client.get(f"/v1/tasks/{task_id}"),
+        )
         if response.status_code != 200:
             raise AssertionError(response.text)
         return response.json()
@@ -229,9 +303,12 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         }
         if decision == "reject":
             payload["reason"] = "현재 변경 창구가 닫혔습니다."
-        response = await session.client.post(
-            f"/v1/tasks/{task_id}/approval",
-            json=payload,
+        response = await _await_bounded(
+            "Approval POST",
+            session.client.post(
+                f"/v1/tasks/{task_id}/approval",
+                json=payload,
+            ),
         )
         if response.status_code != 202:
             raise AssertionError(response.text)
@@ -251,7 +328,7 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         task_id = await self._submit_alert(session, "alert-happy")
-        await session.application.drain()
+        await session.drain("승인 대기")
         waiting = await self._get_task(session, task_id)
 
         self.assertEqual(waiting["status"], "WAITING_APPROVAL")
@@ -273,7 +350,7 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             decision="approve",
             decision_id="decision-happy",
         )
-        await session.application.drain()
+        await session.drain("승인 완료")
         completed = await self._get_task(session, task_id)
 
         self.assertEqual(completed["status"], "COMPLETED")
@@ -328,7 +405,7 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             namespace="reject", agent=agent, sender=sender
         )
         task_id = await self._submit_alert(session, "alert-reject")
-        await session.application.drain()
+        await session.drain("거절 승인 대기")
         waiting = await self._get_task(session, task_id)
 
         await self._decide(
@@ -338,7 +415,7 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             decision="reject",
             decision_id="decision-reject",
         )
-        await session.application.drain()
+        await session.drain("사람 거절")
         rejected = await self._get_task(session, task_id)
 
         self.assertEqual(rejected["status"], "REJECTED")
@@ -371,7 +448,7 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             max_agent_runs=2,
         )
         task_id = await self._submit_alert(session, "alert-failure")
-        await session.application.drain()
+        await session.drain("실패 시나리오 승인 대기")
         waiting = await self._get_task(session, task_id)
 
         await self._decide(
@@ -381,7 +458,7 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             decision="approve",
             decision_id="decision-failure",
         )
-        await session.application.drain()
+        await session.drain("Agent retry 소진")
         escalated = await self._get_task(session, task_id)
 
         self.assertEqual(escalated["status"], "ESCALATED")
@@ -422,10 +499,10 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             sender=first_sender,
         )
         task_id = await self._submit_alert(first, "alert-restart")
-        await first.application.drain()
+        await first.drain("재시작 전 승인 대기")
         waiting = await self._get_task(first, task_id)
         self.assertEqual(waiting["status"], "WAITING_APPROVAL")
-        await first.close()
+        await _await_bounded("첫 application 종료", first.close())
         self.sessions.remove(first)
 
         second_sender = FakeNotificationSender()
@@ -439,20 +516,28 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recovered_waiting, waiting)
         self.assertEqual(second_sender.sent, ())
 
-        await self._decide(
-            second,
-            task_id,
-            recovered_waiting,
-            decision="approve",
-            decision_id="decision-restart",
-        )
-        await agent.entered.wait()
-        stopping = asyncio.create_task(second.application.stop())
-        # stop()은 첫 await 전에 admission을 닫고 queue drain을 기다린다.
-        await asyncio.sleep(0)
-        agent.release_crash.set()
-        await stopping
-        await second.close()
+        stopping: asyncio.Task[None] | None = None
+        try:
+            await self._decide(
+                second,
+                task_id,
+                recovered_waiting,
+                decision="approve",
+                decision_id="decision-restart",
+            )
+            await _await_bounded("Crash Agent 진입", agent.entered.wait())
+            stopping = asyncio.create_task(second.application.stop())
+            # stop()은 첫 await 전에 admission을 닫고 queue drain을 기다린다.
+            await asyncio.sleep(0)
+        finally:
+            # 앞선 assertion/timeout/cancellation에서도 Agent gate를 반드시 연다.
+            agent.release_crash.set()
+        if stopping is None:
+            self.fail(
+                "Crash Agent 진입 뒤 application stop task가 생성되지 않았습니다."
+            )
+        await _await_bounded("두 번째 application crash-stop", stopping)
+        await _await_bounded("두 번째 application lifespan 종료", second.close())
         self.sessions.remove(second)
 
         with SQLiteStore(self.database_path) as crashed_store:
@@ -474,7 +559,7 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             sender=third_sender,
             clock=_StepClock(start=NOW + timedelta(minutes=2)),
         )
-        await third.application.drain()
+        await third.drain("열린 AgentRun 재시작 복구")
         completed = await self._get_task(third, task_id)
 
         self.assertEqual(completed["status"], "COMPLETED")
@@ -523,8 +608,11 @@ class ServerEntrypointTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
             lifespan = app.router.lifespan_context(app)
-            await lifespan.__aenter__()
-            await lifespan.__aexit__(None, None, None)
+            await _await_bounded("Server factory startup", lifespan.__aenter__())
+            await _await_bounded(
+                "Server factory shutdown",
+                lifespan.__aexit__(None, None, None),
+            )
 
             self.assertEqual(app.title, "Agent System")
             self.assertTrue(database_path.is_file())

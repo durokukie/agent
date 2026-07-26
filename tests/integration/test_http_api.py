@@ -83,6 +83,24 @@ class _RecordingApplication(TaskApplication):
         return AcceptedTask(task_id, "CANCELLED", 3, False)
 
 
+class _FailingStartupApplication(_RecordingApplication):
+    """Startup과 선택적 cleanup 실패를 같은 lifespan 경계에서 재현한다."""
+
+    def __init__(self, *, stop_error: BaseException | None = None) -> None:
+        super().__init__()
+        self.start_error = RuntimeError("startup-primary")
+        self.stop_error = stop_error
+
+    async def start(self) -> None:
+        self.started += 1
+        raise self.start_error
+
+    async def stop(self) -> None:
+        self.stopped += 1
+        if self.stop_error is not None:
+            raise self.stop_error
+
+
 class HttpApiContractTests(unittest.IsolatedAsyncioTestCase):
     """HTTP adapter가 runtime interface만 호출하는지 검증한다."""
 
@@ -392,6 +410,33 @@ class HttpApiContractTests(unittest.IsolatedAsyncioTestCase):
             base_url="http://test",
         )
         self.lifespan = _AlreadyExitedLifespan()
+
+    async def test_lifespan_start_failure_still_closes_once_and_preserves_primary_error(
+        self,
+    ) -> None:
+        """Start 실패가 자원을 누수하거나 cleanup 오류로 primary 원인을 덮으면 실패한다."""
+
+        for stop_error in (None, RuntimeError("cleanup-secret")):
+            with self.subTest(stop_error=stop_error):
+                application = _FailingStartupApplication(stop_error=stop_error)
+                app = create_app(application)
+                lifespan = app.router.lifespan_context(app)
+
+                with self.assertRaises(RuntimeError) as raised:
+                    await lifespan.__aenter__()
+
+                self.assertIs(raised.exception, application.start_error)
+                self.assertEqual(application.started, 1)
+                self.assertEqual(application.stopped, 1)
+                notes = getattr(raised.exception, "__notes__", ())
+                if stop_error is None:
+                    self.assertEqual(notes, ())
+                else:
+                    self.assertEqual(
+                        notes,
+                        ["Startup 실패 뒤 application 정리도 실패했습니다."],
+                    )
+                    self.assertNotIn("cleanup-secret", str(notes))
 
 
 class _AlreadyExitedLifespan:

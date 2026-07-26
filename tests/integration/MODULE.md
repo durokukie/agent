@@ -25,7 +25,10 @@ ASGI부터 notification sender까지 잇는 end-to-end 수용 테스트를 포�
 ## 설계 결정과 제약사항
 
 테스트마다 독립된 임시 데이터베이스와 실행 식별자를 사용한다. Application lifespan은
-테스트가 직접 열고 닫으며 외부 network와 실제 provider API를 호출하지 않는다.
+테스트가 직접 열고 닫으며 외부 network와 실제 provider API를 호출하지 않는다. E2E의
+ASGI 요청, queue/outbox drain, Event gate, application stop과 session/lifespan cleanup은
+operation 이름이 있는 10초 timeout 안에서 실행해 regression hang을 명시적인 실패로 바꾼다.
+Teardown은 한 자원 정리가 실패해도 나머지 session과 임시 디렉터리 정리를 계속 시도한다.
 
 ## 테스트 전략
 
@@ -46,7 +49,9 @@ FastAPI ASGI부터 runtime queue, compiled graph, SQLite journal/checkpoint까�
 webhook 멱등성, queue 포화 뒤 durable pump, background failure exact retry, startup command
 recovery, CAS 뒤 approval 자동 복구, approval/cancel 명령과 취소 사유 감사, DB-ahead 전체
 callback과 completion clock replay, OpenAPI 409/503 계약과
-소유 자원 종료를 검증한다.
+소유 자원 종료를 검증한다. HTTP lifespan은 startup 일부 실패 뒤에도 application cleanup을
+정확히 한 번 시도하며 cleanup까지 실패해도 최초 startup 오류를 primary로 보존하는지
+결정 가능한 runtime fake로 검증한다.
 
 End-to-end 수용 테스트는 FastAPI ASGI → bounded runtime → compiled LangGraph → SQLite
 journal/checkpointer/outbox → fake notification sender를 실제로 연결한다. 변경 Alert의 승인

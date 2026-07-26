@@ -189,7 +189,14 @@ def create_app(application: TaskApplication) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        await application.start()
+        try:
+            await application.start()
+        except BaseException as start_error:
+            try:
+                await application.stop()
+            except BaseException:  # noqa: BLE001 - 최초 startup 원인을 primary로 보존한다.
+                start_error.add_note("Startup 실패 뒤 application 정리도 실패했습니다.")
+            raise
         try:
             yield
         finally:
