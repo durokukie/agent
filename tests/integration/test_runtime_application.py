@@ -8,6 +8,7 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 
@@ -129,6 +130,14 @@ class _BlockingResumeOrchestrator(_RecordingOrchestrator):
 class _TerminalCommandReplayOrchestrator(_RecordingOrchestrator):
     """Checkpoint에는 이미 적용됐지만 command만 pending인 crash를 재현한다."""
 
+    def __init__(self, recovered_tasks: dict[str, Task]) -> None:
+        super().__init__()
+        self.recovered_tasks = recovered_tasks
+
+    async def recover(self, *, thread_id: str) -> object:
+        await super().recover(thread_id=thread_id)
+        return SimpleNamespace(task=self.recovered_tasks[thread_id])
+
     async def resume(self, *, thread_id: str, response: object) -> None:
         await super().resume(thread_id=thread_id, response=response)
         raise ApprovalResumeError("이미 terminal인 approval checkpoint")
@@ -161,6 +170,20 @@ class _MixedFailureOrchestrator(_RecordingOrchestrator):
             self.poison_failed.set()
             raise RuntimeError("poison command")
         await self.release_healthy.wait()
+
+
+class _DelayedEnqueueApplication(RuntimeApplication):
+    """Durable commit과 process queue enqueue 사이 shutdown 경합을 재현한다."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.enqueue_entered = asyncio.Event()
+        self.release_enqueue = asyncio.Event()
+
+    async def _enqueue_durable(self, work: object) -> None:
+        self.enqueue_entered.set()
+        await self.release_enqueue.wait()
+        await super()._enqueue_durable(work)  # type: ignore[arg-type]
 
 
 class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
@@ -326,6 +349,42 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
             ["queue-1", "queue-2", "queue-3"],
         )
         self.assertEqual(self.store.list_pending_runtime_commands(), ())
+
+    async def test_stop_blocks_admission_and_post_sentinel_enqueue(self) -> None:
+        """Stop 시작 뒤 accepted work가 종료된 worker queue에 들어가면 실패한다."""
+
+        await self.application.stop()
+        application = _DelayedEnqueueApplication(
+            store=self.store,
+            orchestrator=self.orchestrator,
+            queue_capacity=1,
+            worker_count=1,
+            clock=lambda: NOW,
+            id_factory=iter(("stop-race", "late-admission")).__next__,
+        )
+        self.application = application
+        await application.start()
+        submit = asyncio.create_task(
+            application.submit(
+                Submission(SubmissionKind.USER_TASK, {"input": "종료 경합"})
+            )
+        )
+        await application.enqueue_entered.wait()
+
+        stopping = asyncio.create_task(application.stop())
+        await asyncio.sleep(0)
+        with self.assertRaises(ApplicationBusyError):
+            await application.submit(
+                Submission(SubmissionKind.USER_TASK, {"input": "늦은 수락"})
+            )
+        await stopping
+        application.release_enqueue.set()
+        accepted = await submit
+
+        self.assertEqual(accepted.task_id, "stop-race")
+        self.assertEqual(self.orchestrator.starts, [])
+        pending = self.store.list_pending_runtime_commands()
+        self.assertEqual([command.task_id for command in pending], ["stop-race"])
 
     async def test_other_worker_completion_does_not_retry_a_poison_command(
         self,
@@ -875,7 +934,12 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
                 cancelled.updated_at,
             ),
         )
-        orchestrator = _TerminalCommandReplayOrchestrator()
+        orchestrator = _TerminalCommandReplayOrchestrator(
+            {
+                approval_task.task_id: self.store.get_task(approval_task.task_id),
+                cancel_task.task_id: cancelled,
+            }
+        )
         self.application = RuntimeApplication(
             store=self.store,
             orchestrator=orchestrator,
@@ -893,6 +957,57 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
             ("terminal-approval", "terminal-cancel"),
         )
         self.assertEqual(self.store.list_pending_runtime_commands(), ())
+
+    async def test_terminal_reconcile_rejects_unrelated_terminal_provenance(
+        self,
+    ) -> None:
+        """다른 terminal event를 approval command 성공으로 오인하면 실패한다."""
+
+        await self.application.stop()
+        waiting = self._persist_waiting_task("terminal-mismatch")
+        response = ApprovalResponse.reject(
+            decision_id="expected-rejection",
+            reason="거절",
+        )
+        self.store.put_runtime_command(
+            RuntimeCommandDraft(
+                command_id="command:terminal-mismatch",
+                task_id=waiting.task_id,
+                command_type=RuntimeCommandType.APPROVAL,
+                fingerprint="approval:mismatch",
+                payload={"response": response.to_snapshot()},
+                created_at=NOW + timedelta(seconds=4),
+            ),
+            expected_task=waiting,
+        )
+        cancelled = waiting.cancel(at=NOW + timedelta(seconds=4))
+        self.store.save_task(
+            cancelled,
+            expected_version=waiting.version,
+            event=TaskEventDraft(
+                "event:terminal-mismatch:cancelled",
+                "TASK_CANCELLED",
+                {"reason": "unrelated", "errors": []},
+                cancelled.updated_at,
+            ),
+        )
+        orchestrator = _TerminalCommandReplayOrchestrator({waiting.task_id: cancelled})
+        self.application = RuntimeApplication(
+            store=self.store,
+            orchestrator=orchestrator,
+            queue_capacity=1,
+            worker_count=1,
+            clock=lambda: NOW + timedelta(seconds=5),
+            id_factory=lambda: "unused",
+        )
+
+        await self.application.start()
+        await self.application.drain()
+
+        pending = self.store.list_pending_runtime_commands()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].attempt_count, 1)
+        self.assertEqual(pending[0].last_error, "background_execution_failed")
 
     async def test_sqlite_journal_persists_each_aggregate_step_and_replays_it(
         self,
@@ -1194,7 +1309,9 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         analyzing = workflow.advance(Phase.ANALYZING, at=NOW + timedelta(seconds=2))
-        await journal.record(OrchestrationJournalEntry(task=running, workflow=analyzing))
+        await journal.record(
+            OrchestrationJournalEntry(task=running, workflow=analyzing)
+        )
         completed = running.transition(
             Status.COMPLETED,
             at=NOW + timedelta(seconds=3),
@@ -1212,6 +1329,57 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ApplicationConflictError):
             await journal.record(
                 OrchestrationJournalEntry(task=forged, workflow=analyzing)
+            )
+
+    async def test_journal_rejects_historical_task_with_forged_plan_hash(
+        self,
+    ) -> None:
+        """Event payload와 다른 historical plan hash를 승인하면 실패한다."""
+
+        received = Task.receive(task_id="forged-plan", input="검증", at=NOW)
+        self.store.create_task(
+            received,
+            event=TaskEventDraft(
+                "event:forged-plan:1", "TASK_RECEIVED", {}, received.updated_at
+            ),
+        )
+        running = received.transition(Status.RUNNING, at=NOW + timedelta(seconds=1))
+        self.store.save_task(
+            running,
+            expected_version=received.version,
+            event=TaskEventDraft(
+                "event:forged-plan:2", "TASK_STARTED", {}, running.updated_at
+            ),
+        )
+        planned = running.update_plan("sha256:real", at=NOW + timedelta(seconds=2))
+        self.store.save_task(
+            planned,
+            expected_version=running.version,
+            event=TaskEventDraft(
+                "event:forged-plan:3",
+                "TASK_PLAN_UPDATED",
+                {"plan_hash": "sha256:real"},
+                planned.updated_at,
+            ),
+        )
+        completed = planned.transition(Status.COMPLETED, at=NOW + timedelta(seconds=3))
+        self.store.save_task(
+            completed,
+            expected_version=planned.version,
+            event=TaskEventDraft(
+                "event:forged-plan:4", "TASK_COMPLETED", {}, completed.updated_at
+            ),
+        )
+        forged = replace(planned, plan_hash="sha256:forged")
+
+        with self.assertRaises(ApplicationConflictError):
+            await SQLiteLifecycleJournal(self.store).record(
+                OrchestrationJournalEntry(
+                    task=forged,
+                    workflow=None,
+                    task_event_type="TASK_PLAN_UPDATED",
+                    task_event_payload={"plan_hash": "sha256:real"},
+                )
             )
 
     async def test_queues_active_cancellation_and_rejects_unknown_or_terminal(

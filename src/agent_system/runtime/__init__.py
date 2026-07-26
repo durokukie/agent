@@ -486,6 +486,11 @@ class SQLiteLifecycleJournal:
         )
         if event is None:
             return False
+        if not (
+            entry.task.created_at <= event.occurred_at <= current.updated_at
+            and entry.task.updated_at >= event.occurred_at
+        ):
+            return False
         expected_status = {
             "TASK_RECEIVED": Status.RECEIVED,
             "TASK_STARTED": Status.RUNNING,
@@ -499,6 +504,10 @@ class SQLiteLifecycleJournal:
             "TASK_CANCELLED": Status.CANCELLED,
         }.get(event.event_type)
         if expected_status is None or entry.task.status is not expected_status:
+            return False
+        if event.event_type == "TASK_PLAN_UPDATED" and (
+            event.payload.get("plan_hash") != entry.task.plan_hash
+        ):
             return False
         if entry.task_event_type is None:
             return (
@@ -791,6 +800,8 @@ class RuntimeApplication:
         self._active_fingerprints: dict[str, str] = {}
         self._background_errors: dict[str, str] = {}
         self._started = False
+        self._stopping = False
+        self._prefer_deferred = False
         self._closed = False
 
     async def start(self) -> None:
@@ -839,7 +850,7 @@ class RuntimeApplication:
         if self._closed:
             return
         if self._started:
-            await self.drain()
+            self._stopping = True
             for wakeup in self._retry_wakeups.values():
                 wakeup.cancel()
             if self._retry_wakeups:
@@ -847,6 +858,7 @@ class RuntimeApplication:
                     *self._retry_wakeups.values(), return_exceptions=True
                 )
             self._retry_wakeups.clear()
+            await self.drain()
             for _worker in self._workers:
                 await self._queue.put(None)
             await asyncio.gather(*self._workers)
@@ -1154,6 +1166,18 @@ class RuntimeApplication:
     async def _enqueue_durable(self, work: _WorkItem) -> None:
         """이미 commit된 command는 queue pressure와 무관하게 수락한다."""
 
+        if self._stopping:
+            return
+        if work.command_id is not None:
+            commands = await asyncio.to_thread(
+                self._store.list_runtime_commands, work.task_id
+            )
+            if not any(
+                command.command_id == work.command_id
+                and command.status is RuntimeCommandStatus.PENDING
+                for command in commands
+            ):
+                return
         try:
             await self._enqueue(work)
         except ApplicationBusyError:
@@ -1206,8 +1230,13 @@ class RuntimeApplication:
                 self._active.pop(work.task_id, None)
                 self._active_fingerprints.pop(work.task_id, None)
                 self._queued_commands.discard((work.task_id, work.fingerprint))
-                await self._pump_pending_commands()
-                await self._pump_deferred_work()
+                if self._prefer_deferred:
+                    await self._pump_deferred_work()
+                    await self._pump_pending_commands()
+                else:
+                    await self._pump_pending_commands()
+                    await self._pump_deferred_work()
+                self._prefer_deferred = not self._prefer_deferred
                 self._queue.task_done()
 
     async def _dispatch(self, work: _WorkItem) -> object:
@@ -1229,28 +1258,66 @@ class RuntimeApplication:
                     response=work.response,
                 )
             except ApprovalResumeError:
-                if not await self._task_is_terminal(work.task_id):
+                result = await self._orchestrator.recover(thread_id=work.thread_id)
+                if not await self._terminal_command_matches(work, result):
                     raise
-                return await self._orchestrator.recover(thread_id=work.thread_id)
+                return result
         try:
             return await self._orchestrator.cancel(
                 thread_id=work.thread_id,
                 reason=work.reason,
             )
         except OrchestrationCancellationError:
-            if not await self._task_is_terminal(work.task_id):
+            result = await self._orchestrator.recover(thread_id=work.thread_id)
+            if not await self._terminal_command_matches(work, result):
                 raise
-            return await self._orchestrator.recover(thread_id=work.thread_id)
+            return result
 
-    async def _task_is_terminal(self, task_id: str) -> bool:
-        task = await asyncio.to_thread(self._store.get_task, task_id)
-        return task is not None and task.status in {
-            Status.COMPLETED,
-            Status.REJECTED,
-            Status.FAILED,
-            Status.CANCELLED,
-            Status.ESCALATED,
-        }
+    async def _terminal_command_matches(
+        self,
+        work: _ResumeWork | _CancelWork,
+        recovery_result: object,
+    ) -> bool:
+        task = await asyncio.to_thread(self._store.get_task, work.task_id)
+        recovered_task = getattr(recovery_result, "task", None)
+        if task is None or recovered_task != task:
+            return False
+        events = await asyncio.to_thread(self._store.list_task_events, work.task_id)
+        if isinstance(work, _CancelWork):
+            return task.status is Status.CANCELLED and any(
+                event.task_version == task.version
+                and event.event_type == "TASK_CANCELLED"
+                and event.payload.get("reason") == work.reason
+                and event.occurred_at == task.updated_at
+                for event in events
+            )
+        decision_id = work.response.decision_id
+        expected_type = "TASK_APPROVED" if work.response.accepted else "TASK_REJECTED"
+        if work.response.accepted:
+            approval = work.response.approval
+            if (
+                approval is None
+                or approval.task_id != task.task_id
+                or approval.plan_hash != task.plan_hash
+            ):
+                return False
+            expected_version = approval.task_version + 1
+        else:
+            if task.status is not Status.REJECTED:
+                return False
+            expected_version = task.version
+        return any(
+            event.event_type == expected_type
+            and event.task_version == expected_version
+            and event.payload.get("decision_id") == decision_id
+            and event.payload.get("accepted") is work.response.accepted
+            and (
+                event.occurred_at <= task.updated_at
+                if work.response.accepted
+                else event.occurred_at == task.updated_at
+            )
+            for event in events
+        )
 
     async def _pump_pending_commands(
         self,
@@ -1302,7 +1369,7 @@ class RuntimeApplication:
             await asyncio.sleep(delay)
         finally:
             self._retry_wakeups.pop(command_id, None)
-        if self._started and not self._closed:
+        if self._started and not self._stopping and not self._closed:
             await self._pump_pending_commands()
 
     async def _work_from_command(self, command: RuntimeCommandRecord) -> _WorkItem:
@@ -1409,7 +1476,7 @@ class RuntimeApplication:
         )
 
     def _require_started(self) -> None:
-        if not self._started or self._closed:
+        if not self._started or self._stopping or self._closed:
             raise ApplicationBusyError("RuntimeApplication이 실행 중이 아닙니다.")
 
     @staticmethod

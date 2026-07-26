@@ -54,12 +54,20 @@ Task/command fingerprint만 process 안에서 합친다. 같은 Task의 다른 p
 유지하고 worker pump가 용량이 생길 때 다시 올린다. migration 전 command row 없는 recovery
 후보도 deferred queue에 보존하므로 startup은 queue pressure로 실패하지 않는다. 승인·취소가
 checkpoint terminal 반영 뒤 command 완료 전 중단된 경우 Task ID recover로 조정한 뒤
-command를 완료한다. 외부 webhook identity와 일반 idempotency key는 서로
+recover 결과와 SQLite Task snapshot이 같고 decision ID·승인 결과 또는 취소 사유의
+authoritative event provenance가 command와 일치할 때만 command를 완료한다. 외부 webhook
+identity와 일반 idempotency key는 서로
 다른 namespace를 사용한다. SQLite journal의 callback identity는 aggregate의 상태/version/
 phase/budget과 version별 event가 뜻하는 Task status에 결합하며, 실제 `TASK_RECEIVED` request
 payload도 일치해야 한다. 재실행마다 달라질 수 있는 `updated_at`은 authoritative 저장값으로
 복원한다. 다중 프로세스 배포에서는 queue와 execution coordinator를 별도 adapter로 교체해야
 한다.
+
+`stop()`은 시작 즉시 admission을 닫고 예약된 retry wakeup을 취소·대기한 다음 기존 queue를
+drain한다. durable commit과 enqueue 사이에 stop이 시작된 명령은 SQLite에 pending으로 남아
+다음 startup에서 복구되며, worker sentinel 뒤에는 새 work를 enqueue하지 않는다. durable
+command와 command row 없는 recovery가 함께 밀릴 때는 매 worker 완료마다 pump 우선순위를
+번갈아 적용해 한쪽의 지속적인 starvation을 막는다.
 
 ## 테스트 전략
 
