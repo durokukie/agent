@@ -174,6 +174,15 @@ class NotificationOutbox(Protocol):
     ) -> None:
         """현재 lease의 성공을 확정한다."""
 
+    async def renew(
+        self,
+        claim: NotificationClaim,
+        *,
+        at: datetime,
+        lease_duration: timedelta,
+    ) -> NotificationClaim:
+        """현재 owner의 active lease를 연장한다."""
+
     async def mark_failed(
         self,
         claim: NotificationClaim,
@@ -244,6 +253,7 @@ class NotificationDispatcher:
         id_factory: Callable[[], str],
         lease_duration: timedelta = timedelta(seconds=30),
         send_timeout: timedelta = timedelta(seconds=20),
+        heartbeat_interval: timedelta = timedelta(seconds=5),
         base_retry_delay: timedelta = timedelta(seconds=30),
         max_retry_delay: timedelta = timedelta(minutes=5),
         poll_interval: float = 1.0,
@@ -253,6 +263,13 @@ class NotificationDispatcher:
         if send_timeout <= timedelta(0) or send_timeout >= lease_duration:
             raise ValueError(
                 "send_timeout은 0보다 크고 lease_duration보다 작아야 합니다."
+            )
+        if (
+            heartbeat_interval <= timedelta(0)
+            or heartbeat_interval * 2 >= lease_duration
+        ):
+            raise ValueError(
+                "heartbeat_interval은 양수이고 lease_duration의 절반보다 작아야 합니다."
             )
         if base_retry_delay <= timedelta(0):
             raise ValueError("base_retry_delay는 양수여야 합니다.")
@@ -266,6 +283,7 @@ class NotificationDispatcher:
         self._id_factory = id_factory
         self._lease_duration = lease_duration
         self._send_timeout = send_timeout
+        self._heartbeat_interval = heartbeat_interval
         self._base_retry_delay = base_retry_delay
         self._max_retry_delay = max_retry_delay
         self._poll_interval = float(poll_interval)
@@ -316,12 +334,10 @@ class NotificationDispatcher:
             )
             if claim is None:
                 return False
-            try:
-                await asyncio.wait_for(
-                    self._sender.send(claim.notification),
-                    timeout=self._send_timeout.total_seconds(),
-                )
-            except Exception:  # noqa: BLE001 - provider 오류 원문은 저장하지 않는다.
+            delivered = await self._send_with_heartbeat(claim)
+            if delivered is None:
+                return True
+            if not delivered:
                 failed_at = self._clock()
                 try:
                     await self._outbox.mark_failed(
@@ -340,6 +356,66 @@ class NotificationDispatcher:
                 except NotificationLeaseLostError:
                     pass
             return True
+
+    async def _send_with_heartbeat(self, claim: NotificationClaim) -> bool | None:
+        """Active sender가 끝날 때까지 lease를 갱신하고 전달 결과를 반환한다."""
+
+        sender_task = asyncio.create_task(self._sender.send(claim.notification))
+        loop = asyncio.get_running_loop()
+        timeout_at = loop.time() + self._send_timeout.total_seconds()
+        heartbeat_at = loop.time() + self._heartbeat_interval.total_seconds()
+        timed_out = False
+        try:
+            while not sender_task.done():
+                deadline = heartbeat_at if timed_out else min(timeout_at, heartbeat_at)
+                await asyncio.wait(
+                    {sender_task},
+                    timeout=max(0.0, deadline - loop.time()),
+                )
+                if sender_task.done():
+                    break
+                current = loop.time()
+                if current >= heartbeat_at:
+                    try:
+                        claim = await self._outbox.renew(
+                            claim,
+                            at=self._clock(),
+                            lease_duration=self._lease_duration,
+                        )
+                    except NotificationLeaseLostError:
+                        sender_task.cancel()
+                        await asyncio.sleep(0)
+                        if sender_task.done():
+                            self._consume_task_result(sender_task)
+                        else:
+                            sender_task.add_done_callback(self._consume_task_result)
+                        return None
+                    heartbeat_at = (
+                        loop.time() + self._heartbeat_interval.total_seconds()
+                    )
+                if not timed_out and current >= timeout_at:
+                    timed_out = True
+                    sender_task.cancel()
+            try:
+                await sender_task
+            except asyncio.CancelledError:
+                if not timed_out:
+                    raise
+                return False
+            except Exception:  # noqa: BLE001 - provider 오류 원문은 저장하지 않는다.
+                return False
+            return True
+        except asyncio.CancelledError:
+            sender_task.cancel()
+            await asyncio.gather(sender_task, return_exceptions=True)
+            raise
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task[None]) -> None:
+        """Lease 상실 뒤 분리된 sender task 예외를 회수한다."""
+
+        if not task.cancelled():
+            task.exception()
 
     async def _run(self) -> None:
         while not self._stop_event.is_set():

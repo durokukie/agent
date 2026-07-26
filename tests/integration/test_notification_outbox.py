@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -61,6 +63,27 @@ class _BlockingNotificationSender:
             raise
 
 
+class _CancellationResistantSender:
+    """Timeout cancellation 뒤에도 외부 호출이 끝날 때까지 active인 sender fake."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.release = asyncio.Event()
+        self.attempt_count = 0
+        self.sent: list[Notification] = []
+
+    async def send(self, notification: Notification) -> None:
+        self.attempt_count += 1
+        self.entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            await self.release.wait()
+        self.sent.append(notification)
+
+
 class _StaleFinalizationOutbox:
     """Sender 성공 직후 lease 소유권을 잃는 경합을 재현한다."""
 
@@ -81,6 +104,23 @@ class _StaleFinalizationOutbox:
 
     async def mark_failed(self, *_args: object, **_kwargs: object) -> None:
         raise NotificationLeaseLostError("stale")
+
+
+class _LeaseLosingOutbox(_StaleFinalizationOutbox):
+    """첫 heartbeat에서 lease 소유권을 잃는 outbox fake."""
+
+    def __init__(self, notification: Notification) -> None:
+        super().__init__(notification)
+        self.finalized = False
+
+    async def renew(self, *_args: object, **_kwargs: object) -> NotificationClaim:
+        raise NotificationLeaseLostError("lost-during-send")
+
+    async def mark_delivered(self, *_args: object, **_kwargs: object) -> None:
+        self.finalized = True
+
+    async def mark_failed(self, *_args: object, **_kwargs: object) -> None:
+        self.finalized = True
 
 
 class TransactionalNotificationOutboxTests(unittest.TestCase):
@@ -265,6 +305,68 @@ class TransactionalNotificationOutboxTests(unittest.TestCase):
 
         self.assertEqual(self.store.get_task(received.task_id), running)
 
+    def test_rejects_reserved_notification_topic_from_public_task_writes(self) -> None:
+        """일반 outbox 입력이 trusted notification namespace를 위조하는 버그를 잡는다."""
+
+        received = Task.receive(task_id="task-reserved-create", input="점검", at=NOW)
+        forged = OutboxDraft(
+            "forged-notification",
+            "task.status_changed",
+            {"secret": "must-not-reach-sender"},
+            NOW,
+        )
+
+        with self.assertRaises(InvalidPersistenceValueError):
+            self.store.create_task(
+                received,
+                event=TaskEventDraft("event:reserved:1", "TASK_RECEIVED", {}, NOW),
+                outbox=forged,
+            )
+
+        persisted = Task.receive(task_id="task-reserved-save", input="점검", at=NOW)
+        self.store.create_task(
+            persisted,
+            event=TaskEventDraft("event:reserved-save:1", "TASK_RECEIVED", {}, NOW),
+        )
+        running = persisted.transition(Status.RUNNING, at=NOW + timedelta(seconds=1))
+        with self.assertRaises(InvalidPersistenceValueError):
+            self.store.save_task(
+                running,
+                expected_version=1,
+                event=TaskEventDraft(
+                    "event:reserved-save:2", "TASK_STARTED", {}, running.updated_at
+                ),
+                outbox=forged,
+            )
+
+        self.assertIsNone(self.store.get_task(received.task_id))
+        self.assertEqual(self.store.get_task(persisted.task_id), persisted)
+
+    def test_rejects_public_requeue_of_reserved_notification_topic(self) -> None:
+        """일반 retry API가 forged notification row를 활성화하는 버그를 잡는다."""
+
+        received = Task.receive(task_id="task-reserved-requeue", input="점검", at=NOW)
+        self.store.create_task(
+            received,
+            event=TaskEventDraft("event:reserved-requeue:1", "TASK_RECEIVED", {}, NOW),
+            outbox=OutboxDraft("legacy-requeue", "legacy.topic", {}, NOW),
+        )
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE outbox_events SET topic = ?, status = ? WHERE outbox_id = ?",
+                ("task.status_changed", "FAILED", "legacy-requeue"),
+            )
+
+        with self.assertRaises(InvalidPersistenceValueError):
+            self.store.transition_outbox(
+                "legacy-requeue",
+                expected_status=OutboxStatus.FAILED,
+                target=OutboxStatus.PENDING,
+                at=NOW + timedelta(seconds=1),
+            )
+
+        self.assertEqual(self.store.list_outbox()[0].status, OutboxStatus.FAILED)
+
     def test_claim_competition_has_one_owner_and_success_is_terminal(self) -> None:
         """동시 dispatcher가 같은 알림을 두 번 claim하거나 stale owner가 확정하는 버그를 잡는다."""
 
@@ -362,6 +464,43 @@ class TransactionalNotificationOutboxTests(unittest.TestCase):
         self.assertEqual(recovered.attempt_count, 3)
         self.assertEqual(recovered.lease_token, "lease-recovered")
         self.assertEqual(self.store.get_task(task.task_id), task)
+
+    def test_renews_only_the_current_notification_lease_owner(self) -> None:
+        """Heartbeat가 stale token을 연장하거나 기존 만료 시각을 유지하는 버그를 잡는다."""
+
+        task = self._persist_completed("task-heartbeat-store")
+        claim = self.store.claim_outbox(
+            now=task.updated_at,
+            lease_duration=timedelta(seconds=20),
+            lease_token="heartbeat-owner",
+        )
+        assert claim is not None
+
+        renewed = self.store.renew_outbox_lease(
+            claim.outbox_id,
+            lease_token="heartbeat-owner",
+            at=task.updated_at + timedelta(seconds=10),
+            lease_duration=timedelta(seconds=20),
+        )
+        with self.assertRaises(OptimisticConcurrencyError):
+            self.store.renew_outbox_lease(
+                claim.outbox_id,
+                lease_token="stale-owner",
+                at=task.updated_at + timedelta(seconds=11),
+                lease_duration=timedelta(seconds=20),
+            )
+
+        self.assertEqual(
+            renewed.lease_expires_at,
+            task.updated_at + timedelta(seconds=30),
+        )
+        self.assertIsNone(
+            self.store.claim_outbox(
+                now=task.updated_at + timedelta(seconds=20),
+                lease_duration=timedelta(seconds=20),
+                lease_token="competing-owner",
+            )
+        )
 
     def test_rejected_approval_enqueues_once_across_exact_replay(self) -> None:
         """Approval 전용 transaction이 알림을 누락하거나 replay 때 중복하는 버그를 잡는다."""
@@ -658,11 +797,16 @@ class NotificationDispatcherTests(unittest.IsolatedAsyncioTestCase):
             ),
             outbox=OutboxDraft(
                 "malformed-notification",
-                "task.status_changed",
+                "legacy.notification",
                 {"task_id": malformed_task.task_id},
                 malformed_task.updated_at,
             ),
         )
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE outbox_events SET topic = ?, task_version = ? WHERE outbox_id = ?",
+                ("task.status_changed", 1, "malformed-notification"),
+            )
         dispatcher = NotificationDispatcher(
             outbox=SQLiteNotificationOutbox(self.store),
             sender=FakeNotificationSender(),
@@ -688,6 +832,74 @@ class NotificationDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(dispatcher.is_running)
 
+    async def test_skips_secret_injected_notification_and_delivers_valid_row_behind_it(
+        self,
+    ) -> None:
+        """Poison row가 같은 poll의 정상 알림을 막거나 metadata secret을 보내는 버그를 잡는다."""
+
+        poison_id = f"notification:{self.completed.task_id}:{self.completed.version}"
+        poison_payload = self.store.list_outbox()[0].payload
+        poison_payload["metadata"] = {"secret": "must-not-reach-sender"}
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE outbox_events SET payload_json = ? WHERE outbox_id = ?",
+                (json.dumps(poison_payload), poison_id),
+            )
+
+        received = Task.receive(
+            task_id="task-valid-behind-poison",
+            input="점검",
+            at=NOW + timedelta(seconds=3),
+        )
+        running = received.transition(
+            Status.RUNNING,
+            at=received.updated_at + timedelta(seconds=1),
+        )
+        completed = running.transition(
+            Status.COMPLETED,
+            at=running.updated_at + timedelta(seconds=1),
+        )
+        self.store.create_task(
+            received,
+            event=TaskEventDraft(
+                "event:valid-behind:1", "TASK_RECEIVED", {}, received.updated_at
+            ),
+        )
+        self.store.save_task(
+            running,
+            expected_version=1,
+            event=TaskEventDraft(
+                "event:valid-behind:2", "TASK_STARTED", {}, running.updated_at
+            ),
+        )
+        self.store.save_task(
+            completed,
+            expected_version=2,
+            event=TaskEventDraft(
+                "event:valid-behind:3", "TASK_COMPLETED", {}, completed.updated_at
+            ),
+        )
+        sender = FakeNotificationSender()
+        dispatcher = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=sender,
+            clock=lambda: completed.updated_at,
+            id_factory=lambda: "poison-skip-lease",
+        )
+
+        self.assertTrue(await dispatcher.dispatch_once())
+
+        by_id = {message.outbox_id: message for message in self.store.list_outbox()}
+        self.assertEqual(
+            tuple(item.task_id for item in sender.sent), (completed.task_id,)
+        )
+        self.assertNotIn("secret", repr(sender.sent))
+        self.assertEqual(by_id[poison_id].status, OutboxStatus.FAILED)
+        self.assertEqual(
+            by_id[poison_id].last_error,
+            "notification_payload_invalid",
+        )
+
     async def test_sender_timeout_prevents_slow_delivery_from_crossing_lease(
         self,
     ) -> None:
@@ -708,6 +920,7 @@ class NotificationDispatcherTests(unittest.IsolatedAsyncioTestCase):
             id_factory=lambda: "slow-owner",
             lease_duration=timedelta(milliseconds=50),
             send_timeout=timedelta(milliseconds=20),
+            heartbeat_interval=timedelta(milliseconds=10),
             base_retry_delay=timedelta(milliseconds=100),
             max_retry_delay=timedelta(milliseconds=100),
         )
@@ -718,6 +931,7 @@ class NotificationDispatcherTests(unittest.IsolatedAsyncioTestCase):
             id_factory=lambda: "competing-owner",
             lease_duration=timedelta(milliseconds=50),
             send_timeout=timedelta(milliseconds=20),
+            heartbeat_interval=timedelta(milliseconds=10),
             base_retry_delay=timedelta(milliseconds=100),
             max_retry_delay=timedelta(milliseconds=100),
         )
@@ -733,6 +947,55 @@ class NotificationDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed.status, OutboxStatus.FAILED)
         self.assertEqual(failed.last_error, "notification_delivery_failed")
 
+    async def test_heartbeat_prevents_duplicate_for_cancellation_resistant_sender(
+        self,
+    ) -> None:
+        """Timeout cancellation을 무시한 active send 중 lease 만료와 중복 전달을 잡는다."""
+
+        started = time.monotonic()
+        clock = lambda: (
+            self.completed.updated_at + timedelta(seconds=time.monotonic() - started)
+        )
+        resistant_sender = _CancellationResistantSender()
+        competing_sender = FakeNotificationSender()
+        competing_store = SQLiteStore(self.database_path)
+        self.addAsyncCleanup(asyncio.to_thread, competing_store.close)
+        first = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=resistant_sender,
+            clock=clock,
+            id_factory=lambda: "resistant-owner",
+            lease_duration=timedelta(milliseconds=50),
+            send_timeout=timedelta(milliseconds=20),
+            heartbeat_interval=timedelta(milliseconds=10),
+            base_retry_delay=timedelta(milliseconds=100),
+            max_retry_delay=timedelta(milliseconds=100),
+        )
+        second = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(competing_store),
+            sender=competing_sender,
+            clock=clock,
+            id_factory=lambda: "competing-owner-resistant",
+            lease_duration=timedelta(milliseconds=50),
+            send_timeout=timedelta(milliseconds=20),
+            heartbeat_interval=timedelta(milliseconds=10),
+            base_retry_delay=timedelta(milliseconds=100),
+            max_retry_delay=timedelta(milliseconds=100),
+        )
+
+        first_delivery = asyncio.create_task(first.dispatch_once())
+        await resistant_sender.entered.wait()
+        await asyncio.sleep(0.08)
+        self.assertFalse(await second.dispatch_once())
+        resistant_sender.release.set()
+        self.assertTrue(await first_delivery)
+
+        self.assertTrue(resistant_sender.cancelled.is_set())
+        self.assertEqual(resistant_sender.attempt_count, 1)
+        self.assertEqual(len(resistant_sender.sent), 1)
+        self.assertEqual(competing_sender.sent, ())
+        self.assertEqual(self.store.list_outbox()[0].status, OutboxStatus.DELIVERED)
+
     async def test_stale_finalize_isolated_after_sender_success(self) -> None:
         """다른 owner가 lease를 회수한 뒤 finalize CAS 오류가 dispatcher를 죽이는 버그를 잡는다."""
 
@@ -747,6 +1010,27 @@ class NotificationDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await dispatcher.dispatch_once())
         self.assertEqual(sender.sent, (notification,))
+
+    async def test_lost_heartbeat_lease_cancels_send_without_finalize(self) -> None:
+        """Lease 상실 뒤 stale owner가 성공/실패를 확정하거나 worker를 죽이는 버그를 잡는다."""
+
+        notification = Notification.from_payload(self.store.list_outbox()[0].payload)
+        outbox = _LeaseLosingOutbox(notification)
+        sender = _BlockingNotificationSender()
+        dispatcher = NotificationDispatcher(
+            outbox=outbox,
+            sender=sender,
+            clock=lambda: notification.occurred_at,
+            id_factory=lambda: "lost-owner",
+            lease_duration=timedelta(milliseconds=50),
+            send_timeout=timedelta(milliseconds=40),
+            heartbeat_interval=timedelta(milliseconds=10),
+        )
+
+        self.assertTrue(await dispatcher.dispatch_once())
+
+        self.assertTrue(sender.cancelled.is_set())
+        self.assertFalse(outbox.finalized)
 
 
 if __name__ == "__main__":

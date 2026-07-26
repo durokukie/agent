@@ -70,6 +70,8 @@ from ._values import (
     TaskWriteResult,
 )
 
+_NOTIFICATION_TOPIC = "task.status_changed"
+
 
 def _json_dump(value: object) -> str:
     """JSON 값을 canonical text로 직렬화한다."""
@@ -324,6 +326,7 @@ class SQLiteStore:
             raise InvalidPersistenceValueError(
                 "create_task에는 최초 RECEIVED Task가 필요합니다."
             )
+        self._reject_public_notification_outbox(outbox)
         event_value = TaskEvent(
             event_id=event.event_id,
             task_id=task.task_id,
@@ -584,6 +587,7 @@ class SQLiteStore:
             raise InvalidPersistenceValueError(
                 "expected_version은 양의 정수여야 합니다."
             )
+        self._reject_public_notification_outbox(outbox)
         event_value = TaskEvent(
             event_id=event.event_id,
             task_id=task.task_id,
@@ -1443,6 +1447,45 @@ class SQLiteStore:
             session.refresh(row)
             return _outbox_from_row(row)
 
+    def renew_outbox_lease(
+        self,
+        outbox_id: str,
+        *,
+        lease_token: str,
+        at: datetime,
+        lease_duration: timedelta,
+    ) -> OutboxMessage:
+        """현재 owner의 active outbox lease 만료 시각을 CAS로 연장한다."""
+
+        self._validate_outbox_identity(outbox_id, lease_token)
+        self._validate_outbox_time(at, field_name="at")
+        if not isinstance(lease_duration, timedelta) or lease_duration <= timedelta(0):
+            raise InvalidPersistenceValueError("lease_duration은 양수여야 합니다.")
+        expires_at = at + lease_duration
+        with self._session() as session, session.begin():
+            row = session.get(OutboxRow, outbox_id)
+            self._require_outbox_lease(row, lease_token=lease_token, at=at)
+            assert row is not None
+            result = session.execute(
+                update(OutboxRow)
+                .where(
+                    OutboxRow.outbox_id == outbox_id,
+                    OutboxRow.status == OutboxStatus.PROCESSING.value,
+                    OutboxRow.lease_token == lease_token,
+                )
+                .values(
+                    updated_at=at.isoformat(),
+                    lease_expires_at=expires_at.isoformat(),
+                )
+            )
+            if result.rowcount != 1:
+                raise OptimisticConcurrencyError(
+                    "outbox lease가 다른 dispatcher에 의해 변경되었습니다."
+                )
+            session.flush()
+            session.refresh(row)
+            return _outbox_from_row(row)
+
     def record_outbox_failure(
         self,
         outbox_id: str,
@@ -1536,6 +1579,10 @@ class SQLiteStore:
             row = session.get(OutboxRow, outbox_id)
             if row is None:
                 raise PersistenceNotFoundError(f"outbox가 없습니다: {outbox_id}")
+            if row.topic == _NOTIFICATION_TOPIC:
+                raise InvalidPersistenceValueError(
+                    "notification topic은 lease 전용 interface로만 다시 시도할 수 있습니다."
+                )
             current_status = OutboxStatus(row.status)
             if current_status is not expected_status:
                 raise OptimisticConcurrencyError(
@@ -1597,9 +1644,7 @@ class SQLiteStore:
         return OutboxMessage(
             outbox_id=draft.outbox_id,
             task_id=task.task_id,
-            task_version=(
-                task.version if draft.topic == "task.status_changed" else None
-            ),
+            task_version=(task.version if draft.topic == _NOTIFICATION_TOPIC else None),
             topic=draft.topic,
             payload=dict(draft.payload),
             status=OutboxStatus.PENDING,
@@ -1693,10 +1738,17 @@ class SQLiteStore:
         )
         return OutboxDraft(
             outbox_id=notification_id,
-            topic="task.status_changed",
+            topic=_NOTIFICATION_TOPIC,
             payload=notification.to_payload(),
             created_at=task.updated_at,
         )
+
+    @staticmethod
+    def _reject_public_notification_outbox(outbox: OutboxDraft | None) -> None:
+        if outbox is not None and outbox.topic == _NOTIFICATION_TOPIC:
+            raise InvalidPersistenceValueError(
+                "notification topic은 Task 상태 전이에서만 자동 생성할 수 있습니다."
+            )
 
     @staticmethod
     def _approval_replay(row: ApprovalRow) -> ApprovalApplyResult:

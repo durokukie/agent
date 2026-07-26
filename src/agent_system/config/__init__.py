@@ -19,6 +19,7 @@ _POSITIVE_INTEGER_PATTERN = re.compile(r"[1-9][0-9]*\Z")
 _MAX_AGENT_RUNS = 1_000
 _MAX_QUEUE_CAPACITY = 10_000
 _MAX_WORKER_COUNT = 128
+_MAX_NOTIFICATION_TIMING_SECONDS = 3_600
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +31,9 @@ class RuntimeSettings:
     max_agent_runs: int = 3
     queue_capacity: int = 100
     worker_count: int = 1
+    notification_lease_seconds: int = 30
+    notification_send_timeout_seconds: int = 20
+    notification_heartbeat_seconds: int = 5
 
     def __post_init__(self) -> None:
         """직접 생성도 환경 입력과 동일한 불변 조건으로 제한한다."""
@@ -52,6 +56,29 @@ class RuntimeSettings:
         _validate_positive_integer(
             "AGENT_WORKER_COUNT", self.worker_count, _MAX_WORKER_COUNT
         )
+        _validate_positive_integer(
+            "AGENT_NOTIFICATION_LEASE_SECONDS",
+            self.notification_lease_seconds,
+            _MAX_NOTIFICATION_TIMING_SECONDS,
+        )
+        _validate_positive_integer(
+            "AGENT_NOTIFICATION_SEND_TIMEOUT_SECONDS",
+            self.notification_send_timeout_seconds,
+            _MAX_NOTIFICATION_TIMING_SECONDS,
+        )
+        _validate_positive_integer(
+            "AGENT_NOTIFICATION_HEARTBEAT_SECONDS",
+            self.notification_heartbeat_seconds,
+            _MAX_NOTIFICATION_TIMING_SECONDS,
+        )
+        if self.notification_send_timeout_seconds >= self.notification_lease_seconds:
+            raise RuntimeConfigurationError(
+                "AGENT_NOTIFICATION_SEND_TIMEOUT_SECONDS는 lease보다 작아야 합니다."
+            )
+        if self.notification_heartbeat_seconds * 2 >= self.notification_lease_seconds:
+            raise RuntimeConfigurationError(
+                "AGENT_NOTIFICATION_HEARTBEAT_SECONDS는 lease 절반보다 작아야 합니다."
+            )
 
     @classmethod
     def from_env(cls, mapping: Mapping[str, str] | None = None) -> RuntimeSettings:
@@ -76,6 +103,21 @@ class RuntimeSettings:
                 values.get("AGENT_WORKER_COUNT", "1"),
                 "AGENT_WORKER_COUNT",
                 _MAX_WORKER_COUNT,
+            ),
+            notification_lease_seconds=_parse_positive_integer(
+                values.get("AGENT_NOTIFICATION_LEASE_SECONDS", "30"),
+                "AGENT_NOTIFICATION_LEASE_SECONDS",
+                _MAX_NOTIFICATION_TIMING_SECONDS,
+            ),
+            notification_send_timeout_seconds=_parse_positive_integer(
+                values.get("AGENT_NOTIFICATION_SEND_TIMEOUT_SECONDS", "20"),
+                "AGENT_NOTIFICATION_SEND_TIMEOUT_SECONDS",
+                _MAX_NOTIFICATION_TIMING_SECONDS,
+            ),
+            notification_heartbeat_seconds=_parse_positive_integer(
+                values.get("AGENT_NOTIFICATION_HEARTBEAT_SECONDS", "5"),
+                "AGENT_NOTIFICATION_HEARTBEAT_SECONDS",
+                _MAX_NOTIFICATION_TIMING_SECONDS,
             ),
         )
 

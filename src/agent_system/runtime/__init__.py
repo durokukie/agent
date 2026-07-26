@@ -744,6 +744,11 @@ def build_runtime(
             ),
             clock=clock,
             id_factory=notification_id_factory,
+            lease_duration=timedelta(seconds=settings.notification_lease_seconds),
+            send_timeout=timedelta(seconds=settings.notification_send_timeout_seconds),
+            heartbeat_interval=timedelta(
+                seconds=settings.notification_heartbeat_seconds
+            ),
         )
 
         def close_resources() -> None:

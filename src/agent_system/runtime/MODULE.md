@@ -28,6 +28,7 @@ Agent registry와 orchestrator를 조립해 `RuntimeApplication`을 반환한다
 `cancel()`만 사용한다. 명령 반환은 실행 완료가 아니라 durable 수락 결과다.
 `build_runtime(..., notification_sender=...)`로 기본 logging sender를 fake 또는 다른
 adapter로 교체할 수 있으며 dispatcher의 start/stop/drain은 application 수명에 포함된다.
+Notification lease·send timeout·heartbeat는 검증된 `RuntimeSettings`에서 주입한다.
 
 ## 의존성과 허용된 import 방향
 

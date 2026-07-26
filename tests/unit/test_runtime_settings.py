@@ -22,6 +22,9 @@ class RuntimeSettingsTests(unittest.TestCase):
                 "AGENT_MAX_RUNS": "7",
                 "AGENT_QUEUE_CAPACITY": "250",
                 "AGENT_WORKER_COUNT": "4",
+                "AGENT_NOTIFICATION_LEASE_SECONDS": "60",
+                "AGENT_NOTIFICATION_SEND_TIMEOUT_SECONDS": "40",
+                "AGENT_NOTIFICATION_HEARTBEAT_SECONDS": "10",
                 "MODEL_TIMEOUT_SECONDS": "12.5",
             }
 
@@ -31,6 +34,9 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertEqual(settings.max_agent_runs, 7)
         self.assertEqual(settings.queue_capacity, 250)
         self.assertEqual(settings.worker_count, 4)
+        self.assertEqual(settings.notification_lease_seconds, 60)
+        self.assertEqual(settings.notification_send_timeout_seconds, 40)
+        self.assertEqual(settings.notification_heartbeat_seconds, 10)
         self.assertEqual(
             settings.model_settings,
             ModelSettings(
@@ -50,6 +56,33 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertEqual(settings.max_agent_runs, 3)
         self.assertEqual(settings.queue_capacity, 100)
         self.assertEqual(settings.worker_count, 1)
+        self.assertEqual(settings.notification_lease_seconds, 30)
+        self.assertEqual(settings.notification_send_timeout_seconds, 20)
+        self.assertEqual(settings.notification_heartbeat_seconds, 5)
+
+    def test_rejects_unsafe_notification_timing_relationships(self) -> None:
+        """Timeout이나 heartbeat margin이 lease를 소진해 중복 전달하는 설정을 잡는다."""
+
+        with TemporaryDirectory() as temporary_directory:
+            valid_values = self._valid_environment(
+                Path(temporary_directory) / "agent.sqlite3"
+            )
+            unsafe_values = (
+                {
+                    "AGENT_NOTIFICATION_LEASE_SECONDS": "30",
+                    "AGENT_NOTIFICATION_SEND_TIMEOUT_SECONDS": "30",
+                },
+                {
+                    "AGENT_NOTIFICATION_LEASE_SECONDS": "30",
+                    "AGENT_NOTIFICATION_HEARTBEAT_SECONDS": "15",
+                },
+            )
+            for values in unsafe_values:
+                with (
+                    self.subTest(values=values),
+                    self.assertRaises(RuntimeConfigurationError),
+                ):
+                    RuntimeSettings.from_env(valid_values | values)
 
     def test_is_immutable_after_configuration_is_loaded(self) -> None:
         with TemporaryDirectory() as temporary_directory:
