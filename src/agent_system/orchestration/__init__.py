@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 
 from ._support import (
@@ -40,6 +40,9 @@ from ._support import (
 )
 from ._support import (
     snapshot_integer as _snapshot_integer,
+)
+from ._support import (
+    snapshot_list as _snapshot_list,
 )
 from ._support import (
     snapshot_mapping as _snapshot_mapping,
@@ -393,8 +396,90 @@ class ExecutionBudget:
 
 
 @dataclass(frozen=True, slots=True)
+class _AgentRunIssuance:
+    """WorkflowRun이 실제로 발급한 AgentRun 시작 권한의 immutable 결합이다."""
+
+    agent_run_id: str
+    agent_id: str
+    phase: Phase
+    task_version: int
+    budget_sequence: int
+    started_at: datetime
+
+    def __post_init__(self) -> None:
+        for field_name, value in {
+            "agent_run_id": self.agent_run_id,
+            "agent_id": self.agent_id,
+        }.items():
+            if not isinstance(value, str) or not value.strip():
+                raise InvalidLifecycleValueError(
+                    f"issuance {field_name}는 비어 있을 수 없습니다."
+                )
+        if not isinstance(self.phase, Phase):
+            raise InvalidLifecycleValueError("issuance phase는 Phase 값이어야 합니다.")
+        if isinstance(self.task_version, bool) or not isinstance(
+            self.task_version, int
+        ):
+            raise InvalidLifecycleValueError(
+                "issuance task_version은 양의 정수여야 합니다."
+            )
+        if self.task_version <= 0:
+            raise InvalidLifecycleValueError(
+                "issuance task_version은 양의 정수여야 합니다."
+            )
+        if isinstance(self.budget_sequence, bool) or not isinstance(
+            self.budget_sequence, int
+        ):
+            raise InvalidLifecycleValueError(
+                "issuance budget_sequence는 양의 정수여야 합니다."
+            )
+        if self.budget_sequence <= 0:
+            raise InvalidLifecycleValueError(
+                "issuance budget_sequence는 양의 정수여야 합니다."
+            )
+        _require_aware(self.started_at, field_name="issuance.started_at")
+
+    def matches(self, agent_run: AgentRun) -> bool:
+        """AgentRun의 시작 identity가 발급 기록과 정확히 같은지 반환한다."""
+
+        return (
+            self.agent_run_id == agent_run.agent_run_id
+            and self.agent_id == agent_run.agent_id
+            and self.phase is agent_run.phase
+            and self.task_version == agent_run.task_version
+            and self.budget_sequence == agent_run.budget_sequence
+            and self.started_at.astimezone(UTC) == agent_run.started_at.astimezone(UTC)
+        )
+
+    def to_snapshot(self) -> dict[str, object]:
+        """발급 결합을 JSON 호환 snapshot으로 반환한다."""
+
+        return {
+            "agent_run_id": self.agent_run_id,
+            "agent_id": self.agent_id,
+            "phase": self.phase.value,
+            "task_version": self.task_version,
+            "budget_sequence": self.budget_sequence,
+            "started_at": self.started_at.isoformat(),
+        }
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Mapping[str, object]) -> _AgentRunIssuance:
+        """JSON 호환 snapshot에서 발급 결합을 복원한다."""
+
+        return cls(
+            agent_run_id=_snapshot_string(snapshot, "agent_run_id"),
+            agent_id=_snapshot_string(snapshot, "agent_id"),
+            phase=_snapshot_enum(snapshot, "phase", Phase),
+            task_version=_snapshot_integer(snapshot, "task_version"),
+            budget_sequence=_snapshot_integer(snapshot, "budget_sequence"),
+            started_at=_snapshot_datetime(snapshot, "started_at"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class WorkflowRun:
-    """Task의 orchestration phase와 호출 budget을 보존하는 snapshot이다."""
+    """Task의 phase, 호출 budget과 AgentRun 발급 이력을 보존한다."""
 
     workflow_run_id: str
     task_id: str
@@ -403,6 +488,7 @@ class WorkflowRun:
     budget: ExecutionBudget
     started_at: datetime
     updated_at: datetime
+    agent_run_issuances: tuple[_AgentRunIssuance, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -428,6 +514,48 @@ class WorkflowRun:
             self.started_at,
             field_name="updated_at",
         )
+        if not isinstance(self.agent_run_issuances, tuple):
+            raise InvalidLifecycleValueError(
+                "agent_run_issuances는 immutable tuple이어야 합니다."
+            )
+        if len(self.agent_run_issuances) != self.budget.consumed:
+            raise InvalidLifecycleValueError(
+                "AgentRun 발급 수와 budget consumed가 일치해야 합니다."
+            )
+        seen_agent_run_ids: set[str] = set()
+        previous_started_at = self.started_at
+        for expected_sequence, issuance in enumerate(
+            self.agent_run_issuances,
+            start=1,
+        ):
+            if not isinstance(issuance, _AgentRunIssuance):
+                raise InvalidLifecycleValueError(
+                    "agent_run_issuances 항목이 올바르지 않습니다."
+                )
+            if issuance.budget_sequence != expected_sequence:
+                raise InvalidLifecycleValueError(
+                    "AgentRun 발급 순서와 budget_sequence가 일치해야 합니다."
+                )
+            if issuance.task_version != self.task_version:
+                raise InvalidLifecycleValueError(
+                    "AgentRun 발급의 task_version이 WorkflowRun과 다릅니다."
+                )
+            if issuance.agent_run_id in seen_agent_run_ids:
+                raise InvalidLifecycleValueError(
+                    "한 WorkflowRun에서 agent_run_id는 중복될 수 없습니다."
+                )
+            _require_not_before(
+                issuance.started_at,
+                previous_started_at,
+                field_name="issuance.started_at",
+            )
+            _require_not_before(
+                self.updated_at,
+                issuance.started_at,
+                field_name="updated_at",
+            )
+            seen_agent_run_ids.add(issuance.agent_run_id)
+            previous_started_at = issuance.started_at
 
     @classmethod
     def start(
@@ -478,11 +606,20 @@ class WorkflowRun:
             )
         budget = self.budget.consume()
         phase = Phase.EXECUTING if retry else self.phase
+        issuance = _AgentRunIssuance(
+            agent_run_id=agent_run_id,
+            agent_id=agent_id,
+            phase=phase,
+            task_version=self.task_version,
+            budget_sequence=budget.consumed,
+            started_at=at,
+        )
         workflow = replace(
             self,
             phase=phase,
             budget=budget,
             updated_at=at,
+            agent_run_issuances=self.agent_run_issuances + (issuance,),
         )
         agent_run = AgentRun._create_for_workflow(
             workflow=workflow,
@@ -505,6 +642,9 @@ class WorkflowRun:
             "budget": self.budget.to_snapshot(),
             "started_at": self.started_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
+            "agent_run_issuances": [
+                issuance.to_snapshot() for issuance in self.agent_run_issuances
+            ],
         }
 
     @classmethod
@@ -519,6 +659,10 @@ class WorkflowRun:
             budget=ExecutionBudget.from_snapshot(_snapshot_mapping(snapshot, "budget")),
             started_at=_snapshot_datetime(snapshot, "started_at"),
             updated_at=_snapshot_datetime(snapshot, "updated_at"),
+            agent_run_issuances=tuple(
+                _AgentRunIssuance.from_snapshot(issuance)
+                for issuance in _snapshot_list(snapshot, "agent_run_issuances")
+            ),
         )
 
 
@@ -662,7 +806,7 @@ class AgentRun:
             )
 
     def _validate_owner(self, workflow: WorkflowRun) -> None:
-        """식별자와 budget 소비 순서가 소유 WorkflowRun에 속하는지 검증한다."""
+        """aggregate 식별자와 exact issuance가 WorkflowRun에 속하는지 검증한다."""
 
         if (
             self.workflow_run_id != workflow.workflow_run_id
@@ -672,25 +816,10 @@ class AgentRun:
             raise AgentRunOwnershipError(
                 "AgentRun 식별자가 소유 WorkflowRun과 일치하지 않습니다."
             )
-        if self.budget_sequence > workflow.budget.consumed:
+        if not any(issuance.matches(self) for issuance in workflow.agent_run_issuances):
             raise AgentRunOwnershipError(
-                "AgentRun budget_sequence에 대응하는 소비 이력이 없습니다."
+                "AgentRun 시작 identity와 일치하는 발급 기록이 없습니다."
             )
-        try:
-            _require_not_before(
-                self.started_at,
-                workflow.started_at,
-                field_name="started_at",
-            )
-            _require_not_before(
-                workflow.updated_at,
-                self.started_at,
-                field_name="workflow.updated_at",
-            )
-        except InvalidLifecycleValueError as error:
-            raise AgentRunOwnershipError(
-                "AgentRun 시작 시각이 소유 WorkflowRun 실행 구간 밖입니다."
-            ) from error
 
     @property
     def is_completed(self) -> bool:

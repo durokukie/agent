@@ -612,6 +612,13 @@ class WorkflowRunLifecycleTests(unittest.TestCase):
         self.assertEqual(first_agent_run.phase, Phase.CLASSIFYING)
         self.assertEqual(first_agent_run.budget_sequence, 1)
         self.assertEqual(run.budget.consumed, 0)
+        self.assertEqual(
+            [
+                issuance["budget_sequence"]
+                for issuance in after_first.to_snapshot()["agent_run_issuances"]
+            ],
+            [1],
+        )
 
         verifying = after_first
         for phase in (
@@ -637,11 +644,19 @@ class WorkflowRunLifecycleTests(unittest.TestCase):
         self.assertEqual(after_retry.budget, ExecutionBudget(limit=2, consumed=2))
         self.assertEqual(retry_agent_run.phase, Phase.EXECUTING)
         self.assertEqual(retry_agent_run.budget_sequence, 2)
+        self.assertEqual(
+            [
+                issuance["budget_sequence"]
+                for issuance in after_retry.to_snapshot()["agent_run_issuances"]
+            ],
+            [1, 2],
+        )
 
         exhausted = after_retry.advance(
             Phase.VERIFYING,
             at=after_retry.updated_at + timedelta(minutes=1),
         )
+        before_exhaustion = exhausted.to_snapshot()
         with self.assertRaises(ExecutionBudgetExhaustedError):
             exhausted.begin_agent_run(
                 agent_run_id="agent-run-3",
@@ -649,6 +664,7 @@ class WorkflowRunLifecycleTests(unittest.TestCase):
                 retry=True,
                 at=exhausted.updated_at + timedelta(minutes=1),
             )
+        self.assertEqual(exhausted.to_snapshot(), before_exhaustion)
 
     def test_rejects_invalid_budget_run_identity_and_run_time_reversal(self) -> None:
         invalid_budgets = (
@@ -870,6 +886,75 @@ class AgentRunLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(restored, started)
 
+    def test_rejects_mutations_of_every_issued_agent_run_binding_field(
+        self,
+    ) -> None:
+        workflow = WorkflowRun.start(
+            workflow_run_id="workflow-123",
+            task=Task.receive(task_id="task-123", input="요청", at=NOW),
+            max_agent_runs=2,
+            at=NOW,
+        )
+        workflow, historical = workflow.begin_agent_run(
+            agent_run_id="agent-run-1",
+            agent_id="classifier",
+            at=NOW,
+        )
+        workflow = workflow.advance(Phase.ANALYZING, at=LATER)
+        workflow, current = workflow.begin_agent_run(
+            agent_run_id="agent-run-2",
+            agent_id="analyzer",
+            at=LATER,
+        )
+
+        mutations = (
+            {"agent_run_id": "fabricated"},
+            {"agent_id": current.agent_id},
+            {"phase": current.phase.value},
+            {"task_version": historical.task_version + 1},
+            {"budget_sequence": current.budget_sequence},
+            {"started_at": current.started_at.isoformat()},
+        )
+        for mutation in mutations:
+            with (
+                self.subTest(mutation=mutation),
+                self.assertRaises(AgentRunOwnershipError),
+            ):
+                AgentRun.from_snapshot(
+                    historical.to_snapshot() | mutation,
+                    workflow=workflow,
+                )
+
+    def test_restores_historical_and_current_issued_agent_runs(self) -> None:
+        workflow = WorkflowRun.start(
+            workflow_run_id="workflow-123",
+            task=Task.receive(task_id="task-123", input="요청", at=NOW),
+            max_agent_runs=2,
+            at=NOW,
+        )
+        workflow, historical = workflow.begin_agent_run(
+            agent_run_id="agent-run-1",
+            agent_id="classifier",
+            at=NOW,
+        )
+        workflow = workflow.advance(Phase.ANALYZING, at=LATER)
+        workflow, current = workflow.begin_agent_run(
+            agent_run_id="agent-run-2",
+            agent_id="analyzer",
+            at=LATER,
+        )
+        restored_workflow = WorkflowRun.from_snapshot(
+            json.loads(json.dumps(workflow.to_snapshot()))
+        )
+
+        for issued in (historical, current):
+            with self.subTest(agent_run_id=issued.agent_run_id):
+                restored = AgentRun.from_snapshot(
+                    json.loads(json.dumps(issued.to_snapshot())),
+                    workflow=restored_workflow,
+                )
+                self.assertEqual(restored, issued)
+
 
 class SnapshotSerializationTests(unittest.TestCase):
     """Persisted aggregate가 framework 없는 JSON snapshot으로 왕복된다."""
@@ -921,6 +1006,16 @@ class SnapshotSerializationTests(unittest.TestCase):
                 "budget": {"limit": 2, "consumed": 1},
                 "started_at": "2026-07-26T09:04:00+00:00",
                 "updated_at": "2026-07-26T09:05:00+00:00",
+                "agent_run_issuances": [
+                    {
+                        "agent_run_id": "agent-run-123",
+                        "agent_id": "analysis",
+                        "phase": "CLASSIFYING",
+                        "task_version": 4,
+                        "budget_sequence": 1,
+                        "started_at": "2026-07-26T09:05:00+00:00",
+                    }
+                ],
             },
         )
         self.assertEqual(
@@ -976,6 +1071,54 @@ class SnapshotSerializationTests(unittest.TestCase):
         approval = Approval.grant_for(waiting, at=NOW)
         missing_phase = workflow.to_snapshot()
         del missing_phase["phase"]
+        issuance = {
+            "agent_run_id": "agent-run-123",
+            "agent_id": "analysis",
+            "phase": "CLASSIFYING",
+            "task_version": 1,
+            "budget_sequence": 1,
+            "started_at": NOW.isoformat(),
+        }
+        valid_workflow_snapshot = workflow.to_snapshot() | {
+            "agent_run_issuances": [issuance]
+        }
+        missing_issuances = dict(valid_workflow_snapshot)
+        del missing_issuances["agent_run_issuances"]
+        malformed_workflow_snapshots = (
+            missing_issuances,
+            valid_workflow_snapshot | {"agent_run_issuances": "one"},
+            valid_workflow_snapshot | {"agent_run_issuances": [None]},
+            valid_workflow_snapshot
+            | {"agent_run_issuances": [issuance | {"agent_id": None}]},
+            valid_workflow_snapshot
+            | {"agent_run_issuances": [issuance | {"phase": "UNKNOWN"}]},
+            valid_workflow_snapshot
+            | {"agent_run_issuances": [issuance | {"budget_sequence": True}]},
+            valid_workflow_snapshot
+            | {"agent_run_issuances": [issuance | {"started_at": "not-a-date"}]},
+            valid_workflow_snapshot | {"agent_run_issuances": []},
+            valid_workflow_snapshot
+            | {"agent_run_issuances": [issuance | {"budget_sequence": 2}]},
+            valid_workflow_snapshot
+            | {"agent_run_issuances": [issuance | {"task_version": 2}]},
+            valid_workflow_snapshot
+            | {
+                "agent_run_issuances": [
+                    issuance
+                    | {
+                        "started_at": (NOW - timedelta(minutes=1)).isoformat(),
+                    }
+                ]
+            },
+            valid_workflow_snapshot
+            | {
+                "budget": {"limit": 2, "consumed": 2},
+                "agent_run_issuances": [
+                    issuance,
+                    issuance | {"budget_sequence": 2},
+                ],
+            },
+        )
 
         malformed_loaders = (
             lambda: Approval.from_snapshot(
@@ -999,3 +1142,10 @@ class SnapshotSerializationTests(unittest.TestCase):
         for load in malformed_loaders:
             with self.subTest(load=load), self.assertRaises(InvalidLifecycleValueError):
                 load()
+
+        for snapshot in malformed_workflow_snapshots:
+            with (
+                self.subTest(snapshot=snapshot),
+                self.assertRaises(InvalidLifecycleValueError),
+            ):
+                WorkflowRun.from_snapshot(snapshot)

@@ -195,6 +195,15 @@ def snapshot_mapping(
     return value
 
 
+def snapshot_list(snapshot: Mapping[str, object], field_name: str) -> list[object]:
+    """JSON array 필드를 읽는다."""
+
+    value = snapshot_value(snapshot, field_name)
+    if not isinstance(value, list):
+        raise InvalidLifecycleValueError(f"{field_name}은 list여야 합니다.")
+    return value
+
+
 __all__ = [
     "AgentRunAgentMismatchError",
     "AgentRunAlreadyCompletedError",
@@ -218,6 +227,7 @@ __all__ = [
     "snapshot_datetime",
     "snapshot_enum",
     "snapshot_integer",
+    "snapshot_list",
     "snapshot_mapping",
     "snapshot_optional_string",
     "snapshot_string",

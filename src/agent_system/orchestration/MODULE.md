@@ -6,7 +6,7 @@ Task와 실행 기록의 생명주기, 동적 supervisor graph, 에이전트 선
 
 ## 포함할 구현
 
-현재는 framework에 독립적인 `Task`, `WorkflowRun`, `AgentRun`, `Approval`, `ExecutionBudget`과 상태·단계 전이 정책을 포함한다. 공통 오류, UTC 시각 검증과 typed snapshot parsing은 private `_support.py`에 두고 공개 이름은 module root에서 제공한다. 이후 LangGraph graph 구성, supervisor node와 routing이 이 모델을 사용한다.
+현재는 framework에 독립적인 `Task`, `WorkflowRun`, `AgentRun`, `Approval`, `ExecutionBudget`과 상태·단계 전이 정책을 포함한다. WorkflowRun 내부의 private immutable issuance 값은 AgentRun 발급 identity를 보존한다. 공통 오류, UTC 시각 검증과 typed snapshot parsing은 private `_support.py`에 두고 공개 이름은 module root에서 제공한다. 이후 LangGraph graph 구성, supervisor node와 routing이 이 모델을 사용한다.
 
 ## 공개 인터페이스와 사용 방법
 
@@ -21,9 +21,9 @@ Task와 실행 기록의 생명주기, 동적 supervisor graph, 에이전트 선
 
 `RUNNING → WAITING_APPROVAL`에는 plan hash가 있어야 한다. `WAITING_APPROVAL → RUNNING`에는 현재 `task_id`, `version`, `plan_hash`에 모두 묶인 `Approval`이 필요하다. Task 식별자 불일치, plan 변경, 오래된 version은 각각 명시적인 Approval 오류이며 검증 순서는 식별자, plan, version 순이다. plan은 `RUNNING` 또는 `WAITING_APPROVAL`에서만 교체할 수 있고 교체 자체도 version을 증가시킨다. `Approval.binding`은 이 세 값을 안정적인 tuple로 노출한다.
 
-`WorkflowRun.start()`는 `CLASSIFYING`에서 시작한다. `advance()`는 `CLASSIFYING → ANALYZING → PLANNING → GOVERNING → EXECUTING → VERIFYING` 순서만 허용하며 `VERIFYING → EXECUTING` 직접 전이는 금지한다. `begin_agent_run()`이 호출 budget 한 회를 소비하면서 새 `AgentRun`과 갱신된 `WorkflowRun`을 함께 반환한다. `retry=True`는 `VERIFYING`에서만 가능하고 같은 원자적 연산 안에서 `EXECUTING`으로 이동한다. 마지막 slot은 정상 사용되며 이후 일반 호출과 재실행은 모두 `ExecutionBudgetExhaustedError`로 차단된다.
+`WorkflowRun.start()`는 `CLASSIFYING`에서 시작한다. `advance()`는 `CLASSIFYING → ANALYZING → PLANNING → GOVERNING → EXECUTING → VERIFYING` 순서만 허용하며 `VERIFYING → EXECUTING` 직접 전이는 금지한다. `begin_agent_run()`이 호출 budget 한 회를 소비하면서 새 `AgentRun`과 갱신된 `WorkflowRun`을 함께 반환한다. 이때 갱신된 WorkflowRun에는 발급한 실행의 exact identity가 immutable `agent_run_issuances`에 budget 순서대로 추가된다. `retry=True`는 `VERIFYING`에서만 가능하고 같은 원자적 연산 안에서 `EXECUTING`으로 이동한다. 마지막 slot은 정상 사용되며 이후 일반 호출과 재실행은 모두 `ExecutionBudgetExhaustedError`로 차단된다.
 
-`AgentRun`은 `WorkflowRun.begin_agent_run()`으로만 새로 시작하며 직접 생성은 `AgentRunOwnershipError`로 거부한다. 해당 budget의 `budget_sequence`를 기록하고, 복원할 때도 workflow/task 식별자와 Task version, 이미 소비한 budget 범위, WorkflowRun 실행 구간 안의 시작 시각을 검증한다. `complete()`는 같은 `agent_id`의 결과로 한 번만 종료한다. 이 타입은 Agent 구현 계약이 아니라 orchestration이 소유하는 실행 이력이다.
+`AgentRun`은 `WorkflowRun.begin_agent_run()`으로만 새로 시작하며 직접 생성은 `AgentRunOwnershipError`로 거부한다. 해당 budget의 `budget_sequence`를 기록하고, 복원할 때는 workflow/task 식별자에 더해 `agent_run_id`, `agent_id`, `phase`, Task version, budget sequence, UTC 시작 instant가 소유 WorkflowRun의 한 issuance와 모두 일치해야 한다. 따라서 consumed 범위 안의 그럴듯한 위조 실행도 복원할 수 없다. `complete()`는 같은 `agent_id`의 결과로 한 번만 종료한다. 이 타입은 Agent 구현 계약이 아니라 orchestration이 소유하는 실행 이력이다.
 
 ## 의존성과 허용된 import 방향
 
@@ -31,7 +31,7 @@ Task와 실행 기록의 생명주기, 동적 supervisor graph, 에이전트 선
 
 ## 데이터 및 제어 흐름
 
-Task 변경은 이전 snapshot을 보존한 채 새 version을 만든다. WorkflowRun이 phase와 budget을 추적하고 `begin_agent_run()`이 budget 소비와 개별 호출 기록 생성을 한 결과로 묶는다. 이후 supervisor는 이 값들을 함께 저장한 뒤 Agent를 호출하고 결과를 AgentRun에 반영한다.
+Task 변경은 이전 snapshot을 보존한 채 새 version을 만든다. WorkflowRun이 phase, budget, 지금까지 발급한 모든 AgentRun identity를 추적하고 `begin_agent_run()`이 budget 소비·issuance 추가·개별 호출 기록 생성을 한 결과로 묶는다. 이후 supervisor는 이 값들을 함께 저장한 뒤 Agent를 호출하고 결과를 AgentRun에 반영한다. 과거 또는 현재 AgentRun을 복원할 때는 issuance ledger가 포함된 WorkflowRun snapshot을 먼저 복원해 소유자로 전달한다.
 
 ## 설계 결정과 제약사항
 
@@ -47,13 +47,15 @@ Task 변경은 이전 snapshot을 보존한 채 새 version을 만든다. Workfl
 
 plan을 가진 `RUNNING`은 version 3 이상, `WAITING_APPROVAL`과 plan을 가진 terminal status는 version 4 이상이다. 활성 상태에서 plan을 반복 갱신할 수 있으므로 이 하한보다 높은 planful version은 합법적이다.
 
+`agent_run_issuances`는 JSON array로 직렬화되며 각 항목은 `agent_run_id`, `agent_id`, `phase`, `task_version`, `budget_sequence`, `started_at`을 가진다. 항목 수는 `budget.consumed`와 같고 sequence는 1부터 빠짐없이 증가해야 하며, 한 WorkflowRun 안에서 `agent_run_id`는 고유하다. 발급 시각은 WorkflowRun 실행 구간 안에서 순서대로 증가한다. 이 조건은 직접 생성과 snapshot 복원 모두에 적용된다.
+
 동일한 immutable `Task`와 `Approval`만으로는 프로세스 간 replay 소비 여부를 소유하지 않는다. 한 번만 승인되는 compare-and-transition은 Task 4 persistence가 `Approval.binding`과 현재 Task version을 같은 optimistic transaction에서 비교·저장해 보장해야 한다. Domain에는 global mutable consumed set을 두지 않는다.
 
 ## 테스트 전략
 
-모든 status·phase 조합을 표 기반 단위 테스트로 검증한다. Approval의 task/version/plan 결합과 deterministic binding, planless Task의 정확한 version 도달 가능성과 planful 반복 갱신, plan 변경, 취소, budget과 AgentRun의 원자적 결합·직접 생성 차단·소유 WorkflowRun 기반 복원, DST fold, 모든 aggregate의 JSON snapshot 왕복·오류 정규화를 외부 I/O 없이 검증한다.
+모든 status·phase 조합을 표 기반 단위 테스트로 검증한다. Approval의 task/version/plan 결합과 deterministic binding, planless Task의 정확한 version 도달 가능성과 planful 반복 갱신, plan 변경, 취소, budget과 AgentRun의 원자적 결합·직접 생성 차단·exact issuance 기반 복원, historical/current 실행 복원, malformed issuance ledger, DST fold, 모든 aggregate의 JSON snapshot 왕복·오류 정규화를 외부 I/O 없이 검증한다.
 
-Task 4 persistence 통합 테스트는 같은 Approval의 동시·반복 전달에서 `binding`과 Task version을 optimistic transaction으로 비교해 정확히 한 요청만 `WAITING_APPROVAL → RUNNING`을 저장하고 나머지는 stale/idempotent 결과가 되는지 반드시 검증한다. 또한 `begin_agent_run()`이 반환한 WorkflowRun과 AgentRun을 한 transaction에 함께 저장하고, 저장된 AgentRun을 해당 WorkflowRun snapshot과 함께 복원하는지 검증한다.
+Task 4 persistence 통합 테스트는 같은 Approval의 동시·반복 전달에서 `binding`과 Task version을 optimistic transaction으로 비교해 정확히 한 요청만 `WAITING_APPROVAL → RUNNING`을 저장하고 나머지는 stale/idempotent 결과가 되는지 반드시 검증한다. 또한 `begin_agent_run()`이 반환한 issuance 포함 WorkflowRun과 AgentRun을 한 transaction에 함께 저장하고, 저장된 모든 historical/current AgentRun을 해당 WorkflowRun snapshot과 함께 복원하는지 검증한다.
 
 ## 변경 시 문서 갱신 조건
 
