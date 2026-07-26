@@ -2,32 +2,97 @@
 
 ## 목적과 책임
 
-LangGraph checkpoint와 실행 이력을 SQLite에 저장하고 재개 가능한 실행을 지원한다.
+생명주기 aggregate와 감사 이력을 SQLite에 저장하고, LangGraph checkpoint와
+애플리케이션 table이 같은 데이터베이스 파일을 안전하게 공유하도록 한다. ORM row,
+SQL, SQLite 연결 수명은 이 모듈 안에 숨기고 호출자에게 orchestration domain 값과
+persistence 결과 값만 반환한다.
 
 ## 포함할 구현
 
-SQLite 연결 관리, checkpointer 구성, run metadata와 event 이력 저장을 포함한다.
+다음을 포함한다.
+
+- SQLAlchemy engine과 짧고 명시적인 transaction을 사용하는 `SQLiteStore`
+- Task snapshot과 append-only Task event
+- WorkflowRun snapshot과 모든 AgentRun 이력
+- Approval 기록, 단일 소비와 승인 결과 snapshot
+- webhook/request 멱등성 key
+- transactional notification outbox와 상태 전이
+- non-terminal startup recovery 조회
+- 별도 `sqlite3.Connection`을 소유하는 LangGraph `SqliteSaver`
+- Alembic migration 실행 함수와 revision
 
 ## 공개 인터페이스와 사용 방법
 
-runtime이 저장 자원을 생성해 orchestration에 주입한다. 호출자는 SQLite 연결 세부사항을 알 필요가 없다.
+runtime은 migration을 적용한 뒤 데이터베이스 경로를 주입해 `SQLiteStore`를 만든다.
+호출자는 store의 context manager 수명 안에서 Task 생성·변경, 실행 기록, 승인 소비,
+outbox와 복구 후보를 다룬다. 모든 read interface는 `Task`, `WorkflowRun`,
+`AgentRun` 또는 frozen persistence value를 반환하며 ORM model을 노출하지 않는다.
+
+Task 생성은 선택적인 `IdempotencyKey`와 함께 한 transaction으로 처리한다. 같은
+namespace/key와 같은 fingerprint는 기존 Task를 replay 결과로 반환하고, fingerprint가
+다르면 `IdempotencyConflictError`다. Task 변경은 현재 version과 정확히 다음 version을
+비교한다. 불일치는 `OptimisticConcurrencyError`이며 snapshot과 event 어느 것도
+부분 commit하지 않는다.
+
+`WAITING_APPROVAL → RUNNING`은 일반 Task 저장으로 우회할 수 없다. 승인 전용
+compare-and-transition이 `Approval.binding`, decision key와 현재 Task snapshot을 한
+write transaction에서 검증하고 Approval 소비, Task snapshot, append-only event와
+선택적 outbox를 함께 commit한다. 같은 승인 replay는 저장한 결과 snapshot을
+`ALREADY_APPLIED`로 반환하고, 같은 decision key를 다른 요청에 재사용하면 명시적
+conflict다.
+
+WorkflowRun 최초 저장과 일반 phase 갱신을 분리한다. AgentRun 발급 저장은 이전
+WorkflowRun snapshot, issuance가 추가된 다음 snapshot과 AgentRun을 받아 세 값의
+연속성과 소유권을 검증한 뒤 한 transaction에 기록한다. AgentRun 조회는 같은
+transaction에서 소유 WorkflowRun을 먼저 복원하고 `AgentRun.from_snapshot(...,
+workflow=owner)` 검증을 반드시 거친다.
+
+`open_checkpointer()`는 store와 같은 파일에 연결한 `SqliteSaver` context manager다.
+checkpointer table과 raw connection의 생성·종료는 이 context가 독립적으로 소유한다.
+반환한 saver는 context 밖에서 사용할 수 없다.
 
 ## 의존성과 허용된 import 방향
 
-`config`, LangGraph checkpointer와 SQLite driver를 사용할 수 있다. CLI나 agent 구현에는 의존하지 않는다.
+`orchestration`의 공개 생명주기 값, SQLAlchemy, Alembic, LangGraph SQLite
+checkpointer와 Python `sqlite3`를 사용할 수 있다. Agent 구현, model adapter,
+FastAPI, Rich와 CLI에는 의존하지 않는다. orchestration은 persistence를 import하지
+않는다.
 
 ## 데이터 및 제어 흐름
 
-실행 중 state checkpoint와 event가 thread/run 식별자로 기록되고 재개 요청 시 복원된다.
+Task 명령은 저장된 snapshot을 읽고 optimistic 조건을 검증한 뒤 새 snapshot, event,
+선택적 outbox를 commit한다. WorkflowRun이 발급한 immutable issuance ledger와 해당
+AgentRun은 함께 저장된다. 시작 시 recovery 조회는 terminal Task를 제외하고
+`WAITING_APPROVAL`을 대기 항목으로, 나머지 active Task를 재개 항목으로 구분한다.
+재개 항목의 thread id로 별도 checkpointer가 기존 checkpoint를 읽어 graph 실행을
+계속한다.
 
 ## 설계 결정과 제약사항
 
-checkpoint와 관측용 실행 이력의 책임을 구분한다. 트랜잭션, migration, 보존 정책을 명시적으로 관리한다.
+SQLite는 WAL, foreign key, busy timeout을 모든 애플리케이션 연결과 checkpointer
+연결에 설정한다. 애플리케이션 transaction은 write 선점을 명확히 하는
+`BEGIN IMMEDIATE`와 context manager commit/rollback을 사용하며 외부 model, Agent,
+알림 호출 동안 열어두지 않는다. timezone-aware 시각은 offset을 잃지 않도록 ISO 8601
+문자열로 저장하고 domain snapshot 복원으로 검증한다. JSON은 canonical UTF-8 text로
+저장한다.
+
+Task event는 update/delete trigger로 append-only를 DB에서도 강제한다. app table은
+Alembic만 생성·변경하며 `MetaData.create_all()`을 migration 대체 수단으로 사용하지
+않는다. LangGraph가 소유한 checkpoint table은 Alembic metadata와 app migration에
+포함하지 않는다. 지원 범위는 low-write 단일 프로세스 MVP이며 다중 writer 또는 수평
+확장이 필요하면 PostgreSQL adapter 도입을 검토한다.
 
 ## 테스트 전략
 
-임시 SQLite 데이터베이스로 저장·조회·재개·동시 접근·migration을 통합 테스트한다.
+임시 파일 SQLite로 빈 DB와 반복 migration, WAL/foreign key/busy timeout, domain
+snapshot fidelity, optimistic rollback, event append-only, request idempotency race,
+Approval replay/conflict와 동시 소비, WorkflowRun/AgentRun 원자 저장·소유 복원,
+outbox 전이, terminal 제외 recovery를 통합 테스트한다. 실제 LangGraph graph를
+interrupt한 뒤 checkpointer를 닫고 새 connection에서 resume한다. 외부 서비스는
+사용하지 않는다.
 
 ## 변경 시 문서 갱신 조건
 
-schema, migration, transaction, 보존 또는 checkpoint 정책이 바뀔 때 갱신한다.
+schema/revision, 공개 store interface, transaction과 optimistic 조건, 멱등성 key,
+Approval 소비, recovery 분류, outbox 상태, SQLite PRAGMA, 자원 수명 또는 checkpoint
+정책이 바뀔 때 갱신한다.

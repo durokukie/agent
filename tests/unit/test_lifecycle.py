@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from agent_system.orchestration import (
@@ -31,7 +31,7 @@ from agent_system.orchestration import (
     WorkflowRun,
 )
 
-NOW = datetime(2026, 7, 26, 9, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 26, 9, 0, tzinfo=UTC)
 LATER = NOW + timedelta(minutes=1)
 
 

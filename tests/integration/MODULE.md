@@ -6,7 +6,8 @@
 
 ## 포함할 구현
 
-LangGraph graph 연결, SQLite checkpoint·재개, runtime 조립과 CLI 실행 테스트를 포함한다.
+LangGraph graph 연결, SQLite app migration·transaction·checkpoint 재개, runtime 조립과
+CLI 실행 테스트를 포함한다.
 
 ## 공개 인터페이스와 사용 방법
 
@@ -26,7 +27,11 @@ LangGraph graph 연결, SQLite checkpoint·재개, runtime 조립과 CLI 실행 
 
 ## 테스트 전략
 
-정상 완료, 중단 후 재개, agent 실패, budget 소진과 저장소 오류를 검증한다.
+임시 파일 데이터베이스만 사용해 migration 반복 적용, WAL과 foreign key, optimistic
+rollback, event append-only, 멱등성 race, Approval 단일 소비, WorkflowRun/AgentRun
+원자성, outbox와 startup recovery를 검증한다. 실제 LangGraph checkpoint는 interrupt
+후 연결을 닫고 새 연결에서 재개한다. 이후 정상 완료, agent 실패, budget 소진과
+저장소 오류 경로를 확장한다.
 
 ## 변경 시 문서 갱신 조건
 

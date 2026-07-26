@@ -1,0 +1,968 @@
+"""SQLite persistence 공개 seam의 통합 테스트."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import TypedDict
+
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
+
+from agent_system.orchestration import (
+    AgentRunOwnershipError,
+    Approval,
+    Phase,
+    PlanChangedError,
+    Status,
+    Task,
+    WorkflowRun,
+)
+from agent_system.persistence import (
+    ApprovalApplyStatus,
+    ApprovalConflictError,
+    IdempotencyConflictError,
+    IdempotencyKey,
+    InvalidOutboxTransitionError,
+    OptimisticConcurrencyError,
+    OutboxDraft,
+    OutboxStatus,
+    PersistenceConflictError,
+    RecoveryDisposition,
+    SQLiteStore,
+    TaskEventDraft,
+    upgrade_database,
+)
+
+KST = timezone(timedelta(hours=9))
+NOW = datetime(2026, 7, 26, 19, 0, tzinfo=KST)
+
+
+class MigrationTests(unittest.TestCase):
+    """Alembic이 app schema의 유일한 생성 경로임을 검증한다."""
+
+    def test_upgrades_an_empty_database_and_repeated_upgrade_is_a_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+
+            upgrade_database(database_path)
+            upgrade_database(database_path)
+
+            with sqlite3.connect(database_path) as connection:
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                revision = connection.execute(
+                    "SELECT version_num FROM alembic_version"
+                ).fetchone()
+                event_foreign_keys = connection.execute(
+                    "PRAGMA foreign_key_list(task_events)"
+                ).fetchall()
+
+        self.assertEqual(
+            tables,
+            {
+                "agent_runs",
+                "alembic_version",
+                "approvals",
+                "outbox_events",
+                "request_idempotency",
+                "task_events",
+                "tasks",
+                "workflow_runs",
+            },
+        )
+        self.assertEqual(revision, ("0001_initial",))
+        self.assertTrue(
+            any(row[2] == "tasks" and row[3] == "task_id" for row in event_foreign_keys)
+        )
+
+
+class TaskStoreTests(unittest.TestCase):
+    """Task 변경이 event와 전달 의도를 원자적으로 보존하는지 검증한다."""
+
+    def test_persists_and_restores_task_event_and_transactional_outbox(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            task = Task.receive(task_id="task-1", input="노드 점검", at=NOW)
+            event = TaskEventDraft(
+                event_id="event-1",
+                event_type="TASK_RECEIVED",
+                payload={"source": "ticket", "priority": 2},
+                occurred_at=NOW,
+            )
+            outbox = OutboxDraft(
+                outbox_id="outbox-1",
+                topic="task.received",
+                payload={"task_id": "task-1"},
+                created_at=NOW,
+            )
+
+            with SQLiteStore(database_path) as store:
+                written = store.create_task(task, event=event, outbox=outbox)
+
+            with SQLiteStore(database_path) as reopened:
+                restored = reopened.get_task("task-1")
+                events = reopened.list_task_events("task-1")
+                outbox_messages = reopened.list_outbox(status=OutboxStatus.PENDING)
+
+        self.assertEqual(written.task, task)
+        self.assertFalse(written.replayed)
+        self.assertEqual(restored, task)
+        self.assertEqual(restored.created_at.isoformat(), "2026-07-26T19:00:00+09:00")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_id, "event-1")
+        self.assertEqual(events[0].payload, {"priority": 2, "source": "ticket"})
+        self.assertEqual(len(outbox_messages), 1)
+        self.assertEqual(outbox_messages[0].outbox_id, "outbox-1")
+        self.assertEqual(outbox_messages[0].status, OutboxStatus.PENDING)
+
+    def test_uses_task_version_and_rolls_back_snapshot_when_event_insert_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            received = Task.receive(task_id="task-1", input="노드 점검", at=NOW)
+            running = received.transition(Status.RUNNING, at=NOW + timedelta(seconds=1))
+            stale_cancel = received.cancel(at=NOW + timedelta(seconds=2))
+
+            with SQLiteStore(database_path) as store:
+                store.create_task(
+                    received,
+                    event=TaskEventDraft("event-1", "TASK_RECEIVED", {}, NOW),
+                )
+                store.save_task(
+                    running,
+                    expected_version=1,
+                    event=TaskEventDraft(
+                        "event-2", "TASK_RUNNING", {}, running.updated_at
+                    ),
+                )
+
+                with self.assertRaises(OptimisticConcurrencyError):
+                    store.save_task(
+                        stale_cancel,
+                        expected_version=1,
+                        event=TaskEventDraft(
+                            "event-stale",
+                            "TASK_CANCELLED",
+                            {},
+                            stale_cancel.updated_at,
+                        ),
+                    )
+
+                planned = running.update_plan(
+                    "sha256:plan-v1",
+                    at=NOW + timedelta(seconds=3),
+                )
+                with self.assertRaises(PersistenceConflictError):
+                    store.save_task(
+                        planned,
+                        expected_version=2,
+                        event=TaskEventDraft(
+                            "event-2",
+                            "PLAN_UPDATED",
+                            {},
+                            planned.updated_at,
+                        ),
+                    )
+
+                current = store.get_task("task-1")
+                events = store.list_task_events("task-1")
+
+        self.assertEqual(current, running)
+        self.assertEqual([event.task_version for event in events], [1, 2])
+
+    def test_deduplicates_concurrent_task_creation_by_request_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            idempotency = IdempotencyKey(
+                namespace="alerts",
+                key="external-event-7",
+                fingerprint="sha256:request-a",
+                created_at=NOW,
+            )
+
+            def create(suffix: str):
+                task = Task.receive(
+                    task_id=f"task-{suffix}",
+                    input="노드 점검",
+                    at=NOW,
+                )
+                with SQLiteStore(database_path) as store:
+                    return store.create_task(
+                        task,
+                        event=TaskEventDraft(
+                            f"event-{suffix}",
+                            "TASK_RECEIVED",
+                            {},
+                            NOW,
+                        ),
+                        idempotency=idempotency,
+                    )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first_future = executor.submit(create, "a")
+                second_future = executor.submit(create, "b")
+                results = (first_future.result(), second_future.result())
+
+            with SQLiteStore(database_path) as store:
+                persisted = tuple(
+                    task
+                    for task_id in ("task-a", "task-b")
+                    if (task := store.get_task(task_id)) is not None
+                )
+
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(results[0].task, results[1].task)
+        self.assertEqual(sorted(result.replayed for result in results), [False, True])
+
+    def test_rejects_reusing_request_key_for_a_different_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            task = Task.receive(task_id="task-a", input="노드 점검", at=NOW)
+
+            with SQLiteStore(database_path) as store:
+                store.create_task(
+                    task,
+                    event=TaskEventDraft("event-a", "TASK_RECEIVED", {}, NOW),
+                    idempotency=IdempotencyKey(
+                        "alerts", "external-event-7", "sha256:request-a", NOW
+                    ),
+                )
+                with self.assertRaises(IdempotencyConflictError):
+                    store.create_task(
+                        Task.receive(task_id="task-b", input="다른 요청", at=NOW),
+                        event=TaskEventDraft("event-b", "TASK_RECEIVED", {}, NOW),
+                        idempotency=IdempotencyKey(
+                            "alerts",
+                            "external-event-7",
+                            "sha256:request-b",
+                            NOW,
+                        ),
+                    )
+
+                self.assertIsNone(store.get_task("task-b"))
+
+    def test_enforces_append_only_task_events_in_the_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            task = Task.receive(task_id="task-1", input="노드 점검", at=NOW)
+            with SQLiteStore(database_path) as store:
+                store.create_task(
+                    task,
+                    event=TaskEventDraft("event-1", "TASK_RECEIVED", {}, NOW),
+                )
+
+            for statement in (
+                "UPDATE task_events SET event_type = 'CHANGED'",
+                "DELETE FROM task_events",
+            ):
+                with (
+                    self.subTest(statement=statement),
+                    sqlite3.connect(database_path) as connection,
+                    self.assertRaises(sqlite3.IntegrityError),
+                ):
+                    connection.execute(statement)
+
+    def test_transitions_outbox_with_an_optimistic_status_and_attempt_count(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            task = Task.receive(task_id="task-1", input="노드 점검", at=NOW)
+            with SQLiteStore(database_path) as store:
+                store.create_task(
+                    task,
+                    event=TaskEventDraft("event-1", "TASK_RECEIVED", {}, NOW),
+                    outbox=OutboxDraft(
+                        "outbox-1", "task.received", {"task_id": "task-1"}, NOW
+                    ),
+                )
+                processing = store.transition_outbox(
+                    "outbox-1",
+                    expected_status=OutboxStatus.PENDING,
+                    target=OutboxStatus.PROCESSING,
+                    at=NOW + timedelta(seconds=1),
+                )
+                with self.assertRaises(OptimisticConcurrencyError):
+                    store.transition_outbox(
+                        "outbox-1",
+                        expected_status=OutboxStatus.PENDING,
+                        target=OutboxStatus.PROCESSING,
+                        at=NOW + timedelta(seconds=2),
+                    )
+                failed = store.transition_outbox(
+                    "outbox-1",
+                    expected_status=OutboxStatus.PROCESSING,
+                    target=OutboxStatus.FAILED,
+                    at=NOW + timedelta(seconds=2),
+                    last_error="timeout",
+                )
+                pending = store.transition_outbox(
+                    "outbox-1",
+                    expected_status=OutboxStatus.FAILED,
+                    target=OutboxStatus.PENDING,
+                    at=NOW + timedelta(seconds=3),
+                )
+                processing_again = store.transition_outbox(
+                    "outbox-1",
+                    expected_status=OutboxStatus.PENDING,
+                    target=OutboxStatus.PROCESSING,
+                    at=NOW + timedelta(seconds=4),
+                )
+                delivered = store.transition_outbox(
+                    "outbox-1",
+                    expected_status=OutboxStatus.PROCESSING,
+                    target=OutboxStatus.DELIVERED,
+                    at=NOW + timedelta(seconds=5),
+                )
+                with self.assertRaises(InvalidOutboxTransitionError):
+                    store.transition_outbox(
+                        "outbox-1",
+                        expected_status=OutboxStatus.DELIVERED,
+                        target=OutboxStatus.PENDING,
+                        at=NOW + timedelta(seconds=6),
+                    )
+
+        self.assertEqual(processing.attempt_count, 1)
+        self.assertEqual(failed.last_error, "timeout")
+        self.assertEqual(pending.status, OutboxStatus.PENDING)
+        self.assertEqual(processing_again.attempt_count, 2)
+        self.assertEqual(delivered.status, OutboxStatus.DELIVERED)
+
+
+class RunStoreTests(unittest.TestCase):
+    """Workflow issuance와 AgentRun history의 원자성과 소유권을 검증한다."""
+
+    def test_atomically_persists_issuance_and_restores_all_agent_run_history(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            task = Task.receive(task_id="task-1", input="노드 점검", at=NOW)
+            workflow = WorkflowRun.start(
+                workflow_run_id="workflow-1",
+                task=task,
+                max_agent_runs=3,
+                at=NOW,
+            )
+            first_workflow, first_run = workflow.begin_agent_run(
+                agent_run_id="agent-run-1",
+                agent_id="classifier",
+                at=NOW + timedelta(seconds=1),
+            )
+            completed_first = first_run.complete(
+                agent_id="classifier",
+                outcome="SUCCESS",
+                output="분류 완료",
+                at=NOW + timedelta(seconds=2),
+            )
+            second_workflow, second_run = first_workflow.begin_agent_run(
+                agent_run_id="agent-run-2",
+                agent_id="insight",
+                at=NOW + timedelta(seconds=3),
+            )
+
+            with SQLiteStore(database_path) as store:
+                store.create_task(
+                    task,
+                    event=TaskEventDraft("event-1", "TASK_RECEIVED", {}, NOW),
+                )
+                store.create_workflow_run(workflow)
+                store.record_agent_run(workflow, first_workflow, first_run)
+                store.complete_agent_run(completed_first)
+                store.record_agent_run(
+                    first_workflow,
+                    second_workflow,
+                    second_run,
+                )
+
+            with SQLiteStore(database_path) as reopened:
+                restored_workflow = reopened.get_workflow_run("workflow-1")
+                history = reopened.list_agent_runs("workflow-1")
+
+        self.assertEqual(restored_workflow, second_workflow)
+        self.assertEqual(history, (completed_first, second_run))
+
+    def test_rejects_a_stale_issuance_without_partially_inserting_agent_run(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            task = Task.receive(task_id="task-1", input="노드 점검", at=NOW)
+            workflow = WorkflowRun.start(
+                workflow_run_id="workflow-1",
+                task=task,
+                max_agent_runs=2,
+                at=NOW,
+            )
+            persisted_workflow, persisted_run = workflow.begin_agent_run(
+                agent_run_id="agent-run-1",
+                agent_id="classifier",
+                at=NOW + timedelta(seconds=1),
+            )
+            stale_workflow, stale_run = workflow.begin_agent_run(
+                agent_run_id="agent-run-stale",
+                agent_id="insight",
+                at=NOW + timedelta(seconds=2),
+            )
+
+            with SQLiteStore(database_path) as store:
+                store.create_task(
+                    task,
+                    event=TaskEventDraft("event-1", "TASK_RECEIVED", {}, NOW),
+                )
+                store.create_workflow_run(workflow)
+                store.record_agent_run(
+                    workflow,
+                    persisted_workflow,
+                    persisted_run,
+                )
+                with self.assertRaises(OptimisticConcurrencyError):
+                    store.record_agent_run(workflow, stale_workflow, stale_run)
+
+                self.assertIsNone(store.get_agent_run("agent-run-stale"))
+                self.assertEqual(
+                    store.get_workflow_run("workflow-1"),
+                    persisted_workflow,
+                )
+
+    def test_rolls_back_workflow_ledger_when_agent_run_insert_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            first_task = Task.receive(task_id="task-1", input="첫 요청", at=NOW)
+            second_task = Task.receive(task_id="task-2", input="둘째 요청", at=NOW)
+            first_workflow = WorkflowRun.start(
+                workflow_run_id="workflow-1",
+                task=first_task,
+                max_agent_runs=1,
+                at=NOW,
+            )
+            second_workflow = WorkflowRun.start(
+                workflow_run_id="workflow-2",
+                task=second_task,
+                max_agent_runs=1,
+                at=NOW,
+            )
+            issued_first, first_run = first_workflow.begin_agent_run(
+                agent_run_id="globally-duplicate-run",
+                agent_id="classifier",
+                at=NOW + timedelta(seconds=1),
+            )
+            issued_second, second_run = second_workflow.begin_agent_run(
+                agent_run_id="globally-duplicate-run",
+                agent_id="classifier",
+                at=NOW + timedelta(seconds=1),
+            )
+            with SQLiteStore(database_path) as store:
+                for task in (first_task, second_task):
+                    store.create_task(
+                        task,
+                        event=TaskEventDraft(
+                            f"event-{task.task_id}",
+                            "TASK_RECEIVED",
+                            {},
+                            NOW,
+                        ),
+                    )
+                store.create_workflow_run(first_workflow)
+                store.create_workflow_run(second_workflow)
+                store.record_agent_run(first_workflow, issued_first, first_run)
+                with self.assertRaises(PersistenceConflictError):
+                    store.record_agent_run(
+                        second_workflow,
+                        issued_second,
+                        second_run,
+                    )
+
+                restored_second = store.get_workflow_run("workflow-2")
+                second_history = store.list_agent_runs("workflow-2")
+
+        self.assertEqual(restored_second, second_workflow)
+        self.assertEqual(second_history, ())
+
+    def test_validates_restored_agent_run_against_owning_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            task = Task.receive(task_id="task-1", input="노드 점검", at=NOW)
+            workflow = WorkflowRun.start(
+                workflow_run_id="workflow-1",
+                task=task,
+                max_agent_runs=1,
+                at=NOW,
+            )
+            issued_workflow, agent_run = workflow.begin_agent_run(
+                agent_run_id="agent-run-1",
+                agent_id="classifier",
+                at=NOW + timedelta(seconds=1),
+            )
+            with SQLiteStore(database_path) as store:
+                store.create_task(
+                    task,
+                    event=TaskEventDraft("event-1", "TASK_RECEIVED", {}, NOW),
+                )
+                store.create_workflow_run(workflow)
+                store.record_agent_run(workflow, issued_workflow, agent_run)
+
+            with sqlite3.connect(database_path) as connection:
+                snapshot = json.loads(
+                    connection.execute(
+                        "SELECT snapshot_json FROM agent_runs WHERE agent_run_id = ?",
+                        ("agent-run-1",),
+                    ).fetchone()[0]
+                )
+                snapshot["agent_id"] = "forged-agent"
+                connection.execute(
+                    "UPDATE agent_runs SET snapshot_json = ? WHERE agent_run_id = ?",
+                    (json.dumps(snapshot), "agent-run-1"),
+                )
+
+            with (
+                SQLiteStore(database_path) as reopened,
+                self.assertRaises(AgentRunOwnershipError),
+            ):
+                reopened.get_agent_run("agent-run-1")
+
+    def test_optimistically_saves_a_workflow_phase_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            task = Task.receive(task_id="task-1", input="노드 점검", at=NOW)
+            workflow = WorkflowRun.start(
+                workflow_run_id="workflow-1",
+                task=task,
+                max_agent_runs=2,
+                at=NOW,
+            )
+            analyzing = workflow.advance(
+                Phase.ANALYZING,
+                at=NOW + timedelta(seconds=1),
+            )
+            with SQLiteStore(database_path) as store:
+                store.create_task(
+                    task,
+                    event=TaskEventDraft("event-1", "TASK_RECEIVED", {}, NOW),
+                )
+                store.create_workflow_run(workflow)
+                saved = store.save_workflow_run(workflow, analyzing)
+                with self.assertRaises(OptimisticConcurrencyError):
+                    store.save_workflow_run(workflow, analyzing)
+
+                restored = store.get_workflow_run("workflow-1")
+
+        self.assertEqual(saved, analyzing)
+        self.assertEqual(restored, analyzing)
+
+
+class ApprovalStoreTests(unittest.TestCase):
+    """Approval binding의 atomic compare-and-transition을 검증한다."""
+
+    def test_consumes_one_concurrent_approval_and_replays_the_stored_result(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            waiting = self._create_waiting_task(database_path)
+            approval = Approval.grant_for(
+                waiting,
+                at=NOW + timedelta(seconds=4),
+            )
+
+            def apply(suffix: str):
+                with SQLiteStore(database_path) as store:
+                    return store.apply_approval(
+                        approval,
+                        decision_id="decision-1",
+                        resumed_at=NOW + timedelta(seconds=5),
+                        event=TaskEventDraft(
+                            f"event-approved-{suffix}",
+                            "TASK_APPROVED",
+                            {"decision_id": "decision-1"},
+                            NOW + timedelta(seconds=5),
+                        ),
+                        outbox=OutboxDraft(
+                            f"outbox-approved-{suffix}",
+                            "task.approved",
+                            {"task_id": "task-1"},
+                            NOW + timedelta(seconds=5),
+                        ),
+                    )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first_future = executor.submit(apply, "a")
+                second_future = executor.submit(apply, "b")
+                results = (first_future.result(), second_future.result())
+
+            with SQLiteStore(database_path) as store:
+                current = store.get_task("task-1")
+                events = store.list_task_events("task-1")
+                approvals = store.list_approvals("task-1")
+                outbox = store.list_outbox(status=OutboxStatus.PENDING)
+
+        self.assertEqual(
+            sorted(result.status for result in results),
+            [ApprovalApplyStatus.ALREADY_APPLIED, ApprovalApplyStatus.APPLIED],
+        )
+        self.assertEqual(results[0].task, results[1].task)
+        self.assertEqual(current, results[0].task)
+        self.assertEqual(current.status, Status.RUNNING)
+        self.assertEqual(current.version, waiting.version + 1)
+        self.assertEqual(len(events), 5)
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0].approval, approval)
+        self.assertEqual(len(outbox), 1)
+
+    def test_rolls_back_approval_consumption_when_event_append_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            waiting = self._create_waiting_task(database_path)
+            approval = Approval.grant_for(
+                waiting,
+                at=NOW + timedelta(seconds=4),
+            )
+
+            with SQLiteStore(database_path) as store:
+                with self.assertRaises(PersistenceConflictError):
+                    store.apply_approval(
+                        approval,
+                        decision_id="decision-rollback",
+                        resumed_at=NOW + timedelta(seconds=5),
+                        event=TaskEventDraft(
+                            "event-waiting",
+                            "TASK_APPROVED",
+                            {},
+                            NOW + timedelta(seconds=5),
+                        ),
+                    )
+
+                current = store.get_task("task-1")
+                approvals = store.list_approvals("task-1")
+                events = store.list_task_events("task-1")
+
+        self.assertEqual(current, waiting)
+        self.assertEqual(approvals, ())
+        self.assertEqual(len(events), 4)
+
+    def test_returns_plan_conflict_and_decision_key_conflict_deterministically(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            waiting = self._create_waiting_task(database_path)
+            stale_plan_approval = Approval.grant_for(
+                waiting,
+                at=NOW + timedelta(seconds=4),
+            )
+            changed = waiting.update_plan(
+                "sha256:plan-v2",
+                at=NOW + timedelta(seconds=5),
+            )
+            current_approval = Approval.grant_for(
+                changed,
+                at=NOW + timedelta(seconds=6),
+            )
+
+            with SQLiteStore(database_path) as store:
+                store.save_task(
+                    changed,
+                    expected_version=waiting.version,
+                    event=TaskEventDraft(
+                        "event-plan-v2", "PLAN_UPDATED", {}, changed.updated_at
+                    ),
+                )
+                with self.assertRaises(PlanChangedError):
+                    store.apply_approval(
+                        stale_plan_approval,
+                        decision_id="decision-stale-plan",
+                        resumed_at=NOW + timedelta(seconds=7),
+                        event=TaskEventDraft(
+                            "event-stale-plan", "TASK_APPROVED", {}, NOW
+                        ),
+                    )
+                store.apply_approval(
+                    current_approval,
+                    decision_id="decision-current",
+                    resumed_at=NOW + timedelta(seconds=7),
+                    event=TaskEventDraft(
+                        "event-approved",
+                        "TASK_APPROVED",
+                        {},
+                        NOW + timedelta(seconds=7),
+                    ),
+                )
+                changed_delivery = Approval(
+                    task_id=current_approval.task_id,
+                    task_version=current_approval.task_version,
+                    plan_hash=current_approval.plan_hash,
+                    approved_at=NOW + timedelta(seconds=7),
+                )
+                with self.assertRaises(ApprovalConflictError):
+                    store.apply_approval(
+                        changed_delivery,
+                        decision_id="decision-current",
+                        resumed_at=NOW + timedelta(seconds=8),
+                        event=TaskEventDraft(
+                            "event-conflict", "TASK_APPROVED", {}, NOW
+                        ),
+                    )
+
+    @staticmethod
+    def _create_waiting_task(database_path: Path) -> Task:
+        upgrade_database(database_path)
+        received = Task.receive(task_id="task-1", input="노드 점검", at=NOW)
+        running = received.transition(
+            Status.RUNNING,
+            at=NOW + timedelta(seconds=1),
+        )
+        planned = running.update_plan(
+            "sha256:plan-v1",
+            at=NOW + timedelta(seconds=2),
+        )
+        waiting = planned.transition(
+            Status.WAITING_APPROVAL,
+            at=NOW + timedelta(seconds=3),
+        )
+        snapshots = (
+            (received, None, "event-received", "TASK_RECEIVED"),
+            (running, received.version, "event-running", "TASK_RUNNING"),
+            (planned, running.version, "event-plan", "PLAN_UPDATED"),
+            (waiting, planned.version, "event-waiting", "WAITING_APPROVAL"),
+        )
+        with SQLiteStore(database_path) as store:
+            for task, expected_version, event_id, event_type in snapshots:
+                event = TaskEventDraft(
+                    event_id,
+                    event_type,
+                    {},
+                    task.updated_at,
+                )
+                if expected_version is None:
+                    store.create_task(task, event=event)
+                else:
+                    store.save_task(
+                        task,
+                        expected_version=expected_version,
+                        event=event,
+                    )
+        return waiting
+
+
+class RecoveryAndCheckpointTests(unittest.TestCase):
+    """startup recovery 분류와 checkpoint connection 수명을 검증한다."""
+
+    def test_recovers_only_non_terminal_tasks_and_keeps_approval_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            running = self._create_planless_task(
+                database_path,
+                task_id="task-running",
+                terminal=False,
+            )
+            waiting = self._create_waiting_task(
+                database_path,
+                task_id="task-waiting",
+            )
+            self._create_planless_task(
+                database_path,
+                task_id="task-completed",
+                terminal=True,
+            )
+            running_workflow = WorkflowRun.start(
+                workflow_run_id="workflow-running",
+                task=running,
+                max_agent_runs=2,
+                at=running.updated_at,
+            )
+            waiting_workflow = WorkflowRun.start(
+                workflow_run_id="workflow-waiting",
+                task=waiting,
+                max_agent_runs=2,
+                at=waiting.updated_at,
+            )
+
+            with SQLiteStore(database_path) as store:
+                store.create_workflow_run(running_workflow)
+                store.create_workflow_run(waiting_workflow)
+                candidates = store.list_recovery_candidates()
+
+        self.assertEqual(
+            [
+                (candidate.task.task_id, candidate.disposition)
+                for candidate in candidates
+            ],
+            [
+                ("task-running", RecoveryDisposition.RESUME),
+                ("task-waiting", RecoveryDisposition.WAITING_APPROVAL),
+            ],
+        )
+        self.assertEqual(candidates[0].thread_id, "workflow-running")
+        self.assertEqual(candidates[1].thread_id, "workflow-waiting")
+
+    def test_resumes_an_interrupted_graph_with_a_new_owned_connection(self) -> None:
+        class CheckpointState(TypedDict):
+            result: str
+
+        def wait_for_approval(_state: CheckpointState) -> dict[str, str]:
+            decision = interrupt("승인이 필요합니다.")
+            return {"result": str(decision)}
+
+        builder = StateGraph(CheckpointState)
+        builder.add_node("wait_for_approval", wait_for_approval)
+        builder.add_edge(START, "wait_for_approval")
+        builder.add_edge("wait_for_approval", END)
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            task = self._create_planless_task(
+                database_path,
+                task_id="task-running",
+                terminal=False,
+            )
+            workflow = WorkflowRun.start(
+                workflow_run_id="workflow-running",
+                task=task,
+                max_agent_runs=1,
+                at=task.updated_at,
+            )
+            config = {"configurable": {"thread_id": workflow.workflow_run_id}}
+
+            with SQLiteStore(database_path) as store:
+                store.create_workflow_run(workflow)
+                with store.open_checkpointer() as checkpointer:
+                    graph = builder.compile(checkpointer=checkpointer)
+                    interrupted = graph.invoke({"result": "pending"}, config)
+                    self.assertIn("__interrupt__", interrupted)
+                    self.assertEqual(
+                        checkpointer.conn.execute("PRAGMA journal_mode").fetchone(),
+                        ("wal",),
+                    )
+                    self.assertEqual(
+                        checkpointer.conn.execute("PRAGMA foreign_keys").fetchone(),
+                        (1,),
+                    )
+                    self.assertEqual(
+                        checkpointer.conn.execute("PRAGMA busy_timeout").fetchone(),
+                        (5000,),
+                    )
+                    closed_connection = checkpointer.conn
+
+            with self.assertRaises(sqlite3.ProgrammingError):
+                closed_connection.execute("SELECT 1")
+
+            with SQLiteStore(database_path) as reopened:
+                candidate = reopened.list_recovery_candidates()[0]
+                with reopened.open_checkpointer() as checkpointer:
+                    resumed_graph = builder.compile(checkpointer=checkpointer)
+                    resumed = resumed_graph.invoke(
+                        Command(resume="approved"),
+                        {"configurable": {"thread_id": candidate.thread_id}},
+                    )
+
+            with sqlite3.connect(database_path) as connection:
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+
+        self.assertEqual(resumed["result"], "approved")
+        self.assertIn("tasks", tables)
+        self.assertIn("checkpoints", tables)
+        self.assertIn("writes", tables)
+
+    @staticmethod
+    def _create_planless_task(
+        database_path: Path,
+        *,
+        task_id: str,
+        terminal: bool,
+    ) -> Task:
+        received = Task.receive(task_id=task_id, input="노드 점검", at=NOW)
+        running = received.transition(
+            Status.RUNNING,
+            at=NOW + timedelta(seconds=1),
+        )
+        snapshots = [received, running]
+        if terminal:
+            snapshots.append(
+                running.transition(
+                    Status.COMPLETED,
+                    at=NOW + timedelta(seconds=2),
+                )
+            )
+        with SQLiteStore(database_path) as store:
+            for index, task in enumerate(snapshots, start=1):
+                event = TaskEventDraft(
+                    f"event-{task_id}-{index}",
+                    f"TASK_{task.status.value}",
+                    {},
+                    task.updated_at,
+                )
+                if index == 1:
+                    store.create_task(task, event=event)
+                else:
+                    store.save_task(
+                        task,
+                        expected_version=index - 1,
+                        event=event,
+                    )
+        return snapshots[-1]
+
+    @staticmethod
+    def _create_waiting_task(database_path: Path, *, task_id: str) -> Task:
+        received = Task.receive(task_id=task_id, input="변경 요청", at=NOW)
+        running = received.transition(Status.RUNNING, at=NOW + timedelta(seconds=1))
+        planned = running.update_plan(
+            "sha256:plan-v1",
+            at=NOW + timedelta(seconds=2),
+        )
+        waiting = planned.transition(
+            Status.WAITING_APPROVAL,
+            at=NOW + timedelta(seconds=3),
+        )
+        with SQLiteStore(database_path) as store:
+            for index, task in enumerate(
+                (received, running, planned, waiting),
+                start=1,
+            ):
+                event = TaskEventDraft(
+                    f"event-{task_id}-{index}",
+                    f"TASK_{task.status.value}",
+                    {},
+                    task.updated_at,
+                )
+                if index == 1:
+                    store.create_task(task, event=event)
+                else:
+                    store.save_task(
+                        task,
+                        expected_version=index - 1,
+                        event=event,
+                    )
+        return waiting
+
+
+if __name__ == "__main__":
+    unittest.main()

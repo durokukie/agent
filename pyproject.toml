@@ -7,7 +7,13 @@ name = "agent-system"
 version = "0.1.0"
 description = "LangGraph 기반 동적 supervisor 에이전트 시스템"
 readme = "README.md"
-dependencies = []
+requires-python = ">=3.11"
+dependencies = [
+    "alembic>=1.18.5,<2",
+    "langgraph>=1.2.9,<2",
+    "langgraph-checkpoint-sqlite>=3.1.0,<4",
+    "sqlalchemy>=2.0.51,<2.1",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_system"]
