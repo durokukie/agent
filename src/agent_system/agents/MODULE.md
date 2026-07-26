@@ -12,9 +12,11 @@
 
 핵심 인터페이스는 agent 식별자와 metadata 조회, 비동기 실행이다. 구체적인 타입과 오류 형태는 구현 시 이 문서에 기록한다.
 
+Agent 구현이 한 번 반환하는 결과와 orchestration의 `AgentRun`은 구분한다. `AgentRun`은 task/workflow/phase와 호출 시각, 완료 결과를 연결하는 orchestration 소유 실행 이력이며 Agent의 공개 interface에 포함되지 않는다. 따라서 agents 모듈은 `AgentRun`을 import하거나 생성하지 않는다.
+
 ## 의존성과 허용된 import 방향
 
-공용 `schemas`, `tools`, `models`를 사용할 수 있다. `orchestration`과 다른 구체 agent 구현에는 의존하지 않는다.
+공용 `schemas`, `tools`, `models`를 사용할 수 있다. `orchestration`과 다른 구체 agent 구현에는 의존하지 않으며, 실행 이력 기록은 호출자인 orchestration이 담당한다.
 
 ## 데이터 및 제어 흐름
 
@@ -30,4 +32,4 @@ registry가 요청된 agent adapter를 반환하고 오케스트레이터가 공
 
 ## 변경 시 문서 갱신 조건
 
-공통 인터페이스, metadata, registry 동작 또는 agent 종류가 바뀔 때 갱신한다.
+공통 인터페이스, metadata, registry 동작, agent 종류 또는 Agent 호출 결과와 `AgentRun` 사이의 책임 경계가 바뀔 때 갱신한다.
