@@ -60,12 +60,15 @@ identity와 일반 idempotency key는 서로
 다른 namespace를 사용한다. SQLite journal의 callback identity는 aggregate의 상태/version/
 phase/budget과 version별 event가 뜻하는 Task status에 결합하며, 실제 `TASK_RECEIVED` request
 payload도 일치해야 한다. 재실행마다 달라질 수 있는 `updated_at`은 authoritative 저장값으로
-복원한다. 다중 프로세스 배포에서는 queue와 execution coordinator를 별도 adapter로 교체해야
+복원한다. Approval CAS와 graph journal은 `decision_id`, `accepted`, `errors` canonical
+payload를 공유하며 historical callback은 저장 event의 `occurred_at`을 Task clock으로
+돌려준다. 다중 프로세스 배포에서는 queue와 execution coordinator를 별도 adapter로 교체해야
 한다.
 
 `stop()`은 시작 즉시 admission을 닫고 예약된 retry wakeup을 취소·대기한 다음 기존 queue를
 drain한다. durable commit과 enqueue 사이에 stop이 시작된 명령은 SQLite에 pending으로 남아
-다음 startup에서 복구되며, worker sentinel 뒤에는 새 work를 enqueue하지 않는다. durable
+다음 startup에서 복구되며, worker sentinel 뒤에는 새 work를 enqueue하지 않는다. lifecycle
+lock은 동시 stop의 sentinel과 소유 자원 close를 정확히 한 번만 수행한다. durable
 command와 command row 없는 recovery가 함께 밀릴 때는 매 worker 완료마다 pump 우선순위를
 번갈아 적용해 한쪽의 지속적인 starvation을 막는다.
 

@@ -1402,6 +1402,7 @@ class OrchestratorService:
                     task_event_type="TASK_REJECTED",
                     task_event_payload={
                         "decision_id": response.decision_id,
+                        "accepted": False,
                         "errors": [failure.value],
                     },
                 )
@@ -1424,7 +1425,11 @@ class OrchestratorService:
                 task=task,
                 workflow=workflow,
                 task_event_type="TASK_APPROVED",
-                task_event_payload={"decision_id": response.decision_id},
+                task_event_payload={
+                    "decision_id": response.decision_id,
+                    "accepted": True,
+                    "errors": [],
+                },
             )
         )
         task = approved.task

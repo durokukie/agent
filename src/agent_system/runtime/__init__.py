@@ -6,7 +6,7 @@ import asyncio
 import json
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
@@ -30,6 +30,7 @@ from agent_system.orchestration import (
     ChatModelRequestClassifier,
     ExecutionClaimResult,
     ExecutionClaimStatus,
+    FailureCode,
     Governance,
     GovernanceDecision,
     OrchestrationCancellationError,
@@ -276,6 +277,11 @@ class SQLiteApprovalConsumer:
                     payload={
                         "decision_id": response.decision_id,
                         "accepted": response.accepted,
+                        "errors": (
+                            []
+                            if response.accepted
+                            else [FailureCode.HUMAN_REJECTED.value]
+                        ),
                     },
                     occurred_at=at,
                 ),
@@ -319,9 +325,13 @@ class SQLiteLifecycleJournal:
         elif current_task == entry.task or self._same_task_callback(
             current_task, entry.task
         ):
+            if not self._same_version_event_matches(current_task, entry):
+                raise ApplicationConflictError("Journal Task event가 충돌했습니다.")
             journal_task = current_task
-        elif self._is_historical_task_callback(current_task, entry):
-            journal_task = entry.task
+        elif (
+            historical_task := self._historical_task_callback(current_task, entry)
+        ) is not None:
+            journal_task = historical_task
         elif entry.task.version == current_task.version + 1:
             if entry.task_event_type is None:
                 raise ApplicationConflictError("Task 전이에 journal event가 없습니다.")
@@ -464,18 +474,18 @@ class SQLiteLifecycleJournal:
                 return agent_run
         return None
 
-    def _is_historical_task_callback(
+    def _historical_task_callback(
         self,
         current: Task,
         entry: OrchestrationJournalEntry,
-    ) -> bool:
+    ) -> Task | None:
         if (
             current.version <= entry.task.version
             or current.task_id != entry.task.task_id
             or current.input != entry.task.input
             or current.created_at != entry.task.created_at
         ):
-            return False
+            return None
         event = next(
             (
                 candidate
@@ -485,12 +495,12 @@ class SQLiteLifecycleJournal:
             None,
         )
         if event is None:
-            return False
+            return None
         if not (
             entry.task.created_at <= event.occurred_at <= current.updated_at
             and entry.task.updated_at >= event.occurred_at
         ):
-            return False
+            return None
         expected_status = {
             "TASK_RECEIVED": Status.RECEIVED,
             "TASK_STARTED": Status.RUNNING,
@@ -504,19 +514,43 @@ class SQLiteLifecycleJournal:
             "TASK_CANCELLED": Status.CANCELLED,
         }.get(event.event_type)
         if expected_status is None or entry.task.status is not expected_status:
-            return False
+            return None
         if event.event_type == "TASK_PLAN_UPDATED" and (
             event.payload.get("plan_hash") != entry.task.plan_hash
         ):
-            return False
+            return None
         if entry.task_event_type is None:
-            return (
-                entry.workflow is not None
-                and entry.workflow.task_version == entry.task.version
-            )
-        return event.event_type == entry.task_event_type and dict(
-            event.payload
-        ) == dict(entry.task_event_payload or {})
+            if (
+                entry.workflow is None
+                or entry.workflow.task_version != entry.task.version
+            ):
+                return None
+        elif event.event_type != entry.task_event_type or dict(event.payload) != dict(
+            entry.task_event_payload or {}
+        ):
+            return None
+        return replace(entry.task, updated_at=event.occurred_at)
+
+    def _same_version_event_matches(
+        self,
+        task: Task,
+        entry: OrchestrationJournalEntry,
+    ) -> bool:
+        if entry.task_event_type is None:
+            return True
+        event = next(
+            (
+                candidate
+                for candidate in self._store.list_task_events(task.task_id)
+                if candidate.task_version == task.version
+            ),
+            None,
+        )
+        return (
+            event is not None
+            and event.event_type == entry.task_event_type
+            and dict(event.payload) == dict(entry.task_event_payload or {})
+        )
 
     def _historical_workflow_entry(
         self,
@@ -799,6 +833,7 @@ class RuntimeApplication:
         self._queued_commands: set[tuple[str, str]] = set()
         self._active_fingerprints: dict[str, str] = {}
         self._background_errors: dict[str, str] = {}
+        self._lifecycle_lock = asyncio.Lock()
         self._started = False
         self._stopping = False
         self._prefer_deferred = False
@@ -847,26 +882,26 @@ class RuntimeApplication:
     async def stop(self) -> None:
         """수락을 멈추고 queue를 drain한 뒤 worker와 소유 자원을 닫는다."""
 
-        if self._closed:
-            return
-        if self._started:
+        async with self._lifecycle_lock:
+            if self._closed:
+                return
             self._stopping = True
-            for wakeup in self._retry_wakeups.values():
-                wakeup.cancel()
-            if self._retry_wakeups:
-                await asyncio.gather(
-                    *self._retry_wakeups.values(), return_exceptions=True
-                )
-            self._retry_wakeups.clear()
-            await self.drain()
-            for _worker in self._workers:
-                await self._queue.put(None)
-            await asyncio.gather(*self._workers)
-            self._workers.clear()
-            self._started = False
-        if self._close_resources is not None:
-            await asyncio.to_thread(self._close_resources)
-        self._closed = True
+            if self._started:
+                wakeups = tuple(self._retry_wakeups.values())
+                for wakeup in wakeups:
+                    wakeup.cancel()
+                if wakeups:
+                    await asyncio.gather(*wakeups, return_exceptions=True)
+                self._retry_wakeups.clear()
+                await self.drain()
+                for _worker in self._workers:
+                    await self._queue.put(None)
+                await asyncio.gather(*self._workers)
+                self._workers.clear()
+                self._started = False
+            if self._close_resources is not None:
+                await asyncio.to_thread(self._close_resources)
+            self._closed = True
 
     async def drain(self) -> None:
         """현재 queue와 active child 실행이 모두 끝날 때까지 기다린다."""
@@ -1230,13 +1265,14 @@ class RuntimeApplication:
                 self._active.pop(work.task_id, None)
                 self._active_fingerprints.pop(work.task_id, None)
                 self._queued_commands.discard((work.task_id, work.fingerprint))
-                if self._prefer_deferred:
-                    await self._pump_deferred_work()
-                    await self._pump_pending_commands()
-                else:
-                    await self._pump_pending_commands()
-                    await self._pump_deferred_work()
-                self._prefer_deferred = not self._prefer_deferred
+                if not self._stopping:
+                    if self._prefer_deferred:
+                        await self._pump_deferred_work()
+                        await self._pump_pending_commands()
+                    else:
+                        await self._pump_pending_commands()
+                        await self._pump_deferred_work()
+                    self._prefer_deferred = not self._prefer_deferred
                 self._queue.task_done()
 
     async def _dispatch(self, work: _WorkItem) -> object:
@@ -1324,8 +1360,12 @@ class RuntimeApplication:
     ) -> None:
         """Queue의 남은 용량만큼 durable pending command를 다시 올린다."""
 
+        if self._stopping:
+            return
         commands = await asyncio.to_thread(self._store.list_pending_runtime_commands)
         for command in commands:
+            if self._stopping:
+                return
             eligible_at = command.updated_at + self._retry_delay(command.attempt_count)
             if command.attempt_count > 0 and eligible_at > self._clock():
                 self._schedule_retry(command.command_id, eligible_at)
@@ -1337,7 +1377,11 @@ class RuntimeApplication:
                 return
 
     async def _pump_deferred_work(self) -> None:
+        if self._stopping:
+            return
         while self._deferred_work:
+            if self._stopping:
+                return
             work = self._deferred_work[0]
             try:
                 await self._enqueue(work)
@@ -1356,7 +1400,7 @@ class RuntimeApplication:
         return timedelta(seconds=min(30 * (2**exponent), 300))
 
     def _schedule_retry(self, command_id: str, eligible_at: datetime) -> None:
-        if command_id in self._retry_wakeups:
+        if self._stopping or command_id in self._retry_wakeups:
             return
         delay = max((eligible_at - self._clock()).total_seconds(), 0)
         self._retry_wakeups[command_id] = asyncio.create_task(

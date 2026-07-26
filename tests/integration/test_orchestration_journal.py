@@ -408,7 +408,7 @@ class OrchestrationJournalGraphTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             approved_entry.task_event_payload,
-            {"decision_id": "decision-mutating"},
+            {"decision_id": "decision-mutating", "accepted": True, "errors": []},
         )
         completed_entry = journal.entries[-1]
         self.assertEqual(completed_entry.task_event_type, "TASK_COMPLETED")
@@ -766,6 +766,7 @@ class OrchestrationJournalGraphTests(unittest.IsolatedAsyncioTestCase):
             journal.entries[-1].task_event_payload,
             {
                 "decision_id": "decision-human-reject",
+                "accepted": False,
                 "errors": [orchestration.FailureCode.HUMAN_REJECTED.value],
             },
         )

@@ -39,6 +39,8 @@ node replay에서는 이미 저장된 Task version, phase/budget, AgentRun과 te
 authoritative 값으로 돌려준다. 재실행 clock의 `updated_at`과 AgentRun `completed_at` 차이는
 허용하되 historical Task 시각은 저장 event의 `occurred_at`보다 이르지 않아야 하고
 `TASK_PLAN_UPDATED` payload의 plan hash는 Task snapshot과 일치해야 한다.
+사람 승인·거절 event는 persistence CAS와 동일한
+`{decision_id, accepted, errors}` canonical payload를 사용한다.
 `cancel(reason=...)`은 사유를 TASK_CANCELLED 감사 payload에 보존하고 활성 Task를
 `CANCELLED`로 journal에 기록한 뒤 graph의
 terminal checkpoint와 동기화하며 이후 `recover()`는 부수 효과 없이 같은 결과를 반환한다.

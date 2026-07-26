@@ -386,6 +386,31 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
         pending = self.store.list_pending_runtime_commands()
         self.assertEqual([command.task_id for command in pending], ["stop-race"])
 
+    async def test_concurrent_stop_closes_resources_once(self) -> None:
+        """동시 stop은 worker와 소유 자원을 한 번만 종료해야 한다."""
+
+        await self.application.stop()
+        close_calls = 0
+
+        def close_resources() -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+        self.application = RuntimeApplication(
+            store=self.store,
+            orchestrator=self.orchestrator,
+            queue_capacity=1,
+            worker_count=1,
+            clock=lambda: NOW,
+            id_factory=lambda: "unused",
+            close_resources=close_resources,
+        )
+        await self.application.start()
+
+        await asyncio.gather(self.application.stop(), self.application.stop())
+
+        self.assertEqual(close_calls, 1)
+
     async def test_other_worker_completion_does_not_retry_a_poison_command(
         self,
     ) -> None:
@@ -785,6 +810,50 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.task, replay.task)
         self.assertEqual(first.task.status, Status.REJECTED)
         self.assertEqual(len(self.store.list_approval_decisions(waiting.task_id)), 1)
+        canonical_reject = {
+            "decision_id": response.decision_id,
+            "accepted": False,
+            "errors": ["human_rejected"],
+        }
+        rejected_replay = await SQLiteLifecycleJournal(self.store).record(
+            OrchestrationJournalEntry(
+                task=first.task,
+                workflow=None,
+                task_event_type="TASK_REJECTED",
+                task_event_payload=canonical_reject,
+            )
+        )
+        self.assertEqual(rejected_replay.task, first.task)
+
+        accepted_waiting = self._persist_waiting_task("consumer-accepted")
+        accepted_response = ApprovalResponse(
+            decision_id="decision-consumer-accepted",
+            accepted=True,
+            approval=Approval(
+                task_id=accepted_waiting.task_id,
+                task_version=accepted_waiting.version,
+                plan_hash=accepted_waiting.plan_hash or "",
+                approved_at=NOW + timedelta(seconds=4),
+            ),
+        )
+        accepted_result = await consumer.consume(
+            task=accepted_waiting,
+            response=accepted_response,
+            at=NOW + timedelta(seconds=4),
+        )
+        accepted_replay = await SQLiteLifecycleJournal(self.store).record(
+            OrchestrationJournalEntry(
+                task=accepted_result.task,
+                workflow=None,
+                task_event_type="TASK_APPROVED",
+                task_event_payload={
+                    "decision_id": accepted_response.decision_id,
+                    "accepted": True,
+                    "errors": [],
+                },
+            )
+        )
+        self.assertEqual(accepted_replay.task, accepted_result.task)
 
     async def test_rejects_approval_cas_without_preceding_durable_intent(
         self,
@@ -1271,7 +1340,7 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
 
         replayed = await journal.record(
             OrchestrationJournalEntry(
-                task=received,
+                task=replace(received, updated_at=NOW + timedelta(minutes=1)),
                 workflow=None,
                 task_event_type="TASK_RECEIVED",
                 task_event_payload=request_payload,
