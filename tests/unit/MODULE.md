@@ -26,7 +26,7 @@ Task/WorkflowRun/AgentRun 생명주기, 라우팅, 정책, validation, 변환과
 
 ## 테스트 전략
 
-정상, 오류, 경계값과 불변 조건을 독립된 사례로 검증한다. 생명주기 테스트는 모든 status·phase 조합과 Approval 및 budget 경계를 표 기반으로 다룬다.
+정상, 오류, 경계값과 불변 조건을 독립된 사례로 검증한다. 생명주기 테스트는 모든 status·phase 조합과 Approval 및 budget 경계를 표 기반으로 다룬다. planless Task의 상태별 정확한 version과 planful 반복 갱신을 함께 검증하며, AgentRun은 직접 생성 차단과 소유 WorkflowRun을 요구하는 복원 경계를 검증한다.
 
 ## 변경 시 문서 갱신 조건
 

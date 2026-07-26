@@ -11,6 +11,7 @@ from agent_system.orchestration import (
     AgentRun,
     AgentRunAgentMismatchError,
     AgentRunAlreadyCompletedError,
+    AgentRunOwnershipError,
     Approval,
     ApprovalNotAllowedError,
     ApprovalRequiredError,
@@ -369,6 +370,72 @@ class TaskLifecycleTests(unittest.TestCase):
         ).to_snapshot() | {"version": 7, "plan_hash": "plan-v1"}
         with self.assertRaises(InvalidLifecycleValueError):
             Task.from_snapshot(corrupt_snapshot)
+
+    def test_enforces_exact_reachable_versions_for_planless_tasks(self) -> None:
+        received = Task.receive(task_id="task-planless", input="요청", at=NOW)
+        running = received.transition(Status.RUNNING, at=NOW)
+        legitimate = (
+            received,
+            running,
+            received.cancel(at=NOW),
+            running.cancel(at=NOW),
+            running.transition(Status.COMPLETED, at=NOW),
+            running.transition(Status.REJECTED, at=NOW),
+            running.transition(Status.FAILED, at=NOW),
+            running.transition(Status.ESCALATED, at=NOW),
+        )
+        for task in legitimate:
+            with self.subTest(status=task.status, version=task.version):
+                self.assertEqual(Task.from_snapshot(task.to_snapshot()), task)
+
+        invalid_versions = {
+            Status.RECEIVED: (2, 99),
+            Status.RUNNING: (3, 99),
+            Status.WAITING_APPROVAL: (4, 99),
+            Status.COMPLETED: (2, 4, 99),
+            Status.REJECTED: (2, 4, 99),
+            Status.FAILED: (2, 4, 99),
+            Status.CANCELLED: (1, 4, 99),
+            Status.ESCALATED: (2, 4, 99),
+        }
+        direct_base = {
+            "task_id": "task-corrupt",
+            "input": "요청",
+            "plan_hash": None,
+            "created_at": NOW,
+            "updated_at": NOW,
+        }
+        snapshot_base = received.to_snapshot() | {"task_id": "task-corrupt"}
+        for status, versions in invalid_versions.items():
+            for version in versions:
+                with (
+                    self.subTest(path="direct", status=status, version=version),
+                    self.assertRaises(InvalidLifecycleValueError),
+                ):
+                    Task(**direct_base, status=status, version=version)
+                with (
+                    self.subTest(path="snapshot", status=status, version=version),
+                    self.assertRaises(InvalidLifecycleValueError),
+                ):
+                    Task.from_snapshot(
+                        snapshot_base | {"status": status.value, "version": version}
+                    )
+
+    def test_allows_repeated_plan_updates_to_raise_planful_versions(self) -> None:
+        running = Task.receive(
+            task_id="task-planful",
+            input="요청",
+            at=NOW,
+        ).transition(Status.RUNNING, at=NOW)
+        planned = running.update_plan("plan-v1", at=NOW)
+        replanned = planned.update_plan("plan-v2", at=NOW)
+        waiting = replanned.transition(Status.WAITING_APPROVAL, at=NOW)
+        revised_waiting = waiting.update_plan("plan-v3", at=NOW)
+        terminal = revised_waiting.transition(Status.REJECTED, at=NOW)
+
+        for task in (planned, replanned, waiting, revised_waiting, terminal):
+            with self.subTest(status=task.status, version=task.version):
+                self.assertEqual(Task.from_snapshot(task.to_snapshot()), task)
 
     def test_normalizes_invalid_persisted_snapshots_to_lifecycle_errors(self) -> None:
         snapshot = Task.receive(
@@ -744,29 +811,64 @@ class AgentRunLifecycleTests(unittest.TestCase):
                 )
 
         with self.assertRaises(InvalidLifecycleValueError):
-            AgentRun(
-                agent_run_id="agent-run-123",
-                workflow_run_id="workflow-123",
-                task_id="task-123",
-                task_version=1,
-                agent_id="analysis",
-                phase=Phase.CLASSIFYING,
-                budget_sequence=1,
-                started_at=NOW,
-                outcome="success",
+            AgentRun.from_snapshot(
+                started.to_snapshot() | {"outcome": "success"},
+                workflow=workflow,
             )
 
         with self.assertRaises(InvalidLifecycleValueError):
-            AgentRun(
-                agent_run_id="agent-run-123",
-                workflow_run_id="workflow-123",
-                task_id="task-123",
-                task_version=1,
-                agent_id="analysis",
-                phase="CLASSIFYING",
-                budget_sequence=1,
-                started_at=NOW,
+            AgentRun.from_snapshot(
+                started.to_snapshot() | {"phase": "UNKNOWN"},
+                workflow=workflow,
             )
+
+    def test_rejects_agent_run_fabrication_without_matching_consumed_budget(
+        self,
+    ) -> None:
+        workflow = WorkflowRun.start(
+            workflow_run_id="workflow-123",
+            task=Task.receive(task_id="task-123", input="요청", at=NOW),
+            max_agent_runs=2,
+            at=NOW,
+        )
+        workflow, started = workflow.begin_agent_run(
+            agent_run_id="agent-run-123",
+            agent_id="analysis",
+            at=LATER,
+        )
+
+        with self.assertRaises(AgentRunOwnershipError):
+            AgentRun(
+                agent_run_id="fabricated-run",
+                workflow_run_id=workflow.workflow_run_id,
+                task_id=workflow.task_id,
+                task_version=workflow.task_version,
+                agent_id="analysis",
+                phase=workflow.phase,
+                budget_sequence=1,
+                started_at=LATER,
+            )
+
+        corrupt_snapshots = (
+            started.to_snapshot() | {"workflow_run_id": "other-workflow"},
+            started.to_snapshot() | {"task_id": "other-task"},
+            started.to_snapshot() | {"task_version": 2},
+            started.to_snapshot() | {"budget_sequence": 2},
+            started.to_snapshot()
+            | {"started_at": (LATER + timedelta(minutes=1)).isoformat()},
+        )
+        for snapshot in corrupt_snapshots:
+            with (
+                self.subTest(snapshot=snapshot),
+                self.assertRaises(AgentRunOwnershipError),
+            ):
+                AgentRun.from_snapshot(snapshot, workflow=workflow)
+
+        restored = AgentRun.from_snapshot(
+            json.loads(json.dumps(started.to_snapshot())),
+            workflow=workflow,
+        )
+        self.assertEqual(restored, started)
 
 
 class SnapshotSerializationTests(unittest.TestCase):
@@ -839,15 +941,18 @@ class SnapshotSerializationTests(unittest.TestCase):
         )
 
         round_trips = (
-            (Approval, approval),
-            (ExecutionBudget, workflow.budget),
-            (WorkflowRun, workflow),
-            (AgentRun, agent_run),
+            (Approval, approval, {}),
+            (ExecutionBudget, workflow.budget, {}),
+            (WorkflowRun, workflow, {}),
+            (AgentRun, agent_run, {"workflow": workflow}),
         )
-        for aggregate_type, aggregate in round_trips:
+        for aggregate_type, aggregate, restore_arguments in round_trips:
             with self.subTest(aggregate_type=aggregate_type):
                 encoded = json.dumps(aggregate.to_snapshot())
-                restored = aggregate_type.from_snapshot(json.loads(encoded))
+                restored = aggregate_type.from_snapshot(
+                    json.loads(encoded),
+                    **restore_arguments,
+                )
                 self.assertEqual(restored, aggregate)
 
     def test_rejects_malformed_persisted_aggregate_snapshots(self) -> None:
@@ -882,10 +987,12 @@ class SnapshotSerializationTests(unittest.TestCase):
                 workflow.to_snapshot() | {"budget": "two"}
             ),
             lambda: AgentRun.from_snapshot(
-                agent_run.to_snapshot() | {"completed_at": "not-a-date"}
+                agent_run.to_snapshot() | {"completed_at": "not-a-date"},
+                workflow=workflow,
             ),
             lambda: AgentRun.from_snapshot(
-                agent_run.to_snapshot() | {"budget_sequence": False}
+                agent_run.to_snapshot() | {"budget_sequence": False},
+                workflow=workflow,
             ),
         )
 

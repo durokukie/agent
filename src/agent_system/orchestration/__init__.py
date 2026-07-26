@@ -11,6 +11,7 @@ from ._support import (
     AgentRunAgentMismatchError,
     AgentRunAlreadyCompletedError,
     AgentRunError,
+    AgentRunOwnershipError,
     ApprovalError,
     ApprovalNotAllowedError,
     ApprovalRequiredError,
@@ -104,6 +105,17 @@ _PHASE_TRANSITIONS: dict[Phase, frozenset[Phase]] = {
     Phase.GOVERNING: frozenset({Phase.EXECUTING}),
     Phase.EXECUTING: frozenset({Phase.VERIFYING}),
     Phase.VERIFYING: frozenset(),
+}
+
+_PLANLESS_TASK_VERSIONS: dict[Status, frozenset[int]] = {
+    Status.RECEIVED: frozenset({1}),
+    Status.RUNNING: frozenset({2}),
+    Status.WAITING_APPROVAL: frozenset(),
+    Status.COMPLETED: frozenset({3}),
+    Status.REJECTED: frozenset({3}),
+    Status.FAILED: frozenset({3}),
+    Status.CANCELLED: frozenset({2, 3}),
+    Status.ESCALATED: frozenset({3}),
 }
 
 
@@ -210,33 +222,16 @@ class Task:
             raise InvalidLifecycleValueError(
                 "WAITING_APPROVAL 상태에는 plan_hash가 필요합니다."
             )
-        if self.status is Status.RECEIVED:
-            if self.version != 1 or self.plan_hash is not None:
+        if self.plan_hash is None:
+            if self.version not in _PLANLESS_TASK_VERSIONS[self.status]:
+                raise InvalidLifecycleValueError(
+                    "plan이 없는 Task의 status/version 조합이 도달 불가능합니다."
+                )
+        else:
+            if self.status is Status.RECEIVED:
                 raise InvalidLifecycleValueError(
                     "RECEIVED Task는 version 1이며 plan이 없어야 합니다."
                 )
-        elif self.version < 2:
-            raise InvalidLifecycleValueError(
-                "RECEIVED 이후 status에는 version 2 이상이 필요합니다."
-            )
-        if self.status is Status.WAITING_APPROVAL and self.version < 4:
-            raise InvalidLifecycleValueError(
-                "WAITING_APPROVAL status에는 version 4 이상이 필요합니다."
-            )
-        if (
-            self.status
-            in {
-                Status.COMPLETED,
-                Status.REJECTED,
-                Status.FAILED,
-                Status.ESCALATED,
-            }
-            and self.version < 3
-        ):
-            raise InvalidLifecycleValueError(
-                "이 terminal status에는 version 3 이상이 필요합니다."
-            )
-        if self.plan_hash is not None:
             minimum_plan_version = 3 if self.status is Status.RUNNING else 4
             if self.version < minimum_plan_version:
                 raise InvalidLifecycleValueError(
@@ -489,11 +484,9 @@ class WorkflowRun:
             budget=budget,
             updated_at=at,
         )
-        agent_run = AgentRun(
+        agent_run = AgentRun._create_for_workflow(
+            workflow=workflow,
             agent_run_id=agent_run_id,
-            workflow_run_id=workflow.workflow_run_id,
-            task_id=workflow.task_id,
-            task_version=workflow.task_version,
             agent_id=agent_id,
             phase=workflow.phase,
             budget_sequence=workflow.budget.consumed,
@@ -529,7 +522,7 @@ class WorkflowRun:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class AgentRun:
     """한 번의 Agent 호출과 그 완료 결과를 연결하는 immutable 기록이다."""
 
@@ -544,6 +537,82 @@ class AgentRun:
     outcome: str | None = None
     output: str | None = None
     completed_at: datetime | None = None
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        """소유 WorkflowRun을 우회한 직접 생성을 거부한다."""
+
+        raise AgentRunOwnershipError(
+            "AgentRun은 WorkflowRun.begin_agent_run()으로만 만들 수 있습니다."
+        )
+
+    @classmethod
+    def _build(
+        cls,
+        *,
+        agent_run_id: str,
+        workflow_run_id: str,
+        task_id: str,
+        task_version: int,
+        agent_id: str,
+        phase: Phase,
+        budget_sequence: int,
+        started_at: datetime,
+        outcome: str | None = None,
+        output: str | None = None,
+        completed_at: datetime | None = None,
+    ) -> AgentRun:
+        """검증된 내부 경계에서 immutable AgentRun을 조립한다."""
+
+        agent_run = object.__new__(cls)
+        values = {
+            "agent_run_id": agent_run_id,
+            "workflow_run_id": workflow_run_id,
+            "task_id": task_id,
+            "task_version": task_version,
+            "agent_id": agent_id,
+            "phase": phase,
+            "budget_sequence": budget_sequence,
+            "started_at": started_at,
+            "outcome": outcome,
+            "output": output,
+            "completed_at": completed_at,
+        }
+        for field_name, value in values.items():
+            object.__setattr__(agent_run, field_name, value)
+        agent_run.__post_init__()
+        return agent_run
+
+    @classmethod
+    def _create_for_workflow(
+        cls,
+        *,
+        workflow: WorkflowRun,
+        agent_run_id: str,
+        agent_id: str,
+        phase: Phase,
+        budget_sequence: int,
+        started_at: datetime,
+        outcome: str | None = None,
+        output: str | None = None,
+        completed_at: datetime | None = None,
+    ) -> AgentRun:
+        """WorkflowRun이 소비한 실행 권한에 결합된 AgentRun을 만든다."""
+
+        agent_run = cls._build(
+            agent_run_id=agent_run_id,
+            workflow_run_id=workflow.workflow_run_id,
+            task_id=workflow.task_id,
+            task_version=workflow.task_version,
+            agent_id=agent_id,
+            phase=phase,
+            budget_sequence=budget_sequence,
+            started_at=started_at,
+            outcome=outcome,
+            output=output,
+            completed_at=completed_at,
+        )
+        agent_run._validate_owner(workflow)
+        return agent_run
 
     def __post_init__(self) -> None:
         identifiers = {
@@ -592,6 +661,37 @@ class AgentRun:
                 field_name="completed_at",
             )
 
+    def _validate_owner(self, workflow: WorkflowRun) -> None:
+        """식별자와 budget 소비 순서가 소유 WorkflowRun에 속하는지 검증한다."""
+
+        if (
+            self.workflow_run_id != workflow.workflow_run_id
+            or self.task_id != workflow.task_id
+            or self.task_version != workflow.task_version
+        ):
+            raise AgentRunOwnershipError(
+                "AgentRun 식별자가 소유 WorkflowRun과 일치하지 않습니다."
+            )
+        if self.budget_sequence > workflow.budget.consumed:
+            raise AgentRunOwnershipError(
+                "AgentRun budget_sequence에 대응하는 소비 이력이 없습니다."
+            )
+        try:
+            _require_not_before(
+                self.started_at,
+                workflow.started_at,
+                field_name="started_at",
+            )
+            _require_not_before(
+                workflow.updated_at,
+                self.started_at,
+                field_name="workflow.updated_at",
+            )
+        except InvalidLifecycleValueError as error:
+            raise AgentRunOwnershipError(
+                "AgentRun 시작 시각이 소유 WorkflowRun 실행 구간 밖입니다."
+            ) from error
+
     @property
     def is_completed(self) -> bool:
         """AgentRun에 완료 결과가 기록되었는지 반환한다."""
@@ -615,8 +715,15 @@ class AgentRun:
                 "AgentRun의 agent_id와 결과의 agent_id가 다릅니다."
             )
         _require_not_before(at, self.started_at, field_name="at")
-        return replace(
-            self,
+        return self._build(
+            agent_run_id=self.agent_run_id,
+            workflow_run_id=self.workflow_run_id,
+            task_id=self.task_id,
+            task_version=self.task_version,
+            agent_id=self.agent_id,
+            phase=self.phase,
+            budget_sequence=self.budget_sequence,
+            started_at=self.started_at,
             outcome=outcome,
             output=output,
             completed_at=at,
@@ -642,14 +749,22 @@ class AgentRun:
         }
 
     @classmethod
-    def from_snapshot(cls, snapshot: Mapping[str, object]) -> AgentRun:
-        """JSON 호환 snapshot에서 AgentRun을 복원한다."""
+    def from_snapshot(
+        cls,
+        snapshot: Mapping[str, object],
+        *,
+        workflow: WorkflowRun,
+    ) -> AgentRun:
+        """소유 WorkflowRun 검증과 함께 JSON snapshot을 복원한다."""
 
-        return cls(
+        workflow_run_id = _snapshot_string(snapshot, "workflow_run_id")
+        task_id = _snapshot_string(snapshot, "task_id")
+        task_version = _snapshot_integer(snapshot, "task_version")
+        agent_run = cls._build(
             agent_run_id=_snapshot_string(snapshot, "agent_run_id"),
-            workflow_run_id=_snapshot_string(snapshot, "workflow_run_id"),
-            task_id=_snapshot_string(snapshot, "task_id"),
-            task_version=_snapshot_integer(snapshot, "task_version"),
+            workflow_run_id=workflow_run_id,
+            task_id=task_id,
+            task_version=task_version,
             agent_id=_snapshot_string(snapshot, "agent_id"),
             phase=_snapshot_enum(snapshot, "phase", Phase),
             budget_sequence=_snapshot_integer(snapshot, "budget_sequence"),
@@ -662,6 +777,8 @@ class AgentRun:
                 optional=True,
             ),
         )
+        agent_run._validate_owner(workflow)
+        return agent_run
 
 
 __all__ = [
@@ -669,6 +786,7 @@ __all__ = [
     "AgentRunAgentMismatchError",
     "AgentRunAlreadyCompletedError",
     "AgentRunError",
+    "AgentRunOwnershipError",
     "Approval",
     "ApprovalError",
     "ApprovalNotAllowedError",

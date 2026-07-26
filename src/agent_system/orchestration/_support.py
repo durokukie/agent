@@ -40,6 +40,10 @@ class AgentRunAlreadyCompletedError(AgentRunError):
     """완료된 AgentRun을 다시 완료하려 할 때 발생한다."""
 
 
+class AgentRunOwnershipError(AgentRunError):
+    """AgentRun이 소유 WorkflowRun의 실행 권한과 맞지 않을 때 발생한다."""
+
+
 class PlanRequiredError(LifecycleError):
     """승인 대기 전이에 필요한 plan이 없을 때 발생한다."""
 
@@ -195,6 +199,7 @@ __all__ = [
     "AgentRunAgentMismatchError",
     "AgentRunAlreadyCompletedError",
     "AgentRunError",
+    "AgentRunOwnershipError",
     "ApprovalError",
     "ApprovalNotAllowedError",
     "ApprovalRequiredError",
