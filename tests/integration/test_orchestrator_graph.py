@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ from agent_system.orchestration import (
     ApprovalResponse,
     ApprovalResumeError,
     ExecutionClaimResult,
+    ExecutionClaimStatus,
     FailureCode,
     FakeApprovalConsumer,
     FakeExecutionCoordinator,
@@ -70,7 +72,11 @@ class _RaisingApprovalConsumer:
 
 
 class _CancelledApprovalConsumer:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
     async def consume(self, **kwargs: object) -> object:
+        self.started.set()
         await asyncio.Event().wait()
         raise AssertionError("취소 뒤에는 도달할 수 없습니다.")
 
@@ -163,6 +169,18 @@ class _RecordingExecutionCoordinator(FakeExecutionCoordinator):
         return await super().claim(thread_id=thread_id, claim_key=claim_key)
 
 
+class _StartRaceExecutionCoordinator(_RecordingExecutionCoordinator):
+    def __init__(self, barrier: threading.Barrier) -> None:
+        super().__init__()
+        self._barrier = barrier
+
+    async def claim(self, *, thread_id: str, claim_key: str) -> object:
+        result = await super().claim(thread_id=thread_id, claim_key=claim_key)
+        if result.status is ExecutionClaimStatus.BUSY:
+            self._barrier.abort()
+        return result
+
+
 class _MutatingExecutionCoordinator(FakeExecutionCoordinator):
     def __init__(self) -> None:
         super().__init__()
@@ -252,9 +270,11 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(accepted=accepted):
                 checkpointer = InMemorySaver()
                 consumer = _FailAfterConsumeApprovalConsumer(FakeApprovalConsumer())
+                coordinator = FakeExecutionCoordinator()
                 first_service, agent = self.make_service(
                     checkpointer=checkpointer,
                     approval_consumer=consumer,  # type: ignore[arg-type]
+                    execution_coordinator=coordinator,
                 )
                 waiting = await first_service.start(
                     UserTaskInput("task-heal", "서비스를 복구해 주세요."),
@@ -280,6 +300,7 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
                 second_service, _ = self.make_service(
                     checkpointer=checkpointer,
                     approval_consumer=consumer,  # type: ignore[arg-type]
+                    execution_coordinator=coordinator,
                     agent=agent,
                 )
 
@@ -349,8 +370,13 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent.received_requests, [])
 
     async def test_approval_consumer_cancellation_propagates(self) -> None:
-        service, _ = self.make_service(
-            approval_consumer=_CancelledApprovalConsumer(),  # type: ignore[arg-type]
+        checkpointer = InMemorySaver()
+        coordinator = _RecordingExecutionCoordinator()
+        consumer = _CancelledApprovalConsumer()
+        service, agent = self.make_service(
+            checkpointer=checkpointer,
+            approval_consumer=consumer,  # type: ignore[arg-type]
+            execution_coordinator=coordinator,
         )
         waiting = await service.start(
             UserTaskInput("task-consumer-cancel", "복구"),
@@ -367,11 +393,37 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
         )
-        await asyncio.sleep(0)
+        await consumer.started.wait()
         invocation.cancel()
 
         with self.assertRaises(asyncio.CancelledError):
             await invocation
+
+        retry_service, _ = self.make_service(
+            checkpointer=checkpointer,
+            approval_consumer=FakeApprovalConsumer(),
+            execution_coordinator=coordinator,
+            agent=agent,
+        )
+        result = await retry_service.resume(
+            thread_id="thread-consumer-cancel",
+            response=ApprovalResponse.approve(
+                waiting.interrupt,
+                decision_id="decision-consumer-cancel",
+                at=NOW,
+            ),
+        )
+
+        self.assertEqual(result.task.status, Status.COMPLETED)
+        self.assertEqual(len(agent.received_requests), 1)
+        self.assertEqual(
+            coordinator.claimed,
+            [
+                ("thread-consumer-cancel", "thread:thread-consumer-cancel"),
+                ("thread-consumer-cancel", "thread:thread-consumer-cancel"),
+                ("thread-consumer-cancel", "thread:thread-consumer-cancel"),
+            ],
+        )
 
     async def test_malformed_approval_consumer_result_is_dependency_error(self) -> None:
         for mutation in (
@@ -411,13 +463,18 @@ class ApprovalResumeTests(unittest.IsolatedAsyncioTestCase):
             UserTaskInput(task_id="task-waiting", input="서비스를 복구해 주세요."),
             thread_id="thread-waiting",
         )
+        claims_before_recovery = list(coordinator.claimed)
 
         recovered = await service.recover(thread_id="thread-waiting")
 
         self.assertEqual(recovered, waiting)
         self.assertEqual(recovered.task.status, Status.WAITING_APPROVAL)
         self.assertEqual(agent.received_requests, [])
-        self.assertEqual(coordinator.claimed, [])
+        self.assertEqual(
+            claims_before_recovery,
+            [("thread-waiting", "thread:thread-waiting")],
+        )
+        self.assertEqual(coordinator.claimed, claims_before_recovery)
 
     async def test_bound_approval_resumes_and_executes_exactly_once(self) -> None:
         service, agent = self.make_service()
@@ -619,6 +676,28 @@ class _RecoverableAgent:
         return AgentResult(self.metadata.agent_id, AgentOutcome.SUCCESS, "복구 완료")
 
 
+class _FirstReadBarrierCheckpointer:
+    """두 SQLite service가 최초 thread 소유권 조회를 함께 통과하게 한다."""
+
+    def __init__(self, inner: object, barrier: threading.Barrier) -> None:
+        self._inner = inner
+        self._barrier = barrier
+        self._first_read = True
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def get_tuple(self, config: object) -> object:
+        result = self._inner.get_tuple(config)  # type: ignore[attr-defined]
+        if self._first_read:
+            self._first_read = False
+            try:
+                self._barrier.wait(timeout=2.0)
+            except threading.BrokenBarrierError:
+                pass
+        return result
+
+
 class AgentIssuanceCheckpointTests(unittest.IsolatedAsyncioTestCase):
     """외부 Agent 호출보다 budget issuance checkpoint가 먼저 기록된다."""
 
@@ -751,7 +830,7 @@ class RecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(raised.exception.__cause__)
         self.assertNotIn("claim-secret", str(raised.exception))
 
-    async def test_recovery_uses_stable_thread_claim_key(self) -> None:
+    async def test_recovery_uses_thread_execution_claim_key(self) -> None:
         saver, registry, classifier, agent = await self.make_open_checkpoint()
         coordinator = _RecordingExecutionCoordinator()
         agent.release.set()
@@ -766,7 +845,7 @@ class RecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             coordinator.claimed,
-            [("thread-open", "recovery:thread-open")],
+            [("thread-open", "thread:thread-open")],
         )
 
     async def test_claim_cancellation_propagates(self) -> None:
@@ -905,6 +984,224 @@ class RecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 class SQLiteCheckpointerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
     """Persistence 공개 checkpointer를 async supervisor에 그대로 주입한다."""
 
+    async def test_two_services_claim_thread_before_sqlite_start_ownership(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "start-claim-race.db"
+            upgrade_database(database_path)
+            agent = _RecoverableAgent()
+            registry = AgentRegistry()
+            registry.register(agent)
+            classifier = FakeRequestClassifier(
+                {
+                    RequestKind.USER_TASK: RoutingDecision(
+                        RequestKind.USER_TASK,
+                        "recoverable",
+                        ActionKind.READ_ONLY,
+                        "시작 경합",
+                    )
+                }
+            )
+            barrier = threading.Barrier(2)
+            coordinator = _StartRaceExecutionCoordinator(barrier)
+            with (
+                SQLiteStore(database_path) as store,
+                store.open_checkpointer() as first_saver,
+                store.open_checkpointer() as second_saver,
+            ):
+                first = OrchestratorService(
+                    classifier=classifier,
+                    governance=FakeGovernance(approved=True, reason="허용"),
+                    approval_consumer=FakeApprovalConsumer(),
+                    execution_coordinator=coordinator,
+                    registry=registry,
+                    max_agent_runs=2,
+                    checkpointer=_FirstReadBarrierCheckpointer(first_saver, barrier),  # type: ignore[arg-type]
+                    clock=lambda: NOW,
+                    id_factory=iter(
+                        ("workflow-start-first", "agent-run-start-first")
+                    ).__next__,
+                )
+                second = OrchestratorService(
+                    classifier=classifier,
+                    governance=FakeGovernance(approved=True, reason="허용"),
+                    approval_consumer=FakeApprovalConsumer(),
+                    execution_coordinator=coordinator,
+                    registry=registry,
+                    max_agent_runs=2,
+                    checkpointer=_FirstReadBarrierCheckpointer(second_saver, barrier),  # type: ignore[arg-type]
+                    clock=lambda: NOW,
+                    id_factory=iter(
+                        ("workflow-start-second", "agent-run-start-second")
+                    ).__next__,
+                )
+                invocations = (
+                    asyncio.create_task(
+                        first.start(
+                            UserTaskInput("task-start-first", "복구"),
+                            thread_id="thread-start-claim",
+                        )
+                    ),
+                    asyncio.create_task(
+                        second.start(
+                            UserTaskInput("task-start-second", "복구"),
+                            thread_id="thread-start-claim",
+                        )
+                    ),
+                )
+                await agent.started.wait()
+                agent.release.set()
+                results = await asyncio.gather(
+                    *invocations,
+                    return_exceptions=True,
+                )
+
+            winners = [
+                result for result in results if not isinstance(result, BaseException)
+            ]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(
+                sum(isinstance(result, OrchestrationStartError) for result in results),
+                1,
+            )
+            winner = winners[0]
+            self.assertEqual(winner.task.status, Status.COMPLETED)
+            self.assertEqual(winner.workflow.budget.consumed, 1)
+            self.assertEqual(len(winner.agent_runs), 1)
+            self.assertEqual(len(agent.agent_run_ids), 1)
+            self.assertEqual(agent.agent_run_ids[0], winner.agent_runs[0].agent_run_id)
+            self.assertEqual(agent.effects, 1)
+            self.assertEqual(
+                coordinator.claimed,
+                [
+                    ("thread-start-claim", "thread:thread-start-claim"),
+                    ("thread-start-claim", "thread:thread-start-claim"),
+                ],
+            )
+
+    async def test_recover_loses_to_blocked_sqlite_approval_resume(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "resume-recovery-race.db"
+            upgrade_database(database_path)
+            plan = ActionPlan("서비스 재시작", ("재시작",))
+            classifier = FakeRequestClassifier(
+                {
+                    RequestKind.USER_TASK: RoutingDecision(
+                        RequestKind.USER_TASK,
+                        "recoverable",
+                        ActionKind.MUTATING,
+                        "승인 실행 경합",
+                        plan,
+                    )
+                }
+            )
+            agent = _RecoverableAgent()
+            registry = AgentRegistry()
+            registry.register(agent)
+            consumer = FakeApprovalConsumer()
+            coordinator = _RecordingExecutionCoordinator()
+            with SQLiteStore(database_path) as store:
+                with store.open_checkpointer() as saver:
+                    starter = OrchestratorService(
+                        classifier=classifier,
+                        governance=FakeGovernance(approved=True, reason="허용"),
+                        approval_consumer=consumer,
+                        execution_coordinator=coordinator,
+                        registry=registry,
+                        max_agent_runs=2,
+                        checkpointer=saver,
+                        clock=lambda: NOW,
+                        id_factory=iter(("workflow-resume-race",)).__next__,
+                    )
+                    waiting = await starter.start(
+                        UserTaskInput("task-resume-race", "복구"),
+                        thread_id="thread-resume-race",
+                    )
+                    assert waiting.interrupt is not None
+                with (
+                    store.open_checkpointer() as resume_saver,
+                    store.open_checkpointer() as recovery_saver,
+                ):
+                    resumer = OrchestratorService(
+                        classifier=classifier,
+                        governance=FakeGovernance(approved=True, reason="허용"),
+                        approval_consumer=consumer,
+                        execution_coordinator=coordinator,
+                        registry=registry,
+                        max_agent_runs=2,
+                        checkpointer=resume_saver,
+                        clock=lambda: NOW,
+                        id_factory=iter(("agent-run-resume-race",)).__next__,
+                    )
+                    recoverer = OrchestratorService(
+                        classifier=classifier,
+                        governance=FakeGovernance(approved=True, reason="허용"),
+                        approval_consumer=consumer,
+                        execution_coordinator=coordinator,
+                        registry=registry,
+                        max_agent_runs=2,
+                        checkpointer=recovery_saver,
+                        clock=lambda: NOW,
+                        id_factory=iter(("unused-recovery-id",)).__next__,
+                    )
+                    resuming = asyncio.create_task(
+                        resumer.resume(
+                            thread_id="thread-resume-race",
+                            response=ApprovalResponse.approve(
+                                waiting.interrupt,
+                                decision_id="decision-resume-race",
+                                at=NOW,
+                            ),
+                        )
+                    )
+                    await agent.started.wait()
+                    for _ in range(1000):
+                        observed = await recoverer.get_result(
+                            thread_id="thread-resume-race"
+                        )
+                        if (
+                            observed.agent_runs
+                            and not observed.agent_runs[-1].is_completed
+                        ):
+                            break
+                        await asyncio.sleep(0)
+                    else:
+                        self.fail(
+                            "recovery service가 열린 AgentRun을 관찰하지 못했습니다."
+                        )
+                    recovering = asyncio.create_task(
+                        recoverer.recover(thread_id="thread-resume-race")
+                    )
+                    for _ in range(1000):
+                        if recovering.done() or len(agent.agent_run_ids) > 1:
+                            break
+                        await asyncio.sleep(0)
+                    agent.release.set()
+                    resumed, recovered = await asyncio.gather(
+                        resuming,
+                        recovering,
+                        return_exceptions=True,
+                    )
+
+            self.assertNotIsInstance(resumed, BaseException)
+            assert not isinstance(resumed, BaseException)
+            self.assertEqual(resumed.task.status, Status.COMPLETED)
+            self.assertIsInstance(recovered, OrchestrationRecoveryError)
+            self.assertEqual(resumed.workflow.budget.consumed, 1)
+            self.assertEqual(len(resumed.agent_runs), 1)
+            self.assertEqual(agent.agent_run_ids, ["agent-run-resume-race"])
+            self.assertEqual(agent.agent_run_ids[0], resumed.agent_runs[0].agent_run_id)
+            self.assertEqual(agent.effects, 1)
+            self.assertEqual(
+                coordinator.claimed,
+                [
+                    ("thread-resume-race", "thread:thread-resume-race"),
+                    ("thread-resume-race", "thread:thread-resume-race"),
+                    ("thread-resume-race", "thread:thread-resume-race"),
+                ],
+            )
+
     async def test_async_service_runs_and_reads_after_sync_saver_reconnect(
         self,
     ) -> None:
@@ -928,13 +1225,14 @@ class SQLiteCheckpointerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                     )
                 }
             )
+            coordinator = _RecordingExecutionCoordinator()
             with SQLiteStore(database_path) as store:
                 with store.open_checkpointer() as saver:
                     service = OrchestratorService(
                         classifier=classifier,
                         governance=FakeGovernance(approved=True, reason="허용"),
                         approval_consumer=FakeApprovalConsumer(),
-                        execution_coordinator=FakeExecutionCoordinator(),
+                        execution_coordinator=coordinator,
                         registry=registry,
                         max_agent_runs=1,
                         checkpointer=saver,
@@ -954,7 +1252,7 @@ class SQLiteCheckpointerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                         classifier=classifier,
                         governance=FakeGovernance(approved=True, reason="허용"),
                         approval_consumer=FakeApprovalConsumer(),
-                        execution_coordinator=FakeExecutionCoordinator(),
+                        execution_coordinator=coordinator,
                         registry=registry,
                         max_agent_runs=1,
                         checkpointer=reopened_saver,
@@ -965,6 +1263,10 @@ class SQLiteCheckpointerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                         thread_id="thread-sqlite"
                     )
                     self.assertEqual(recovered, completed)
+                    self.assertEqual(
+                        coordinator.claimed,
+                        [("thread-sqlite", "thread:thread-sqlite")],
+                    )
 
     async def test_recovers_open_issuance_without_another_budget_slot(self) -> None:
         with TemporaryDirectory() as directory:
@@ -983,13 +1285,14 @@ class SQLiteCheckpointerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                     )
                 }
             )
+            coordinator = _RecordingExecutionCoordinator()
             with SQLiteStore(database_path) as store:
                 with store.open_checkpointer() as saver:
                     service = OrchestratorService(
                         classifier=classifier,
                         governance=FakeGovernance(approved=True, reason="허용"),
                         approval_consumer=FakeApprovalConsumer(),
-                        execution_coordinator=FakeExecutionCoordinator(),
+                        execution_coordinator=coordinator,
                         registry=registry,
                         max_agent_runs=2,
                         checkpointer=saver,
@@ -1014,7 +1317,7 @@ class SQLiteCheckpointerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                         classifier=classifier,
                         governance=FakeGovernance(approved=True, reason="허용"),
                         approval_consumer=FakeApprovalConsumer(),
-                        execution_coordinator=FakeExecutionCoordinator(),
+                        execution_coordinator=coordinator,
                         registry=registry,
                         max_agent_runs=2,
                         checkpointer=reopened,
@@ -1028,6 +1331,13 @@ class SQLiteCheckpointerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(result.agent_runs), 1)
             self.assertEqual(set(agent.agent_run_ids), {"agent-run-recover"})
             self.assertEqual(agent.effects, 1)
+            self.assertEqual(
+                coordinator.claimed,
+                [
+                    ("thread-recover", "thread:thread-recover"),
+                    ("thread-recover", "thread:thread-recover"),
+                ],
+            )
 
     async def test_two_services_claim_one_open_sqlite_agent_run(self) -> None:
         with TemporaryDirectory() as directory:

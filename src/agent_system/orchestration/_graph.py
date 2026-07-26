@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import CancelledError as ConcurrentCancelledError
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -23,7 +24,7 @@ from langgraph.checkpoint.base import (
     CheckpointTuple,
 )
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, interrupt
+from langgraph.types import Command, StateSnapshot, interrupt
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agent_system.agents import (
@@ -89,7 +90,7 @@ class ApprovalConsumeStatus(StrEnum):
 
 
 class ExecutionClaimStatus(StrEnum):
-    """열린 AgentRun 복구 실행권의 획득 결과다."""
+    """Thread 단위 orchestration 실행권의 획득 결과다."""
 
     CLAIMED = "claimed"
     BUSY = "busy"
@@ -116,7 +117,7 @@ class OrchestrationDependencyError(RuntimeError):
 
 
 class OrchestrationRecoveryError(RuntimeError):
-    """다른 runner가 같은 열린 AgentRun을 복구 중일 때 발생한다."""
+    """다른 runner가 같은 thread를 실행 중일 때 복구가 실패하면 발생한다."""
 
 
 def _require_text(value: str, *, field_name: str) -> None:
@@ -901,7 +902,7 @@ class ExecutionCoordinator(Protocol):
 
 
 class FakeExecutionCoordinator:
-    """단일 process 복구 경합을 결정 가능하게 조정하는 test adapter다."""
+    """단일 process thread 실행 경합을 결정 가능하게 조정하는 test adapter다."""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -1249,7 +1250,14 @@ class OrchestratorService:
 
         _require_text(thread_id, field_name="thread_id")
         config = {"configurable": {"thread_id": thread_id}}
-        async with self._thread_locks.setdefault(thread_id, asyncio.Lock()):
+        async with (
+            self._thread_locks.setdefault(thread_id, asyncio.Lock()),
+            self._execution_scope(
+                thread_id=thread_id,
+                busy_error=OrchestrationStartError,
+                busy_message="다른 runner가 같은 thread를 실행하고 있습니다.",
+            ),
+        ):
             checkpoint = await self._graph.aget_state(config)
             if checkpoint.values:
                 raise OrchestrationStartError(
@@ -1288,87 +1296,62 @@ class OrchestratorService:
 
         _require_text(thread_id, field_name="thread_id")
         config = {"configurable": {"thread_id": thread_id}}
-        async with self._thread_locks.setdefault(thread_id, asyncio.Lock()):
+        async with (
+            self._thread_locks.setdefault(thread_id, asyncio.Lock()),
+            self._execution_scope(
+                thread_id=thread_id,
+                busy_error=ApprovalResumeError,
+                busy_message="다른 runner가 같은 thread를 실행하고 있습니다.",
+            ),
+        ):
             snapshot = await self._graph.aget_state(config)
             if "approval" not in snapshot.next or not snapshot.interrupts:
                 raise ApprovalResumeError(
                     "해당 checkpoint thread에 대기 중인 승인이 없습니다."
                 )
             try:
-                claim = await self._execution_coordinator.claim(
-                    thread_id=thread_id,
-                    claim_key=f"approval:{response.decision_id}",
+                current_task = Task.from_snapshot(snapshot.values["task"])
+            except (KeyError, TypeError, ValueError, LifecycleError):
+                raise OrchestrationStateError(
+                    "Approval checkpoint state가 올바르지 않습니다."
+                ) from None
+            try:
+                consumed = await self._approval_consumer.consume(
+                    task=current_task,
+                    response=response,
+                    at=self._clock(),
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - seam 상세를 경계에서 제거한다.
                 raise OrchestrationDependencyError(
-                    "ExecutionCoordinator claim에 실패했습니다."
+                    "ApprovalConsumer 호출에 실패했습니다."
                 ) from None
-            claim = self._validate_execution_claim_result(claim)
-            if claim.status is ExecutionClaimStatus.BUSY:
+            consumed = self._validate_approval_consume_result(consumed)
+            if consumed.status not in {
+                ApprovalConsumeStatus.APPLIED,
+                ApprovalConsumeStatus.ALREADY_APPLIED,
+            }:
                 raise ApprovalResumeError(
-                    "다른 runner가 같은 Approval을 재개하고 있습니다."
+                    f"Approval decision을 소비할 수 없습니다: {consumed.status.value}"
                 )
-            if claim.status is not ExecutionClaimStatus.CLAIMED:
-                raise OrchestrationDependencyError(
-                    "ExecutionCoordinator가 잘못된 claim 결과를 반환했습니다."
-                )
-            claim_key = thread_id, f"approval:{response.decision_id}"
-            cancelled = False
+            resume_payload = {
+                "response": response.to_snapshot(),
+                "successor": consumed.task.to_snapshot(),
+                "failure": (
+                    None if consumed.failure is None else consumed.failure.value
+                ),
+            }
             try:
-                try:
-                    current_task = Task.from_snapshot(snapshot.values["task"])
-                except (KeyError, TypeError, ValueError, LifecycleError):
-                    raise OrchestrationStateError(
-                        "Approval checkpoint state가 올바르지 않습니다."
-                    ) from None
-                try:
-                    consumed = await self._approval_consumer.consume(
-                        task=current_task,
-                        response=response,
-                        at=self._clock(),
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - seam 상세를 경계에서 제거한다.
-                    raise OrchestrationDependencyError(
-                        "ApprovalConsumer 호출에 실패했습니다."
-                    ) from None
-                consumed = self._validate_approval_consume_result(consumed)
-                if consumed.status not in {
-                    ApprovalConsumeStatus.APPLIED,
-                    ApprovalConsumeStatus.ALREADY_APPLIED,
-                }:
-                    raise ApprovalResumeError(
-                        "Approval decision을 소비할 수 없습니다: "
-                        f"{consumed.status.value}"
-                    )
-                resume_payload = {
-                    "response": response.to_snapshot(),
-                    "successor": consumed.task.to_snapshot(),
-                    "failure": (
-                        None if consumed.failure is None else consumed.failure.value
-                    ),
-                }
-                try:
-                    result = await self._graph.ainvoke(
-                        Command(resume=resume_payload),
-                        config=config,
-                    )
-                except (KeyError, TypeError, ValueError, LifecycleError):
-                    raise OrchestrationStateError(
-                        "Approval checkpoint state가 올바르지 않습니다."
-                    ) from None
-                return self._result_from_state(result)
-            except asyncio.CancelledError:
-                cancelled = True
-                raise
-            finally:
-                if cancelled:
-                    await self._release_after_cancellation(*claim_key)
-                else:
-                    await self._release_execution_claim(*claim_key)
+                result = await self._graph.ainvoke(
+                    Command(resume=resume_payload),
+                    config=config,
+                )
+            except (KeyError, TypeError, ValueError, LifecycleError):
+                raise OrchestrationStateError(
+                    "Approval checkpoint state가 올바르지 않습니다."
+                ) from None
+            return self._result_from_state(result)
 
     async def get_result(self, *, thread_id: str) -> OrchestrationResult:
         """background runner가 checkpoint의 현재 공개 결과를 조회한다."""
@@ -1392,69 +1375,110 @@ class OrchestratorService:
         config = {"configurable": {"thread_id": thread_id}}
         async with self._thread_locks.setdefault(thread_id, asyncio.Lock()):
             snapshot = await self._graph.aget_state(config)
-            if not snapshot.values:
-                raise OrchestrationStateError(
-                    "해당 checkpoint thread에 orchestration state가 없습니다."
-                )
-            current = dict(snapshot.values)
-            if snapshot.interrupts:
-                current["__interrupt__"] = snapshot.interrupts
-            try:
-                _input_from_snapshot(_snapshot_mapping(current, "request"))
-                current_result = self._result_from_state(current)
-            except (KeyError, TypeError, ValueError, LifecycleError):
-                raise OrchestrationStateError(
-                    "Checkpoint state가 올바르지 않습니다."
-                ) from None
+            current_result = self._recovery_result_from_snapshot(snapshot)
             if (
                 current_result.task.status is Status.WAITING_APPROVAL
                 or not snapshot.next
             ):
                 return current_result
+            async with self._execution_scope(
+                thread_id=thread_id,
+                busy_error=OrchestrationRecoveryError,
+                busy_message="다른 runner가 같은 thread를 실행하고 있습니다.",
+            ):
+                snapshot = await self._graph.aget_state(config)
+                current_result = self._recovery_result_from_snapshot(snapshot)
+                if (
+                    current_result.task.status is Status.WAITING_APPROVAL
+                    or not snapshot.next
+                ):
+                    return current_result
+                try:
+                    result = await self._graph.ainvoke(None, config=config)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - checkpoint parse 오류를 정규화한다.
+                    raise OrchestrationStateError(
+                        "Checkpoint state를 복구할 수 없습니다."
+                    ) from None
+                return self._result_from_state(result)
+
+    def _recovery_result_from_snapshot(
+        self, snapshot: StateSnapshot
+    ) -> OrchestrationResult:
+        if not snapshot.values:
+            raise OrchestrationStateError(
+                "해당 checkpoint thread에 orchestration state가 없습니다."
+            )
+        try:
+            current = dict(snapshot.values)
+            if snapshot.interrupts:
+                current["__interrupt__"] = snapshot.interrupts
+            _input_from_snapshot(_snapshot_mapping(current, "request"))
+            current_result = self._result_from_state(current)
             if "call_agent" in snapshot.next:
                 if not current_result.agent_runs:
                     raise OrchestrationStateError(
                         "열린 AgentRun이 없는 call_agent checkpoint입니다."
                     )
-                agent_run = current_result.agent_runs[-1]
-                if agent_run.is_completed:
+                if current_result.agent_runs[-1].is_completed:
                     raise OrchestrationStateError(
                         "완료된 AgentRun은 call_agent에서 복구할 수 없습니다."
                     )
-            recovery_claim_id = f"recovery:{thread_id}"
-            try:
-                claim = await self._execution_coordinator.claim(
-                    thread_id=thread_id,
-                    claim_key=recovery_claim_id,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - seam 상세를 경계에서 제거한다.
-                raise OrchestrationDependencyError(
-                    "ExecutionCoordinator claim에 실패했습니다."
-                ) from None
-            claim = self._validate_execution_claim_result(claim)
-            if claim.status is ExecutionClaimStatus.BUSY:
-                raise OrchestrationRecoveryError(
-                    "다른 runner가 같은 thread를 복구하고 있습니다."
-                )
-            if claim.status is not ExecutionClaimStatus.CLAIMED:
-                raise OrchestrationDependencyError(
-                    "ExecutionCoordinator가 잘못된 claim 결과를 반환했습니다."
-                )
-            claim_key = thread_id, recovery_claim_id
-            try:
-                result = await self._graph.ainvoke(None, config=config)
-            except asyncio.CancelledError:
-                await self._release_after_cancellation(*claim_key)
-                raise
-            except Exception:  # noqa: BLE001 - checkpoint parse 오류를 정규화한다.
-                await self._release_execution_claim(*claim_key)
-                raise OrchestrationStateError(
-                    "Checkpoint state를 복구할 수 없습니다."
-                ) from None
-            await self._release_execution_claim(*claim_key)
-            return self._result_from_state(result)
+            return current_result
+        except OrchestrationStateError:
+            raise
+        except (KeyError, TypeError, ValueError, LifecycleError):
+            raise OrchestrationStateError(
+                "Checkpoint state가 올바르지 않습니다."
+            ) from None
+
+    @staticmethod
+    def _thread_execution_claim_key(thread_id: str) -> str:
+        return f"thread:{thread_id}"
+
+    @asynccontextmanager
+    async def _execution_scope(
+        self,
+        *,
+        thread_id: str,
+        busy_error: type[RuntimeError],
+        busy_message: str,
+    ) -> AsyncIterator[None]:
+        claim_key = self._thread_execution_claim_key(thread_id)
+        try:
+            claim = await self._execution_coordinator.claim(
+                thread_id=thread_id,
+                claim_key=claim_key,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - seam 상세를 경계에서 제거한다.
+            raise OrchestrationDependencyError(
+                "ExecutionCoordinator claim에 실패했습니다."
+            ) from None
+        claim = self._validate_execution_claim_result(claim)
+        if claim.status is ExecutionClaimStatus.BUSY:
+            raise busy_error(busy_message)
+        if claim.status is not ExecutionClaimStatus.CLAIMED:
+            raise OrchestrationDependencyError(
+                "ExecutionCoordinator가 잘못된 claim 결과를 반환했습니다."
+            )
+        cancelled = False
+        try:
+            yield
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            if cancelled:
+                await self._release_after_cancellation(thread_id, claim_key)
+            else:
+                try:
+                    await self._release_execution_claim(thread_id, claim_key)
+                except asyncio.CancelledError:
+                    await self._release_after_cancellation(thread_id, claim_key)
+                    raise
 
     async def _release_execution_claim(self, thread_id: str, claim_key: str) -> None:
         try:
@@ -1498,13 +1522,19 @@ class OrchestratorService:
             ) from None
 
     async def _release_after_cancellation(self, thread_id: str, claim_key: str) -> None:
-        try:
-            await asyncio.shield(
-                self._execution_coordinator.release(
-                    thread_id=thread_id,
-                    claim_key=claim_key,
-                )
+        release = asyncio.create_task(
+            self._execution_coordinator.release(
+                thread_id=thread_id,
+                claim_key=claim_key,
             )
+        )
+        try:
+            await asyncio.shield(release)
+        except asyncio.CancelledError:
+            try:
+                await release
+            except BaseException:  # noqa: BLE001 - 원래 cancellation을 보존한다.
+                return
         except BaseException:  # noqa: BLE001 - 원래 cancellation을 보존한다.
             return
 
