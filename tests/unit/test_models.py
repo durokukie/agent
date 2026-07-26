@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import math
+import socket
 import unittest
+from unittest.mock import patch
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage
+from langchain_upstage import ChatUpstage
 
 from agent_system.models import (
     FakeChatModel,
@@ -50,6 +54,34 @@ class ModelSettingsTests(unittest.TestCase):
                     timeout_seconds=timeout_seconds,
                 )
 
+    def test_rejects_non_finite_timeout_at_our_configuration_boundary(self) -> None:
+        for timeout_seconds in (math.nan, math.inf, -math.inf):
+            with (
+                self.subTest(timeout_seconds=timeout_seconds),
+                self.assertRaises(ModelConfigurationError),
+            ):
+                ModelSettings(
+                    provider="upstage",
+                    model_name="solar-pro2",
+                    api_key="secret-value",
+                    timeout_seconds=timeout_seconds,
+                )
+
+    def test_rejects_non_numeric_and_boolean_timeout_as_configuration_error(
+        self,
+    ) -> None:
+        for timeout_seconds in (True, False, "30"):
+            with (
+                self.subTest(timeout_seconds=timeout_seconds),
+                self.assertRaises(ModelConfigurationError),
+            ):
+                ModelSettings(
+                    provider="upstage",
+                    model_name="solar-pro2",
+                    api_key="secret-value",
+                    timeout_seconds=timeout_seconds,
+                )
+
     def test_rejects_negative_retry_count_at_our_configuration_boundary(self) -> None:
         with self.assertRaises(ModelConfigurationError):
             ModelSettings(
@@ -58,6 +90,21 @@ class ModelSettingsTests(unittest.TestCase):
                 api_key="secret-value",
                 max_retries=-1,
             )
+
+    def test_rejects_non_integer_and_boolean_retry_count_at_our_boundary(
+        self,
+    ) -> None:
+        for max_retries in (1.5, True, False, "2"):
+            with (
+                self.subTest(max_retries=max_retries),
+                self.assertRaises(ModelConfigurationError),
+            ):
+                ModelSettings(
+                    provider="upstage",
+                    model_name="solar-pro2",
+                    api_key="secret-value",
+                    max_retries=max_retries,
+                )
 
     def test_rejects_missing_required_model_settings(self) -> None:
         valid_settings = {
@@ -96,6 +143,21 @@ class ModelSettingsTests(unittest.TestCase):
 class ModelFactoryTests(unittest.TestCase):
     """Provider별 SDK를 LangChain ChatModel seam 뒤에서 생성한다."""
 
+    def setUp(self) -> None:
+        network_denied = AssertionError("테스트 중 외부 네트워크 접근이 발생했습니다.")
+        self.create_connection = self.enterContext(
+            patch("socket.create_connection", side_effect=network_denied)
+        )
+        self.resolve_address = self.enterContext(
+            patch("socket.getaddrinfo", side_effect=network_denied)
+        )
+        self.socket_connect = self.enterContext(
+            patch.object(socket.socket, "connect", side_effect=network_denied)
+        )
+        self.socket_connect_ex = self.enterContext(
+            patch.object(socket.socket, "connect_ex", side_effect=network_denied)
+        )
+
     def test_creates_an_upstage_adapter_as_a_langchain_chat_model(self) -> None:
         model = create_chat_model(
             ModelSettings(
@@ -109,6 +171,41 @@ class ModelFactoryTests(unittest.TestCase):
 
         self.assertIsInstance(model, BaseChatModel)
         self.assertEqual(model._llm_type, "upstage-chat")
+
+    def test_creates_upstage_adapter_without_network_access(self) -> None:
+        model = create_chat_model(
+            ModelSettings(
+                provider="upstage",
+                model_name="solar-pro2",
+                api_key="test-api-key",
+            )
+        )
+
+        self.assertIsInstance(model, BaseChatModel)
+        self.create_connection.assert_not_called()
+        self.resolve_address.assert_not_called()
+        self.socket_connect.assert_not_called()
+        self.socket_connect_ex.assert_not_called()
+
+    def test_forwards_timeout_and_retry_to_the_upstage_adapter(self) -> None:
+        with patch("langchain_upstage.ChatUpstage", wraps=ChatUpstage) as constructor:
+            model = create_chat_model(
+                ModelSettings(
+                    provider="upstage",
+                    model_name="solar-pro2",
+                    api_key="test-api-key",
+                    timeout_seconds=7.5,
+                    max_retries=3,
+                )
+            )
+
+        self.assertIsInstance(model, BaseChatModel)
+        constructor.assert_called_once_with(
+            model="solar-pro2",
+            api_key="test-api-key",
+            timeout=7.5,
+            max_retries=3,
+        )
 
     def test_accepts_capabilities_used_by_agents_and_classifier(self) -> None:
         model = create_chat_model(

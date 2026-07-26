@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from numbers import Real
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -56,10 +58,23 @@ class ModelSettings:
                 raise ModelConfigurationError(
                     f"{setting_name}는 비어 있을 수 없습니다."
                 )
-        if self.timeout_seconds <= 0:
-            raise ModelConfigurationError("MODEL_TIMEOUT_SECONDS는 0보다 커야 합니다.")
-        if self.max_retries < 0:
-            raise ModelConfigurationError("MODEL_MAX_RETRIES는 0 이상이어야 합니다.")
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, Real)
+            or not math.isfinite(self.timeout_seconds)
+            or self.timeout_seconds <= 0
+        ):
+            raise ModelConfigurationError(
+                "MODEL_TIMEOUT_SECONDS는 finite 양수여야 합니다."
+            )
+        if (
+            isinstance(self.max_retries, bool)
+            or not isinstance(self.max_retries, int)
+            or self.max_retries < 0
+        ):
+            raise ModelConfigurationError(
+                "MODEL_MAX_RETRIES는 0 이상의 정수여야 합니다."
+            )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> ModelSettings:
