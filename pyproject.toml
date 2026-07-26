@@ -7,7 +7,12 @@ name = "agent-system"
 version = "0.1.0"
 description = "LangGraph 기반 동적 supervisor 에이전트 시스템"
 readme = "README.md"
-dependencies = []
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-core>=1.2.5,<2.0.0",
+    "langchain-upstage>=0.7.7,<0.8.0",
+    "pydantic>=2.7.0,<3.0.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_system"]
