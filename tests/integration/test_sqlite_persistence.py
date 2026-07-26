@@ -43,6 +43,9 @@ from agent_system.persistence import (
     OutboxStatus,
     PersistenceConflictError,
     RecoveryDisposition,
+    RuntimeCommandDraft,
+    RuntimeCommandStatus,
+    RuntimeCommandType,
     SQLiteStore,
     TaskEventDraft,
     upgrade_database,
@@ -85,12 +88,13 @@ class MigrationTests(unittest.TestCase):
                 "approvals",
                 "outbox_events",
                 "request_idempotency",
+                "runtime_commands",
                 "task_events",
                 "tasks",
                 "workflow_runs",
             },
         )
-        self.assertEqual(revision, ("0002_approval_decisions",))
+        self.assertEqual(revision, ("0003_runtime_commands",))
         self.assertTrue(
             any(row[2] == "tasks" and row[3] == "task_id" for row in event_foreign_keys)
         )
@@ -112,6 +116,7 @@ class MigrationTests(unittest.TestCase):
                         NOW.isoformat(),
                     ),
                 )
+                connection.execute("DROP TABLE runtime_commands")
                 connection.execute("DROP TABLE approval_decisions")
                 connection.execute(
                     "UPDATE alembic_version SET version_num = ?",
@@ -132,10 +137,15 @@ class MigrationTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
                     ("approval_decisions",),
                 ).fetchone()
+                command_table = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    ("runtime_commands",),
+                ).fetchone()
 
-        self.assertEqual(revision, ("0002_approval_decisions",))
+        self.assertEqual(revision, ("0003_runtime_commands",))
         self.assertEqual(existing, ("기존 요청",))
         self.assertEqual(decision_table, ("approval_decisions",))
+        self.assertEqual(command_table, ("runtime_commands",))
 
     def test_upgrades_from_a_repo_layout_free_package_and_has_no_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -170,7 +180,7 @@ with sqlite3.connect(database_path) as connection:
     revision = connection.execute(
         "SELECT version_num FROM alembic_version"
     ).fetchone()
-assert revision == ("0002_approval_decisions",)
+assert revision == ("0003_runtime_commands",)
 """
             environment = os.environ.copy()
             environment["PYTHONPATH"] = str(installed_root)
@@ -232,6 +242,61 @@ class TaskStoreTests(unittest.TestCase):
         self.assertEqual(len(outbox_messages), 1)
         self.assertEqual(outbox_messages[0].outbox_id, "outbox-1")
         self.assertEqual(outbox_messages[0].status, OutboxStatus.PENDING)
+
+    def test_persists_task_and_start_command_atomically_and_replays_exactly(
+        self,
+    ) -> None:
+        """Task commit과 start intent 사이 crash 또는 이종 command 덮어쓰기를 막는다."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            task = Task.receive(task_id="task-command", input="상태 조회", at=NOW)
+            start = RuntimeCommandDraft(
+                command_id="command-start",
+                task_id=task.task_id,
+                command_type=RuntimeCommandType.START,
+                fingerprint="sha256:start",
+                payload={"request": {"kind": "user_task", "input": "상태 조회"}},
+                created_at=NOW,
+            )
+            approval = RuntimeCommandDraft(
+                command_id="command-approval",
+                task_id=task.task_id,
+                command_type=RuntimeCommandType.APPROVAL,
+                fingerprint="sha256:approval",
+                payload={"decision_id": "decision-1"},
+                created_at=NOW + timedelta(seconds=1),
+            )
+
+            with SQLiteStore(database_path) as store:
+                store.create_task(
+                    task,
+                    event=TaskEventDraft("event-command", "TASK_RECEIVED", {}, NOW),
+                    command=start,
+                )
+                pending = store.list_pending_runtime_commands()
+                replay = store.put_runtime_command(start, expected_task=task)
+                with self.assertRaises(PersistenceConflictError):
+                    store.put_runtime_command(approval, expected_task=task)
+                failed = store.record_runtime_command_failure(
+                    start.command_id,
+                    error_code="background_execution_failed",
+                    at=NOW + timedelta(seconds=2),
+                )
+                completed = store.complete_runtime_command(
+                    start.command_id,
+                    at=NOW + timedelta(seconds=3),
+                )
+
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0].fingerprint, "sha256:start")
+                self.assertTrue(replay.replayed)
+                self.assertEqual(failed.status, RuntimeCommandStatus.PENDING)
+                self.assertEqual(failed.attempt_count, 1)
+                self.assertEqual(failed.last_error, "background_execution_failed")
+                self.assertEqual(completed.status, RuntimeCommandStatus.COMPLETED)
+                self.assertEqual(store.list_pending_runtime_commands(), ())
 
     def test_uses_task_version_and_rolls_back_snapshot_when_event_insert_fails(
         self,

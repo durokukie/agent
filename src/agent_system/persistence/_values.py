@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 
 from agent_system.orchestration import (
     Approval,
@@ -69,6 +70,21 @@ class RecoveryDisposition(StrEnum):
 
     RESUME = "RESUME"
     WAITING_APPROVAL = "WAITING_APPROVAL"
+
+
+class RuntimeCommandType(StrEnum):
+    """Background runner가 durable하게 실행할 명령 종류."""
+
+    START = "START"
+    APPROVAL = "APPROVAL"
+    CANCEL = "CANCEL"
+
+
+class RuntimeCommandStatus(StrEnum):
+    """Runtime command의 durable 처리 상태."""
+
+    PENDING = "PENDING"
+    COMPLETED = "COMPLETED"
 
 
 def _require_text(value: str, *, field_name: str) -> None:
@@ -223,6 +239,47 @@ class RecoveryCandidate:
     thread_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeCommandDraft:
+    """Task에 결합해 먼저 저장할 background 실행 의도."""
+
+    command_id: str
+    task_id: str
+    command_type: RuntimeCommandType
+    fingerprint: str
+    payload: Mapping[str, object]
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_text(self.command_id, field_name="command_id")
+        _require_text(self.task_id, field_name="task_id")
+        if type(self.command_type) is not RuntimeCommandType:
+            raise InvalidPersistenceValueError(
+                "command_type은 RuntimeCommandType이어야 합니다."
+            )
+        _require_text(self.fingerprint, field_name="fingerprint")
+        _require_payload(self.payload)
+        _require_aware(self.created_at, field_name="created_at")
+        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeCommandRecord:
+    """저장된 runtime command와 처리 결과."""
+
+    command_id: str
+    task_id: str
+    command_type: RuntimeCommandType
+    fingerprint: str
+    payload: Mapping[str, object]
+    status: RuntimeCommandStatus
+    attempt_count: int
+    created_at: datetime
+    updated_at: datetime
+    last_error: str | None = None
+    replayed: bool = False
+
+
 __all__ = [
     "ApprovalApplyResult",
     "ApprovalApplyStatus",
@@ -242,6 +299,10 @@ __all__ = [
     "PersistenceNotFoundError",
     "RecoveryCandidate",
     "RecoveryDisposition",
+    "RuntimeCommandDraft",
+    "RuntimeCommandRecord",
+    "RuntimeCommandStatus",
+    "RuntimeCommandType",
     "TaskEvent",
     "TaskEventDraft",
     "TaskWriteResult",

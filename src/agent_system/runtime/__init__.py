@@ -31,8 +31,10 @@ from agent_system.orchestration import (
     Governance,
     GovernanceDecision,
     OrchestrationJournalEntry,
+    OrchestrationStartError,
     OrchestratorInput,
     OrchestratorService,
+    Phase,
     RequestClassifier,
     RoutingDecision,
     Status,
@@ -48,6 +50,10 @@ from agent_system.persistence import (
     OptimisticConcurrencyError,
     PersistenceConflictError,
     RecoveryDisposition,
+    RuntimeCommandDraft,
+    RuntimeCommandRecord,
+    RuntimeCommandStatus,
+    RuntimeCommandType,
     SQLiteStore,
     TaskEvent,
     TaskEventDraft,
@@ -229,7 +235,12 @@ class RuntimeOrchestrator(Protocol):
     async def resume(self, *, thread_id: str, response: object) -> object:
         """승인 결정을 기존 checkpoint에 전달한다."""
 
-    async def cancel(self, *, thread_id: str) -> object:
+    async def cancel(
+        self,
+        *,
+        thread_id: str,
+        reason: str | None = None,
+    ) -> object:
         """Checkpoint 실행을 terminal cancellation으로 만든다."""
 
 
@@ -293,6 +304,7 @@ class SQLiteLifecycleJournal:
 
     def _record(self, entry: OrchestrationJournalEntry) -> OrchestrationJournalEntry:
         current_task = self._store.get_task(entry.task.task_id)
+        journal_task = entry.task
         if current_task is None:
             if entry.task.version != 1 or entry.task_event_type is None:
                 raise ApplicationConflictError("Journal의 최초 Task entry가 아닙니다.")
@@ -304,7 +316,9 @@ class SQLiteLifecycleJournal:
         elif current_task == entry.task or self._same_task_callback(
             current_task, entry.task
         ):
-            pass
+            journal_task = current_task
+        elif self._is_historical_task_callback(current_task, entry):
+            journal_task = entry.task
         elif entry.task.version == current_task.version + 1:
             if entry.task_event_type is None:
                 raise ApplicationConflictError("Task 전이에 journal event가 없습니다.")
@@ -314,28 +328,41 @@ class SQLiteLifecycleJournal:
                 event=self._event_draft(entry),
             )
             current_task = entry.task
+            journal_task = current_task
         else:
             raise ApplicationConflictError("Journal Task snapshot이 충돌했습니다.")
 
         if entry.workflow is None:
-            return entry
+            return OrchestrationJournalEntry(
+                task=journal_task,
+                workflow=None,
+                task_event_type=entry.task_event_type,
+                task_event_payload=entry.task_event_payload,
+            )
         current_workflow = self._store.get_workflow_run(entry.workflow.workflow_run_id)
         if current_workflow is None:
             existing_owner = self._store.get_workflow_run_for_task(entry.task.task_id)
             if existing_owner is not None:
-                return OrchestrationJournalEntry(
-                    task=current_task,
-                    workflow=existing_owner,
-                    task_event_type=entry.task_event_type,
-                    task_event_payload=entry.task_event_payload,
+                return self._historical_workflow_entry(
+                    entry,
+                    task=journal_task,
+                    current_workflow=existing_owner,
                 )
             self._store.create_workflow_run(entry.workflow)
             return entry
+        if self._workflow_progress(current_workflow) > self._workflow_progress(
+            entry.workflow
+        ):
+            return self._historical_workflow_entry(
+                entry,
+                task=journal_task,
+                current_workflow=current_workflow,
+            )
         if current_workflow == entry.workflow or self._same_workflow_callback(
             current_workflow, entry.workflow
         ):
             authoritative = OrchestrationJournalEntry(
-                task=current_task,
+                task=journal_task,
                 workflow=current_workflow,
                 agent_run=entry.agent_run,
                 task_event_type=entry.task_event_type,
@@ -367,19 +394,30 @@ class SQLiteLifecycleJournal:
             )
             if existing is not None and not existing.is_completed:
                 return OrchestrationJournalEntry(
-                    task=current_task,
+                    task=journal_task,
                     workflow=current_workflow,
                     agent_run=existing,
                 )
+        recorded_agent = entry.agent_run
         if entry.agent_run is not None and entry.agent_run.is_completed:
-            self._store.complete_agent_run(entry.agent_run)
+            existing = self._store.get_agent_run(entry.agent_run.agent_run_id)
+            if existing is not None and existing.is_completed:
+                recorded_agent = existing
+            else:
+                recorded_agent = self._store.complete_agent_run(entry.agent_run)
         if (
             entry.workflow.phase != current_workflow.phase
             and entry.workflow.task_version == current_workflow.task_version
             and entry.workflow.budget.consumed == current_workflow.budget.consumed
         ):
             self._store.save_workflow_run(current_workflow, entry.workflow)
-            return entry
+            return OrchestrationJournalEntry(
+                task=journal_task,
+                workflow=entry.workflow,
+                agent_run=recorded_agent,
+                task_event_type=entry.task_event_type,
+                task_event_payload=entry.task_event_payload,
+            )
         if (
             entry.workflow.phase == current_workflow.phase
             and entry.workflow.task_version != current_workflow.task_version
@@ -400,6 +438,14 @@ class SQLiteLifecycleJournal:
             raise ApplicationConflictError("Workflow issuance의 AgentRun이 없습니다.")
         if existing == entry.agent_run:
             return entry
+        if existing.is_completed and entry.agent_run.is_completed:
+            return OrchestrationJournalEntry(
+                task=entry.task,
+                workflow=workflow,
+                agent_run=existing,
+                task_event_type=entry.task_event_type,
+                task_event_payload=entry.task_event_payload,
+            )
         if entry.agent_run.is_completed and not existing.is_completed:
             self._store.complete_agent_run(entry.agent_run)
             return entry
@@ -414,6 +460,91 @@ class SQLiteLifecycleJournal:
             if agent_run.budget_sequence == sequence:
                 return agent_run
         return None
+
+    def _is_historical_task_callback(
+        self,
+        current: Task,
+        entry: OrchestrationJournalEntry,
+    ) -> bool:
+        if (
+            current.version <= entry.task.version
+            or current.task_id != entry.task.task_id
+            or current.input != entry.task.input
+            or current.created_at != entry.task.created_at
+        ):
+            return False
+        event = next(
+            (
+                candidate
+                for candidate in self._store.list_task_events(entry.task.task_id)
+                if candidate.task_version == entry.task.version
+            ),
+            None,
+        )
+        if event is None:
+            return False
+        if entry.task_event_type is None:
+            return True
+        return event.event_type == entry.task_event_type and dict(
+            event.payload
+        ) == dict(entry.task_event_payload or {})
+
+    def _historical_workflow_entry(
+        self,
+        entry: OrchestrationJournalEntry,
+        *,
+        task: Task,
+        current_workflow: WorkflowRun,
+    ) -> OrchestrationJournalEntry:
+        assert entry.workflow is not None
+        if self._workflow_progress(current_workflow) < self._workflow_progress(
+            entry.workflow
+        ):
+            raise ApplicationConflictError(
+                "Journal WorkflowRun owner가 callback보다 뒤에 있습니다."
+            )
+        snapshot = entry.workflow.to_snapshot()
+        current_snapshot = current_workflow.to_snapshot()
+        snapshot["workflow_run_id"] = current_workflow.workflow_run_id
+        snapshot["started_at"] = current_snapshot["started_at"]
+        consumed = entry.workflow.budget.consumed
+        snapshot["agent_run_issuances"] = current_snapshot["agent_run_issuances"][
+            :consumed
+        ]
+        workflow = WorkflowRun.from_snapshot(snapshot)
+        agent_run = None
+        if entry.agent_run is not None:
+            existing = self._agent_for_sequence(
+                current_workflow,
+                entry.agent_run.budget_sequence,
+            )
+            if existing is None:
+                raise ApplicationConflictError("Journal replay의 AgentRun이 없습니다.")
+            agent_snapshot = existing.to_snapshot()
+            if not entry.agent_run.is_completed:
+                agent_snapshot.update(
+                    {"outcome": None, "output": None, "completed_at": None}
+                )
+            agent_run = AgentRun.from_snapshot(agent_snapshot, workflow=workflow)
+        return OrchestrationJournalEntry(
+            task=task,
+            workflow=workflow,
+            agent_run=agent_run,
+            task_event_type=entry.task_event_type,
+            task_event_payload=entry.task_event_payload,
+        )
+
+    @staticmethod
+    def _workflow_progress(workflow: WorkflowRun) -> tuple[int, int]:
+        phase_order = {
+            Phase.CLASSIFYING: 0,
+            Phase.ANALYZING: 1,
+            Phase.PLANNING: 2,
+            Phase.GOVERNING: 3,
+            Phase.EXECUTING: 4,
+            Phase.VERIFYING: 5,
+        }
+        return workflow.budget.consumed, phase_order[workflow.phase]
 
     @staticmethod
     def _same_task_callback(left: Task, right: Task) -> bool:
@@ -559,6 +690,8 @@ def build_runtime(
 class _StartWork:
     request: OrchestratorInput
     initial_task: Task
+    command_id: str | None = None
+    fingerprint: str = "start"
 
     @property
     def task_id(self) -> str:
@@ -569,6 +702,8 @@ class _StartWork:
 class _RecoverWork:
     task_id: str
     thread_id: str
+    command_id: str | None = None
+    fingerprint: str = "recover"
 
 
 @dataclass(frozen=True, slots=True)
@@ -576,12 +711,17 @@ class _ResumeWork:
     task_id: str
     thread_id: str
     response: ApprovalResponse
+    command_id: str | None = None
+    fingerprint: str = "approval"
 
 
 @dataclass(frozen=True, slots=True)
 class _CancelWork:
     task_id: str
     thread_id: str
+    reason: str | None = None
+    command_id: str | None = None
+    fingerprint: str = "cancel"
 
 
 _WorkItem = _StartWork | _RecoverWork | _ResumeWork | _CancelWork
@@ -624,8 +764,8 @@ class RuntimeApplication:
         self._close_resources = close_resources
         self._workers: list[asyncio.Task[None]] = []
         self._active: dict[str, asyncio.Task[object]] = {}
-        self._queued_task_ids: set[str] = set()
-        self._submission_enqueued: set[str] = set()
+        self._queued_commands: set[tuple[str, str]] = set()
+        self._active_fingerprints: dict[str, str] = {}
         self._background_errors: dict[str, str] = {}
         self._started = False
         self._closed = False
@@ -642,8 +782,15 @@ class RuntimeApplication:
             asyncio.create_task(self._worker(), name=f"agent-worker-{index}")
             for index in range(self._worker_count)
         ]
+        await self._pump_pending_commands()
+        durable_task_ids = {
+            command.task_id
+            for command in await asyncio.to_thread(self._store.list_runtime_commands)
+        }
         candidates = await asyncio.to_thread(self._store.list_recovery_candidates)
         for candidate in candidates:
+            if candidate.task.task_id in durable_task_ids:
+                continue
             if candidate.disposition is RecoveryDisposition.WAITING_APPROVAL:
                 continue
             if candidate.workflow_run is None:
@@ -655,7 +802,6 @@ class RuntimeApplication:
                 await self._enqueue(
                     _StartWork(request=request, initial_task=candidate.task)
                 )
-                self._submission_enqueued.add(candidate.task.task_id)
             else:
                 await self._enqueue(
                     _RecoverWork(
@@ -695,6 +841,14 @@ class RuntimeApplication:
         task = Task.receive(task_id=candidate_task_id, input=request.text, at=now)
         fingerprint = self._fingerprint(submission)
         idempotency = self._idempotency(submission, fingerprint, at=now)
+        start_fingerprint = f"start:{fingerprint}"
+        start_command = self._runtime_command(
+            task_id=task.task_id,
+            command_type=RuntimeCommandType.START,
+            fingerprint=start_fingerprint,
+            payload={"request": request.to_snapshot()},
+            at=now,
+        )
         try:
             write = await asyncio.to_thread(
                 self._store.create_task,
@@ -706,6 +860,7 @@ class RuntimeApplication:
                     occurred_at=now,
                 ),
                 idempotency=idempotency,
+                command=start_command,
             )
         except IdempotencyConflictError:
             raise ApplicationConflictError(
@@ -716,14 +871,27 @@ class RuntimeApplication:
             persisted.task_id,
             submission,
         )
-        if (
-            persisted.status is Status.RECEIVED
-            and persisted.task_id not in self._submission_enqueued
-        ):
+        persisted_command = self._runtime_command(
+            task_id=persisted.task_id,
+            command_type=RuntimeCommandType.START,
+            fingerprint=start_fingerprint,
+            payload={"request": persisted_request.to_snapshot()},
+            at=now,
+        )
+        command_record = await asyncio.to_thread(
+            self._store.put_runtime_command,
+            persisted_command,
+            expected_task=persisted,
+        )
+        if command_record.status is RuntimeCommandStatus.PENDING:
             await self._enqueue(
-                _StartWork(request=persisted_request, initial_task=persisted)
+                _StartWork(
+                    request=persisted_request,
+                    initial_task=persisted,
+                    command_id=command_record.command_id,
+                    fingerprint=command_record.fingerprint,
+                )
             )
-            self._submission_enqueued.add(persisted.task_id)
         return AcceptedTask(
             task_id=persisted.task_id,
             status=persisted.status.value,
@@ -791,20 +959,33 @@ class RuntimeApplication:
         task = await asyncio.to_thread(self._store.get_task, task_id)
         if task is None:
             raise ApplicationNotFoundError("Task가 없습니다.")
+        fingerprint = self._command_fingerprint(
+            RuntimeCommandType.APPROVAL,
+            {
+                "decision_id": command.decision_id,
+                "decision": command.decision.value,
+                "task_version": command.task_version,
+                "plan_hash": command.plan_hash,
+                "reason": command.reason,
+            },
+        )
+        existing = await self._runtime_command_replay(
+            task_id,
+            RuntimeCommandType.APPROVAL,
+            fingerprint,
+        )
+        if existing is not None:
+            if existing.status is RuntimeCommandStatus.PENDING:
+                await self._enqueue(await self._work_from_command(existing))
+            return AcceptedTask(task.task_id, task.status.value, task.version, True)
         if (
             task.status is not Status.WAITING_APPROVAL
             or task.version != command.task_version
             or task.plan_hash != command.plan_hash
         ):
-            replayed_response = await self._approval_replay(task_id, command)
-            await self._enqueue(
-                _ResumeWork(
-                    task_id=task.task_id,
-                    thread_id=task.task_id,
-                    response=replayed_response,
-                )
+            raise ApplicationConflictError(
+                "Approval command가 현재 Task binding과 다릅니다."
             )
-            return AcceptedTask(task.task_id, task.status.value, task.version, True)
         now = self._clock()
         if command.decision is ApprovalDecision.APPROVE:
             response = ApprovalResponse(
@@ -824,42 +1005,30 @@ class RuntimeApplication:
                 decision_id=command.decision_id,
                 reason=command.reason,
             )
-        await self._enqueue(
-            _ResumeWork(task_id=task.task_id, thread_id=task.task_id, response=response)
+        draft = self._runtime_command(
+            task_id=task.task_id,
+            command_type=RuntimeCommandType.APPROVAL,
+            fingerprint=fingerprint,
+            payload={"response": response.to_snapshot()},
+            at=now,
         )
-        return AcceptedTask(task.task_id, task.status.value, task.version, False)
-
-    async def _approval_replay(
-        self,
-        task_id: str,
-        command: ApprovalCommand,
-    ) -> ApprovalResponse:
-        """CAS와 graph Command 사이 crash의 exact persisted response를 복원한다."""
-
-        records = await asyncio.to_thread(
-            self._store.list_approval_decisions,
-            task_id,
-        )
-        record = next(
-            (
-                candidate
-                for candidate in records
-                if candidate.decision_id == command.decision_id
-            ),
-            None,
-        )
-        expected_accepted = command.decision is ApprovalDecision.APPROVE
-        if (
-            record is None
-            or record.task_version != command.task_version
-            or record.plan_hash != command.plan_hash
-            or record.response.accepted is not expected_accepted
-            or (not expected_accepted and record.response.reason != command.reason)
-        ):
-            raise ApplicationConflictError(
-                "Approval command가 현재 Task binding과 다릅니다."
+        try:
+            record = await asyncio.to_thread(
+                self._store.put_runtime_command,
+                draft,
+                expected_task=task,
             )
-        return record.response
+        except (OptimisticConcurrencyError, PersistenceConflictError):
+            raise ApplicationConflictError(
+                "Approval command가 현재 Task binding과 충돌했습니다."
+            ) from None
+        await self._enqueue(await self._work_from_command(record))
+        return AcceptedTask(
+            task.task_id,
+            task.status.value,
+            task.version,
+            record.replayed,
+        )
 
     async def cancel(
         self,
@@ -872,6 +1041,19 @@ class RuntimeApplication:
         task = await asyncio.to_thread(self._store.get_task, task_id)
         if task is None:
             raise ApplicationNotFoundError("Task가 없습니다.")
+        fingerprint = self._command_fingerprint(
+            RuntimeCommandType.CANCEL,
+            {"expected_version": command.expected_version, "reason": command.reason},
+        )
+        existing = await self._runtime_command_replay(
+            task_id,
+            RuntimeCommandType.CANCEL,
+            fingerprint,
+        )
+        if existing is not None:
+            if existing.status is RuntimeCommandStatus.PENDING:
+                await self._enqueue(await self._work_from_command(existing))
+            return AcceptedTask(task.task_id, task.status.value, task.version, True)
         if task.version != command.expected_version or task.status in {
             Status.COMPLETED,
             Status.REJECTED,
@@ -880,39 +1062,33 @@ class RuntimeApplication:
             Status.ESCALATED,
         }:
             raise ApplicationConflictError("Task가 terminal이거나 version이 다릅니다.")
-        if task.status is Status.RECEIVED:
-            cancelled = task.cancel(at=self._clock())
-            try:
-                await asyncio.to_thread(
-                    self._store.save_task,
-                    cancelled,
-                    expected_version=task.version,
-                    event=TaskEventDraft(
-                        event_id=f"event:{task.task_id}:{cancelled.version}",
-                        event_type="TASK_CANCELLED",
-                        payload={"reason": command.reason},
-                        occurred_at=cancelled.updated_at,
-                    ),
-                )
-            except Exception:  # noqa: BLE001 - persistence 상세를 숨긴다.
-                raise ApplicationConflictError(
-                    "Task cancellation이 충돌했습니다."
-                ) from None
-            return AcceptedTask(
-                cancelled.task_id,
-                cancelled.status.value,
-                cancelled.version,
-                False,
+        draft = self._runtime_command(
+            task_id=task.task_id,
+            command_type=RuntimeCommandType.CANCEL,
+            fingerprint=fingerprint,
+            payload={
+                "expected_version": command.expected_version,
+                "reason": command.reason,
+            },
+            at=self._clock(),
+        )
+        try:
+            record = await asyncio.to_thread(
+                self._store.put_runtime_command,
+                draft,
+                expected_task=task,
             )
-        active = self._active.get(task_id)
-        if active is not None:
-            active.cancel()
-            try:
-                await active
-            except asyncio.CancelledError:
-                pass
-        await self._enqueue(_CancelWork(task_id=task_id, thread_id=task_id))
-        return AcceptedTask(task.task_id, task.status.value, task.version, False)
+        except (OptimisticConcurrencyError, PersistenceConflictError):
+            raise ApplicationConflictError(
+                "Task cancellation이 다른 command와 충돌했습니다."
+            ) from None
+        await self._enqueue(await self._work_from_command(record))
+        return AcceptedTask(
+            task.task_id,
+            task.status.value,
+            task.version,
+            record.replayed,
+        )
 
     async def _workflow_for_task(self, task_id: str) -> object | None:
         candidates = await asyncio.to_thread(self._store.list_recovery_candidates)
@@ -924,13 +1100,26 @@ class RuntimeApplication:
         return await asyncio.to_thread(self._store.get_workflow_run_for_task, task_id)
 
     async def _enqueue(self, work: _WorkItem) -> None:
-        if work.task_id in self._queued_task_ids:
+        key = (work.task_id, work.fingerprint)
+        if key in self._queued_commands:
             return
+        active_fingerprint = self._active_fingerprints.get(work.task_id)
+        if active_fingerprint is not None and active_fingerprint != work.fingerprint:
+            raise ApplicationConflictError(
+                "Task에 다른 background command가 실행 중입니다."
+            )
+        if any(
+            task_id == work.task_id and fingerprint != work.fingerprint
+            for task_id, fingerprint in self._queued_commands
+        ):
+            raise ApplicationConflictError(
+                "Task에 다른 background command가 대기 중입니다."
+            )
         try:
             self._queue.put_nowait(work)
         except asyncio.QueueFull:
             raise ApplicationBusyError("Background queue가 가득 찼습니다.") from None
-        self._queued_task_ids.add(work.task_id)
+        self._queued_commands.add(key)
 
     async def _worker(self) -> None:
         while True:
@@ -940,25 +1129,46 @@ class RuntimeApplication:
                 return
             child = asyncio.create_task(self._dispatch(work))
             self._active[work.task_id] = child
+            self._active_fingerprints[work.task_id] = work.fingerprint
+            failed_command_id: str | None = None
             try:
                 await child
+                if work.command_id is not None:
+                    await asyncio.to_thread(
+                        self._store.complete_runtime_command,
+                        work.command_id,
+                        at=self._clock(),
+                    )
             except asyncio.CancelledError:
                 if not child.cancelled():
                     raise
             except Exception:  # noqa: BLE001 - 다음 startup에서 durable state를 복구한다.
                 self._background_errors[work.task_id] = "background_execution_failed"
+                failed_command_id = work.command_id
+                if work.command_id is not None:
+                    await asyncio.to_thread(
+                        self._store.record_runtime_command_failure,
+                        work.command_id,
+                        error_code="background_execution_failed",
+                        at=self._clock(),
+                    )
             finally:
                 self._active.pop(work.task_id, None)
-                self._queued_task_ids.discard(work.task_id)
+                self._active_fingerprints.pop(work.task_id, None)
+                self._queued_commands.discard((work.task_id, work.fingerprint))
+                await self._pump_pending_commands(exclude_command_id=failed_command_id)
                 self._queue.task_done()
 
     async def _dispatch(self, work: _WorkItem) -> object:
         if isinstance(work, _StartWork):
-            return await self._orchestrator.start(
-                work.request,
-                thread_id=work.task_id,
-                initial_task=work.initial_task,
-            )
+            try:
+                return await self._orchestrator.start(
+                    work.request,
+                    thread_id=work.task_id,
+                    initial_task=work.initial_task,
+                )
+            except OrchestrationStartError:
+                return await self._orchestrator.recover(thread_id=work.task_id)
         if isinstance(work, _RecoverWork):
             return await self._orchestrator.recover(thread_id=work.thread_id)
         if isinstance(work, _ResumeWork):
@@ -966,7 +1176,130 @@ class RuntimeApplication:
                 thread_id=work.thread_id,
                 response=work.response,
             )
-        return await self._orchestrator.cancel(thread_id=work.thread_id)
+        return await self._orchestrator.cancel(
+            thread_id=work.thread_id,
+            reason=work.reason,
+        )
+
+    async def _pump_pending_commands(
+        self,
+        *,
+        exclude_command_id: str | None = None,
+    ) -> None:
+        """Queue의 남은 용량만큼 durable pending command를 다시 올린다."""
+
+        commands = await asyncio.to_thread(self._store.list_pending_runtime_commands)
+        for command in commands:
+            if command.command_id == exclude_command_id:
+                continue
+            try:
+                work = await self._work_from_command(command)
+                await self._enqueue(work)
+            except ApplicationBusyError:
+                return
+
+    async def _work_from_command(self, command: RuntimeCommandRecord) -> _WorkItem:
+        task = await asyncio.to_thread(self._store.get_task, command.task_id)
+        if task is None:
+            raise ApplicationConflictError("Runtime command의 Task가 없습니다.")
+        if command.command_type is RuntimeCommandType.START:
+            events = await asyncio.to_thread(
+                self._store.list_task_events,
+                task.task_id,
+            )
+            request = self._request_from_events(task, events)
+            initial_task = Task.receive(
+                task_id=task.task_id,
+                input=task.input,
+                at=task.created_at,
+            )
+            return _StartWork(
+                request=request,
+                initial_task=initial_task,
+                command_id=command.command_id,
+                fingerprint=command.fingerprint,
+            )
+        if command.command_type is RuntimeCommandType.APPROVAL:
+            response = command.payload.get("response")
+            if not isinstance(response, Mapping):
+                raise ApplicationConflictError(
+                    "Approval command payload가 올바르지 않습니다."
+                )
+            try:
+                restored = ApprovalResponse.from_snapshot(response)
+            except (KeyError, TypeError, ValueError):
+                raise ApplicationConflictError(
+                    "Approval command payload가 올바르지 않습니다."
+                ) from None
+            return _ResumeWork(
+                task_id=task.task_id,
+                thread_id=task.task_id,
+                response=restored,
+                command_id=command.command_id,
+                fingerprint=command.fingerprint,
+            )
+        if command.command_type is RuntimeCommandType.CANCEL:
+            reason = command.payload.get("reason")
+            if reason is not None and not isinstance(reason, str):
+                raise ApplicationConflictError(
+                    "Cancel command payload가 올바르지 않습니다."
+                )
+            return _CancelWork(
+                task_id=task.task_id,
+                thread_id=task.task_id,
+                reason=reason,
+                command_id=command.command_id,
+                fingerprint=command.fingerprint,
+            )
+        raise ApplicationConflictError("지원하지 않는 Runtime command입니다.")
+
+    async def _runtime_command_replay(
+        self,
+        task_id: str,
+        command_type: RuntimeCommandType,
+        fingerprint: str,
+    ) -> RuntimeCommandRecord | None:
+        commands = await asyncio.to_thread(self._store.list_runtime_commands, task_id)
+        for command in commands:
+            if command.fingerprint == fingerprint:
+                if command.command_type is not command_type:
+                    raise ApplicationConflictError(
+                        "같은 command fingerprint의 종류가 다릅니다."
+                    )
+                return command
+        return None
+
+    @staticmethod
+    def _command_fingerprint(
+        command_type: RuntimeCommandType,
+        payload: Mapping[str, object],
+    ) -> str:
+        canonical = json.dumps(
+            {"command_type": command_type.value, "payload": dict(payload)},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return sha256(canonical.encode()).hexdigest()
+
+    @staticmethod
+    def _runtime_command(
+        *,
+        task_id: str,
+        command_type: RuntimeCommandType,
+        fingerprint: str,
+        payload: Mapping[str, object],
+        at: datetime,
+    ) -> RuntimeCommandDraft:
+        identity = sha256(f"{task_id}:{fingerprint}".encode()).hexdigest()
+        return RuntimeCommandDraft(
+            command_id=f"command:{identity}",
+            task_id=task_id,
+            command_type=command_type,
+            fingerprint=fingerprint,
+            payload=payload,
+            created_at=at,
+        )
 
     def _require_started(self) -> None:
         if not self._started or self._closed:

@@ -350,6 +350,34 @@ class HttpApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conflict.status_code, 409)
         self.assertNotIn("bearer-secret", conflict.text)
 
+    async def test_openapi_declares_command_conflict_and_queue_busy_responses(
+        self,
+    ) -> None:
+        """모든 비동기 command endpoint가 409/503 계약을 공개한다."""
+
+        paths = self.app.openapi()["paths"]
+        expected = {
+            "/v1/tasks": {"202", "409", "422", "503"},
+            "/v1/webhooks/alerts": {"202", "409", "422", "503"},
+            "/v1/webhooks/tickets": {"202", "409", "422", "503"},
+            "/v1/tasks/{task_id}/approval": {
+                "202",
+                "404",
+                "409",
+                "422",
+                "503",
+            },
+            "/v1/tasks/{task_id}/cancel": {
+                "202",
+                "404",
+                "409",
+                "422",
+                "503",
+            },
+        }
+        for path, response_codes in expected.items():
+            self.assertEqual(set(paths[path]["post"]["responses"]), response_codes)
+
     async def test_lifespan_starts_and_stops_the_injected_application(self) -> None:
         """FastAPI lifespan에서 runtime 자원 수명 호출이 빠지면 실패한다."""
 

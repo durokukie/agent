@@ -1149,9 +1149,18 @@ class OrchestratorService:
         if (
             requested.task_event_type != recorded.task_event_type
             or requested.task_event_payload != recorded.task_event_payload
-            or requested.agent_run != recorded.agent_run
         ):
             return False
+        if requested.agent_run is None or recorded.agent_run is None:
+            if requested.agent_run is not recorded.agent_run:
+                return False
+        else:
+            requested_agent_run = requested.agent_run.to_snapshot()
+            recorded_agent_run = recorded.agent_run.to_snapshot()
+            requested_agent_run.pop("completed_at")
+            recorded_agent_run.pop("completed_at")
+            if requested_agent_run != recorded_agent_run:
+                return False
         requested_task = requested.task.to_snapshot()
         recorded_task = recorded.task.to_snapshot()
         requested_task.pop("updated_at")
@@ -1760,10 +1769,17 @@ class OrchestratorService:
             state["__interrupt__"] = snapshot.interrupts
         return self._result_from_state(state)
 
-    async def cancel(self, *, thread_id: str) -> OrchestrationResult:
+    async def cancel(
+        self,
+        *,
+        thread_id: str,
+        reason: str | None = None,
+    ) -> OrchestrationResult:
         """Checkpoint의 활성 Task를 terminal cancellation으로 전이한다."""
 
         _require_text(thread_id, field_name="thread_id")
+        if reason is not None:
+            _require_text(reason, field_name="reason")
         config = {"configurable": {"thread_id": thread_id}}
         async with (
             self._thread_locks.setdefault(thread_id, asyncio.Lock()),
@@ -1789,7 +1805,7 @@ class OrchestratorService:
                     task=cancelled,
                     workflow=current.workflow,
                     task_event_type="TASK_CANCELLED",
-                    task_event_payload={"errors": []},
+                    task_event_payload={"reason": reason, "errors": []},
                 )
             )
             try:

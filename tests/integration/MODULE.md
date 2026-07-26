@@ -37,7 +37,9 @@ rollback, event append-only, 멱등성 race, Approval 단일 소비와 ApprovalR
 malformed 결과와 모든 retry failure code를 compiled graph의 공개 facade에서 검증한다. 이후
 FastAPI ASGI부터 runtime queue, compiled graph, SQLite journal/checkpoint까지 read-only 완료,
 사람 승인과 취소를 실제 수직 경로로 검증한다. Runtime contract는 durable-before-queue,
-webhook 멱등성, bounded dispatch, startup recovery, approval/cancel 명령, callback clock replay와
+webhook 멱등성, queue 포화 뒤 durable pump, background failure exact retry, startup command
+recovery, CAS 뒤 approval 자동 복구, approval/cancel 명령과 취소 사유 감사, DB-ahead 전체
+callback과 completion clock replay, OpenAPI 409/503 계약과
 소유 자원 종료를 검증한다.
 
 ## 변경 시 문서 갱신 조건

@@ -32,8 +32,11 @@ framework에 독립적인 `Task`, `WorkflowRun`, `AgentRun`, `Approval`, `Execut
 Task 6 runtime은 이미 저장한 exact `RECEIVED` v1을 `start(initial_task=...)`로 전달한다.
 필수 `OrchestrationJournal` seam은 모든 Task version, WorkflowRun phase/rebind와 AgentRun
 발급·완료를 persistence adapter에 전달하고 authoritative callback replay를 돌려받는다.
-일반 callback은 상태 identity를 엄격히 검증하되 재실행마다 달라질 수 있는 `updated_at`은
-저장된 값을 허용한다. `cancel()`은 활성 Task를 `CANCELLED`로 journal에 기록한 뒤 graph의
+일반 callback은 상태 identity를 엄격히 검증하되 DB journal이 checkpoint보다 앞선 모든
+node replay에서는 이미 저장된 Task version, phase/budget, AgentRun과 terminal 결과를
+authoritative 값으로 돌려준다. 재실행 clock의 `updated_at`과 AgentRun `completed_at` 차이는
+허용한다. `cancel(reason=...)`은 사유를 TASK_CANCELLED 감사 payload에 보존하고 활성 Task를
+`CANCELLED`로 journal에 기록한 뒤 graph의
 terminal checkpoint와 동기화하며 이후 `recover()`는 부수 효과 없이 같은 결과를 반환한다.
 
 ## 의존성과 허용된 import 방향
@@ -78,8 +81,9 @@ LangGraph 통합 테스트는 실제 `InMemorySaver`, `interrupt`, `Command`를 
 
 Task 4 persistence 통합 테스트는 같은 Approval의 동시·반복 전달에서 `binding`과 Task version을 optimistic transaction으로 비교해 정확히 한 요청만 `WAITING_APPROVAL → RUNNING`을 저장하고 나머지는 stale/idempotent 결과가 되는지 반드시 검증한다. 또한 `begin_agent_run()`이 반환한 issuance 포함 WorkflowRun과 AgentRun을 한 transaction에 함께 저장하고, 저장된 모든 historical/current AgentRun을 해당 WorkflowRun snapshot과 함께 복원하는지 검증한다.
 
-Journal 통합 테스트는 모든 생명주기 callback 순서, persisted clock과 issuance의
-authoritative replay, journal 오류 정규화, 승인 대기·실행 중 취소와 checkpoint terminal
+Journal 통합 테스트는 모든 생명주기 callback 순서, DB-ahead Task/phase/issuance/completion/
+terminal callback, persisted clock과 issuance의 authoritative replay, journal 오류 정규화,
+취소 사유 감사, 승인 대기·실행 중 취소와 checkpoint terminal
 동기화를 실제 compiled graph에서 검증한다.
 
 ## 변경 시 문서 갱신 조건

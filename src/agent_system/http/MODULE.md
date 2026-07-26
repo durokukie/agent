@@ -28,7 +28,8 @@ FastAPI application을 반환한다. 일반 Task 생성은 선택적 `Idempotenc
 - `POST /v1/tasks/{task_id}/cancel`
 
 명령 수락은 `202`, 알 수 없는 Task는 `404`, 멱등성·version·terminal·승인 경합은
-`409`, request schema 오류는 FastAPI의 `422`를 반환한다.
+`409`, request schema 오류는 FastAPI의 `422`, bounded queue 포화는 `503`을 반환한다.
+모든 POST command endpoint는 가능한 `409`와 `503`을 OpenAPI 응답으로 선언한다.
 
 ## 의존성과 허용된 import 방향
 

@@ -245,7 +245,11 @@ def create_app(application: TaskApplication) -> FastAPI:
         "/v1/tasks",
         status_code=status.HTTP_202_ACCEPTED,
         response_model=AcceptedTaskResponse,
-        responses={422: {"model": ErrorResponse}},
+        responses={
+            409: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
     )
     async def submit_task(
         body: UserTaskRequest,
@@ -272,7 +276,11 @@ def create_app(application: TaskApplication) -> FastAPI:
         "/v1/webhooks/alerts",
         status_code=status.HTTP_202_ACCEPTED,
         response_model=AcceptedTaskResponse,
-        responses={422: {"model": ErrorResponse}},
+        responses={
+            409: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
     )
     async def submit_alert(body: AlertWebhookRequest) -> AcceptedTaskResponse:
         accepted = await application.submit(
@@ -287,7 +295,11 @@ def create_app(application: TaskApplication) -> FastAPI:
         "/v1/webhooks/tickets",
         status_code=status.HTTP_202_ACCEPTED,
         response_model=AcceptedTaskResponse,
-        responses={409: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+        responses={
+            409: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
     )
     async def submit_ticket(body: TicketWebhookRequest) -> AcceptedTaskResponse:
         accepted = await application.submit(
@@ -314,6 +326,7 @@ def create_app(application: TaskApplication) -> FastAPI:
             404: {"model": ErrorResponse},
             409: {"model": ErrorResponse},
             422: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
         },
     )
     async def approve_task(
@@ -340,6 +353,7 @@ def create_app(application: TaskApplication) -> FastAPI:
             404: {"model": ErrorResponse},
             409: {"model": ErrorResponse},
             422: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
         },
     )
     async def cancel_task(

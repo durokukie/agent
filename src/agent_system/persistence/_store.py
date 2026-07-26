@@ -37,6 +37,7 @@ from ._schema import (
     ApprovalRow,
     OutboxRow,
     RequestIdempotencyRow,
+    RuntimeCommandRow,
     TaskEventRow,
     TaskRow,
     WorkflowRunRow,
@@ -59,6 +60,10 @@ from ._values import (
     PersistenceNotFoundError,
     RecoveryCandidate,
     RecoveryDisposition,
+    RuntimeCommandDraft,
+    RuntimeCommandRecord,
+    RuntimeCommandStatus,
+    RuntimeCommandType,
     TaskEvent,
     TaskEventDraft,
     TaskWriteResult,
@@ -143,6 +148,26 @@ def _event_from_row(row: TaskEventRow) -> TaskEvent:
         event_type=row.event_type,
         payload=_json_load(row.payload_json),
         occurred_at=_parse_datetime(row.occurred_at),
+    )
+
+
+def _runtime_command_from_row(
+    row: RuntimeCommandRow,
+    *,
+    replayed: bool = False,
+) -> RuntimeCommandRecord:
+    return RuntimeCommandRecord(
+        command_id=row.command_id,
+        task_id=row.task_id,
+        command_type=RuntimeCommandType(row.command_type),
+        fingerprint=row.fingerprint,
+        payload=_json_load(row.payload_json),
+        status=RuntimeCommandStatus(row.status),
+        attempt_count=row.attempt_count,
+        created_at=datetime.fromisoformat(row.created_at),
+        updated_at=datetime.fromisoformat(row.updated_at),
+        last_error=row.last_error,
+        replayed=replayed,
     )
 
 
@@ -279,6 +304,7 @@ class SQLiteStore:
         event: TaskEventDraft,
         outbox: OutboxDraft | None = None,
         idempotency: IdempotencyKey | None = None,
+        command: RuntimeCommandDraft | None = None,
     ) -> TaskWriteResult:
         """최초 Task, event와 선택적 outbox를 한 transaction에 기록한다."""
 
@@ -295,6 +321,10 @@ class SQLiteStore:
             occurred_at=event.occurred_at,
         )
         outbox_value = None if outbox is None else self._new_outbox(task, outbox)
+        if command is not None and command.task_id != task.task_id:
+            raise InvalidPersistenceValueError(
+                "Runtime command와 Task의 task_id가 다릅니다."
+            )
         try:
             with self._session() as session, session.begin():
                 if idempotency is not None:
@@ -355,6 +385,8 @@ class SQLiteStore:
                             last_error=outbox_value.last_error,
                         )
                     )
+                if command is not None:
+                    session.add(self._runtime_command_row(command))
                 if idempotency is not None:
                     session.add(
                         RequestIdempotencyRow(
@@ -371,6 +403,150 @@ class SQLiteStore:
             task=task,
             event=event_value,
             outbox=outbox_value,
+        )
+
+    def put_runtime_command(
+        self,
+        command: RuntimeCommandDraft,
+        *,
+        expected_task: Task,
+    ) -> RuntimeCommandRecord:
+        """Task snapshot에 결합된 명령을 저장하거나 exact replay를 반환한다."""
+
+        try:
+            with self._session() as session, session.begin():
+                existing = session.scalar(
+                    select(RuntimeCommandRow).where(
+                        RuntimeCommandRow.task_id == command.task_id,
+                        RuntimeCommandRow.fingerprint == command.fingerprint,
+                    )
+                )
+                if existing is not None:
+                    restored = _runtime_command_from_row(existing, replayed=True)
+                    if restored.command_type is not command.command_type or dict(
+                        restored.payload
+                    ) != dict(command.payload):
+                        raise PersistenceConflictError(
+                            "같은 command fingerprint의 내용이 다릅니다."
+                        )
+                    return restored
+                current_row = session.get(TaskRow, command.task_id)
+                if current_row is None or _task_from_row(current_row) != expected_task:
+                    raise OptimisticConcurrencyError(
+                        "Runtime command의 Task snapshot이 현재 값과 다릅니다."
+                    )
+                active = session.scalar(
+                    select(RuntimeCommandRow).where(
+                        RuntimeCommandRow.task_id == command.task_id,
+                        RuntimeCommandRow.status == RuntimeCommandStatus.PENDING.value,
+                    )
+                )
+                if active is not None:
+                    raise PersistenceConflictError(
+                        "Task에 다른 background command가 대기 중입니다."
+                    )
+                row = self._runtime_command_row(command)
+                session.add(row)
+                session.flush()
+                return _runtime_command_from_row(row)
+        except IntegrityError as error:
+            raise PersistenceConflictError(
+                "Runtime command identity 또는 활성 순서가 충돌했습니다."
+            ) from error
+
+    def list_pending_runtime_commands(self) -> tuple[RuntimeCommandRecord, ...]:
+        """Startup과 queue pump가 처리할 명령을 생성 순서로 반환한다."""
+
+        statement = select(RuntimeCommandRow).where(
+            RuntimeCommandRow.status == RuntimeCommandStatus.PENDING.value
+        )
+        with self._session() as session, session.begin():
+            records = tuple(
+                _runtime_command_from_row(row) for row in session.scalars(statement)
+            )
+        return tuple(
+            sorted(
+                records,
+                key=lambda record: (
+                    record.created_at.astimezone(UTC),
+                    record.command_id,
+                ),
+            )
+        )
+
+    def list_runtime_commands(
+        self,
+        task_id: str | None = None,
+    ) -> tuple[RuntimeCommandRecord, ...]:
+        """Task 필터를 선택해 모든 command history를 반환한다."""
+
+        statement = select(RuntimeCommandRow)
+        if task_id is not None:
+            statement = statement.where(RuntimeCommandRow.task_id == task_id)
+        with self._session() as session, session.begin():
+            records = tuple(
+                _runtime_command_from_row(row) for row in session.scalars(statement)
+            )
+        return tuple(
+            sorted(records, key=lambda record: (record.created_at, record.command_id))
+        )
+
+    def record_runtime_command_failure(
+        self,
+        command_id: str,
+        *,
+        error_code: str,
+        at: datetime,
+    ) -> RuntimeCommandRecord:
+        """실패한 명령을 pending으로 유지하고 안정적인 오류만 기록한다."""
+
+        with self._session() as session, session.begin():
+            row = session.get(RuntimeCommandRow, command_id)
+            if row is None:
+                raise PersistenceNotFoundError("Runtime command가 없습니다.")
+            if row.status != RuntimeCommandStatus.PENDING.value:
+                raise PersistenceConflictError(
+                    "완료된 Runtime command는 실패할 수 없습니다."
+                )
+            row.attempt_count += 1
+            row.last_error = error_code
+            row.updated_at = at.isoformat()
+            session.flush()
+            return _runtime_command_from_row(row)
+
+    def complete_runtime_command(
+        self,
+        command_id: str,
+        *,
+        at: datetime,
+    ) -> RuntimeCommandRecord:
+        """성공한 command를 terminal COMPLETED로 전이한다."""
+
+        with self._session() as session, session.begin():
+            row = session.get(RuntimeCommandRow, command_id)
+            if row is None:
+                raise PersistenceNotFoundError("Runtime command가 없습니다.")
+            if row.status == RuntimeCommandStatus.COMPLETED.value:
+                return _runtime_command_from_row(row, replayed=True)
+            row.status = RuntimeCommandStatus.COMPLETED.value
+            row.updated_at = at.isoformat()
+            row.last_error = None
+            session.flush()
+            return _runtime_command_from_row(row)
+
+    @staticmethod
+    def _runtime_command_row(command: RuntimeCommandDraft) -> RuntimeCommandRow:
+        return RuntimeCommandRow(
+            command_id=command.command_id,
+            task_id=command.task_id,
+            command_type=command.command_type.value,
+            fingerprint=command.fingerprint,
+            payload_json=_json_dump(dict(command.payload)),
+            status=RuntimeCommandStatus.PENDING.value,
+            attempt_count=0,
+            created_at=command.created_at.isoformat(),
+            updated_at=command.created_at.isoformat(),
+            last_error=None,
         )
 
     def save_task(

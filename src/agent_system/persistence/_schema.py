@@ -5,10 +5,12 @@ from __future__ import annotations
 from sqlalchemy import (
     CheckConstraint,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -196,12 +198,51 @@ class ApprovalDecisionRow(Base):
     failure: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
 
+class RuntimeCommandRow(Base):
+    """HTTP 202 전에 저장하는 background command row."""
+
+    __tablename__ = "runtime_commands"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "fingerprint",
+            name="uq_runtime_commands_task_fingerprint",
+        ),
+        Index(
+            "uq_runtime_commands_pending_task",
+            "task_id",
+            unique=True,
+            sqlite_where=text("status = 'PENDING'"),
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_runtime_commands_attempt_nonnegative",
+        ),
+    )
+
+    command_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    task_id: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("tasks.task_id", ondelete="RESTRICT"),
+        index=True,
+    )
+    command_type: Mapped[str] = mapped_column(String(32))
+    fingerprint: Mapped[str] = mapped_column(String(255))
+    payload_json: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[str] = mapped_column(Text)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 __all__ = [
     "AgentRunRow",
     "ApprovalDecisionRow",
     "ApprovalRow",
     "OutboxRow",
     "RequestIdempotencyRow",
+    "RuntimeCommandRow",
     "TaskEventRow",
     "TaskRow",
     "WorkflowRunRow",

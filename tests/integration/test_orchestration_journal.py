@@ -75,6 +75,27 @@ class _AuthoritativePhaseJournal(orchestration.RecordingOrchestrationJournal):
         return await super().record(entry)
 
 
+class _AuthoritativeCompletionJournal(orchestration.RecordingOrchestrationJournal):
+    """AgentRun completion callback의 먼저 저장된 완료 시각을 반환한다."""
+
+    async def record(
+        self, entry: orchestration.OrchestrationJournalEntry
+    ) -> orchestration.OrchestrationJournalEntry:
+        if entry.agent_run is not None and entry.agent_run.is_completed:
+            assert entry.workflow is not None
+            snapshot = entry.agent_run.to_snapshot()
+            snapshot["completed_at"] = entry.agent_run.started_at.isoformat()
+            entry = orchestration.OrchestrationJournalEntry(
+                task=entry.task,
+                workflow=entry.workflow,
+                agent_run=orchestration.AgentRun.from_snapshot(
+                    snapshot,
+                    workflow=entry.workflow,
+                ),
+            )
+        return await super().record(entry)
+
+
 class _RecordingCoordinator(orchestration.FakeExecutionCoordinator):
     def __init__(self) -> None:
         super().__init__()
@@ -478,6 +499,48 @@ class OrchestrationJournalGraphTests(unittest.IsolatedAsyncioTestCase):
             analyzing.workflow.started_at,
         )
 
+    async def test_agent_completion_replay_uses_authoritative_persisted_clock(
+        self,
+    ) -> None:
+        """AgentRun completion 뒤 checkpoint 전 crash의 clock replay를 허용한다."""
+
+        journal = _AuthoritativeCompletionJournal()
+        registry = AgentRegistry()
+        registry.register(FakeAgent(AgentMetadata("reader", "조회", "상태 조회")))
+        moments = iter(NOW + timedelta(seconds=index) for index in range(20))
+        service = orchestration.OrchestratorService(
+            classifier=orchestration.FakeRequestClassifier(
+                {
+                    orchestration.RequestKind.USER_TASK: orchestration.RoutingDecision(
+                        orchestration.RequestKind.USER_TASK,
+                        "reader",
+                        orchestration.ActionKind.READ_ONLY,
+                        "상태 조회",
+                    )
+                }
+            ),
+            governance=orchestration.FakeGovernance(approved=True, reason="허용"),
+            approval_consumer=orchestration.FakeApprovalConsumer(),
+            execution_coordinator=orchestration.FakeExecutionCoordinator(),
+            journal=journal,
+            registry=registry,
+            max_agent_runs=1,
+            checkpointer=InMemorySaver(),
+            clock=lambda: next(moments),
+            id_factory=iter(("workflow-completion", "agent-run-completion")).__next__,
+        )
+
+        result = await service.start(
+            orchestration.UserTaskInput("task-completion", "상태 조회"),
+            thread_id="thread-completion",
+        )
+
+        self.assertEqual(result.task.status, orchestration.Status.COMPLETED)
+        self.assertEqual(
+            result.agent_runs[0].completed_at,
+            result.agent_runs[0].started_at,
+        )
+
     async def test_classifier_failure_records_terminal_task_and_stable_errors(
         self,
     ) -> None:
@@ -739,7 +802,10 @@ class OrchestrationCancellationTests(unittest.IsolatedAsyncioTestCase):
         entries_before_cancel = len(journal.entries)
 
         try:
-            cancelled = await service.cancel(thread_id="thread-cancel")
+            cancelled = await service.cancel(
+                thread_id="thread-cancel",
+                reason="운영자 중단 요청",
+            )
         except NotImplementedError:
             self.fail("OrchestratorService.cancel이 구현되지 않았습니다.")
 
@@ -748,6 +814,10 @@ class OrchestrationCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(journal.entries), entries_before_cancel + 1)
         self.assertEqual(journal.entries[-1].task_event_type, "TASK_CANCELLED")
         self.assertEqual(journal.entries[-1].task, cancelled.task)
+        self.assertEqual(
+            journal.entries[-1].task_event_payload,
+            {"reason": "운영자 중단 요청", "errors": []},
+        )
         snapshot = await service._graph.aget_state(
             {"configurable": {"thread_id": "thread-cancel"}}
         )

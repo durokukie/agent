@@ -17,6 +17,7 @@ persistence 결과 값만 반환한다.
 - 기존 Approval 기록과 ApprovalResponse 승인·거절 decision의 단일 소비 및 exact 결과 snapshot
 - webhook/request 멱등성 key
 - transactional notification outbox와 상태 전이
+- durable START/APPROVAL/CANCEL runtime command와 실행 상태·실패 이력
 - non-terminal startup recovery 조회
 - 별도 `sqlite3.Connection`을 소유하는 LangGraph `SqliteSaver`
 - Alembic migration 실행 함수와 revision
@@ -33,6 +34,11 @@ namespace/key와 같은 fingerprint는 기존 Task를 replay 결과로 반환하
 다르면 `IdempotencyConflictError`다. Task 변경은 현재 version과 정확히 다음 version을
 비교한다. 불일치는 `OptimisticConcurrencyError`이며 snapshot과 event 어느 것도
 부분 commit하지 않는다.
+
+Task 생성은 선택적인 START command까지 같은 transaction에 묶을 수 있다. 이후 APPROVAL과
+CANCEL command는 authoritative Task snapshot에 CAS로 결합한다. Task별 PENDING command는
+하나이며 같은 fingerprint/type/payload만 exact replay다. 성공한 worker는 COMPLETED로
+전환하고 실패한 worker는 PENDING 상태에서 attempt와 안정적인 오류 code를 갱신한다.
 
 `WAITING_APPROVAL → RUNNING`은 일반 Task 저장으로 우회할 수 없다. 기존
 `apply_approval()`은 `Approval` 수락 호출과 outbox 계약을 유지한다.
@@ -77,7 +83,8 @@ Task 명령은 저장된 snapshot을 읽고 optimistic 조건을 검증한 뒤 �
 저장된다. 시작 시 recovery 조회는 terminal Task를 제외하고
 `WAITING_APPROVAL`을 대기 항목으로, 나머지 active Task를 재개 항목으로 구분한다.
 재개 항목은 최초 수락부터 안정적인 Task ID를 thread id로 사용하고 별도 checkpointer가 기존 checkpoint를 읽어 graph 실행을
-계속한다.
+계속한다. Runtime command recovery는 생성 시각 순으로 PENDING 의도를 읽어 bounded queue에
+공급하며 Task journal이 checkpoint보다 앞선 경우에도 command를 잃지 않는다.
 
 ## 설계 결정과 제약사항
 
@@ -101,7 +108,8 @@ Alembic만 생성·변경하며 `MetaData.create_all()`을 migration 대체 수�
 schema drift, WAL/foreign key/busy timeout, domain snapshot fidelity, optimistic
 rollback, event append-only, request idempotency race, Approval replay/conflict와 동시
 소비, ApprovalResponse 승인·거절의 별도 connection 경합·exact replay·rollback·명시적
-decision/binding/version/terminal conflict, WorkflowRun/AgentRun의 정확한 다음 상태 원자 저장·소유 복원, offset 혼합 목록
+decision/binding/version/terminal conflict, runtime command의 원자 생성·exact fingerprint
+replay·Task별 pending 순서·failure retry, WorkflowRun/AgentRun의 정확한 다음 상태 원자 저장·소유 복원, offset 혼합 목록
 정렬, outbox 전이, terminal 제외 recovery를 통합 테스트한다. 실제 LangGraph graph를
 interrupt한 뒤 checkpointer를 닫고 새 connection에서 resume한다. 외부 서비스는
 사용하지 않는다.
