@@ -318,6 +318,16 @@ class OrchestrationJournalGraphTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(journal.entries[0].task, initial_task)
+        self.assertEqual(
+            journal.entries[0].task_event_payload,
+            {
+                "request": {
+                    "kind": "user_task",
+                    "task_id": "task-initial",
+                    "input": "상태 확인",
+                }
+            },
+        )
         self.assertEqual(result.task.created_at, initial_task.created_at)
 
     async def test_mutating_run_records_plan_wait_approval_and_terminal_versions(

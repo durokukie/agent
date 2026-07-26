@@ -1651,7 +1651,7 @@ class OrchestratorService:
                     task=task,
                     workflow=None,
                     task_event_type="TASK_RECEIVED",
-                    task_event_payload={},
+                    task_event_payload={"request": request.to_snapshot()},
                 )
             )
             task = received.task

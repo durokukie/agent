@@ -22,9 +22,11 @@ from agent_system.orchestration import (
     Approval,
     ApprovalConsumeStatus,
     ApprovalResponse,
+    ApprovalResumeError,
     FakeExecutionCoordinator,
     FakeGovernance,
     FakeRequestClassifier,
+    OrchestrationCancellationError,
     OrchestrationJournalEntry,
     OrchestratorService,
     Phase,
@@ -122,6 +124,43 @@ class _BlockingResumeOrchestrator(_RecordingOrchestrator):
         await super().resume(thread_id=thread_id, response=response)
         self.resume_entered.set()
         await self.release_resume.wait()
+
+
+class _TerminalCommandReplayOrchestrator(_RecordingOrchestrator):
+    """Checkpoint에는 이미 적용됐지만 command만 pending인 crash를 재현한다."""
+
+    async def resume(self, *, thread_id: str, response: object) -> None:
+        await super().resume(thread_id=thread_id, response=response)
+        raise ApprovalResumeError("이미 terminal인 approval checkpoint")
+
+    async def cancel(self, *, thread_id: str, reason: str | None = None) -> None:
+        await super().cancel(thread_id=thread_id, reason=reason)
+        raise OrchestrationCancellationError("이미 terminal인 cancel checkpoint")
+
+
+class _MixedFailureOrchestrator(_RecordingOrchestrator):
+    """한 poison command와 늦게 완료되는 정상 command를 함께 실행한다."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.poison_attempts = 0
+        self.poison_failed = asyncio.Event()
+        self.release_healthy = asyncio.Event()
+
+    async def start(
+        self,
+        request: object,
+        *,
+        thread_id: str,
+        initial_task: Task,
+    ) -> None:
+        await super().start(request, thread_id=thread_id, initial_task=initial_task)
+        assert isinstance(request, UserTaskInput)
+        if request.input == "poison":
+            self.poison_attempts += 1
+            self.poison_failed.set()
+            raise RuntimeError("poison command")
+        await self.release_healthy.wait()
 
 
 class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
@@ -265,13 +304,12 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
         await application.submit(
             Submission(SubmissionKind.USER_TASK, {"input": "두 번째"})
         )
-        with self.assertRaises(ApplicationBusyError):
-            await application.submit(
+        try:
+            third = await application.submit(
                 Submission(SubmissionKind.USER_TASK, {"input": "세 번째"})
             )
-
-        try:
             self.assertIsNotNone(self.store.get_task("queue-3"))
+            self.assertEqual(third.task_id, "queue-3")
             self.assertCountEqual(
                 (
                     command.task_id
@@ -288,6 +326,40 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
             ["queue-1", "queue-2", "queue-3"],
         )
         self.assertEqual(self.store.list_pending_runtime_commands(), ())
+
+    async def test_other_worker_completion_does_not_retry_a_poison_command(
+        self,
+    ) -> None:
+        """다른 command 완료가 실패 command의 즉시 재시도 trigger가 되면 실패한다."""
+
+        await self.application.stop()
+        orchestrator = _MixedFailureOrchestrator()
+        ids = iter(("poison-task", "healthy-task"))
+        self.application = RuntimeApplication(
+            store=self.store,
+            orchestrator=orchestrator,
+            queue_capacity=4,
+            worker_count=2,
+            clock=lambda: NOW,
+            id_factory=lambda: next(ids),
+        )
+        await self.application.start()
+
+        await self.application.submit(
+            Submission(SubmissionKind.USER_TASK, {"input": "poison"}, "poison")
+        )
+        await self.application.submit(
+            Submission(SubmissionKind.USER_TASK, {"input": "healthy"}, "healthy")
+        )
+        await orchestrator.poison_failed.wait()
+        orchestrator.release_healthy.set()
+        await self.application.drain()
+
+        self.assertEqual(orchestrator.poison_attempts, 1)
+        pending = self.store.list_pending_runtime_commands()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].task_id, "poison-task")
+        self.assertEqual(pending[0].attempt_count, 1)
 
     async def test_background_failure_stays_pending_without_a_tight_retry_loop(
         self,
@@ -336,6 +408,59 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(orchestrator.starts), 2)
         self.assertEqual(self.store.list_pending_runtime_commands(), ())
 
+    async def test_restart_preserves_failed_command_retry_eligibility(self) -> None:
+        """재시작이 durable backoff를 지우거나 영구 suppression하면 실패한다."""
+
+        await self.application.stop()
+        failing = _FailingOrchestrator()
+        self.application = RuntimeApplication(
+            store=self.store,
+            orchestrator=failing,
+            queue_capacity=1,
+            worker_count=1,
+            clock=lambda: NOW,
+            id_factory=lambda: "retry-restart",
+        )
+        await self.application.start()
+        await self.application.submit(
+            Submission(SubmissionKind.USER_TASK, {"input": "재시작 backoff"})
+        )
+        await self.application.drain()
+        await self.application.stop()
+
+        before_eligible = _RecordingOrchestrator()
+        self.application = RuntimeApplication(
+            store=self.store,
+            orchestrator=before_eligible,
+            queue_capacity=1,
+            worker_count=1,
+            clock=lambda: NOW + timedelta(seconds=1),
+            id_factory=lambda: "unused-before",
+        )
+        await self.application.start()
+        await asyncio.sleep(0)
+        self.assertEqual(before_eligible.starts, [])
+        self.assertEqual(
+            self.store.list_pending_runtime_commands()[0].attempt_count,
+            1,
+        )
+        await self.application.stop()
+
+        eligible = _RecordingOrchestrator()
+        self.application = RuntimeApplication(
+            store=self.store,
+            orchestrator=eligible,
+            queue_capacity=1,
+            worker_count=1,
+            clock=lambda: NOW + timedelta(seconds=31),
+            id_factory=lambda: "unused-after",
+        )
+        await self.application.start()
+        await self.application.drain()
+
+        self.assertEqual([call[1] for call in eligible.starts], ["retry-restart"])
+        self.assertEqual(self.store.list_pending_runtime_commands(), ())
+
     async def test_startup_recovers_a_durable_received_task_once(self) -> None:
         """Process restart가 queue 이전 RECEIVED Task를 잃으면 실패한다."""
 
@@ -380,6 +505,51 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
             call for call in self.orchestrator.starts if call[1] == "task-restart"
         ]
         self.assertEqual(len(recovered_starts), 1)
+
+    async def test_startup_defers_legacy_recovery_beyond_queue_capacity(self) -> None:
+        """Migration 전 Task가 queue 용량보다 많아도 startup은 성공해야 한다."""
+
+        await self.application.stop()
+        for index in range(3):
+            task = Task.receive(
+                task_id=f"legacy-{index}",
+                input="legacy recovery",
+                at=NOW + timedelta(seconds=index),
+            )
+            self.store.create_task(
+                task,
+                event=TaskEventDraft(
+                    event_id=f"event:legacy-{index}:1",
+                    event_type="TASK_RECEIVED",
+                    payload={
+                        "request": {
+                            "kind": "user_task",
+                            "task_id": task.task_id,
+                            "input": task.input,
+                        }
+                    },
+                    occurred_at=task.updated_at,
+                ),
+            )
+        orchestrator = _BlockingOrchestrator()
+        self.application = RuntimeApplication(
+            store=self.store,
+            orchestrator=orchestrator,
+            queue_capacity=1,
+            worker_count=1,
+            clock=lambda: NOW + timedelta(seconds=10),
+            id_factory=lambda: "unused",
+        )
+
+        await self.application.start()
+        await orchestrator.entered.wait()
+        orchestrator.release.set()
+        await self.application.drain()
+
+        self.assertCountEqual(
+            (thread_id for _, thread_id, _ in orchestrator.starts),
+            ("legacy-0", "legacy-1", "legacy-2"),
+        )
 
     async def test_startup_recovers_active_checkpoint_by_runtime_task_thread(
         self,
@@ -650,6 +820,80 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.store.list_pending_runtime_commands(), ())
 
+    async def test_startup_completes_commands_already_terminal_in_checkpoint(
+        self,
+    ) -> None:
+        """Graph terminal 후 command 완료 전 crash는 exact recover로 종료해야 한다."""
+
+        await self.application.stop()
+        approval_task = self._persist_waiting_task("terminal-approval")
+        approval_response = ApprovalResponse.reject(
+            decision_id="terminal-decision",
+            reason="승인하지 않음",
+        )
+        self.store.put_runtime_command(
+            RuntimeCommandDraft(
+                command_id="command:terminal-approval",
+                task_id=approval_task.task_id,
+                command_type=RuntimeCommandType.APPROVAL,
+                fingerprint="approval:terminal",
+                payload={"response": approval_response.to_snapshot()},
+                created_at=NOW + timedelta(seconds=4),
+            ),
+            expected_task=approval_task,
+        )
+        await SQLiteApprovalConsumer(self.store).consume(
+            task=approval_task,
+            response=approval_response,
+            at=NOW + timedelta(seconds=4),
+        )
+
+        cancel_task = self._persist_waiting_task("terminal-cancel")
+        cancel_reason = "운영자 중단"
+        self.store.put_runtime_command(
+            RuntimeCommandDraft(
+                command_id="command:terminal-cancel",
+                task_id=cancel_task.task_id,
+                command_type=RuntimeCommandType.CANCEL,
+                fingerprint="cancel:terminal",
+                payload={
+                    "expected_version": cancel_task.version,
+                    "reason": cancel_reason,
+                },
+                created_at=NOW + timedelta(seconds=4),
+            ),
+            expected_task=cancel_task,
+        )
+        cancelled = cancel_task.cancel(at=NOW + timedelta(seconds=4))
+        self.store.save_task(
+            cancelled,
+            expected_version=cancel_task.version,
+            event=TaskEventDraft(
+                "event:terminal-cancel:5",
+                "TASK_CANCELLED",
+                {"reason": cancel_reason, "errors": []},
+                cancelled.updated_at,
+            ),
+        )
+        orchestrator = _TerminalCommandReplayOrchestrator()
+        self.application = RuntimeApplication(
+            store=self.store,
+            orchestrator=orchestrator,
+            queue_capacity=2,
+            worker_count=1,
+            clock=lambda: NOW + timedelta(seconds=5),
+            id_factory=lambda: "unused",
+        )
+
+        await self.application.start()
+        await self.application.drain()
+
+        self.assertCountEqual(
+            orchestrator.recoveries,
+            ("terminal-approval", "terminal-cancel"),
+        )
+        self.assertEqual(self.store.list_pending_runtime_commands(), ())
+
     async def test_sqlite_journal_persists_each_aggregate_step_and_replays_it(
         self,
     ) -> None:
@@ -870,6 +1114,105 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(replayed_terminal.task, terminal)
+
+    async def test_journal_replays_the_actual_received_event_after_started_commit(
+        self,
+    ) -> None:
+        """STARTED commit 후 첫 checkpoint 전 crash를 실제 request event로 재생한다."""
+
+        received = Task.receive(task_id="received-crash", input="복구", at=NOW)
+        request_payload = {
+            "request": {
+                "kind": "user_task",
+                "task_id": received.task_id,
+                "input": received.input,
+            }
+        }
+        self.store.create_task(
+            received,
+            event=TaskEventDraft(
+                "event:received-crash:1",
+                "TASK_RECEIVED",
+                request_payload,
+                received.updated_at,
+            ),
+        )
+        running = received.transition(Status.RUNNING, at=NOW + timedelta(seconds=1))
+        workflow = WorkflowRun.start(
+            workflow_run_id="workflow-received-crash",
+            task=running,
+            max_agent_runs=2,
+            at=running.updated_at,
+        )
+        journal = SQLiteLifecycleJournal(self.store)
+        await journal.record(
+            OrchestrationJournalEntry(
+                task=running,
+                workflow=workflow,
+                task_event_type="TASK_STARTED",
+                task_event_payload={},
+            )
+        )
+
+        replayed = await journal.record(
+            OrchestrationJournalEntry(
+                task=received,
+                workflow=None,
+                task_event_type="TASK_RECEIVED",
+                task_event_payload=request_payload,
+            )
+        )
+
+        self.assertEqual(replayed.task, received)
+
+    async def test_journal_rejects_historical_task_with_wrong_event_semantics(
+        self,
+    ) -> None:
+        """Event row 존재만으로 잘못된 historical Task snapshot을 승인하지 않는다."""
+
+        received = Task.receive(task_id="semantic-task", input="검증", at=NOW)
+        self.store.create_task(
+            received,
+            event=TaskEventDraft(
+                "event:semantic-task:1", "TASK_RECEIVED", {}, received.updated_at
+            ),
+        )
+        running = received.transition(Status.RUNNING, at=NOW + timedelta(seconds=1))
+        workflow = WorkflowRun.start(
+            workflow_run_id="workflow-semantic-task",
+            task=running,
+            max_agent_runs=2,
+            at=running.updated_at,
+        )
+        journal = SQLiteLifecycleJournal(self.store)
+        await journal.record(
+            OrchestrationJournalEntry(
+                task=running,
+                workflow=workflow,
+                task_event_type="TASK_STARTED",
+                task_event_payload={},
+            )
+        )
+        analyzing = workflow.advance(Phase.ANALYZING, at=NOW + timedelta(seconds=2))
+        await journal.record(OrchestrationJournalEntry(task=running, workflow=analyzing))
+        completed = running.transition(
+            Status.COMPLETED,
+            at=NOW + timedelta(seconds=3),
+        )
+        await journal.record(
+            OrchestrationJournalEntry(
+                task=completed,
+                workflow=analyzing,
+                task_event_type="TASK_COMPLETED",
+                task_event_payload={"output": "완료", "errors": []},
+            )
+        )
+        forged = received.cancel(at=NOW + timedelta(seconds=4))
+
+        with self.assertRaises(ApplicationConflictError):
+            await journal.record(
+                OrchestrationJournalEntry(task=forged, workflow=analyzing)
+            )
 
     async def test_queues_active_cancellation_and_rejects_unknown_or_terminal(
         self,
