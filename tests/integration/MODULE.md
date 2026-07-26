@@ -29,10 +29,10 @@ LangGraph graph 연결·분류·routing·오류 정책·interrupt·Command resum
 임시 파일 데이터베이스만 사용해 migration 반복 적용, WAL과 foreign key, optimistic
 rollback, event append-only, 멱등성 race, Approval 단일 소비, WorkflowRun/AgentRun
 원자성, outbox와 startup recovery를 검증한다. Supervisor graph는 실제 compiled graph와
-`InMemorySaver`로 승인 binding·거절·resume·replay, 두 service의 승인 소비 경합과 Agent 호출 전 issuance 저장 순서를
+`InMemorySaver`로 승인 binding·거절·resume·replay, consume 뒤 checkpoint 전 crash healing, 두 service의 승인 소비 경합과 Agent 호출 전 issuance 저장 순서를
 검증한다. Persistence 공개 sync saver를 async supervisor에 주입해 실행하고 새 연결에서
 결과를 복원하는 호환 경로도 검증한다. SQLite checkpoint는 interrupt 또는 열린 issuance 뒤 연결을 닫고 새
-연결에서 동일 budget과 실행 ID로 재개한다. 승인 대기·terminal 복구는 무동작임을 확인한다. Fake classifier/Governance/Agent로 read-only·mutating 분기, 입력 종류,
+연결에서 동일 budget, 실행 ID와 idempotency key로 재개한다. 공유 coordinator를 사용하는 두 service의 recovery race에서 한 호출만 실행되는지 확인하고 claim 취소·오류 해제와 malformed recovery 오류 정규화를 검증한다. 승인 대기·terminal 복구는 무동작임을 확인한다. Fake classifier/Governance/Agent로 read-only·mutating 분기, 입력 종류,
 malformed 결과와 모든 retry failure code를 compiled graph의 공개 facade에서 검증한다. 이후
 runtime 조립과 저장소 오류 경로를 확장한다.
 

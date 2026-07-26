@@ -20,6 +20,7 @@ from agent_system.agents import (
 REQUEST = AgentRequest(
     task_id="task-123",
     input="현재 상태를 분석해 주세요.",
+    idempotency_key="agent-run-123",
     context={"priority": "high"},
 )
 METADATA = AgentMetadata(
@@ -108,3 +109,16 @@ class AgentRegistryTests(unittest.TestCase):
 
         with self.assertRaises(AgentNotFoundError):
             registry.get("missing")
+
+
+class AgentRequestTests(unittest.TestCase):
+    """Agent 호출의 effect 멱등 키는 명시적이고 유효해야 한다."""
+
+    def test_rejects_empty_or_non_string_idempotency_key(self) -> None:
+        for key in ("", 1):
+            with self.subTest(key=key), self.assertRaises((TypeError, ValueError)):
+                AgentRequest(
+                    task_id="task",
+                    input="실행",
+                    idempotency_key=key,  # type: ignore[arg-type]
+                )

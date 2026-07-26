@@ -29,6 +29,7 @@ from agent_system.orchestration import (
     ClassificationError,
     FailureCode,
     FakeApprovalConsumer,
+    FakeExecutionCoordinator,
     FakeGovernance,
     FakeRequestClassifier,
     GovernanceDecision,
@@ -78,9 +79,11 @@ class _RecoveringAgent:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.received_requests: list[AgentRequest] = []
 
     async def run(self, request: AgentRequest) -> AgentResult:
         self.calls += 1
+        self.received_requests.append(request)
         return AgentResult(
             agent_id=self.metadata.agent_id,
             outcome=(AgentOutcome.FAILURE if self.calls == 1 else AgentOutcome.SUCCESS),
@@ -372,6 +375,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             classifier=classifier,
             governance=governance,
             approval_consumer=FakeApprovalConsumer(),
+            execution_coordinator=FakeExecutionCoordinator(),
             registry=registry,
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -406,6 +410,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             classifier=FakeRequestClassifier({RequestKind.USER_TASK: decision}),
             governance=FakeGovernance(approved=True, reason="허용"),
             approval_consumer=FakeApprovalConsumer(),
+            execution_coordinator=FakeExecutionCoordinator(),
             registry=registry,
             max_agent_runs=1,
             checkpointer=saver,
@@ -440,6 +445,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             classifier=_RaisingClassifier(),
             governance=FakeGovernance(approved=True, reason="허용"),
             approval_consumer=FakeApprovalConsumer(),
+            execution_coordinator=FakeExecutionCoordinator(),
             registry=AgentRegistry(),
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -482,6 +488,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             classifier=classifier,
             governance=governance,
             approval_consumer=FakeApprovalConsumer(),
+            execution_coordinator=FakeExecutionCoordinator(),
             registry=registry,
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -528,6 +535,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             classifier=classifier,
             governance=governance,
             approval_consumer=FakeApprovalConsumer(),
+            execution_coordinator=FakeExecutionCoordinator(),
             registry=registry,
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -558,6 +566,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             classifier=FakeRequestClassifier({RequestKind.USER_TASK: decision}),
             governance=_RaisingGovernance(),
             approval_consumer=FakeApprovalConsumer(),
+            execution_coordinator=FakeExecutionCoordinator(),
             registry=AgentRegistry(),
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -594,6 +603,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             classifier=classifier,
             governance=FakeGovernance(approved=True, reason="허용"),
             approval_consumer=FakeApprovalConsumer(),
+            execution_coordinator=FakeExecutionCoordinator(),
             registry=registry,
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -650,6 +660,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
                     classifier=FakeRequestClassifier({RequestKind.USER_TASK: decision}),
                     governance=FakeGovernance(approved=True, reason="허용"),
                     approval_consumer=FakeApprovalConsumer(),
+                    execution_coordinator=FakeExecutionCoordinator(),
                     registry=registry,
                     max_agent_runs=1,
                     checkpointer=InMemorySaver(),
@@ -691,6 +702,7 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
             classifier=FakeRequestClassifier({RequestKind.USER_TASK: decision}),
             governance=FakeGovernance(approved=True, reason="허용"),
             approval_consumer=FakeApprovalConsumer(),
+            execution_coordinator=FakeExecutionCoordinator(),
             registry=registry,
             max_agent_runs=2,
             checkpointer=InMemorySaver(),
@@ -709,4 +721,12 @@ class OrchestratorServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.output, "복구 완료")
         self.assertEqual(result.workflow.budget.consumed, 2)
         self.assertEqual([run.budget_sequence for run in result.agent_runs], [1, 2])
+        self.assertEqual(
+            [request.idempotency_key for request in agent.received_requests],
+            [run.agent_run_id for run in result.agent_runs],
+        )
+        self.assertEqual(
+            len({request.idempotency_key for request in agent.received_requests}),
+            2,
+        )
         self.assertEqual(result.errors, (FailureCode.AGENT_FAILURE,))

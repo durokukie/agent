@@ -27,7 +27,7 @@ framework에 독립적인 `Task`, `WorkflowRun`, `AgentRun`, `Approval`, `Execut
 
 외부 입력은 `UserTaskInput`, `AlertInput`, `TicketInput`으로 구분한다. `RequestClassifier`는 추적 가능한 `RoutingDecision(request_kind, agent_id, action, reason, plan)`을 반환한다. `FakeRequestClassifier`는 외부 호출 없는 테스트 adapter다. `ChatModelRequestClassifier`는 주입된 LangChain `BaseChatModel`만 사용하고 응답 JSON을 Pydantic schema로 검증한다. provider SDK는 import하지 않는다. 변경 route에는 canonical SHA-256 hash를 제공하는 `ActionPlan`이 필수이고 read-only route에는 plan을 허용하지 않는다.
 
-`OrchestratorService.start()`는 새 checkpoint thread를 시작하고 terminal 결과 또는 `ApprovalRequest` interrupt가 포함된 `OrchestrationResult`를 반환한다. 승인 요청은 전체 `ActionPlan`, `agent_id`, action과 Task version/hash를 노출한다. `resume()`은 필수 주입 seam인 `ApprovalConsumer`가 현재 Task/Approval binding을 원자적으로 소비해 반환한 exact successor를 검증한 뒤 `Command`를 전달한다. `FakeApprovalConsumer`는 프로세스 내 경합 테스트 adapter다. `get_result()`는 checkpoint 조회 seam이고 `recover()`는 저장된 next node에서 non-approval 실행을 계속한다. 승인 대기와 terminal checkpoint에는 부수 효과가 없다. 이미 사용된 thread의 새 시작, 승인 대기가 없는 thread의 resume, state가 없는 thread 조회·복구와 malformed checkpoint는 공개 orchestration 오류로 정규화한다. Runtime은 checkpointer, 승인 소비자, UTC clock과 ID factory를 모두 주입한다. Private compatibility adapter는 `BaseCheckpointSaver`의 async method가 지원되지 않을 때 같은 public sync method를 worker thread에서 호출하므로 orchestration은 `SqliteSaver` 구현을 import하지 않는다.
+`OrchestratorService.start()`는 새 checkpoint thread를 시작하고 terminal 결과 또는 `ApprovalRequest` interrupt가 포함된 `OrchestrationResult`를 반환한다. 승인 요청은 전체 `ActionPlan`, `agent_id`, action과 Task version/hash를 노출한다. `resume()`은 필수 주입 seam인 `ApprovalConsumer`가 현재 Task/Approval binding을 원자적으로 소비해 반환한 exact successor를 검증한 뒤 `Command`를 전달한다. 같은 decision/binding의 `ALREADY_APPLIED`는 아직 승인 대기인 checkpoint에서 저장된 successor로 crash window를 복구하고, decision 또는 binding conflict는 거부한다. `get_result()`는 checkpoint 조회 seam이고 `recover()`는 저장된 next node에서 non-approval 실행을 계속한다. 열린 `call_agent` 복구는 필수 주입 `ExecutionCoordinator`로 thread/AgentRun 실행권을 먼저 획득한다. 승인 대기와 terminal checkpoint에는 claim이나 부수 효과가 없다. 이미 사용된 thread의 새 시작, 승인 대기가 없는 thread의 resume, state가 없는 thread 조회·복구와 malformed checkpoint는 공개 orchestration 오류로 정규화한다. Runtime은 checkpointer, 승인 소비자, execution coordinator, UTC clock과 ID factory를 모두 주입한다. `FakeApprovalConsumer`와 `FakeExecutionCoordinator`는 test adapter다. Private compatibility adapter는 `BaseCheckpointSaver`의 async method가 지원되지 않을 때 같은 public sync method를 worker thread에서 호출하므로 orchestration은 `SqliteSaver` 구현을 import하지 않는다.
 
 ## 의존성과 허용된 import 방향
 
@@ -35,7 +35,7 @@ framework에 독립적인 `Task`, `WorkflowRun`, `AgentRun`, `Approval`, `Execut
 
 ## 데이터 및 제어 흐름
 
-Task 변경은 이전 snapshot을 보존한 채 새 version을 만든다. Supervisor는 입력 분류 후 read-only route를 바로 실행 단계로 보내고, mutating route는 Governance를 통과한 plan만 Task에 기록해 `WAITING_APPROVAL` interrupt를 만든다. 승인 수락은 `task_id/task_version/plan_hash`를 모두 검증하고 persisted successor로 WorkflowRun을 재결합한 뒤 실행한다. AgentRequest context에는 승인된 plan snapshot/hash와 approval binding, routing action/agent, 승인·실행 Task version을 함께 전달한다. 거절 또는 잘못된 binding은 `REJECTED`로 끝난다.
+Task 변경은 이전 snapshot을 보존한 채 새 version을 만든다. Supervisor는 입력 분류 후 read-only route를 바로 실행 단계로 보내고, mutating route는 Governance를 통과한 plan만 Task에 기록해 `WAITING_APPROVAL` interrupt를 만든다. 승인 수락은 `task_id/task_version/plan_hash`를 모두 검증하고 persisted successor로 WorkflowRun을 재결합한 뒤 실행한다. AgentRequest context에는 승인된 plan snapshot/hash와 approval binding, routing action/agent, 승인·실행 Task version을 함께 전달하고, 공개 `idempotency_key`에는 exact `agent_run_id`를 전달한다. 거절 또는 잘못된 binding은 `REJECTED`로 끝난다.
 
 Agent 호출은 `issue_agent_run` node에서 `begin_agent_run()`으로 budget과 open AgentRun snapshot을 먼저 checkpoint한 뒤 별도 `call_agent` node에서 비동기로 수행한다. 성공은 `COMPLETED`, 실패·예외·결과 agent ID 불일치·미등록 route는 표준 `FailureCode`와 완료된 AgentRun을 남기고 다음 budget slot으로 재시도한다. 마지막 slot 실패는 `ESCALATED`로 끝난다. 과거 또는 현재 AgentRun 복원은 issuance ledger가 포함된 WorkflowRun을 owner로 사용한다.
 
@@ -55,9 +55,9 @@ plan을 가진 `RUNNING`은 version 3 이상, `WAITING_APPROVAL`과 plan을 가�
 
 `agent_run_issuances`는 JSON array로 직렬화되며 각 항목은 `agent_run_id`, `agent_id`, `phase`, `task_version`, `budget_sequence`, `started_at`을 가진다. 항목 수는 `budget.consumed`와 같고 sequence는 1부터 빠짐없이 증가해야 하며, 한 WorkflowRun 안에서 `agent_run_id`는 고유하다. 발급 시각은 WorkflowRun 실행 구간 안에서 순서대로 증가한다. 이 조건은 직접 생성과 snapshot 복원 모두에 적용된다.
 
-동일한 immutable `Task`와 `Approval`만으로는 프로세스 간 replay 소비 여부를 소유하지 않는다. 한 번만 승인되는 compare-and-transition은 주입된 `ApprovalConsumer`가 `Approval.binding`, decision ID와 현재 Task version을 같은 원자적 연산에서 비교·저장해 보장한다. Graph는 consumer가 반환한 exact successor를 재검증하며 자체 global mutable consumed set을 두지 않는다.
+동일한 immutable `Task`와 `Approval`만으로는 프로세스 간 replay 소비 여부를 소유하지 않는다. 한 번만 승인되는 compare-and-transition은 주입된 `ApprovalConsumer`가 `Approval.binding`, decision ID와 현재 Task version을 같은 원자적 연산에서 비교·저장해 보장한다. CAS와 LangGraph checkpoint commit은 한 DB transaction일 수 없으므로 같은 decision/binding replay는 exact persisted successor를 반환해야 한다. Graph는 이 successor를 재검증하며 자체 global mutable consumed set을 두지 않는다.
 
-Graph 안에서는 checkpoint `thread_id`가 실행 소유권이다. 같은 thread를 새 Task에 재사용하지 않고 terminal 후 `Command(resume=...)` replay도 거부한다. 프로세스 간 Approval 소비와 애플리케이션 table 저장이 필요하면 orchestration이 SQLite 세부사항을 아는 대신 runtime이 persistence 공개 facade의 approval transaction을 먼저 적용해야 한다.
+Graph 안에서는 checkpoint `thread_id`가 실행 소유권이다. 같은 thread를 새 Task에 재사용하지 않고 terminal 후 `Command(resume=...)` replay도 거부한다. 단일 프로세스 MVP에서 Task 6 composition root는 모든 service instance에 같은 `ExecutionCoordinator`를 주입해 동시 복구 호출을 막는다. 이 claim은 취소와 오류에도 해제된다. 다중 프로세스에서는 process-local coordinator만으로 부족하므로 distributed lease/claim adapter가 별도로 필요하다. 외부 Agent adapter는 claim과 별개로 동일 `AgentRequest.idempotency_key`의 effect를 deduplicate해야 한다.
 
 Classifier는 `BaseChatModel.ainvoke()`를 직접 await하며 provider 예외 상세를 `ClassificationError`로 제거하고 실행 취소는 전파한다. Snapshot 경계는 bool을 int로 받거나 coercion 가능한 문자열·tuple·mapping 유사값을 허용하지 않고 필드별 exact type을 요구한다. Classifier·Governance·Agent 구현에서 나온 예외 문자열은 결과에 노출하지 않고 안정적인 `FailureCode`로 정규화한다. Graph의 모든 cycle은 남은 `ExecutionBudget`을 감소시키므로 무한 loop가 없고 terminal Task에는 outgoing edge가 없다.
 
@@ -67,7 +67,7 @@ Classifier는 `BaseChatModel.ainvoke()`를 직접 await하며 provider 예외 �
 
 Fake 기반 supervisor service 통합 테스트는 User/Alert/Ticket 분류, ChatModel JSON 검증, dynamic registry routing, read-only 완료, Governance 거절·예외, Agent FAILURE·예외·결과 불일치·missing route, 성공 재시도와 budget 소진 escalation을 검증한다. 단위 architecture test는 orchestration의 Upstage·SQLite/ORM·FastAPI·Rich import를 금지한다.
 
-LangGraph 통합 테스트는 실제 `InMemorySaver`, `interrupt`, `Command`를 사용해 승인 대기, human 거절, stale/wrong/plan-changed approval, 정상 resume, terminal replay 차단과 thread 재사용 차단을 검증한다. 공유 checkpointer와 승인 소비자를 쓰는 두 service의 경합에서 하나만 실행되는지도 확인한다. Blocking Agent로 외부 호출 전에 open AgentRun issuance가 checkpoint되는 순서와, 취소 후 SQLite 연결을 다시 열어 같은 issuance/budget으로 복구하는 경로를 검증한다. 승인 대기와 terminal 복구는 무동작이어야 한다.
+LangGraph 통합 테스트는 실제 `InMemorySaver`, `interrupt`, `Command`를 사용해 승인 대기, human 거절, stale/wrong/plan-changed approval, consume 직후 crash의 accept/reject healing, terminal replay 차단과 thread 재사용 차단을 검증한다. 공유 checkpointer·승인 소비자·coordinator를 쓰는 두 service의 경합에서 하나만 실행되는지도 확인한다. Blocking Agent로 외부 호출 전에 open AgentRun issuance가 checkpoint되는 순서와, 취소 후 SQLite 연결을 다시 열어 같은 issuance/budget/idempotency key로 복구하는 경로를 검증한다. 두 service의 SQLite recovery 경합, claim 취소/오류 해제, malformed state와 `ainvoke` 오류 정규화도 검증한다. 승인 대기와 terminal 복구는 무동작이어야 한다.
 
 Task 4 persistence 통합 테스트는 같은 Approval의 동시·반복 전달에서 `binding`과 Task version을 optimistic transaction으로 비교해 정확히 한 요청만 `WAITING_APPROVAL → RUNNING`을 저장하고 나머지는 stale/idempotent 결과가 되는지 반드시 검증한다. 또한 `begin_agent_run()`이 반환한 issuance 포함 WorkflowRun과 AgentRun을 한 transaction에 함께 저장하고, 저장된 모든 historical/current AgentRun을 해당 WorkflowRun snapshot과 함께 복원하는지 검증한다.
 

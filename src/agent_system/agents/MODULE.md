@@ -10,7 +10,7 @@
 
 ## 공개 인터페이스와 사용 방법
 
-`AgentMetadata`는 안정적인 `agent_id`, 표시 이름, 설명을 제공한다. `AgentRequest`는 `task_id`, 입력 문자열, 선택 context를 전달하고, `AgentResult`는 실행 agent ID, `AgentOutcome`, 출력 문자열을 반환한다. 실패 사유도 출력 문자열에 담아 호출자가 결과 형식을 일관되게 처리한다.
+`AgentMetadata`는 안정적인 `agent_id`, 표시 이름, 설명을 제공한다. `AgentRequest`는 `task_id`, 입력 문자열, 필수 `idempotency_key`, 선택 context를 전달하고, `AgentResult`는 실행 agent ID, `AgentOutcome`, 출력 문자열을 반환한다. `idempotency_key`는 비어 있지 않은 문자열이며 orchestration이 발급한 `agent_run_id`와 같다. 모든 Agent adapter는 같은 key로 반복된 호출의 외부 effect를 중복 적용하지 않아야 한다. 실패 사유도 출력 문자열에 담아 호출자가 결과 형식을 일관되게 처리한다.
 
 `Agent`는 `metadata`와 `async run(request)`를 요구하는 구조적 Protocol이다. `AgentRegistry.register()`는 ID를 하나만 등록하고 중복 시 `DuplicateAgentIdError`를 발생시킨다. `get()`은 미등록 ID에 `AgentNotFoundError`를 발생시킨다. `FakeAgent`는 고정된 결과를 반환하고 받은 요청을 기록하는 결정 가능한 테스트 adapter다.
 
@@ -22,7 +22,7 @@ Agent 구현이 한 번 반환하는 결과와 orchestration의 `AgentRun`은 �
 
 ## 데이터 및 제어 흐름
 
-runtime이 구현체를 registry에 등록하고, registry가 요청된 agent adapter를 반환한다. 오케스트레이터는 공통 Protocol로 요청을 전달해 구조화 결과를 받는다.
+runtime이 구현체를 registry에 등록하고, registry가 요청된 agent adapter를 반환한다. 오케스트레이터는 공통 Protocol로 요청과 실행 멱등 키를 전달해 구조화 결과를 받는다. retry의 새 AgentRun은 새 key를 받고, crash recovery로 같은 열린 AgentRun을 다시 호출할 때는 기존 key를 재사용한다.
 
 ## 설계 결정과 제약사항
 
@@ -30,7 +30,7 @@ runtime이 구현체를 registry에 등록하고, registry가 요청된 agent ad
 
 ## 테스트 전략
 
-공통 contract test를 `EchoAgent`와 `FakeAgent`에 적용하고 registry의 정상 조회, 중복 식별자, 미등록 조회를 검증한다. fake는 네트워크·시간·난수에 의존하지 않는다.
+공통 contract test를 `EchoAgent`와 `FakeAgent`에 적용하고 `AgentRequest.idempotency_key` 검증, registry의 정상 조회, 중복 식별자, 미등록 조회를 검증한다. fake는 네트워크·시간·난수에 의존하지 않는다.
 
 ## 변경 시 문서 갱신 조건
 

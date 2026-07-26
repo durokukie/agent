@@ -30,7 +30,21 @@ class AgentRequest:
 
     task_id: str
     input: str
+    idempotency_key: str
     context: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.task_id, str) or not self.task_id.strip():
+            raise ValueError("task_id는 비어 있지 않은 문자열이어야 합니다.")
+        if not isinstance(self.input, str) or not self.input.strip():
+            raise ValueError("input은 비어 있지 않은 문자열이어야 합니다.")
+        if (
+            not isinstance(self.idempotency_key, str)
+            or not self.idempotency_key.strip()
+        ):
+            raise ValueError("idempotency_key는 비어 있지 않은 문자열이어야 합니다.")
+        if not isinstance(self.context, Mapping):
+            raise TypeError("context는 mapping이어야 합니다.")
 
 
 @dataclass(frozen=True, slots=True)
