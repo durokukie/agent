@@ -1,0 +1,324 @@
+"""알림 wire 값과 전달 adapter의 공개 interface."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import StrEnum
+from types import MappingProxyType
+from typing import Protocol
+
+
+class NotificationChannel(StrEnum):
+    """MVP에서 지원하는 논리적 알림 channel."""
+
+    OPERATIONS = "operations"
+
+
+class NotificationDeliveryError(RuntimeError):
+    """Sender가 알림을 전달하지 못했음을 나타내는 안정적인 오류."""
+
+
+def _require_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name}는 비어 있을 수 없습니다.")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class Notification:
+    """Adapter가 domain 객체 없이 소비할 수 있는 불변 알림 값."""
+
+    notification_id: str
+    task_id: str
+    task_version: int
+    status: str
+    channel: NotificationChannel
+    occurred_at: datetime
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require_text(self.notification_id, "notification_id")
+        _require_text(self.task_id, "task_id")
+        if (
+            isinstance(self.task_version, bool)
+            or not isinstance(self.task_version, int)
+            or self.task_version <= 0
+        ):
+            raise ValueError("task_version은 양의 정수여야 합니다.")
+        _require_text(self.status, "status")
+        if type(self.channel) is not NotificationChannel:
+            raise ValueError("channel은 NotificationChannel이어야 합니다.")
+        if (
+            not isinstance(self.occurred_at, datetime)
+            or self.occurred_at.tzinfo is None
+            or self.occurred_at.utcoffset() is None
+        ):
+            raise ValueError("occurred_at에는 timezone-aware datetime이 필요합니다.")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("metadata는 mapping이어야 합니다.")
+        metadata = dict(self.metadata)
+        if any(not isinstance(key, str) or not key.strip() for key in metadata):
+            raise ValueError("metadata key는 비어 있지 않은 문자열이어야 합니다.")
+        object.__setattr__(self, "metadata", MappingProxyType(metadata))
+
+    def to_payload(self) -> dict[str, object]:
+        """Persistence와 sender 사이의 안정적인 JSON object를 반환한다."""
+
+        return {
+            "notification_id": self.notification_id,
+            "task_id": self.task_id,
+            "task_version": self.task_version,
+            "status": self.status,
+            "channel": self.channel.value,
+            "occurred_at": self.occurred_at.isoformat(),
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> Notification:
+        """저장된 JSON object를 검증해 알림 값으로 복원한다."""
+
+        if not isinstance(payload, Mapping):
+            raise TypeError("notification payload는 mapping이어야 합니다.")
+        try:
+            occurred_at = datetime.fromisoformat(str(payload["occurred_at"]))
+            channel = NotificationChannel(payload["channel"])
+            metadata = payload.get("metadata", {})
+            if not isinstance(metadata, Mapping):
+                raise TypeError
+            return cls(
+                notification_id=payload["notification_id"],  # type: ignore[arg-type]
+                task_id=payload["task_id"],  # type: ignore[arg-type]
+                task_version=payload["task_version"],  # type: ignore[arg-type]
+                status=payload["status"],  # type: ignore[arg-type]
+                channel=channel,
+                occurred_at=occurred_at,
+                metadata=metadata,
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("notification payload가 올바르지 않습니다.") from None
+
+
+class NotificationSender(Protocol):
+    """외부 알림 전달 구현이 만족할 작은 async interface."""
+
+    async def send(self, notification: Notification) -> None:
+        """알림 한 건을 전달하거나 NotificationDeliveryError를 발생시킨다."""
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationClaim:
+    """Outbox adapter가 한 dispatcher에게 부여한 전달 lease."""
+
+    notification: Notification
+    lease_token: str
+    attempt_count: int
+    lease_expires_at: datetime
+
+
+class NotificationOutbox(Protocol):
+    """Dispatcher가 persistence 구현에서 요구하는 lease/CAS interface."""
+
+    async def claim(
+        self,
+        *,
+        now: datetime,
+        lease_duration: timedelta,
+        lease_token: str,
+    ) -> NotificationClaim | None:
+        """현재 eligible한 알림 한 건의 lease를 얻는다."""
+
+    async def mark_delivered(
+        self,
+        claim: NotificationClaim,
+        *,
+        at: datetime,
+    ) -> None:
+        """현재 lease의 성공을 확정한다."""
+
+    async def mark_failed(
+        self,
+        claim: NotificationClaim,
+        *,
+        error_code: str,
+        at: datetime,
+        next_attempt_at: datetime,
+    ) -> None:
+        """실패와 다음 eligibility를 기록한다."""
+
+
+class LoggingNotificationSender:
+    """비밀 metadata 없이 알림 identity만 표준 log로 전달한다."""
+
+    def __init__(self, *, logger_name: str = "agent_system.notifications") -> None:
+        self._logger = logging.getLogger(logger_name)
+
+    async def send(self, notification: Notification) -> None:
+        self._logger.info(
+            "notification delivered id=%s task_id=%s version=%d status=%s channel=%s",
+            notification.notification_id,
+            notification.task_id,
+            notification.task_version,
+            notification.status,
+            notification.channel.value,
+        )
+
+
+class FakeNotificationSender:
+    """지정한 횟수만 실패한 뒤 전달 기록을 보존하는 결정 가능한 fake."""
+
+    def __init__(self, *, failures_before_success: int = 0) -> None:
+        if (
+            isinstance(failures_before_success, bool)
+            or not isinstance(failures_before_success, int)
+            or failures_before_success < 0
+        ):
+            raise ValueError("failures_before_success는 0 이상의 정수여야 합니다.")
+        self._remaining_failures = failures_before_success
+        self._attempts: list[Notification] = []
+        self._sent: list[Notification] = []
+
+    @property
+    def attempts(self) -> tuple[Notification, ...]:
+        return tuple(self._attempts)
+
+    @property
+    def sent(self) -> tuple[Notification, ...]:
+        return tuple(self._sent)
+
+    async def send(self, notification: Notification) -> None:
+        self._attempts.append(notification)
+        if self._remaining_failures > 0:
+            self._remaining_failures -= 1
+            raise NotificationDeliveryError("fake_delivery_failed")
+        self._sent.append(notification)
+
+
+class NotificationDispatcher:
+    """Lease claim과 bounded retry를 조정하는 단일 background dispatcher."""
+
+    def __init__(
+        self,
+        *,
+        outbox: NotificationOutbox,
+        sender: NotificationSender,
+        clock: Callable[[], datetime],
+        id_factory: Callable[[], str],
+        lease_duration: timedelta = timedelta(seconds=30),
+        base_retry_delay: timedelta = timedelta(seconds=30),
+        max_retry_delay: timedelta = timedelta(minutes=5),
+        poll_interval: float = 1.0,
+    ) -> None:
+        if lease_duration <= timedelta(0):
+            raise ValueError("lease_duration은 양수여야 합니다.")
+        if base_retry_delay <= timedelta(0):
+            raise ValueError("base_retry_delay는 양수여야 합니다.")
+        if max_retry_delay < base_retry_delay:
+            raise ValueError("max_retry_delay는 base_retry_delay 이상이어야 합니다.")
+        if not isinstance(poll_interval, (int, float)) or poll_interval <= 0:
+            raise ValueError("poll_interval은 양수여야 합니다.")
+        self._outbox = outbox
+        self._sender = sender
+        self._clock = clock
+        self._id_factory = id_factory
+        self._lease_duration = lease_duration
+        self._base_retry_delay = base_retry_delay
+        self._max_retry_delay = max_retry_delay
+        self._poll_interval = float(poll_interval)
+        self._stop_event = asyncio.Event()
+        self._dispatch_lock = asyncio.Lock()
+        self._worker: asyncio.Task[None] | None = None
+
+    @property
+    def is_running(self) -> bool:
+        return self._worker is not None and not self._worker.done()
+
+    async def start(self) -> None:
+        """Idempotent하게 polling worker를 시작한다."""
+
+        if self.is_running:
+            return
+        self._stop_event.clear()
+        self._worker = asyncio.create_task(
+            self._run(),
+            name="notification-dispatcher",
+        )
+
+    async def stop(self) -> None:
+        """새 poll을 중단하고 진행 중인 전달이 끝날 때까지 기다린다."""
+
+        worker = self._worker
+        if worker is None:
+            return
+        self._stop_event.set()
+        await worker
+        self._worker = None
+
+    async def drain(self) -> None:
+        """현재 시각에 eligible한 모든 알림을 처리한다."""
+
+        while await self.dispatch_once():
+            pass
+
+    async def dispatch_once(self) -> bool:
+        """Eligible 알림 한 건을 claim해 성공 또는 retry 상태로 확정한다."""
+
+        async with self._dispatch_lock:
+            claimed_at = self._clock()
+            claim = await self._outbox.claim(
+                now=claimed_at,
+                lease_duration=self._lease_duration,
+                lease_token=self._id_factory(),
+            )
+            if claim is None:
+                return False
+            try:
+                await self._sender.send(claim.notification)
+            except Exception:  # noqa: BLE001 - provider 오류 원문은 저장하지 않는다.
+                failed_at = self._clock()
+                await self._outbox.mark_failed(
+                    claim,
+                    error_code="notification_delivery_failed",
+                    at=failed_at,
+                    next_attempt_at=failed_at + self._retry_delay(claim.attempt_count),
+                )
+            else:
+                await self._outbox.mark_delivered(claim, at=self._clock())
+            return True
+
+    async def _run(self) -> None:
+        while not self._stop_event.is_set():
+            if await self.dispatch_once():
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=self._poll_interval,
+                )
+            except TimeoutError:
+                continue
+
+    def _retry_delay(self, attempt_count: int) -> timedelta:
+        exponent = min(max(attempt_count - 1, 0), 16)
+        seconds = min(
+            self._base_retry_delay.total_seconds() * (2**exponent),
+            self._max_retry_delay.total_seconds(),
+        )
+        return timedelta(seconds=seconds)
+
+
+__all__ = [
+    "FakeNotificationSender",
+    "LoggingNotificationSender",
+    "Notification",
+    "NotificationChannel",
+    "NotificationClaim",
+    "NotificationDeliveryError",
+    "NotificationDispatcher",
+    "NotificationOutbox",
+    "NotificationSender",
+]

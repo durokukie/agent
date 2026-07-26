@@ -1,0 +1,558 @@
+"""Task 전이와 notification outbox의 SQLite 통합 계약."""
+
+from __future__ import annotations
+
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+from agent_system.notifications import (
+    FakeNotificationSender,
+    Notification,
+    NotificationDispatcher,
+)
+from agent_system.orchestration import ApprovalResponse, Status, Task
+from agent_system.persistence import (
+    InvalidPersistenceValueError,
+    OptimisticConcurrencyError,
+    OutboxDraft,
+    OutboxStatus,
+    PersistenceConflictError,
+    SQLiteNotificationOutbox,
+    SQLiteStore,
+    TaskEventDraft,
+    upgrade_database,
+)
+
+NOW = datetime(2026, 7, 27, 2, 0, tzinfo=UTC)
+NOTIFIED = frozenset(
+    {
+        Status.WAITING_APPROVAL,
+        Status.COMPLETED,
+        Status.REJECTED,
+        Status.FAILED,
+        Status.ESCALATED,
+        Status.CANCELLED,
+    }
+)
+
+
+class TransactionalNotificationOutboxTests(unittest.TestCase):
+    """Task snapshot과 자동 알림 의도가 같은 transaction을 공유하는지 검증한다."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.database_path = Path(self.directory.name) / "notifications.sqlite3"
+        upgrade_database(self.database_path)
+        self.store = SQLiteStore(self.database_path)
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self.directory.cleanup()
+
+    def test_enqueues_only_configured_statuses_with_safe_wire_payload(self) -> None:
+        """대상 누락, RUNNING 오발행, input 유출 또는 unstable payload를 잡는다."""
+
+        for offset, status in enumerate(sorted(NOTIFIED, key=lambda item: item.value)):
+            received = Task.receive(
+                task_id=f"task-{status.value.lower()}",
+                input="token=super-secret original webhook body",
+                at=NOW + timedelta(minutes=offset),
+            )
+            running = received.transition(
+                Status.RUNNING,
+                at=received.updated_at + timedelta(seconds=1),
+            )
+            self.store.create_task(
+                received,
+                event=TaskEventDraft(
+                    f"event:{received.task_id}:1",
+                    "TASK_RECEIVED",
+                    {},
+                    received.updated_at,
+                ),
+            )
+            self.store.save_task(
+                running,
+                expected_version=1,
+                event=TaskEventDraft(
+                    f"event:{received.task_id}:2",
+                    "TASK_STARTED",
+                    {},
+                    running.updated_at,
+                ),
+            )
+            if status is Status.WAITING_APPROVAL:
+                planned = running.update_plan(
+                    "sha256:plan",
+                    at=running.updated_at + timedelta(seconds=1),
+                )
+                self.store.save_task(
+                    planned,
+                    expected_version=2,
+                    event=TaskEventDraft(
+                        f"event:{received.task_id}:3",
+                        "TASK_PLAN_UPDATED",
+                        {"plan_hash": "sha256:plan"},
+                        planned.updated_at,
+                    ),
+                )
+                target = planned.transition(
+                    status,
+                    at=planned.updated_at + timedelta(seconds=1),
+                )
+                expected_version = 3
+            else:
+                target = running.transition(
+                    status,
+                    at=running.updated_at + timedelta(seconds=1),
+                )
+                expected_version = 2
+            self.store.save_task(
+                target,
+                expected_version=expected_version,
+                event=TaskEventDraft(
+                    f"event:{received.task_id}:{target.version}",
+                    f"TASK_{status.value}",
+                    {"errors": ["safe_code"]},
+                    target.updated_at,
+                ),
+            )
+
+        messages = self.store.list_outbox()
+
+        self.assertEqual(len(messages), len(NOTIFIED))
+        self.assertEqual(
+            {message.status for message in messages}, {OutboxStatus.PENDING}
+        )
+        self.assertEqual(
+            {message.topic for message in messages}, {"task.status_changed"}
+        )
+        for message in messages:
+            notification = Notification.from_payload(message.payload)
+            self.assertEqual(notification.notification_id, message.outbox_id)
+            self.assertEqual(notification.task_id, message.task_id)
+            self.assertIn(notification.status, {status.value for status in NOTIFIED})
+            self.assertNotIn("secret", repr(message.payload))
+            self.assertEqual(message.next_attempt_at, notification.occurred_at)
+
+    def test_rolls_back_task_when_automatic_outbox_identity_conflicts(self) -> None:
+        """Outbox insert 실패 뒤 Task snapshot만 전진하는 atomicity 파손을 잡는다."""
+
+        received = Task.receive(task_id="task-atomic", input="점검", at=NOW)
+        running = received.transition(Status.RUNNING, at=NOW + timedelta(seconds=1))
+        completed = running.transition(Status.COMPLETED, at=NOW + timedelta(seconds=2))
+        self.store.create_task(
+            received,
+            event=TaskEventDraft("event:atomic:1", "TASK_RECEIVED", {}, NOW),
+            outbox=OutboxDraft(
+                outbox_id="notification:task-atomic:3",
+                topic="occupied",
+                payload={"occupied": True},
+                created_at=NOW,
+            ),
+        )
+        self.store.save_task(
+            running,
+            expected_version=1,
+            event=TaskEventDraft(
+                "event:atomic:2",
+                "TASK_STARTED",
+                {},
+                running.updated_at,
+            ),
+        )
+
+        with self.assertRaises(PersistenceConflictError):
+            self.store.save_task(
+                completed,
+                expected_version=2,
+                event=TaskEventDraft(
+                    "event:atomic:3",
+                    "TASK_COMPLETED",
+                    {},
+                    completed.updated_at,
+                ),
+            )
+
+        self.assertEqual(self.store.get_task(received.task_id), running)
+        self.assertEqual(
+            [
+                event.task_version
+                for event in self.store.list_task_events(received.task_id)
+            ],
+            [1, 2],
+        )
+
+    def test_target_notification_cannot_be_replaced_by_a_custom_outbox(self) -> None:
+        """호출자가 대상 상태의 필수 notification을 임의 topic으로 우회하는 버그를 잡는다."""
+
+        received = Task.receive(task_id="task-required", input="점검", at=NOW)
+        running = received.transition(Status.RUNNING, at=NOW + timedelta(seconds=1))
+        completed = running.transition(Status.COMPLETED, at=NOW + timedelta(seconds=2))
+        self.store.create_task(
+            received,
+            event=TaskEventDraft("event:required:1", "TASK_RECEIVED", {}, NOW),
+        )
+        self.store.save_task(
+            running,
+            expected_version=1,
+            event=TaskEventDraft(
+                "event:required:2", "TASK_STARTED", {}, running.updated_at
+            ),
+        )
+
+        with self.assertRaises(InvalidPersistenceValueError):
+            self.store.save_task(
+                completed,
+                expected_version=2,
+                event=TaskEventDraft(
+                    "event:required:3", "TASK_COMPLETED", {}, completed.updated_at
+                ),
+                outbox=OutboxDraft(
+                    "custom-outbox",
+                    "custom.topic",
+                    {"raw": "override"},
+                    completed.updated_at,
+                ),
+            )
+
+        self.assertEqual(self.store.get_task(received.task_id), running)
+
+    def test_claim_competition_has_one_owner_and_success_is_terminal(self) -> None:
+        """동시 dispatcher가 같은 알림을 두 번 claim하거나 stale owner가 확정하는 버그를 잡는다."""
+
+        task = self._persist_completed("task-race")
+
+        def claim(token: str):
+            with SQLiteStore(self.database_path) as competing_store:
+                return competing_store.claim_outbox(
+                    now=task.updated_at,
+                    lease_duration=timedelta(seconds=30),
+                    lease_token=token,
+                )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(executor.map(claim, ("lease-a", "lease-b")))
+
+        claims = tuple(result for result in results if result is not None)
+        self.assertEqual(len(claims), 1)
+        claim = claims[0]
+        self.assertEqual(claim.status, OutboxStatus.PROCESSING)
+        self.assertEqual(claim.attempt_count, 1)
+        delivered = self.store.mark_outbox_delivered(
+            claim.outbox_id,
+            lease_token=claim.lease_token,
+            at=task.updated_at + timedelta(seconds=1),
+        )
+        self.assertEqual(delivered.status, OutboxStatus.DELIVERED)
+        self.assertEqual(delivered.delivered_at, task.updated_at + timedelta(seconds=1))
+        self.assertIsNone(
+            self.store.claim_outbox(
+                now=task.updated_at + timedelta(minutes=1),
+                lease_duration=timedelta(seconds=30),
+                lease_token="lease-after-delivery",
+            )
+        )
+
+    def test_failure_backoff_and_expired_lease_are_recoverable(self) -> None:
+        """실패 즉시 재시도, stale lease 영구 고착 또는 old-token commit을 잡는다."""
+
+        task = self._persist_completed("task-retry")
+        first = self.store.claim_outbox(
+            now=task.updated_at,
+            lease_duration=timedelta(seconds=20),
+            lease_token="lease-first",
+        )
+        assert first is not None
+        failed_at = task.updated_at + timedelta(seconds=1)
+        eligible_at = failed_at + timedelta(seconds=30)
+        failed = self.store.record_outbox_failure(
+            first.outbox_id,
+            lease_token="lease-first",
+            error_code="delivery_failed",
+            at=failed_at,
+            next_attempt_at=eligible_at,
+        )
+
+        self.assertEqual(failed.status, OutboxStatus.FAILED)
+        self.assertEqual(failed.attempt_count, 1)
+        self.assertEqual(failed.last_error, "delivery_failed")
+        self.assertIsNone(
+            self.store.claim_outbox(
+                now=eligible_at - timedelta(microseconds=1),
+                lease_duration=timedelta(seconds=20),
+                lease_token="lease-too-early",
+            )
+        )
+        second = self.store.claim_outbox(
+            now=eligible_at,
+            lease_duration=timedelta(seconds=20),
+            lease_token="lease-second",
+        )
+        assert second is not None
+        self.assertEqual(second.attempt_count, 2)
+        with self.assertRaises(OptimisticConcurrencyError):
+            self.store.mark_outbox_delivered(
+                second.outbox_id,
+                lease_token="lease-first",
+                at=eligible_at + timedelta(seconds=1),
+            )
+
+        # 두 번째 owner가 죽으면 lease 만료 전에는 claim할 수 없고 만료 시 복구한다.
+        self.assertIsNone(
+            self.store.claim_outbox(
+                now=eligible_at + timedelta(seconds=19),
+                lease_duration=timedelta(seconds=20),
+                lease_token="lease-before-expiry",
+            )
+        )
+        recovered = self.store.claim_outbox(
+            now=eligible_at + timedelta(seconds=20),
+            lease_duration=timedelta(seconds=20),
+            lease_token="lease-recovered",
+        )
+        assert recovered is not None
+        self.assertEqual(recovered.attempt_count, 3)
+        self.assertEqual(recovered.lease_token, "lease-recovered")
+        self.assertEqual(self.store.get_task(task.task_id), task)
+
+    def test_rejected_approval_enqueues_once_across_exact_replay(self) -> None:
+        """Approval 전용 transaction이 알림을 누락하거나 replay 때 중복하는 버그를 잡는다."""
+
+        received = Task.receive(task_id="task-rejected", input="변경", at=NOW)
+        running = received.transition(Status.RUNNING, at=NOW + timedelta(seconds=1))
+        planned = running.update_plan(
+            "sha256:reject-plan",
+            at=NOW + timedelta(seconds=2),
+        )
+        waiting = planned.transition(
+            Status.WAITING_APPROVAL,
+            at=NOW + timedelta(seconds=3),
+        )
+        snapshots = (received, running, planned, waiting)
+        for index, snapshot in enumerate(snapshots, start=1):
+            event = TaskEventDraft(
+                f"event:rejected:{index}",
+                f"TASK_{snapshot.status.value}",
+                {},
+                snapshot.updated_at,
+            )
+            if index == 1:
+                self.store.create_task(snapshot, event=event)
+            else:
+                self.store.save_task(snapshot, expected_version=index - 1, event=event)
+        # WAITING_APPROVAL 알림을 제외하고 거절 전이만 관찰한다.
+        waiting_message = self.store.claim_outbox(
+            now=waiting.updated_at,
+            lease_duration=timedelta(seconds=10),
+            lease_token="waiting-lease",
+        )
+        assert waiting_message is not None
+        self.store.mark_outbox_delivered(
+            waiting_message.outbox_id,
+            lease_token="waiting-lease",
+            at=waiting.updated_at,
+        )
+        response = ApprovalResponse.reject(
+            decision_id="decision-reject",
+            reason="운영자가 거절함",
+        )
+        rejected_at = NOW + timedelta(seconds=4)
+        first = self.store.consume_approval(
+            task=waiting,
+            response=response,
+            at=rejected_at,
+            event=TaskEventDraft(
+                "event:rejected:5",
+                "TASK_REJECTED",
+                {"decision_id": response.decision_id},
+                rejected_at,
+            ),
+        )
+        replay = self.store.consume_approval(
+            task=waiting,
+            response=response,
+            at=rejected_at + timedelta(seconds=1),
+            event=TaskEventDraft(
+                "event:rejected:replay",
+                "TASK_REJECTED",
+                {"decision_id": response.decision_id},
+                rejected_at + timedelta(seconds=1),
+            ),
+        )
+
+        pending = self.store.list_outbox(status=OutboxStatus.PENDING)
+        self.assertEqual(first.task.status, Status.REJECTED)
+        self.assertEqual(replay.task, first.task)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(
+            Notification.from_payload(pending[0].payload).status,
+            "REJECTED",
+        )
+
+    def _persist_completed(self, task_id: str) -> Task:
+        received = Task.receive(task_id=task_id, input="점검", at=NOW)
+        running = received.transition(Status.RUNNING, at=NOW + timedelta(seconds=1))
+        completed = running.transition(
+            Status.COMPLETED,
+            at=NOW + timedelta(seconds=2),
+        )
+        self.store.create_task(
+            received,
+            event=TaskEventDraft(f"event:{task_id}:1", "TASK_RECEIVED", {}, NOW),
+        )
+        self.store.save_task(
+            running,
+            expected_version=1,
+            event=TaskEventDraft(
+                f"event:{task_id}:2",
+                "TASK_STARTED",
+                {},
+                running.updated_at,
+            ),
+        )
+        self.store.save_task(
+            completed,
+            expected_version=2,
+            event=TaskEventDraft(
+                f"event:{task_id}:3",
+                "TASK_COMPLETED",
+                {},
+                completed.updated_at,
+            ),
+        )
+        return completed
+
+
+class NotificationDispatcherTests(unittest.IsolatedAsyncioTestCase):
+    """Dispatcher의 실제 SQLite 전달, 실패와 재시작 복구를 검증한다."""
+
+    async def asyncSetUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.database_path = Path(self.directory.name) / "dispatcher.sqlite3"
+        upgrade_database(self.database_path)
+        self.store = SQLiteStore(self.database_path)
+        received = Task.receive(task_id="task-dispatch", input="점검", at=NOW)
+        running = received.transition(Status.RUNNING, at=NOW + timedelta(seconds=1))
+        self.completed = running.transition(
+            Status.COMPLETED,
+            at=NOW + timedelta(seconds=2),
+        )
+        self.store.create_task(
+            received,
+            event=TaskEventDraft("event:dispatch:1", "TASK_RECEIVED", {}, NOW),
+        )
+        self.store.save_task(
+            running,
+            expected_version=1,
+            event=TaskEventDraft(
+                "event:dispatch:2", "TASK_STARTED", {}, running.updated_at
+            ),
+        )
+        self.store.save_task(
+            self.completed,
+            expected_version=2,
+            event=TaskEventDraft(
+                "event:dispatch:3",
+                "TASK_COMPLETED",
+                {},
+                self.completed.updated_at,
+            ),
+        )
+
+    async def asyncTearDown(self) -> None:
+        self.store.close()
+        self.directory.cleanup()
+
+    async def test_dispatch_once_delivers_and_marks_the_claim_terminal(self) -> None:
+        """Sender 성공 뒤 outbox가 PROCESSING에 남거나 중복 전달되는 버그를 잡는다."""
+
+        sender = FakeNotificationSender()
+        dispatcher = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=sender,
+            clock=lambda: self.completed.updated_at,
+            id_factory=lambda: "dispatcher-lease",
+        )
+
+        claimed = await dispatcher.dispatch_once()
+        second = await dispatcher.dispatch_once()
+
+        self.assertTrue(claimed)
+        self.assertFalse(second)
+        self.assertEqual(len(sender.sent), 1)
+        messages = self.store.list_outbox()
+        self.assertEqual(messages[0].status, OutboxStatus.DELIVERED)
+        self.assertEqual(messages[0].attempt_count, 1)
+
+    async def test_sender_failure_does_not_change_task_and_restarts_at_eligibility(
+        self,
+    ) -> None:
+        """외부 실패가 Task를 되돌리거나 persisted backoff가 재시작에서 사라지는 버그를 잡는다."""
+
+        clock = [self.completed.updated_at]
+        failing_sender = FakeNotificationSender(failures_before_success=1)
+        first_dispatcher = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=failing_sender,
+            clock=lambda: clock[0],
+            id_factory=lambda: "first-lease",
+            base_retry_delay=timedelta(seconds=30),
+        )
+
+        self.assertTrue(await first_dispatcher.dispatch_once())
+        failed = self.store.list_outbox()[0]
+        self.assertEqual(failed.status, OutboxStatus.FAILED)
+        self.assertEqual(failed.last_error, "notification_delivery_failed")
+        self.assertEqual(
+            failed.next_attempt_at,
+            self.completed.updated_at + timedelta(seconds=30),
+        )
+        self.assertEqual(self.store.get_task(self.completed.task_id), self.completed)
+        self.store.close()
+
+        # 새 process 역할의 store/dispatcher가 persisted eligibility부터 이어받는다.
+        self.store = SQLiteStore(self.database_path)
+        sender_after_restart = FakeNotificationSender()
+        dispatcher_after_restart = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=sender_after_restart,
+            clock=lambda: clock[0],
+            id_factory=lambda: "restart-lease",
+            base_retry_delay=timedelta(seconds=30),
+        )
+        self.assertFalse(await dispatcher_after_restart.dispatch_once())
+        clock[0] += timedelta(seconds=30)
+        self.assertTrue(await dispatcher_after_restart.dispatch_once())
+
+        delivered = self.store.list_outbox()[0]
+        self.assertEqual(delivered.status, OutboxStatus.DELIVERED)
+        self.assertEqual(delivered.attempt_count, 2)
+        self.assertEqual(len(sender_after_restart.sent), 1)
+
+    async def test_start_drain_and_stop_own_the_polling_lifecycle(self) -> None:
+        """Runtime lifecycle에서 dispatcher worker가 시작되지 않거나 stop 뒤 남는 버그를 잡는다."""
+
+        sender = FakeNotificationSender()
+        dispatcher = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=sender,
+            clock=lambda: self.completed.updated_at,
+            id_factory=lambda: "lifecycle-lease",
+            poll_interval=0.01,
+        )
+
+        await dispatcher.start()
+        await dispatcher.drain()
+        await dispatcher.stop()
+        await dispatcher.stop()
+
+        self.assertEqual(len(sender.sent), 1)
+        self.assertFalse(dispatcher.is_running)
+
+
+if __name__ == "__main__":
+    unittest.main()

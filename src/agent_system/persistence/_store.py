@@ -6,7 +6,7 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from types import TracebackType
@@ -18,6 +18,7 @@ from sqlalchemy import URL, Engine, create_engine, event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from agent_system.notifications import Notification, NotificationChannel
 from agent_system.orchestration import (
     AgentRun,
     Approval,
@@ -175,12 +176,23 @@ def _outbox_from_row(row: OutboxRow) -> OutboxMessage:
     return OutboxMessage(
         outbox_id=row.outbox_id,
         task_id=row.task_id,
+        task_version=row.task_version,
         topic=row.topic,
         payload=_json_load(row.payload_json),
         status=OutboxStatus(row.status),
         attempt_count=row.attempt_count,
         created_at=_parse_datetime(row.created_at),
         updated_at=_parse_datetime(row.updated_at),
+        next_attempt_at=_parse_datetime(row.next_attempt_at),
+        lease_token=row.lease_token,
+        lease_expires_at=(
+            None
+            if row.lease_expires_at is None
+            else _parse_datetime(row.lease_expires_at)
+        ),
+        delivered_at=(
+            None if row.delivered_at is None else _parse_datetime(row.delivered_at)
+        ),
         last_error=row.last_error,
     )
 
@@ -376,12 +388,17 @@ class SQLiteStore:
                         OutboxRow(
                             outbox_id=outbox_value.outbox_id,
                             task_id=outbox_value.task_id,
+                            task_version=outbox_value.task_version,
                             topic=outbox_value.topic,
                             payload_json=_json_dump(outbox_value.payload),
                             status=outbox_value.status.value,
                             attempt_count=outbox_value.attempt_count,
                             created_at=outbox_value.created_at.isoformat(),
                             updated_at=outbox_value.updated_at.isoformat(),
+                            next_attempt_at=outbox_value.next_attempt_at.isoformat(),
+                            lease_token=outbox_value.lease_token,
+                            lease_expires_at=None,
+                            delivered_at=None,
                             last_error=outbox_value.last_error,
                         )
                     )
@@ -575,6 +592,13 @@ class SQLiteStore:
             payload=dict(event.payload),
             occurred_at=event.occurred_at,
         )
+        automatic_outbox = self._notification_draft(task)
+        if automatic_outbox is not None:
+            if outbox is not None and outbox != automatic_outbox:
+                raise InvalidPersistenceValueError(
+                    "알림 대상 Task 전이의 notification outbox는 교체할 수 없습니다."
+                )
+            outbox = automatic_outbox
         outbox_value = None if outbox is None else self._new_outbox(task, outbox)
         try:
             with self._session() as session, session.begin():
@@ -619,12 +643,17 @@ class SQLiteStore:
                         OutboxRow(
                             outbox_id=outbox_value.outbox_id,
                             task_id=outbox_value.task_id,
+                            task_version=outbox_value.task_version,
                             topic=outbox_value.topic,
                             payload_json=_json_dump(outbox_value.payload),
                             status=outbox_value.status.value,
                             attempt_count=outbox_value.attempt_count,
                             created_at=outbox_value.created_at.isoformat(),
                             updated_at=outbox_value.updated_at.isoformat(),
+                            next_attempt_at=outbox_value.next_attempt_at.isoformat(),
+                            lease_token=outbox_value.lease_token,
+                            lease_expires_at=None,
+                            delivered_at=None,
                             last_error=outbox_value.last_error,
                         )
                     )
@@ -1019,12 +1048,17 @@ class SQLiteStore:
                         OutboxRow(
                             outbox_id=outbox_value.outbox_id,
                             task_id=outbox_value.task_id,
+                            task_version=outbox_value.task_version,
                             topic=outbox_value.topic,
                             payload_json=_json_dump(outbox_value.payload),
                             status=outbox_value.status.value,
                             attempt_count=outbox_value.attempt_count,
                             created_at=outbox_value.created_at.isoformat(),
                             updated_at=outbox_value.updated_at.isoformat(),
+                            next_attempt_at=outbox_value.next_attempt_at.isoformat(),
+                            lease_token=outbox_value.lease_token,
+                            lease_expires_at=None,
+                            delivered_at=None,
                             last_error=outbox_value.last_error,
                         )
                     )
@@ -1179,6 +1213,27 @@ class SQLiteStore:
                         occurred_at=event_value.occurred_at.isoformat(),
                     )
                 )
+                outbox_draft = self._notification_draft(successor)
+                if outbox_draft is not None:
+                    outbox_value = self._new_outbox(successor, outbox_draft)
+                    session.add(
+                        OutboxRow(
+                            outbox_id=outbox_value.outbox_id,
+                            task_id=outbox_value.task_id,
+                            task_version=outbox_value.task_version,
+                            topic=outbox_value.topic,
+                            payload_json=_json_dump(outbox_value.payload),
+                            status=outbox_value.status.value,
+                            attempt_count=outbox_value.attempt_count,
+                            created_at=outbox_value.created_at.isoformat(),
+                            updated_at=outbox_value.updated_at.isoformat(),
+                            next_attempt_at=outbox_value.next_attempt_at.isoformat(),
+                            lease_token=None,
+                            lease_expires_at=None,
+                            delivered_at=None,
+                            last_error=None,
+                        )
+                    )
                 return ApprovalConsumeResult(
                     ApprovalConsumeStatus.APPLIED,
                     successor,
@@ -1280,6 +1335,163 @@ class SQLiteStore:
                 )
             )
 
+    def claim_outbox(
+        self,
+        *,
+        now: datetime,
+        lease_duration: timedelta,
+        lease_token: str,
+    ) -> OutboxMessage | None:
+        """가장 오래된 eligible outbox 한 건을 lease CAS로 claim한다."""
+
+        self._validate_outbox_time(now, field_name="now")
+        if not isinstance(lease_duration, timedelta) or lease_duration <= timedelta(0):
+            raise InvalidPersistenceValueError("lease_duration은 양수여야 합니다.")
+        if not isinstance(lease_token, str) or not lease_token.strip():
+            raise InvalidPersistenceValueError("lease_token은 비어 있을 수 없습니다.")
+        expires_at = now + lease_duration
+        active_statuses = {
+            OutboxStatus.PENDING.value,
+            OutboxStatus.FAILED.value,
+            OutboxStatus.PROCESSING.value,
+        }
+        with self._session() as session, session.begin():
+            candidates = tuple(
+                session.scalars(
+                    select(OutboxRow).where(OutboxRow.status.in_(active_statuses))
+                )
+            )
+            eligible = [
+                row for row in candidates if self._outbox_is_eligible(row, now=now)
+            ]
+            if not eligible:
+                return None
+            row = min(
+                eligible,
+                key=lambda candidate: (
+                    _parse_datetime(candidate.next_attempt_at).astimezone(UTC),
+                    _parse_datetime(candidate.created_at).astimezone(UTC),
+                    candidate.outbox_id,
+                ),
+            )
+            previous_status = row.status
+            previous_token = row.lease_token
+            conditions = [
+                OutboxRow.outbox_id == row.outbox_id,
+                OutboxRow.status == previous_status,
+            ]
+            if previous_token is None:
+                conditions.append(OutboxRow.lease_token.is_(None))
+            else:
+                conditions.append(OutboxRow.lease_token == previous_token)
+            result = session.execute(
+                update(OutboxRow)
+                .where(*conditions)
+                .values(
+                    status=OutboxStatus.PROCESSING.value,
+                    attempt_count=row.attempt_count + 1,
+                    updated_at=now.isoformat(),
+                    lease_token=lease_token,
+                    lease_expires_at=expires_at.isoformat(),
+                    delivered_at=None,
+                )
+            )
+            if result.rowcount != 1:
+                return None
+            session.flush()
+            session.refresh(row)
+            return _outbox_from_row(row)
+
+    def mark_outbox_delivered(
+        self,
+        outbox_id: str,
+        *,
+        lease_token: str,
+        at: datetime,
+    ) -> OutboxMessage:
+        """현재 lease owner만 outbox 전달 성공을 확정한다."""
+
+        self._validate_outbox_identity(outbox_id, lease_token)
+        self._validate_outbox_time(at, field_name="at")
+        with self._session() as session, session.begin():
+            row = session.get(OutboxRow, outbox_id)
+            self._require_outbox_lease(row, lease_token=lease_token, at=at)
+            assert row is not None
+            result = session.execute(
+                update(OutboxRow)
+                .where(
+                    OutboxRow.outbox_id == outbox_id,
+                    OutboxRow.status == OutboxStatus.PROCESSING.value,
+                    OutboxRow.lease_token == lease_token,
+                )
+                .values(
+                    status=OutboxStatus.DELIVERED.value,
+                    updated_at=at.isoformat(),
+                    lease_token=None,
+                    lease_expires_at=None,
+                    delivered_at=at.isoformat(),
+                    last_error=None,
+                )
+            )
+            if result.rowcount != 1:
+                raise OptimisticConcurrencyError(
+                    "outbox lease가 다른 dispatcher에 의해 변경되었습니다."
+                )
+            session.flush()
+            session.refresh(row)
+            return _outbox_from_row(row)
+
+    def record_outbox_failure(
+        self,
+        outbox_id: str,
+        *,
+        lease_token: str,
+        error_code: str,
+        at: datetime,
+        next_attempt_at: datetime,
+    ) -> OutboxMessage:
+        """전달 실패와 다음 eligibility를 기록하고 Task에는 손대지 않는다."""
+
+        self._validate_outbox_identity(outbox_id, lease_token)
+        if not isinstance(error_code, str) or not error_code.strip():
+            raise InvalidPersistenceValueError("error_code는 비어 있을 수 없습니다.")
+        if len(error_code) > 100:
+            raise InvalidPersistenceValueError("error_code는 100자 이하여야 합니다.")
+        self._validate_outbox_time(at, field_name="at")
+        self._validate_outbox_time(next_attempt_at, field_name="next_attempt_at")
+        if next_attempt_at.astimezone(UTC) <= at.astimezone(UTC):
+            raise InvalidPersistenceValueError(
+                "next_attempt_at은 실패 시각보다 뒤여야 합니다."
+            )
+        with self._session() as session, session.begin():
+            row = session.get(OutboxRow, outbox_id)
+            self._require_outbox_lease(row, lease_token=lease_token, at=at)
+            assert row is not None
+            result = session.execute(
+                update(OutboxRow)
+                .where(
+                    OutboxRow.outbox_id == outbox_id,
+                    OutboxRow.status == OutboxStatus.PROCESSING.value,
+                    OutboxRow.lease_token == lease_token,
+                )
+                .values(
+                    status=OutboxStatus.FAILED.value,
+                    updated_at=at.isoformat(),
+                    next_attempt_at=next_attempt_at.isoformat(),
+                    lease_token=None,
+                    lease_expires_at=None,
+                    delivered_at=None,
+                    last_error=error_code,
+                )
+            )
+            if result.rowcount != 1:
+                raise OptimisticConcurrencyError(
+                    "outbox lease가 다른 dispatcher에 의해 변경되었습니다."
+                )
+            session.flush()
+            session.refresh(row)
+            return _outbox_from_row(row)
+
     def transition_outbox(
         self,
         outbox_id: str,
@@ -1354,12 +1566,25 @@ class SQLiteStore:
             return OutboxMessage(
                 outbox_id=row.outbox_id,
                 task_id=row.task_id,
+                task_version=row.task_version,
                 topic=row.topic,
                 payload=_json_load(row.payload_json),
                 status=target,
                 attempt_count=attempt_count,
                 created_at=_parse_datetime(row.created_at),
                 updated_at=at,
+                next_attempt_at=_parse_datetime(row.next_attempt_at),
+                lease_token=row.lease_token,
+                lease_expires_at=(
+                    None
+                    if row.lease_expires_at is None
+                    else _parse_datetime(row.lease_expires_at)
+                ),
+                delivered_at=(
+                    None
+                    if row.delivered_at is None
+                    else _parse_datetime(row.delivered_at)
+                ),
                 last_error=persisted_error,
             )
 
@@ -1368,13 +1593,105 @@ class SQLiteStore:
         return OutboxMessage(
             outbox_id=draft.outbox_id,
             task_id=task.task_id,
+            task_version=(
+                task.version if draft.topic == "task.status_changed" else None
+            ),
             topic=draft.topic,
             payload=dict(draft.payload),
             status=OutboxStatus.PENDING,
             attempt_count=0,
             created_at=draft.created_at,
             updated_at=draft.created_at,
+            next_attempt_at=draft.created_at,
+            lease_token=None,
+            lease_expires_at=None,
+            delivered_at=None,
             last_error=None,
+        )
+
+    @staticmethod
+    def _outbox_is_eligible(row: OutboxRow, *, now: datetime) -> bool:
+        current = now.astimezone(UTC)
+        status = OutboxStatus(row.status)
+        if status in {OutboxStatus.PENDING, OutboxStatus.FAILED}:
+            return _parse_datetime(row.next_attempt_at).astimezone(UTC) <= current
+        if status is OutboxStatus.PROCESSING:
+            return row.lease_expires_at is not None and (
+                _parse_datetime(row.lease_expires_at).astimezone(UTC) <= current
+            )
+        return False
+
+    @staticmethod
+    def _validate_outbox_time(value: datetime, *, field_name: str) -> None:
+        if (
+            not isinstance(value, datetime)
+            or value.tzinfo is None
+            or value.utcoffset() is None
+        ):
+            raise InvalidPersistenceValueError(
+                f"{field_name}에는 timezone-aware datetime이 필요합니다."
+            )
+
+    @staticmethod
+    def _validate_outbox_identity(outbox_id: str, lease_token: str) -> None:
+        if not isinstance(outbox_id, str) or not outbox_id.strip():
+            raise InvalidPersistenceValueError("outbox_id는 비어 있을 수 없습니다.")
+        if not isinstance(lease_token, str) or not lease_token.strip():
+            raise InvalidPersistenceValueError("lease_token은 비어 있을 수 없습니다.")
+
+    @staticmethod
+    def _require_outbox_lease(
+        row: OutboxRow | None,
+        *,
+        lease_token: str,
+        at: datetime,
+    ) -> None:
+        if row is None:
+            raise PersistenceNotFoundError("outbox가 없습니다.")
+        if (
+            row.status != OutboxStatus.PROCESSING.value
+            or row.lease_token != lease_token
+        ):
+            raise OptimisticConcurrencyError(
+                "현재 dispatcher가 outbox lease를 소유하지 않습니다."
+            )
+        if row.lease_expires_at is None or (
+            _parse_datetime(row.lease_expires_at).astimezone(UTC) < at.astimezone(UTC)
+        ):
+            raise OptimisticConcurrencyError("outbox lease가 만료되었습니다.")
+
+    @staticmethod
+    def _notification_draft(task: Task) -> OutboxDraft | None:
+        notified_statuses = {
+            Status.WAITING_APPROVAL,
+            Status.COMPLETED,
+            Status.REJECTED,
+            Status.FAILED,
+            Status.ESCALATED,
+            Status.CANCELLED,
+        }
+        if task.status not in notified_statuses:
+            return None
+        notification_id = f"notification:{task.task_id}:{task.version}"
+        metadata = (
+            {"plan_hash": task.plan_hash}
+            if task.status is Status.WAITING_APPROVAL and task.plan_hash is not None
+            else {}
+        )
+        notification = Notification(
+            notification_id=notification_id,
+            task_id=task.task_id,
+            task_version=task.version,
+            status=task.status.value,
+            channel=NotificationChannel.OPERATIONS,
+            occurred_at=task.updated_at,
+            metadata=metadata,
+        )
+        return OutboxDraft(
+            outbox_id=notification_id,
+            topic="task.status_changed",
+            payload=notification.to_payload(),
+            created_at=task.updated_at,
         )
 
     @staticmethod

@@ -19,6 +19,11 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from agent_system.agents import AgentMetadata, AgentRegistry, EchoAgent
 from agent_system.config import RuntimeSettings
 from agent_system.models import ModelSettings, create_chat_model
+from agent_system.notifications import (
+    LoggingNotificationSender,
+    NotificationDispatcher,
+    NotificationSender,
+)
 from agent_system.orchestration import (
     AgentRun,
     AlertInput,
@@ -58,6 +63,7 @@ from agent_system.persistence import (
     RuntimeCommandRecord,
     RuntimeCommandStatus,
     RuntimeCommandType,
+    SQLiteNotificationOutbox,
     SQLiteStore,
     TaskEvent,
     TaskEventDraft,
@@ -691,6 +697,8 @@ def build_runtime(
     model_factory: Callable[[ModelSettings], BaseChatModel] = create_chat_model,
     clock: Callable[[], datetime] = _utc_now,
     id_factory: Callable[[], str] = _uuid,
+    notification_sender: NotificationSender | None = None,
+    notification_id_factory: Callable[[], str] = _uuid,
 ) -> RuntimeApplication:
     """설정과 주입 adapter를 하나의 소유권 명확한 runtime으로 조립한다."""
 
@@ -727,6 +735,16 @@ def build_runtime(
             clock=clock,
             id_factory=id_factory,
         )
+        notification_dispatcher = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(store),
+            sender=(
+                notification_sender
+                if notification_sender is not None
+                else LoggingNotificationSender()
+            ),
+            clock=clock,
+            id_factory=notification_id_factory,
+        )
 
         def close_resources() -> None:
             try:
@@ -741,6 +759,7 @@ def build_runtime(
             worker_count=settings.worker_count,
             clock=clock,
             id_factory=id_factory,
+            notification_dispatcher=notification_dispatcher,
             close_resources=close_resources,
         )
     except BaseException:
@@ -802,6 +821,7 @@ class RuntimeApplication:
         worker_count: int,
         clock: Callable[[], datetime],
         id_factory: Callable[[], str],
+        notification_dispatcher: NotificationDispatcher | None = None,
         close_resources: Callable[[], None] | None = None,
     ) -> None:
         if (
@@ -824,6 +844,7 @@ class RuntimeApplication:
         self._worker_count = worker_count
         self._clock = clock
         self._id_factory = id_factory
+        self._notification_dispatcher = notification_dispatcher
         self._close_resources = close_resources
         self._workers: list[asyncio.Task[None]] = []
         self._deferred_work: deque[_WorkItem] = deque()
@@ -851,6 +872,8 @@ class RuntimeApplication:
             asyncio.create_task(self._worker(), name=f"agent-worker-{index}")
             for index in range(self._worker_count)
         ]
+        if self._notification_dispatcher is not None:
+            await self._notification_dispatcher.start()
         await self._pump_pending_commands()
         durable_task_ids = {
             command.task_id
@@ -899,6 +922,8 @@ class RuntimeApplication:
                 await asyncio.gather(*self._workers)
                 self._workers.clear()
                 self._started = False
+            if self._notification_dispatcher is not None:
+                await self._notification_dispatcher.stop()
             if self._close_resources is not None:
                 await asyncio.to_thread(self._close_resources)
             self._closed = True
@@ -907,6 +932,8 @@ class RuntimeApplication:
         """현재 queue와 active child 실행이 모두 끝날 때까지 기다린다."""
 
         await self._queue.join()
+        if self._notification_dispatcher is not None:
+            await self._notification_dispatcher.drain()
 
     async def submit(self, submission: Submission) -> AcceptedTask:
         """RECEIVED snapshot을 먼저 저장한 뒤 background start를 수락한다."""

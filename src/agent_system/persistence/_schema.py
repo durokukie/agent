@@ -67,6 +67,20 @@ class OutboxRow(Base):
             "attempt_count >= 0",
             name="ck_outbox_attempt_count_nonnegative",
         ),
+        Index(
+            "uq_outbox_task_version_topic",
+            "task_id",
+            "task_version",
+            "topic",
+            unique=True,
+            sqlite_where=text("task_version IS NOT NULL"),
+        ),
+        Index(
+            "ix_outbox_delivery_eligibility",
+            "status",
+            "next_attempt_at",
+            "lease_expires_at",
+        ),
     )
 
     outbox_id: Mapped[str] = mapped_column(String(255), primary_key=True)
@@ -75,12 +89,17 @@ class OutboxRow(Base):
         ForeignKey("tasks.task_id", ondelete="RESTRICT"),
         nullable=True,
     )
+    task_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     topic: Mapped[str] = mapped_column(String(255))
     payload_json: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), index=True)
     attempt_count: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[str] = mapped_column(Text)
+    next_attempt_at: Mapped[str] = mapped_column(Text)
+    lease_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_expires_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivered_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 

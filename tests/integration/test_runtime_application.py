@@ -16,6 +16,7 @@ from agent_system.agents import AgentMetadata, AgentRegistry, FakeAgent
 from agent_system.config import RuntimeSettings
 from agent_system.http import create_app
 from agent_system.models import ModelSettings
+from agent_system.notifications import FakeNotificationSender
 from agent_system.orchestration import (
     ActionKind,
     ActionPlan,
@@ -1818,6 +1819,7 @@ class RuntimeFullStackTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
             ids = iter(("task-builder", "workflow-builder", "agent-run-builder"))
+            notification_sender = FakeNotificationSender()
             application = build_runtime(
                 settings,
                 classifier=classifier,
@@ -1825,6 +1827,7 @@ class RuntimeFullStackTests(unittest.IsolatedAsyncioTestCase):
                 registry=registry,
                 clock=_StepClock(),
                 id_factory=lambda: next(ids),
+                notification_sender=notification_sender,
             )
 
             await application.start()
@@ -1840,6 +1843,10 @@ class RuntimeFullStackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(task)
                 assert task is not None
                 self.assertEqual(task.status, Status.COMPLETED)
+            self.assertEqual(
+                [notification.status for notification in notification_sender.sent],
+                ["COMPLETED"],
+            )
 
 
 class _StepClock:

@@ -158,12 +158,17 @@ class OutboxMessage:
 
     outbox_id: str
     task_id: str | None
+    task_version: int | None
     topic: str
     payload: Mapping[str, object]
     status: OutboxStatus
     attempt_count: int
     created_at: datetime
     updated_at: datetime
+    next_attempt_at: datetime
+    lease_token: str | None
+    lease_expires_at: datetime | None
+    delivered_at: datetime | None
     last_error: str | None
 
 

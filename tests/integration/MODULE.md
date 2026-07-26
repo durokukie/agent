@@ -29,7 +29,10 @@ LangGraph graph 연결·분류·routing·오류 정책·interrupt·Command resum
 임시 파일 데이터베이스만 사용해 migration 반복 적용, WAL과 foreign key, optimistic
 rollback, event append-only, 멱등성 race, Approval 단일 소비와 ApprovalResponse
 승인·거절의 별도 SQLiteStore 경합·exact replay·rollback·conflict, WorkflowRun/AgentRun
-원자성, outbox와 startup recovery를 검증한다. Supervisor graph는 실제 compiled graph와
+원자성, outbox와 startup recovery를 검증한다. Notification outbox는 대상 상태의
+transaction 원자성·safe payload·exact replay, 동시 claim, lease 만료, bounded backoff,
+sender 실패 독립성과 process restart retry를 실제 임시 SQLite로 검증한다. Supervisor
+graph는 실제 compiled graph와
 `InMemorySaver`로 승인 binding·거절·resume·replay, consume 뒤 checkpoint 전 crash healing, 두 service의 승인 소비 경합과 Agent 호출 전 issuance 저장 순서를
 검증한다. Persistence 공개 sync saver를 async supervisor에 주입해 실행하고 새 연결에서
 결과를 복원하는 호환 경로도 검증한다. SQLite checkpoint는 interrupt 또는 열린 issuance 뒤 연결을 닫고 새

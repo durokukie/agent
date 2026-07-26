@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict
 
+from alembic import command as alembic_command
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
@@ -48,6 +49,7 @@ from agent_system.persistence import (
     RuntimeCommandType,
     SQLiteStore,
     TaskEventDraft,
+    _alembic_config,
     upgrade_database,
 )
 
@@ -94,7 +96,7 @@ class MigrationTests(unittest.TestCase):
                 "workflow_runs",
             },
         )
-        self.assertEqual(revision, ("0003_runtime_commands",))
+        self.assertEqual(revision, ("0004_notification_outbox",))
         self.assertTrue(
             any(row[2] == "tasks" and row[3] == "task_id" for row in event_foreign_keys)
         )
@@ -103,6 +105,10 @@ class MigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "state.sqlite3"
             upgrade_database(database_path)
+            alembic_command.downgrade(
+                _alembic_config(database_path),
+                "0001_initial",
+            )
             with sqlite3.connect(database_path) as connection:
                 connection.execute(
                     "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -116,13 +122,6 @@ class MigrationTests(unittest.TestCase):
                         NOW.isoformat(),
                     ),
                 )
-                connection.execute("DROP TABLE runtime_commands")
-                connection.execute("DROP TABLE approval_decisions")
-                connection.execute(
-                    "UPDATE alembic_version SET version_num = ?",
-                    ("0001_initial",),
-                )
-
             upgrade_database(database_path)
 
             with sqlite3.connect(database_path) as connection:
@@ -142,7 +141,7 @@ class MigrationTests(unittest.TestCase):
                     ("runtime_commands",),
                 ).fetchone()
 
-        self.assertEqual(revision, ("0003_runtime_commands",))
+        self.assertEqual(revision, ("0004_notification_outbox",))
         self.assertEqual(existing, ("기존 요청",))
         self.assertEqual(decision_table, ("approval_decisions",))
         self.assertEqual(command_table, ("runtime_commands",))
@@ -180,7 +179,7 @@ with sqlite3.connect(database_path) as connection:
     revision = connection.execute(
         "SELECT version_num FROM alembic_version"
     ).fetchone()
-assert revision == ("0003_runtime_commands",)
+assert revision == ("0004_notification_outbox",)
 """
             environment = os.environ.copy()
             environment["PYTHONPATH"] = str(installed_root)
@@ -1055,7 +1054,11 @@ class ApprovalStoreTests(unittest.TestCase):
         self.assertEqual(len(events), 5)
         self.assertEqual(len(approvals), 1)
         self.assertEqual(approvals[0].approval, approval)
-        self.assertEqual(len(outbox), 1)
+        self.assertEqual(len(outbox), 2)
+        self.assertEqual(
+            {message.topic for message in outbox},
+            {"task.approved", "task.status_changed"},
+        )
 
     def test_atomically_rejects_and_replays_the_exact_successor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

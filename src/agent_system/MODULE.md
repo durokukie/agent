@@ -2,11 +2,13 @@
 
 ## 목적과 책임
 
-HTTP/CLI 전송, 애플리케이션 조립, 오케스트레이션, 에이전트, 도구, 모델, 저장 및 관측 기능을 하나의 모듈형 모놀리스로 제공한다.
+HTTP/CLI 전송, 애플리케이션 조립, 오케스트레이션, 에이전트, 도구, 모델, 저장,
+알림 및 관측 기능을 하나의 모듈형 모놀리스로 제공한다.
 
 ## 포함할 구현
 
-`http`, `cli`, `runtime`, `orchestration`, `agents`, `tools`, `models`, `persistence`, `observability`, `schemas`, `config` 모듈을 포함한다.
+`http`, `cli`, `runtime`, `orchestration`, `agents`, `tools`, `models`,
+`persistence`, `notifications`, `observability`, `schemas`, `config` 모듈을 포함한다.
 
 ## 공개 인터페이스와 사용 방법
 
@@ -18,7 +20,9 @@ HTTP와 CLI는 내부 모듈을 직접 조립하지 않고 `runtime`의 applicat
 
 ## 데이터 및 제어 흐름
 
-HTTP/CLI 요청은 runtime에서 먼저 영속화되고 background queue를 거쳐 orchestration graph가 에이전트를 선택한다. 조회는 persistence authority에서 조립된다.
+HTTP/CLI 요청은 runtime에서 먼저 영속화되고 background queue를 거쳐 orchestration graph가
+에이전트를 선택한다. 조회는 persistence authority에서 조립되며 대상 Task 전이는
+transactional outbox와 dispatcher를 거쳐 알림 sender에 전달된다.
 
 ## 설계 결정과 제약사항
 

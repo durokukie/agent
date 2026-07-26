@@ -9,7 +9,8 @@ SQLite authority에 저장하고 bounded background queue에서 orchestration을
 ## 포함할 구현
 
 `TaskApplication` 계약, `RuntimeApplication`, `build_runtime()`, 제출·승인·취소 명령과
-조회 값, process-local worker queue를 포함한다. `SQLiteLifecycleJournal`은 graph의 Task,
+조회 값, process-local worker queue와 notification dispatcher 조립을 포함한다.
+`SQLiteLifecycleJournal`은 graph의 Task,
 WorkflowRun, AgentRun 변경을 짧은 transaction에 기록하고 같은 callback replay에는 먼저
 저장된 authoritative snapshot을 반환한다. `SQLiteApprovalConsumer`는 승인·거절 CAS를,
 `InProcessExecutionCoordinator`는 같은 checkpoint thread의 실행권을 adapter 계약에 맞춘다.
@@ -25,10 +26,13 @@ Agent registry와 orchestrator를 조립해 `RuntimeApplication`을 반환한다
 구성은 classifier, Governance, registry, model factory, clock과 ID factory를 주입할 수 있다.
 전송 adapter는 `start()`/`stop()` 수명 안에서 `submit()`, `get_task()`, `approve()`,
 `cancel()`만 사용한다. 명령 반환은 실행 완료가 아니라 durable 수락 결과다.
+`build_runtime(..., notification_sender=...)`로 기본 logging sender를 fake 또는 다른
+adapter로 교체할 수 있으며 dispatcher의 start/stop/drain은 application 수명에 포함된다.
 
 ## 의존성과 허용된 import 방향
 
-composition root이므로 `config`, `models`, `agents`, `orchestration`, `persistence`를 조립할
+composition root이므로 `config`, `models`, `agents`, `orchestration`, `persistence`,
+`notifications`를 조립할
 수 있다. FastAPI와 Rich는 import하지 않으며 HTTP와 CLI가 runtime을 import한다. 외부
 adapter의 동기 SQLite 호출은 `asyncio.to_thread()` 뒤에 둔다.
 
@@ -43,8 +47,8 @@ backoff를 기다리지 않는 명시적 재시도이고, 다른 worker의 완�
 command를 다시 실행하지 않는다. 조회는 SQLite의
 Task, event, workflow와 AgentRun에서 승인·결과 metadata를 조립한다. 시작 시 terminal을
 제외한 recovery 후보를 읽어 `RECEIVED`는 재시작하고, 승인 대기는 사람 입력을 기다리며,
-나머지는 Task ID checkpoint에서 복구한다. 종료는 queue를 drain하고 checkpointer와 store를
-각각 한 번 닫는다.
+나머지는 Task ID checkpoint에서 복구한다. 종료는 queue와 notification outbox를 drain하고
+dispatcher를 중단한 뒤 checkpointer와 store를 각각 한 번 닫는다.
 
 ## 설계 결정과 제약사항
 
@@ -77,9 +81,11 @@ command와 command row 없는 recovery가 함께 밀릴 때는 매 worker 완료
 임시 SQLite와 orchestration fake로 durable-before-queue, webhook replay/conflict, recovery,
 승인·거절, 취소, 자원 종료를 검증한다. 실제 FastAPI ASGI, compiled LangGraph, SQLite
 checkpointer와 fake classifier/Governance/Agent를 함께 사용해 read-only 완료, 사람 승인,
-취소와 durable journal replay를 수직 통합 테스트한다.
+취소와 durable journal replay를 수직 통합 테스트한다. Notification sender 성공·실패와
+재시작 retry, dispatcher 수명도 실제 SQLite outbox로 검증한다.
 
 ## 변경 시 문서 갱신 조건
 
 application 계약, 조립 대상, queue/recovery 정책, Task thread identity, journal/승인 adapter,
-멱등성 namespace, 자원 수명 또는 runtime import 방향이 바뀔 때 갱신한다.
+멱등성 namespace, notification sender/dispatcher 조립, 자원 수명 또는 runtime import
+방향이 바뀔 때 갱신한다.

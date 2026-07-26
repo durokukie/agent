@@ -8,6 +8,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import URL
 
+from ._notifications import SQLiteNotificationOutbox
 from ._store import SQLiteStore
 from ._values import (
     ApprovalApplyResult,
@@ -86,6 +87,7 @@ __all__ = [
     "RuntimeCommandRecord",
     "RuntimeCommandStatus",
     "RuntimeCommandType",
+    "SQLiteNotificationOutbox",
     "SQLiteStore",
     "TaskEvent",
     "TaskEventDraft",

@@ -6,7 +6,9 @@
 
 ## 포함할 구현
 
-Task/WorkflowRun/AgentRun 생명주기, runtime 환경 설정, HTTP schema의 순수 validation·변환·registry와 import 방향 테스트를 포함한다. Compiled graph를 실행하는 supervisor 테스트는 integration 영역에 둔다.
+Task/WorkflowRun/AgentRun 생명주기, notification wire/sender, runtime 환경 설정, HTTP
+schema의 순수 validation·변환·registry와 import 방향 테스트를 포함한다. Compiled graph를
+실행하는 supervisor 테스트는 integration 영역에 둔다.
 
 ## 공개 인터페이스와 사용 방법
 

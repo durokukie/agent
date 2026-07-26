@@ -16,7 +16,8 @@ persistence 결과 값만 반환한다.
 - WorkflowRun snapshot과 모든 AgentRun 이력
 - 기존 Approval 기록과 ApprovalResponse 승인·거절 decision의 단일 소비 및 exact 결과 snapshot
 - webhook/request 멱등성 key
-- transactional notification outbox와 상태 전이
+- 대상 Task status에서 자동 생성되는 transactional notification outbox
+- retry eligibility, claim lease/CAS와 전달 성공·실패 상태 전이
 - durable START/APPROVAL/CANCEL runtime command와 실행 상태·실패 이력
 - non-terminal startup recovery 조회
 - 별도 `sqlite3.Connection`을 소유하는 LangGraph `SqliteSaver`
@@ -26,7 +27,8 @@ persistence 결과 값만 반환한다.
 
 runtime은 migration을 적용한 뒤 데이터베이스 경로를 주입해 `SQLiteStore`를 만든다.
 호출자는 store의 context manager 수명 안에서 Task 생성·변경, 실행 기록, 승인 소비,
-outbox와 복구 후보를 다룬다. 모든 read interface는 `Task`, `WorkflowRun`,
+outbox와 복구 후보를 다룬다. `SQLiteNotificationOutbox`는 동기 store를 notifications의
+async lease interface로 바꾼다. 모든 read interface는 `Task`, `WorkflowRun`,
 `AgentRun` 또는 frozen persistence value를 반환하며 ORM model을 노출하지 않는다.
 
 Task 생성은 선택적인 `IdempotencyKey`와 함께 한 transaction으로 처리한다. 같은
@@ -69,7 +71,7 @@ checkpointer table과 raw connection의 생성·종료는 이 context가 독립�
 
 ## 의존성과 허용된 import 방향
 
-`orchestration`의 공개 생명주기 값, SQLAlchemy, Alembic, LangGraph SQLite
+`orchestration`과 `notifications`의 공개 값, SQLAlchemy, Alembic, LangGraph SQLite
 checkpointer와 Python `sqlite3`를 사용할 수 있다. Agent 구현, model adapter,
 FastAPI, Rich와 CLI에는 의존하지 않는다. orchestration은 persistence를 import하지
 않는다.
@@ -77,7 +79,9 @@ FastAPI, Rich와 CLI에는 의존하지 않는다. orchestration은 persistence�
 ## 데이터 및 제어 흐름
 
 Task 명령은 저장된 snapshot을 읽고 optimistic 조건을 검증한 뒤 새 snapshot, event,
-선택적 outbox를 commit한다. ApprovalResponse 소비는 decision replay를 먼저 판별하고,
+대상 상태의 notification outbox를 commit한다. 대상은 `WAITING_APPROVAL`, `COMPLETED`,
+`REJECTED`, `FAILED`, `ESCALATED`, `CANCELLED`이며 `(task_id, task_version, topic)`으로
+exact enqueue를 보장한다. ApprovalResponse 소비는 decision replay를 먼저 판별하고,
 새 decision이면 binding과 authoritative Task를 검증해 successor/event/decision record를
 원자 저장한다. WorkflowRun이 발급한 immutable issuance ledger와 해당 AgentRun은 함께
 저장된다. 시작 시 recovery 조회는 terminal Task를 제외하고
@@ -96,7 +100,10 @@ SQLite는 WAL, foreign key, busy timeout을 모든 애플리케이션 연결과 
 저장한다. 여러 offset이 섞인 시각 기반 목록은 복원한 timezone-aware `datetime`의 실제
 instant와 안정적인 식별자로 정렬한다.
 
-Task event는 update/delete trigger로 append-only를 DB에서도 강제한다. app table은
+Dispatcher claim은 `BEGIN IMMEDIATE` transaction 안에서 eligibility와 만료 lease를 실제
+UTC instant로 비교하고 token CAS로 owner를 결합한다. 전달 실패는 Task를 변경하지 않고
+attempt, 안정적인 오류 code와 다음 시각을 기록한다. Task event는 update/delete trigger로
+append-only를 DB에서도 강제한다. app table은
 Alembic만 생성·변경하며 `MetaData.create_all()`을 migration 대체 수단으로 사용하지
 않는다. LangGraph가 소유한 checkpoint table은 Alembic metadata와 app migration에
 포함하지 않는다. 지원 범위는 low-write 단일 프로세스 MVP이며 다중 writer 또는 수평
@@ -110,12 +117,13 @@ rollback, event append-only, request idempotency race, Approval replay/conflict�
 소비, ApprovalResponse 승인·거절의 별도 connection 경합·exact replay·rollback·명시적
 decision/binding/version/terminal conflict, runtime command의 원자 생성·exact fingerprint
 replay·Task별 pending 순서·failure retry, WorkflowRun/AgentRun의 정확한 다음 상태 원자 저장·소유 복원, offset 혼합 목록
-정렬, outbox 전이, terminal 제외 recovery를 통합 테스트한다. 실제 LangGraph graph를
+정렬, 대상 상태 자동 outbox·원자 rollback·replay dedupe, claim 경쟁·stale token·lease
+recovery·backoff, terminal 제외 recovery를 통합 테스트한다. 실제 LangGraph graph를
 interrupt한 뒤 checkpointer를 닫고 새 connection에서 resume한다. 외부 서비스는
 사용하지 않는다.
 
 ## 변경 시 문서 갱신 조건
 
 schema/revision, 공개 store interface, transaction과 optimistic 조건, 멱등성 key,
-Approval 소비, recovery 분류, outbox 상태, SQLite PRAGMA, 자원 수명 또는 checkpoint
+Approval 소비, recovery 분류, outbox payload/상태/lease, SQLite PRAGMA, 자원 수명 또는 checkpoint
 정책이 바뀔 때 갱신한다.
