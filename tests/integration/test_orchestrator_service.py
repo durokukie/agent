@@ -33,6 +33,7 @@ from agent_system.orchestration import (
     FakeGovernance,
     FakeRequestClassifier,
     GovernanceDecision,
+    ModelSupervisorClassifier,
     NoopOrchestrationJournal,
     OrchestrationStateError,
     OrchestratorService,
@@ -44,6 +45,10 @@ from agent_system.orchestration import (
 )
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=UTC)
+CLASSIFIER_AGENTS = (
+    AgentMetadata("incident-reader", "Incident Reader", "운영 경보를 분석합니다."),
+    AgentMetadata("reader", "Reader", "일반 조회를 처리합니다."),
+)
 
 
 class _RaisingAgent:
@@ -207,7 +212,7 @@ class RequestClassifierTests(unittest.IsolatedAsyncioTestCase):
                 '"action":"read_only","reason":"운영 경보 분석","plan":null}'
             )
         )
-        classifier = ChatModelRequestClassifier(model)
+        classifier = ModelSupervisorClassifier(model, CLASSIFIER_AGENTS)
         request = AlertInput(
             task_id="task-alert",
             alert_id="alert-8",
@@ -227,10 +232,30 @@ class RequestClassifierTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertEqual(len(model.received_messages), 1)
+        prompt = str(model.received_messages[0][0].content)
+        self.assertIn('"agent_id": "incident-reader"', prompt)
+        self.assertIn("운영 경보를 분석합니다.", prompt)
+
+    async def test_model_supervisor_rejects_agent_outside_registry_metadata(
+        self,
+    ) -> None:
+        classifier = ModelSupervisorClassifier(
+            FakeChatModel(
+                response=(
+                    '{"request_kind":"user_task","agent_id":"invented-agent",'
+                    '"action":"read_only","reason":"조회","plan":null}'
+                )
+            ),
+            CLASSIFIER_AGENTS,
+        )
+
+        with self.assertRaises(ClassificationError):
+            await classifier.classify(UserTaskInput("task-unknown", "조회"))
 
     async def test_chat_model_classifier_rejects_unvalidated_output(self) -> None:
         classifier = ChatModelRequestClassifier(
-            FakeChatModel(response='{"request_kind":"alert"}')
+            FakeChatModel(response='{"request_kind":"alert"}'),
+            CLASSIFIER_AGENTS,
         )
 
         with self.assertRaises(ClassificationError):
@@ -250,7 +275,8 @@ class RequestClassifierTests(unittest.IsolatedAsyncioTestCase):
                     '{"request_kind":"user_task","agent_id":"reader",'
                     '"action":"read_only","reason":"조회","plan":null}'
                 )
-            )
+            ),
+            CLASSIFIER_AGENTS,
         )
 
         result = await classifier.classify(UserTaskInput("task-async", "조회"))
@@ -258,7 +284,9 @@ class RequestClassifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.agent_id, "reader")
 
     async def test_chat_model_classifier_hides_provider_exception_detail(self) -> None:
-        classifier = ChatModelRequestClassifier(_FailingAsyncChatModel(response=""))
+        classifier = ChatModelRequestClassifier(
+            _FailingAsyncChatModel(response=""), CLASSIFIER_AGENTS
+        )
 
         with self.assertRaises(ClassificationError) as raised:
             await classifier.classify(UserTaskInput("task-failure", "조회"))
@@ -267,7 +295,9 @@ class RequestClassifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(raised.exception.__cause__)
 
     async def test_chat_model_classifier_propagates_cancellation(self) -> None:
-        classifier = ChatModelRequestClassifier(_CancelledAsyncChatModel(response=""))
+        classifier = ChatModelRequestClassifier(
+            _CancelledAsyncChatModel(response=""), CLASSIFIER_AGENTS
+        )
         invocation = asyncio.create_task(
             classifier.classify(UserTaskInput("task-cancel", "조회"))
         )

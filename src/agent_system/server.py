@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from fastapi import FastAPI
+from langchain_core.language_models.chat_models import BaseChatModel
 
 from agent_system.config import RuntimeSettings
 from agent_system.http import create_app
+from agent_system.models import ModelSettings, create_chat_model
 from agent_system.runtime import build_runtime
 
 
-def create_app_from_env(env: Mapping[str, str] | None = None) -> FastAPI:
+def create_app_from_env(
+    env: Mapping[str, str] | None = None,
+    *,
+    model_factory: Callable[[ModelSettings], BaseChatModel] = create_chat_model,
+) -> FastAPI:
     """환경 mapping을 검증하고 소유 runtime을 가진 FastAPI app을 반환한다."""
 
     settings = RuntimeSettings.from_env(env)
-    return create_app(build_runtime(settings))
+    return create_app(build_runtime(settings, model_factory=model_factory))
 
 
 __all__ = ["create_app_from_env"]

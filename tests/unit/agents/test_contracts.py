@@ -97,6 +97,12 @@ class AgentRegistryTests(unittest.TestCase):
 
         self.assertIs(registry.get("analysis"), agent)
 
+    def test_exposes_registered_metadata_for_supervisor_routing(self) -> None:
+        registry = AgentRegistry()
+        registry.register(EchoAgent(METADATA))
+
+        self.assertEqual(registry.list_metadata(), (METADATA,))
+
     def test_rejects_duplicate_agent_identifier(self) -> None:
         registry = AgentRegistry()
         registry.register(EchoAgent(METADATA))

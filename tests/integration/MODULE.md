@@ -61,6 +61,10 @@ orphan을 회수하는지 검증한다. Subprocess의 외부 안전망은 느린
 검증과 경합하지 않도록 10초를 사용한다. 실제 runtime의 cooperative blocked orchestration을
 실행 중인 worker는 stop cancellation 때 grace 안에 취소되며 notification과 소유 자원을 닫고,
 notification startup 실패 뒤 HTTP global cleanup registry도 비워지는지 확인한다.
+정상 stop도 blocked cooperative 실행을 grace 뒤 취소하고 timeout을 최초 오류로 반환하며,
+동시·반복 stop에서 cleanup을 한 번만 수행하는지 검증한다. Notification/resource cleanup 도중
+호출자 cancellation은 이미 시작한 동일 owned Task를 완료시킨다. Env server에 deterministic
+ChatModel을 주입한 실제 요청은 registry metadata prompt를 거쳐 `operations-agent`로 route된다.
 
 End-to-end 수용 테스트는 FastAPI ASGI → bounded runtime → compiled LangGraph → SQLite
 journal/checkpointer/outbox → fake notification sender를 실제로 연결한다. 변경 Alert의 승인

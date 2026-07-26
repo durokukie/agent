@@ -26,9 +26,17 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, StateSnapshot, interrupt
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+)
 
 from agent_system.agents import (
+    AgentMetadata,
     AgentNotFoundError,
     AgentOutcome,
     AgentRegistry,
@@ -404,14 +412,45 @@ class _RoutingDecisionSchema(BaseModel):
     reason: str = Field(min_length=1)
     plan: _ActionPlanSchema | None
 
+    @field_validator("agent_id")
+    @classmethod
+    def validate_allowed_agent_id(
+        cls,
+        value: str,
+        info: ValidationInfo,
+    ) -> str:
+        """Registry가 제공한 ID 밖의 model route를 schema 오류로 거부한다."""
 
-class ChatModelRequestClassifier:
+        context = info.context
+        allowed = (
+            context.get("allowed_agent_ids") if isinstance(context, Mapping) else None
+        )
+        if not isinstance(allowed, frozenset) or value not in allowed:
+            raise ValueError("등록되지 않은 Agent ID입니다.")
+        return value
+
+
+class ModelSupervisorClassifier:
     """주입된 LangChain ChatModel 응답을 검증된 routing 결정으로 변환한다."""
 
-    def __init__(self, model: BaseChatModel) -> None:
+    def __init__(
+        self,
+        model: BaseChatModel,
+        agents: Sequence[AgentMetadata],
+    ) -> None:
         if not isinstance(model, BaseChatModel):
             raise TypeError("model은 BaseChatModel이어야 합니다.")
+        metadata = tuple(agents)
+        if not metadata or any(
+            not isinstance(item, AgentMetadata) for item in metadata
+        ):
+            raise ValueError("agents에는 하나 이상의 AgentMetadata가 필요합니다.")
+        allowed_ids = frozenset(item.agent_id for item in metadata)
+        if len(allowed_ids) != len(metadata):
+            raise ValueError("agents의 agent_id는 중복될 수 없습니다.")
         self._model = model
+        self._agents = metadata
+        self._allowed_agent_ids = allowed_ids
 
     async def classify(self, request: OrchestratorInput) -> RoutingDecision:
         """Provider 중립 JSON schema로 model 응답을 검증한다."""
@@ -420,8 +459,17 @@ class ChatModelRequestClassifier:
             {
                 "instruction": (
                     "요청을 분류해 request_kind, agent_id, action, reason, plan을 "
-                    "JSON object로 반환하세요. mutating action에만 plan을 지정하세요."
+                    "JSON object로 반환하세요. available_agents의 agent_id 중 하나만 "
+                    "선택하고 mutating action에만 plan을 지정하세요."
                 ),
+                "available_agents": [
+                    {
+                        "agent_id": metadata.agent_id,
+                        "name": metadata.name,
+                        "description": metadata.description,
+                    }
+                    for metadata in self._agents
+                ],
                 "request": request.to_snapshot(),
             },
             ensure_ascii=False,
@@ -436,7 +484,10 @@ class ChatModelRequestClassifier:
         try:
             if not isinstance(message.content, str):
                 raise ClassificationError("Classifier 응답은 JSON 문자열이어야 합니다.")
-            parsed = _RoutingDecisionSchema.model_validate_json(message.content)
+            parsed = _RoutingDecisionSchema.model_validate_json(
+                message.content,
+                context={"allowed_agent_ids": self._allowed_agent_ids},
+            )
             plan = (
                 None
                 if parsed.plan is None
@@ -463,6 +514,9 @@ class ChatModelRequestClassifier:
             raise ClassificationError(
                 "Classifier 응답이 routing schema와 맞지 않습니다."
             ) from None
+
+
+ChatModelRequestClassifier = ModelSupervisorClassifier
 
 
 @dataclass(frozen=True, slots=True)
@@ -2082,6 +2136,7 @@ __all__ = [
     "FakeRequestClassifier",
     "Governance",
     "GovernanceDecision",
+    "ModelSupervisorClassifier",
     "NoopOrchestrationJournal",
     "OrchestrationCancellationError",
     "OrchestrationDependencyError",

@@ -27,7 +27,7 @@ from agent_system.agents import (
 )
 from agent_system.config import RuntimeSettings
 from agent_system.http import create_app
-from agent_system.models import ModelSettings
+from agent_system.models import FakeChatModel, ModelSettings
 from agent_system.notifications import FakeNotificationSender
 from agent_system.orchestration import (
     ActionKind,
@@ -700,6 +700,60 @@ class ServerEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(app.title, "Agent System")
             self.assertTrue(database_path.is_file())
+
+    async def test_env_server_routes_model_decision_to_registered_operations_agent(
+        self,
+    ) -> None:
+        """Composition root가 registry metadata를 model supervisor에 전달하지 않으면 실패한다."""
+
+        from agent_system.server import create_app_from_env
+
+        model = FakeChatModel(
+            response=(
+                '{"request_kind":"user_task","agent_id":"operations-agent",'
+                '"action":"read_only","reason":"기본 운영 조회", "plan":null}'
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "server-routing.sqlite3"
+            app = create_app_from_env(
+                {
+                    "AGENT_SYSTEM_DB_PATH": str(database_path),
+                    "MODEL_PROVIDER": "upstage",
+                    "MODEL_NAME": "solar",
+                    "UPSTAGE_API_KEY": "not-called",
+                },
+                model_factory=lambda _settings: model,
+            )
+            lifespan = app.router.lifespan_context(app)
+            await _await_bounded("routing server startup", lifespan.__aenter__())
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app),
+                    base_url="http://test",
+                ) as client:
+                    accepted = await client.post(
+                        "/v1/tasks", json={"input": "운영 상태를 확인해 주세요."}
+                    )
+                    self.assertEqual(accepted.status_code, 202)
+                    task_id = accepted.json()["task_id"]
+                    for _attempt in range(50):
+                        current = await client.get(f"/v1/tasks/{task_id}")
+                        if current.json()["status"] == "COMPLETED":
+                            break
+                        await asyncio.sleep(0.01)
+                    self.assertEqual(current.json()["status"], "COMPLETED")
+                    self.assertEqual(
+                        current.json()["result"]["output"], "운영 상태를 확인해 주세요."
+                    )
+            finally:
+                await _await_bounded(
+                    "routing server shutdown",
+                    lifespan.__aexit__(None, None, None),
+                )
+
+        prompt = str(model.received_messages[0][0].content)
+        self.assertIn('"agent_id": "operations-agent"', prompt)
 
 
 class HardWatchdogTests(unittest.IsolatedAsyncioTestCase):

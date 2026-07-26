@@ -24,7 +24,8 @@ composition entrypoint로 `config`, `runtime`, `http`를 함께 import한다. �
 
 ## 데이터 및 제어 흐름
 
-Server factory는 환경 설정으로 runtime을 만든 뒤 HTTP lifespan에 소유권을 넘긴다.
+Server factory는 환경 설정으로 runtime을 만든 뒤 HTTP lifespan에 소유권을 넘긴다. Runtime은
+registry metadata를 provider-neutral model supervisor에 주입해 model route를 등록 ID로 제한한다.
 HTTP/CLI 요청은 runtime에서 먼저 영속화되고 background queue를 거쳐 orchestration graph가
 에이전트를 선택한다. 조회는 persistence authority에서 조립되며 대상 Task 전이는
 transactional outbox와 dispatcher를 거쳐 알림 sender에 전달된다.
@@ -36,7 +37,9 @@ transactional outbox와 dispatcher를 거쳐 알림 sender에 전달된다.
 ## 테스트 전략
 
 모듈별 단위 테스트와 전체 실행 경로 통합 테스트를 분리한다. Server factory는 임시 SQLite와
-가짜 API key로 lifespan을 열고 닫되 provider 요청이 발생하지 않는 smoke test를 둔다.
+가짜 API key로 lifespan을 열고 닫되 provider 요청이 발생하지 않는 smoke test를 둔다. 별도
+model factory seam에는 deterministic fake를 주입해 실제 HTTP 요청이 기본
+`operations-agent`로 route되고 완료되는 경로를 검증한다.
 
 ## 변경 시 문서 갱신 조건
 

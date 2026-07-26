@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -249,6 +250,22 @@ class _RecordingNotificationLifecycle:
 
     async def stop(self) -> None:
         self.stop_calls += 1
+
+
+class _BlockingNotificationLifecycle(_RecordingNotificationLifecycle):
+    """Stop 호출자의 cancellation과 독립적으로 끝나야 하는 owned cleanup fake다."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stop_entered = asyncio.Event()
+        self.stop_completed = asyncio.Event()
+        self.release_stop = asyncio.Event()
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+        self.stop_entered.set()
+        await self.release_stop.wait()
+        self.stop_completed.set()
 
 
 class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
@@ -560,6 +577,138 @@ class RuntimeApplicationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             orchestrator.release.set()
             await application.stop()
+
+    async def test_cancelled_stop_finishes_same_owned_notification_task_once(
+        self,
+    ) -> None:
+        """Notification stop을 직접 await하거나 cancellation 뒤 중복 호출하면 실패한다."""
+
+        await self.application.stop()
+        notification = _BlockingNotificationLifecycle()
+        close_calls = 0
+
+        def close_resources() -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+        application = RuntimeApplication(
+            store=self.store,
+            orchestrator=self.orchestrator,
+            queue_capacity=1,
+            worker_count=1,
+            clock=lambda: NOW,
+            id_factory=lambda: "unused",
+            notification_dispatcher=notification,  # type: ignore[arg-type]
+            close_resources=close_resources,
+            shutdown_grace_seconds=0.2,
+        )
+        self.application = application
+        await application.start()
+        stopping = asyncio.create_task(application.stop())
+        await notification.stop_entered.wait()
+
+        stopping.cancel("notification-stop-cancelled")
+        await asyncio.sleep(0)
+        self.assertFalse(stopping.done())
+        notification.release_stop.set()
+
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await stopping
+        self.assertEqual(raised.exception.args, ("notification-stop-cancelled",))
+        self.assertTrue(notification.stop_completed.is_set())
+        self.assertEqual(notification.stop_calls, 1)
+        self.assertEqual(close_calls, 1)
+
+    async def test_cancelled_stop_finishes_same_owned_resource_task_once(self) -> None:
+        """to_thread close wrapper 취소가 실제 close 완료보다 먼저 closed 처리되면 실패한다."""
+
+        await self.application.stop()
+        close_entered = threading.Event()
+        close_release = threading.Event()
+        close_completed = threading.Event()
+        close_calls = 0
+
+        def close_resources() -> None:
+            nonlocal close_calls
+            close_calls += 1
+            close_entered.set()
+            close_release.wait(timeout=2)
+            close_completed.set()
+
+        application = RuntimeApplication(
+            store=self.store,
+            orchestrator=self.orchestrator,
+            queue_capacity=1,
+            worker_count=1,
+            clock=lambda: NOW,
+            id_factory=lambda: "unused",
+            close_resources=close_resources,
+            shutdown_grace_seconds=0.2,
+        )
+        self.application = application
+        await application.start()
+        stopping = asyncio.create_task(application.stop())
+        entered = await asyncio.to_thread(close_entered.wait, 1)
+        self.assertTrue(entered)
+
+        stopping.cancel("resource-close-cancelled")
+        await asyncio.sleep(0)
+        self.assertFalse(stopping.done())
+        close_release.set()
+
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await stopping
+        self.assertEqual(raised.exception.args, ("resource-close-cancelled",))
+        self.assertTrue(close_completed.is_set())
+        self.assertEqual(close_calls, 1)
+
+    async def test_normal_stop_times_out_cooperative_work_and_closes_once(self) -> None:
+        """호출자 cancellation 없이도 grace 뒤 active worker를 종료하고 자원을 닫는다."""
+
+        await self.application.stop()
+        orchestrator = _CancellationAwareBlockingOrchestrator()
+        notification = _RecordingNotificationLifecycle()
+        close_calls = 0
+
+        def close_resources() -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+        application = RuntimeApplication(
+            store=self.store,
+            orchestrator=orchestrator,
+            queue_capacity=1,
+            worker_count=1,
+            clock=lambda: NOW,
+            id_factory=lambda: "normal-stop-timeout-task",
+            notification_dispatcher=notification,  # type: ignore[arg-type]
+            close_resources=close_resources,
+            shutdown_grace_seconds=0.02,
+        )
+        self.application = application
+        await application.start()
+        await application.submit(
+            Submission(SubmissionKind.USER_TASK, {"input": "blocked work"})
+        )
+        await orchestrator.entered.wait()
+
+        first, second = await asyncio.wait_for(
+            asyncio.gather(
+                application.stop(),
+                application.stop(),
+                return_exceptions=True,
+            ),
+            timeout=0.5,
+        )
+
+        self.assertIsInstance(first, TimeoutError)
+        self.assertIsNone(second)
+        self.assertTrue(orchestrator.cancelled.is_set())
+        self.assertEqual(notification.stop_calls, 1)
+        self.assertEqual(close_calls, 1)
+        await application.stop()
+        self.assertEqual(notification.stop_calls, 1)
+        self.assertEqual(close_calls, 1)
 
     async def test_http_startup_failure_finishes_bounded_runtime_cleanup_tracking(
         self,

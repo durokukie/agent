@@ -16,7 +16,8 @@
 호출 Task의 cancellation을 삼키지 않고 `CancelledError`를 신속하게 다시 전파해야 한다.
 `AgentRegistry.register()`는 ID를 하나만 등록하고 중복 시 `DuplicateAgentIdError`를 발생시킨다.
 `get()`은 미등록 ID에 `AgentNotFoundError`를 발생시킨다. `FakeAgent`는 고정된 결과를 반환하고
-받은 요청을 기록하는 결정 가능한 테스트 adapter다.
+받은 요청을 기록하는 결정 가능한 테스트 adapter다. `list_metadata()`는 등록 순서의 immutable
+tuple을 반환해 runtime이 model supervisor에 허용된 ID·이름·설명을 주입하게 한다.
 
 Agent 구현이 한 번 반환하는 결과와 orchestration의 `AgentRun`은 구분한다. `AgentRun`은 task/workflow/phase와 호출 시각, 완료 결과를 연결하는 orchestration 소유 실행 이력이며 Agent의 공개 interface에 포함되지 않는다. 따라서 agents 모듈은 `AgentRun`을 import하거나 생성하지 않는다.
 
@@ -43,5 +44,5 @@ process supervisor의 hard-kill로 이 경계를 닫는다. registry는 조회�
 
 ## 변경 시 문서 갱신 조건
 
-공통 인터페이스, 요청·결과 필드, metadata, cancellation 협조 조건, registry 동작, agent 종류
+공통 인터페이스, 요청·결과 필드, metadata 공개, cancellation 협조 조건, registry 동작, agent 종류
 또는 Agent 호출 결과와 `AgentRun` 사이의 책임 경계가 바뀔 때 갱신한다.

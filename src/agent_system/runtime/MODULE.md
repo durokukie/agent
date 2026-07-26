@@ -48,8 +48,10 @@ backoff를 기다리지 않는 명시적 재시도이고, 다른 worker의 완�
 command를 다시 실행하지 않는다. 조회는 SQLite의
 Task, event, workflow와 AgentRun에서 승인·결과 metadata를 조립한다. 시작 시 terminal을
 제외한 recovery 후보를 읽어 `RECEIVED`는 재시작하고, 승인 대기는 사람 입력을 기다리며,
-나머지는 Task ID checkpoint에서 복구한다. 정상 종료는 queue와 notification outbox를
-drain하고 dispatcher를 중단한 뒤 checkpointer와 store를 각각 한 번 닫는다. `stop()` 호출자가
+나머지는 Task ID checkpoint에서 복구한다. 정상 종료도 queue/outbox drain과 worker 완료를
+각 단계별 10초까지만 기다린다. Grace가 끝나면 active child와 worker를 취소·회수하고
+`RuntimeShutdownTimeoutError`를 최초 오류로 보존하면서 dispatcher, checkpointer와 store를
+각각 한 번 닫는다. `stop()` 호출자가
 취소되면 active child, retry wakeup과 worker를 모두 취소하고 단계별 10초 grace 안에서 완료를
 기다린다. 이어 dispatcher와 persistence close를 같은 bounded best-effort 방식으로 시도한 뒤
 cleanup 오류가 아닌 원래 `CancelledError`를 보존한다.
@@ -80,10 +82,15 @@ lock은 동시 stop의 sentinel과 소유 자원 close를 정확히 한 번만 �
 command와 command row 없는 recovery가 함께 밀릴 때는 매 worker 완료마다 pump 우선순위를
 번갈아 적용해 한쪽의 지속적인 starvation을 막는다. Notification drain 또는 stop이 실패해도
 worker 종료와 checkpointer/store close를 수행한 뒤 최초 lifecycle 오류를 호출자에게 반환한다.
+Notification stop과 동기 resource close는 시작 순간부터 별도 owned Task다. Stop 호출자
+cancellation이나 grace timeout 뒤에도 같은 Task의 완료 여부를 기준으로 bounded wait하거나
+late registry에 넘기므로 close를 중복 호출하지 않는다. `_closed`는 admission과 재시작이
+영구히 닫혔고 cooperative cleanup은 완료됐으며, 비협조 Task가 있다면 late registry가 그
+완료와 예외 회수만 소유한다는 뜻이다.
 
 `TaskApplication.stop()`과 runtime이 호출하는 Agent·notification·resource adapter는
-cancellation-cooperative해야 한다. Runtime은 외부 cancellation 때 각 shutdown 단계의 대기를
-기본 10초로 제한하지만, cancellation을 삼키는 coroutine이나 종료되지 않는 native blocking
+cancellation-cooperative해야 한다. Runtime은 정상·취소 shutdown 모두 각 단계의 대기를 기본
+10초로 제한하지만, cancellation을 삼키는 coroutine이나 종료되지 않는 native blocking
 I/O를 동일 event loop에서 강제 정지할 수는 없다. 이런 구현은 adapter 계약 위반이며 운영
 process supervisor가 전체 graceful shutdown deadline 뒤 hard-kill을 수행해야 한다. Grace를
 넘긴 Python Task는 완료까지 강하게 보관하고 늦은 예외를 회수하되 application은 닫힌 상태로
@@ -97,7 +104,10 @@ checkpointer와 fake classifier/Governance/Agent를 함께 사용해 read-only �
 취소와 durable journal replay를 수직 통합 테스트한다. Notification sender 성공·실패와
 재시작 retry, dispatcher 수명도 실제 SQLite outbox로 검증한다. 실제 worker가
 cancellation-aware blocked Agent를 실행하는 동안 `stop()` 호출자를 취소해 active 실행 취소,
-bounded cleanup, notification/resource 정리와 원래 cancellation 보존을 검증한다.
+bounded cleanup, notification/resource 정리와 원래 cancellation 보존을 검증한다. 호출자가
+취소되지 않은 stop도 blocked cooperative Agent를 grace 뒤 취소하고 timeout을 반환하며, 동시
+stop 사이 notification/resource close가 정확히 한 번인지 검증한다. Cleanup 도중 stop 호출자가
+취소돼도 이미 시작한 notification/to_thread owned Task를 중복 없이 완료하는지 검증한다.
 
 ## 변경 시 문서 갱신 조건
 

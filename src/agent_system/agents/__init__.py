@@ -108,6 +108,11 @@ class AgentRegistry:
                 f"등록되지 않은 Agent ID입니다: {agent_id}"
             ) from error
 
+    def list_metadata(self) -> tuple[AgentMetadata, ...]:
+        """등록 순서대로 supervisor routing에 필요한 metadata만 반환한다."""
+
+        return tuple(agent.metadata for agent in self._agents.values())
+
 
 class EchoAgent:
     """입력 문자열을 그대로 반환하는 외부 I/O 없는 최소 Agent 구현이다."""

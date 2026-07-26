@@ -75,13 +75,27 @@ plan을 가진 `RUNNING`은 version 3 이상, `WAITING_APPROVAL`과 plan을 가�
 
 Graph 안에서는 checkpoint `thread_id`가 실행 소유권이다. 같은 thread를 새 Task에 재사용하지 않고 terminal 후 `Command(resume=...)` replay도 거부한다. 단일 프로세스 MVP에서 Task 6 composition root는 모든 service instance에 같은 `ExecutionCoordinator`를 주입한다. Coordinator는 operation이나 decision ID와 무관한 `thread:{thread_id}` key로 start/resume/recover 사이의 실행도 직렬화하고, claim은 취소와 모든 종료 경로에서 해제된다. 다중 프로세스에서는 process-local coordinator만으로 부족하므로 같은 key 계약을 구현하는 distributed lease/claim adapter가 별도로 필요하다. 외부 Agent adapter는 claim과 별개로 동일 `AgentRequest.idempotency_key`의 effect를 deduplicate해야 한다.
 
-Classifier는 `BaseChatModel.ainvoke()`를 직접 await하며 provider 예외 상세를 `ClassificationError`로 제거하고 실행 취소는 전파한다. Snapshot 경계는 bool을 int로 받거나 coercion 가능한 문자열·tuple·mapping 유사값을 허용하지 않고 필드별 exact type을 요구한다. 주입 seam의 `ApprovalConsumeResult`와 `ExecutionClaimResult`도 생성 시 exact enum/aggregate/failure 조합을 검증하고 facade에서 다시 구성해 forged typed instance를 차단한다. 잘못된 collaborator 결과는 dereference 전에 cause-free `OrchestrationDependencyError`로 정규화한다. Classifier·Governance·Agent 구현에서 나온 예외 문자열은 결과에 노출하지 않고 안정적인 `FailureCode`로 정규화한다. Graph의 모든 cycle은 남은 `ExecutionBudget`을 감소시키므로 무한 loop가 없고 terminal Task에는 outgoing edge가 없다.
+`ModelSupervisorClassifier`는 `BaseChatModel.ainvoke()`를 직접 await한다. Prompt에는 runtime이
+`AgentRegistry`에서 주입한 ID·이름·설명만 포함하고, Pydantic schema는 응답 `agent_id`가 이
+허용 집합 안에 있는지 검증한다. 따라서 model이 만든 미등록 route는 Agent 호출 전에
+`ClassificationError`가 된다. Provider 예외 상세는 제거하고 실행 취소는 전파한다. 기존
+`ChatModelRequestClassifier` 이름은 같은 구현의 호환 alias다. Snapshot 경계는 bool을 int로
+받거나 coercion 가능한 문자열·tuple·mapping 유사값을 허용하지 않고 필드별 exact type을
+요구한다. 주입 seam의 `ApprovalConsumeResult`와 `ExecutionClaimResult`도 생성 시 exact
+enum/aggregate/failure 조합을 검증하고 facade에서 다시 구성해 forged typed instance를
+차단한다. 잘못된 collaborator 결과는 dereference 전에 cause-free
+`OrchestrationDependencyError`로 정규화한다. Classifier·Governance·Agent 구현에서 나온 예외
+문자열은 결과에 노출하지 않고 안정적인 `FailureCode`로 정규화한다. Graph의 모든 cycle은
+남은 `ExecutionBudget`을 감소시키므로 무한 loop가 없고 terminal Task에는 outgoing edge가 없다.
 
 ## 테스트 전략
 
 모든 status·phase 조합을 표 기반 단위 테스트로 검증한다. Approval의 task/version/plan 결합과 deterministic binding, planless Task의 정확한 version 도달 가능성과 planful 반복 갱신, plan 변경, 취소, budget과 AgentRun의 원자적 결합·직접 생성 차단·exact issuance 기반 복원, historical/current 실행 복원, malformed issuance ledger, DST fold, 모든 aggregate의 JSON snapshot 왕복·오류 정규화를 외부 I/O 없이 검증한다.
 
-Fake 기반 supervisor service 통합 테스트는 User/Alert/Ticket 분류, ChatModel JSON 검증, dynamic registry routing, read-only 완료, Governance 거절·예외, Agent FAILURE·예외·결과 불일치·missing route, 성공 재시도와 budget 소진 escalation을 검증한다. 단위 architecture test는 orchestration의 Upstage·SQLite/ORM·FastAPI·Rich import를 금지한다.
+Fake 기반 supervisor service 통합 테스트는 User/Alert/Ticket 분류, ChatModel JSON과 registry
+허용 ID 검증, dynamic registry routing, read-only 완료, Governance 거절·예외, Agent
+FAILURE·예외·결과 불일치·missing route, 성공 재시도와 budget 소진 escalation을 검증한다.
+단위 architecture test는 orchestration의 Upstage·SQLite/ORM·FastAPI·Rich import를 금지한다.
 
 LangGraph 통합 테스트는 실제 `InMemorySaver`, `interrupt`, `Command`를 사용해 승인 대기, human 거절, stale/wrong/plan-changed approval, consume 직후 crash의 accept/reject healing, terminal replay 차단과 thread 재사용 차단을 검증한다. 공유 checkpointer·승인 소비자·coordinator를 쓰는 두 service의 경합에서 하나만 실행되는지도 확인한다. Blocking Agent로 외부 호출 전에 open AgentRun issuance가 checkpoint되는 순서와, 취소 후 SQLite 연결을 다시 열어 같은 issuance/budget/idempotency key로 복구하는 경로를 검증한다. 실제 compiled graph와 별도 SQLite 연결 두 개로 start/start, blocked resume/recover, `issue_agent_run` 직전과 열린 `call_agent`의 recover/recover를 경합시키며 모두 한 issuance/call/effect/budget과 안정적인 loser 오류만 허용한다. Start/resume/recover 취소 뒤 같은 coordinator로 재시도해 claim 해제를 검증하고, malformed state·collaborator result와 `ainvoke` 오류 정규화도 확인한다. 승인 대기와 terminal 복구는 claim 없는 무동작이어야 한다.
 

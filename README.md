@@ -49,13 +49,14 @@ Server factory가 설정 검증, Alembic migration, runtime/compiled graph/check
 lifespan을 조립합니다. 종료 시 새 명령 수락을 닫고 queue와 outbox를 drain한 뒤 SQLite
 연결을 정리합니다.
 
-정상 shutdown은 진행 중인 cooperative 작업이 끝날 때까지 drain합니다. Shutdown 호출 자체가
-취소되면 runtime은 active Agent 실행과 worker를 취소하고, notification과 SQLite 자원까지 각
-단계별 기본 10초 graceful shutdown grace 안에서 best-effort로 정리한 뒤 원래 cancellation을
-반환합니다. Agent와 외부 adapter는 `CancelledError`를 삼키지 않고 bounded I/O를 사용해야
-합니다. cancellation을 무시하는 coroutine이나 종료되지 않는 native I/O는 같은 Python
-event loop에서 강제 종료할 수 없으므로 운영 process supervisor의 전체 shutdown deadline과
-hard-kill을 최종 경계로 설정해야 합니다.
+정상 shutdown도 queue/outbox drain과 worker 종료를 각 단계별 기본 10초 grace까지만
+기다립니다. 작업이 grace를 넘기면 active Agent 실행과 worker를 취소하고 notification과
+SQLite 자원을 한 번씩 정리한 뒤 `RuntimeShutdownTimeoutError`를 반환합니다. Shutdown 호출
+자체가 취소된 경우에도 notification/resource cleanup은 독립된 owned Task로 계속하며 원래
+`CancelledError`를 보존합니다. Agent와 외부 adapter는 cancellation을 삼키지 않고 bounded
+I/O를 사용해야 합니다. cancellation을 무시하는 coroutine이나 종료되지 않는 native I/O는
+같은 Python event loop에서 강제 종료할 수 없으므로 운영 process supervisor의 전체 shutdown
+deadline과 hard-kill을 최종 경계로 설정해야 합니다.
 
 ## HTTP API
 

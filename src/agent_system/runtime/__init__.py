@@ -6,7 +6,7 @@ import asyncio
 import json
 import math
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -33,12 +33,12 @@ from agent_system.orchestration import (
     ApprovalConsumeStatus,
     ApprovalResponse,
     ApprovalResumeError,
-    ChatModelRequestClassifier,
     ExecutionClaimResult,
     ExecutionClaimStatus,
     FailureCode,
     Governance,
     GovernanceDecision,
+    ModelSupervisorClassifier,
     OrchestrationCancellationError,
     OrchestrationJournalEntry,
     OrchestrationStartError,
@@ -101,6 +101,10 @@ class ApplicationConflictError(ApplicationError):
 
 class ApplicationBusyError(ApplicationError):
     """Bounded runner가 현재 작업을 더 수락할 수 없을 때 발생한다."""
+
+
+class RuntimeShutdownTimeoutError(TimeoutError):
+    """Runtime 소유 단계가 설정된 shutdown grace를 넘겼을 때 발생한다."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -725,8 +729,9 @@ def build_runtime(
                 )
             )
         if classifier is None:
-            classifier = ChatModelRequestClassifier(
-                model_factory(settings.model_settings)
+            classifier = ModelSupervisorClassifier(
+                model_factory(settings.model_settings),
+                registry.list_metadata(),
             )
         shared_coordinator = coordinator or InProcessExecutionCoordinator()
         service = OrchestratorService(
@@ -935,62 +940,80 @@ class RuntimeApplication:
                 return
             self._stopping = True
             failure: BaseException | None = None
-            notification_stop_attempted = False
-            resource_close_attempted = False
+            drain_task: asyncio.Task[object] | None = None
+            notification_task: asyncio.Task[object] | None = None
+            resource_task: asyncio.Task[object] | None = None
             try:
                 if self._started:
-                    wakeups = tuple(self._retry_wakeups.values())
-                    for wakeup in wakeups:
-                        wakeup.cancel()
-                    if wakeups:
-                        await asyncio.gather(*wakeups, return_exceptions=True)
-                    self._retry_wakeups.clear()
-                    try:
-                        await self.drain()
-                    except asyncio.CancelledError:
-                        raise
-                    except BaseException as error:  # noqa: BLE001 - 정리 후 최초 오류를 반환한다.
-                        failure = error
-                    for _worker in self._workers:
-                        await self._queue.put(None)
-                    worker_results = await asyncio.gather(
-                        *self._workers,
-                        return_exceptions=True,
+                    wakeup_failure = await self._cancel_and_settle_runtime_tasks(
+                        set(self._retry_wakeups.values()),
+                        operation="retry wakeup 정리",
                     )
                     if failure is None:
-                        failure = next(
-                            (
-                                result
-                                for result in worker_results
-                                if isinstance(result, BaseException)
-                            ),
-                            None,
+                        failure = wakeup_failure
+                    self._retry_wakeups.clear()
+                    drain_task = asyncio.create_task(
+                        self.drain(),
+                        name="runtime-shutdown-drain",
+                    )
+                    drain_failure = await self._wait_owned_task(
+                        drain_task,
+                        operation="Runtime queue/outbox drain",
+                    )
+                    if failure is None:
+                        failure = drain_failure
+                    if isinstance(drain_failure, RuntimeShutdownTimeoutError):
+                        abort_failure = await self._cancel_and_settle_runtime_tasks(
+                            {
+                                drain_task,
+                                *self._active.values(),
+                                *self._workers,
+                            },
+                            operation="active Runtime 실행 정리",
                         )
+                        if failure is None:
+                            failure = abort_failure
+                    else:
+                        for _worker in self._workers:
+                            await self._queue.put(None)
+                        worker_failure = await self._wait_runtime_tasks(
+                            set(self._workers),
+                            operation="Runtime worker 종료",
+                        )
+                        if failure is None:
+                            failure = worker_failure
                     self._workers.clear()
                     self._started = False
                 if self._notification_dispatcher is not None:
-                    notification_stop_attempted = True
-                    try:
-                        await self._notification_dispatcher.stop()
-                    except asyncio.CancelledError:
-                        raise
-                    except BaseException as error:  # noqa: BLE001 - 정리 후 최초 오류를 반환한다.
-                        if failure is None:
-                            failure = error
+                    notification_task = asyncio.create_task(
+                        self._notification_dispatcher.stop(),
+                        name="runtime-notification-stop",
+                    )
+                    notification_failure = await self._wait_owned_task(
+                        notification_task,
+                        operation="Notification dispatcher 정리",
+                        track_timeout=True,
+                    )
+                    if failure is None:
+                        failure = notification_failure
                 if self._close_resources is not None:
-                    resource_close_attempted = True
-                    try:
-                        await asyncio.to_thread(self._close_resources)
-                    except asyncio.CancelledError:
-                        raise
-                    except BaseException as error:  # noqa: BLE001 - 정리 후 최초 오류를 반환한다.
-                        if failure is None:
-                            failure = error
+                    resource_task = asyncio.create_task(
+                        asyncio.to_thread(self._close_resources),
+                        name="runtime-resource-close",
+                    )
+                    resource_failure = await self._wait_owned_task(
+                        resource_task,
+                        operation="Runtime 소유 자원 정리",
+                        track_timeout=True,
+                    )
+                    if failure is None:
+                        failure = resource_failure
             except asyncio.CancelledError as cancellation:
                 await self._finish_cancelled_stop(
                     cancellation,
-                    stop_notification=not notification_stop_attempted,
-                    close_resources=not resource_close_attempted,
+                    drain_task=drain_task,
+                    notification_task=notification_task,
+                    resource_task=resource_task,
                 )
                 self._closed = True
                 raise
@@ -1002,8 +1025,9 @@ class RuntimeApplication:
         self,
         cancellation: asyncio.CancelledError,
         *,
-        stop_notification: bool,
-        close_resources: bool,
+        drain_task: asyncio.Task[object] | None,
+        notification_task: asyncio.Task[object] | None,
+        resource_task: asyncio.Task[object] | None,
     ) -> None:
         """첫 cancellation을 가리지 않고 남은 shutdown 단계를 제한 시간 안에 시도한다."""
 
@@ -1012,28 +1036,15 @@ class RuntimeApplication:
             *self._active.values(),
             *self._workers,
         }
-        for task in running:
-            task.cancel()
-        if running:
-            try:
-                done, pending = await asyncio.wait(
-                    running,
-                    timeout=self._shutdown_grace_seconds,
-                )
-            except asyncio.CancelledError:
-                done = {task for task in running if task.done()}
-                pending = running - done
-                cancellation.add_note(
-                    "Runtime 실행 정리 중 추가 cancellation을 받았습니다."
-                )
-            for task in done:
-                self._consume_shutdown_task(task)
-            if pending:
-                cancellation.add_note(
-                    "일부 Runtime 실행이 shutdown 제한 시간 안에 종료되지 않았습니다."
-                )
-                for task in pending:
-                    self._track_late_shutdown_task(task)
+        if drain_task is not None:
+            running.add(drain_task)
+        running_failure = await self._cancel_and_settle_runtime_tasks(
+            running,
+            operation="Runtime 실행 정리",
+            cancellation=cancellation,
+        )
+        if running_failure is not None:
+            cancellation.add_note(str(running_failure))
 
         self._retry_wakeups.clear()
         self._active.clear()
@@ -1041,18 +1052,28 @@ class RuntimeApplication:
         self._workers.clear()
         self._started = False
 
-        if stop_notification and self._notification_dispatcher is not None:
-            await self._run_bounded_shutdown_step(
-                self._notification_dispatcher.stop(),
+        if self._notification_dispatcher is not None:
+            if notification_task is None:
+                notification_task = asyncio.create_task(
+                    self._notification_dispatcher.stop(),
+                    name="runtime-notification-stop",
+                )
+            await self._finish_owned_task_after_cancellation(
+                notification_task,
                 cancellation,
                 failure_note="Notification dispatcher 정리에 실패했습니다.",
                 timeout_note=(
                     "Notification dispatcher가 shutdown 제한 시간 안에 종료되지 않았습니다."
                 ),
             )
-        if close_resources and self._close_resources is not None:
-            await self._run_bounded_shutdown_step(
-                asyncio.to_thread(self._close_resources),
+        if self._close_resources is not None:
+            if resource_task is None:
+                resource_task = asyncio.create_task(
+                    asyncio.to_thread(self._close_resources),
+                    name="runtime-resource-close",
+                )
+            await self._finish_owned_task_after_cancellation(
+                resource_task,
                 cancellation,
                 failure_note="Runtime 소유 자원 정리에 실패했습니다.",
                 timeout_note=(
@@ -1060,9 +1081,96 @@ class RuntimeApplication:
                 ),
             )
 
-    async def _run_bounded_shutdown_step(
+    async def _wait_owned_task(
         self,
-        operation: Awaitable[object],
+        task: asyncio.Task[object],
+        *,
+        operation: str,
+        track_timeout: bool = False,
+    ) -> BaseException | None:
+        """소유 Task를 grace만 기다리고 결과 또는 안정적인 timeout을 반환한다."""
+
+        _done, pending = await asyncio.wait(
+            {task},
+            timeout=self._shutdown_grace_seconds,
+        )
+        if pending:
+            if track_timeout:
+                self._track_late_shutdown_task(task)
+            return RuntimeShutdownTimeoutError(
+                f"{operation}가 shutdown 제한 시간 안에 종료되지 않았습니다."
+            )
+        return self._task_failure(task)
+
+    async def _wait_runtime_tasks(
+        self,
+        tasks: set[asyncio.Task[object]],
+        *,
+        operation: str,
+    ) -> BaseException | None:
+        """정상 worker 종료를 기다리고 timeout이면 같은 Task들을 취소·회수한다."""
+
+        if not tasks:
+            return None
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=self._shutdown_grace_seconds,
+        )
+        failure = next(
+            (error for task in done if (error := self._task_failure(task)) is not None),
+            None,
+        )
+        if not pending:
+            return failure
+        timeout = RuntimeShutdownTimeoutError(
+            f"{operation}가 shutdown 제한 시간 안에 종료되지 않았습니다."
+        )
+        await self._cancel_and_settle_runtime_tasks(
+            pending,
+            operation=operation,
+        )
+        return failure or timeout
+
+    async def _cancel_and_settle_runtime_tasks(
+        self,
+        tasks: set[asyncio.Task[object]],
+        *,
+        operation: str,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> BaseException | None:
+        """실행 Task에 cancellation을 전파하고 grace 뒤 late registry로 넘긴다."""
+
+        pending_tasks = {task for task in tasks if not task.done()}
+        for task in pending_tasks:
+            task.cancel()
+        if not pending_tasks:
+            return None
+        try:
+            done, pending = await asyncio.wait(
+                pending_tasks,
+                timeout=self._shutdown_grace_seconds,
+            )
+        except asyncio.CancelledError:
+            if cancellation is None:
+                raise
+            done = {task for task in pending_tasks if task.done()}
+            pending = pending_tasks - done
+            cancellation.add_note(
+                "Runtime 실행 정리 중 추가 cancellation을 받았습니다."
+            )
+        for task in done:
+            self._consume_shutdown_task(task)
+        if not pending:
+            return None
+        for task in pending:
+            self._track_late_shutdown_task(task)
+        return RuntimeShutdownTimeoutError(
+            f"{operation}가 shutdown 제한 시간 안에 종료되지 않았습니다."
+        )
+
+    async def _finish_owned_task_after_cancellation(
+        self,
+        task: asyncio.Task[object],
         cancellation: asyncio.CancelledError,
         *,
         failure_note: str,
@@ -1070,19 +1178,16 @@ class RuntimeApplication:
     ) -> None:
         """Cleanup operation 하나를 제한 시간만 소유하고 상세 오류는 노출하지 않는다."""
 
-        task = asyncio.create_task(operation)
         try:
             _done, pending = await asyncio.wait(
                 {task},
                 timeout=self._shutdown_grace_seconds,
             )
         except asyncio.CancelledError:
-            task.cancel()
             self._track_late_shutdown_task(task)
             cancellation.add_note(failure_note)
             return
         if pending:
-            task.cancel()
             self._track_late_shutdown_task(task)
             cancellation.add_note(timeout_note)
             return
@@ -1090,6 +1195,16 @@ class RuntimeApplication:
             task.result()
         except BaseException:  # noqa: BLE001 - 원래 cancellation을 primary로 보존한다.
             cancellation.add_note(failure_note)
+
+    @staticmethod
+    def _task_failure(task: asyncio.Task[object]) -> BaseException | None:
+        """완료 Task의 오류를 값으로 회수한다."""
+
+        try:
+            task.result()
+        except BaseException as error:  # noqa: BLE001 - shutdown precedence용 값이다.
+            return error
+        return None
 
     def _track_late_shutdown_task(self, task: asyncio.Task[object]) -> None:
         """Grace를 넘긴 Task를 강하게 보관하고 늦은 예외를 회수한다."""
@@ -1893,6 +2008,7 @@ __all__ = [
     "ResultView",
     "RuntimeApplication",
     "RuntimeOrchestrator",
+    "RuntimeShutdownTimeoutError",
     "SQLiteApprovalConsumer",
     "SQLiteLifecycleJournal",
     "Submission",
