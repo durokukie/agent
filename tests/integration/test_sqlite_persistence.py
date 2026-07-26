@@ -1027,6 +1027,36 @@ class RunStoreTests(unittest.TestCase):
 class ApprovalStoreTests(unittest.TestCase):
     """Approval binding의 atomic compare-and-transition을 검증한다."""
 
+    def test_rejects_reserved_notification_topic_from_approval_outbox(self) -> None:
+        """Approval ingress가 trusted notification namespace를 위조하는 버그를 잡는다."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            waiting = self._create_waiting_task(database_path)
+            approval = Approval.grant_for(waiting, at=NOW + timedelta(seconds=4))
+            with SQLiteStore(database_path) as store:
+                with self.assertRaises(InvalidPersistenceValueError):
+                    store.apply_approval(
+                        approval,
+                        decision_id="forged-notification-decision",
+                        resumed_at=NOW + timedelta(seconds=5),
+                        event=TaskEventDraft(
+                            "event-forged-notification",
+                            "TASK_APPROVED",
+                            {},
+                            NOW + timedelta(seconds=5),
+                        ),
+                        outbox=OutboxDraft(
+                            "forged-approval-notification",
+                            "task.status_changed",
+                            {"secret": "must-not-reach-sender"},
+                            NOW + timedelta(seconds=5),
+                        ),
+                    )
+
+                self.assertEqual(store.get_task(waiting.task_id), waiting)
+                self.assertEqual(store.list_approvals(waiting.task_id), ())
+
     def test_consumes_one_concurrent_approval_and_replays_the_stored_result(
         self,
     ) -> None:

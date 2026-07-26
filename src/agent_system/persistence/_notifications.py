@@ -9,11 +9,13 @@ from agent_system.notifications import (
     Notification,
     NotificationChannel,
     NotificationClaim,
+    NotificationClaimBatchProgress,
     NotificationLeaseLostError,
 )
+from agent_system.orchestration import Task
 
 from ._store import SQLiteStore
-from ._values import OptimisticConcurrencyError, OutboxMessage
+from ._values import OptimisticConcurrencyError, OutboxMessage, TaskEvent
 
 _NOTIFICATION_TOPIC = "task.status_changed"
 _INVALID_PAYLOAD_BACKOFF = timedelta(minutes=5)
@@ -53,7 +55,7 @@ class SQLiteNotificationOutbox:
         now: datetime,
         lease_duration: timedelta,
         lease_token: str,
-    ) -> NotificationClaim | None:
+    ) -> NotificationClaim | NotificationClaimBatchProgress | None:
         for _invalid_count in range(_MAX_INVALID_PAYLOAD_SKIPS):
             message = await asyncio.to_thread(
                 self._store.claim_outbox,
@@ -69,6 +71,12 @@ class SQLiteNotificationOutbox:
             try:
                 notification = Notification.from_payload(message.payload)
                 self._validate_binding(message, notification)
+                authority = await asyncio.to_thread(
+                    self._store.get_notification_authority,
+                    notification.task_id,
+                    notification.task_version,
+                )
+                self._validate_authority(notification, authority)
             except (TypeError, ValueError):
                 await asyncio.to_thread(
                     self._store.record_outbox_failure,
@@ -85,7 +93,9 @@ class SQLiteNotificationOutbox:
                 attempt_count=message.attempt_count,
                 lease_expires_at=message.lease_expires_at,
             )
-        return None
+        return NotificationClaimBatchProgress(
+            processed_count=_MAX_INVALID_PAYLOAD_SKIPS,
+        )
 
     @staticmethod
     def _validate_binding(
@@ -114,6 +124,34 @@ class SQLiteNotificationOutbox:
                 raise ValueError("approval notification metadata가 올바르지 않습니다.")
         elif metadata:
             raise ValueError("terminal notification metadata는 비어 있어야 합니다.")
+
+    @staticmethod
+    def _validate_authority(
+        notification: Notification,
+        authority: tuple[Task, TaskEvent] | None,
+    ) -> None:
+        if authority is None:
+            raise ValueError("notification authority가 없습니다.")
+        task, event = authority
+        expected_event_type = f"TASK_{notification.status}"
+        if (
+            task.task_id != notification.task_id
+            or task.version < notification.task_version
+            or event.task_id != notification.task_id
+            or event.task_version != notification.task_version
+            or event.event_type != expected_event_type
+            or event.occurred_at != notification.occurred_at
+        ):
+            raise ValueError("notification Task binding이 올바르지 않습니다.")
+        if notification.status == "WAITING_APPROVAL":
+            if task.plan_hash != notification.metadata["plan_hash"]:
+                raise ValueError("notification plan binding이 올바르지 않습니다.")
+        elif (
+            task.version != notification.task_version
+            or task.status.value != notification.status
+            or task.updated_at != notification.occurred_at
+        ):
+            raise ValueError("terminal notification Task binding이 올바르지 않습니다.")
 
     async def renew(
         self,

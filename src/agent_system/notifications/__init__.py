@@ -154,6 +154,13 @@ class NotificationClaim:
     lease_expires_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class NotificationClaimBatchProgress:
+    """Bounded poison skip batch가 실제 row를 처리했음을 나타낸다."""
+
+    processed_count: int
+
+
 class NotificationOutbox(Protocol):
     """Dispatcher가 persistence 구현에서 요구하는 lease/CAS interface."""
 
@@ -163,7 +170,7 @@ class NotificationOutbox(Protocol):
         now: datetime,
         lease_duration: timedelta,
         lease_token: str,
-    ) -> NotificationClaim | None:
+    ) -> NotificationClaim | NotificationClaimBatchProgress | None:
         """현재 eligible한 알림 한 건의 lease를 얻는다."""
 
     async def mark_delivered(
@@ -334,6 +341,8 @@ class NotificationDispatcher:
             )
             if claim is None:
                 return False
+            if isinstance(claim, NotificationClaimBatchProgress):
+                return True
             delivered = await self._send_with_heartbeat(claim)
             if delivered is None:
                 return True
@@ -383,13 +392,11 @@ class NotificationDispatcher:
                             lease_duration=self._lease_duration,
                         )
                     except NotificationLeaseLostError:
-                        sender_task.cancel()
-                        await asyncio.sleep(0)
-                        if sender_task.done():
-                            self._consume_task_result(sender_task)
-                        else:
-                            sender_task.add_done_callback(self._consume_task_result)
+                        await self._cancel_sender_task(sender_task)
                         return None
+                    except Exception:
+                        await self._cancel_sender_task(sender_task)
+                        raise
                     heartbeat_at = (
                         loop.time() + self._heartbeat_interval.total_seconds()
                     )
@@ -406,16 +413,15 @@ class NotificationDispatcher:
                 return False
             return True
         except asyncio.CancelledError:
-            sender_task.cancel()
-            await asyncio.gather(sender_task, return_exceptions=True)
+            await self._cancel_sender_task(sender_task)
             raise
 
     @staticmethod
-    def _consume_task_result(task: asyncio.Task[None]) -> None:
-        """Lease 상실 뒤 분리된 sender task 예외를 회수한다."""
+    async def _cancel_sender_task(task: asyncio.Task[None]) -> None:
+        """Sender task를 취소하고 종료 결과를 회수한다."""
 
-        if not task.cancelled():
-            task.exception()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     async def _run(self) -> None:
         while not self._stop_event.is_set():
@@ -448,6 +454,7 @@ __all__ = [
     "Notification",
     "NotificationChannel",
     "NotificationClaim",
+    "NotificationClaimBatchProgress",
     "NotificationDeliveryError",
     "NotificationDispatcher",
     "NotificationLeaseLostError",

@@ -100,9 +100,11 @@ SQLite는 WAL, foreign key, busy timeout을 모든 애플리케이션 연결과 
 저장한다. 여러 offset이 섞인 시각 기반 목록은 복원한 timezone-aware `datetime`의 실제
 instant와 안정적인 식별자로 정렬한다.
 
-예약 notification topic은 Task 상태 전이의 내부 transactional path만 생성할 수 있고 일반
-outbox create/save/requeue에서는 거부한다. Dispatcher claim은 notification 전용 topic만
-선택하며 ID·Task/version·허용 status·channel/time·metadata allowlist를 검증한다.
+예약 notification topic은 `_new_outbox` 공통 경계의 trusted 내부 capability를 통해 Task 상태
+전이의 transactional path만 생성할 수 있고 create/save/Approval/requeue 등 public ingress에서는
+거부한다. Dispatcher claim은 notification 전용 topic만 선택하며 ID·Task/version·허용
+status·channel/time·metadata allowlist를 검증한 뒤 같은 DB transaction에서 읽은 현재 Task와
+exact-version append-only event로 status·version·occurred_at·plan_hash를 다시 결합한다.
 `BEGIN IMMEDIATE` transaction 안에서 eligibility와 만료 lease를 실제
 UTC instant로 비교하고 token CAS로 owner를 결합한다. 전달 실패는 Task를 변경하지 않고
 attempt, 안정적인 오류 code와 다음 시각을 기록한다. Active send lease 갱신도 동일 token
@@ -123,8 +125,9 @@ rollback, event append-only, request idempotency race, Approval replay/conflict�
 소비, ApprovalResponse 승인·거절의 별도 connection 경합·exact replay·rollback·명시적
 decision/binding/version/terminal conflict, runtime command의 원자 생성·exact fingerprint
 replay·Task별 pending 순서·failure retry, WorkflowRun/AgentRun의 정확한 다음 상태 원자 저장·소유 복원, offset 혼합 목록
-정렬, 대상 상태 자동 outbox·원자 rollback·replay dedupe, 예약 topic 위조 차단, claim
-binding·poison skip 경쟁·stale token·lease renewal/recovery·backoff, terminal 제외 recovery를
+정렬, 대상 상태 자동 outbox·원자 rollback·replay dedupe, 모든 ingress의 예약 topic 위조 차단,
+authoritative claim binding·101 poison skip 경쟁·stale token·lease renewal/recovery·backoff,
+terminal 제외 recovery를
 통합 테스트한다. 실제 LangGraph graph를
 interrupt한 뒤 checkpointer를 닫고 새 connection에서 resume한다. 외부 서비스는
 사용하지 않는다.

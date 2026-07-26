@@ -123,6 +123,44 @@ class _LeaseLosingOutbox(_StaleFinalizationOutbox):
         self.finalized = True
 
 
+class _RenewalFailingOutbox:
+    """실제 SQLite claim/finalize를 유지하고 heartbeat dependency만 실패시킨다."""
+
+    def __init__(self, delegate: SQLiteNotificationOutbox) -> None:
+        self._delegate = delegate
+        self.renew_failed = asyncio.Event()
+
+    async def claim(self, **kwargs: object) -> NotificationClaim | None:
+        return await self._delegate.claim(**kwargs)  # type: ignore[arg-type]
+
+    async def renew(self, *_args: object, **_kwargs: object) -> NotificationClaim:
+        self.renew_failed.set()
+        raise RuntimeError("heartbeat-database-unavailable")
+
+    async def mark_delivered(self, *args: object, **kwargs: object) -> None:
+        await self._delegate.mark_delivered(*args, **kwargs)  # type: ignore[arg-type]
+
+    async def mark_failed(self, *args: object, **kwargs: object) -> None:
+        await self._delegate.mark_failed(*args, **kwargs)  # type: ignore[arg-type]
+
+
+class _CleanupTrackingSender:
+    """Cancellation 시 정리가 끝났는지 관찰하는 sender fake."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.cleaned = asyncio.Event()
+        self.active_count = 0
+
+    async def send(self, _notification: Notification) -> None:
+        self.active_count += 1
+        try:
+            await self.release.wait()
+        finally:
+            self.active_count -= 1
+            self.cleaned.set()
+
+
 class TransactionalNotificationOutboxTests(unittest.TestCase):
     """Task snapshot과 자동 알림 의도가 같은 transaction을 공유하는지 검증한다."""
 
@@ -900,6 +938,154 @@ class NotificationDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "notification_payload_invalid",
         )
 
+    async def test_drain_continues_after_poison_batch_cap_to_valid_row(self) -> None:
+        """100건 skip cap을 no-work로 오인해 101번째 poison 뒤 valid를 남기는 버그를 잡는다."""
+
+        for index in range(101):
+            task = Task.receive(
+                task_id=f"task-poison-batch-{index:03d}",
+                input="poison",
+                at=NOW,
+            )
+            self.store.create_task(
+                task,
+                event=TaskEventDraft(
+                    f"event:poison-batch:{index:03d}",
+                    "TASK_RECEIVED",
+                    {},
+                    NOW,
+                ),
+                outbox=OutboxDraft(
+                    f"poison-batch-{index:03d}",
+                    "legacy.notification",
+                    {"invalid": True},
+                    NOW,
+                ),
+            )
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE outbox_events SET topic = ?, task_version = ? "
+                "WHERE outbox_id LIKE ?",
+                ("task.status_changed", 1, "poison-batch-%"),
+            )
+        sender = FakeNotificationSender()
+        dispatcher = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=sender,
+            clock=lambda: self.completed.updated_at,
+            id_factory=lambda: "poison-batch-lease",
+        )
+
+        await dispatcher.drain()
+
+        messages = self.store.list_outbox()
+        poison = [
+            item for item in messages if item.outbox_id.startswith("poison-batch-")
+        ]
+        self.assertEqual(
+            tuple(item.task_id for item in sender.sent), (self.completed.task_id,)
+        )
+        self.assertEqual(len(poison), 101)
+        self.assertEqual({item.status for item in poison}, {OutboxStatus.FAILED})
+        self.assertFalse(await dispatcher.dispatch_once())
+
+    async def test_rejects_status_not_bound_to_authoritative_task_event(self) -> None:
+        """Raw row가 허용된 다른 terminal status로 위조되어 전달되는 버그를 잡는다."""
+
+        message = self.store.list_outbox()[0]
+        payload = dict(message.payload)
+        payload["status"] = "FAILED"
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE outbox_events SET payload_json = ? WHERE outbox_id = ?",
+                (json.dumps(payload), message.outbox_id),
+            )
+        sender = FakeNotificationSender()
+        dispatcher = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=sender,
+            clock=lambda: self.completed.updated_at,
+            id_factory=lambda: "forged-status-lease",
+        )
+
+        await dispatcher.dispatch_once()
+
+        self.assertEqual(sender.sent, ())
+        forged = self.store.list_outbox()[0]
+        self.assertEqual(forged.status, OutboxStatus.FAILED)
+        self.assertEqual(forged.last_error, "notification_payload_invalid")
+
+    async def test_rejects_plan_hash_not_bound_to_authoritative_task(self) -> None:
+        """Safe-shaped forged plan_hash가 approval notification으로 전달되는 버그를 잡는다."""
+
+        initial = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=FakeNotificationSender(),
+            clock=lambda: self.completed.updated_at,
+            id_factory=lambda: "initial-delivery-lease",
+        )
+        self.assertTrue(await initial.dispatch_once())
+        received = Task.receive(
+            task_id="task-forged-plan-notification",
+            input="변경",
+            at=NOW + timedelta(seconds=3),
+        )
+        running = received.transition(
+            Status.RUNNING,
+            at=received.updated_at + timedelta(seconds=1),
+        )
+        planned = running.update_plan(
+            "sha256:authoritative-plan",
+            at=running.updated_at + timedelta(seconds=1),
+        )
+        waiting = planned.transition(
+            Status.WAITING_APPROVAL,
+            at=planned.updated_at + timedelta(seconds=1),
+        )
+        for index, snapshot in enumerate(
+            (received, running, planned, waiting), start=1
+        ):
+            event = TaskEventDraft(
+                f"event:forged-plan-notification:{index}",
+                f"TASK_{snapshot.status.value}",
+                {},
+                snapshot.updated_at,
+            )
+            if index == 1:
+                self.store.create_task(snapshot, event=event)
+            else:
+                self.store.save_task(snapshot, expected_version=index - 1, event=event)
+        notification_id = f"notification:{waiting.task_id}:{waiting.version}"
+        message = next(
+            item
+            for item in self.store.list_outbox()
+            if item.outbox_id == notification_id
+        )
+        payload = dict(message.payload)
+        payload["metadata"] = {"plan_hash": "sha256:forged-plan"}
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE outbox_events SET payload_json = ? WHERE outbox_id = ?",
+                (json.dumps(payload), notification_id),
+            )
+        sender = FakeNotificationSender()
+        dispatcher = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=sender,
+            clock=lambda: waiting.updated_at,
+            id_factory=lambda: "forged-plan-lease",
+        )
+
+        await dispatcher.dispatch_once()
+
+        self.assertEqual(sender.sent, ())
+        forged = next(
+            item
+            for item in self.store.list_outbox()
+            if item.outbox_id == notification_id
+        )
+        self.assertEqual(forged.status, OutboxStatus.FAILED)
+
     async def test_sender_timeout_prevents_slow_delivery_from_crossing_lease(
         self,
     ) -> None:
@@ -1031,6 +1217,40 @@ class NotificationDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(sender.cancelled.is_set())
         self.assertFalse(outbox.finalized)
+
+    async def test_renewal_error_cleans_sender_and_keeps_lease_backoff_on_shutdown(
+        self,
+    ) -> None:
+        """Heartbeat dependency 오류가 sender task를 orphan으로 남기는 버그를 잡는다."""
+
+        outbox = _RenewalFailingOutbox(SQLiteNotificationOutbox(self.store))
+        sender = _CleanupTrackingSender()
+        self.addAsyncCleanup(sender.release.set)
+        started = time.monotonic()
+        dispatcher = NotificationDispatcher(
+            outbox=outbox,
+            sender=sender,
+            clock=lambda: (
+                self.completed.updated_at
+                + timedelta(seconds=time.monotonic() - started)
+            ),
+            id_factory=lambda: "renewal-error-owner",
+            lease_duration=timedelta(milliseconds=50),
+            send_timeout=timedelta(milliseconds=40),
+            heartbeat_interval=timedelta(milliseconds=10),
+            poll_interval=0.05,
+        )
+
+        await dispatcher.start()
+        await asyncio.wait_for(outbox.renew_failed.wait(), timeout=0.2)
+        await dispatcher.stop()
+
+        persisted = self.store.list_outbox()[0]
+        self.assertTrue(sender.cleaned.is_set())
+        self.assertEqual(sender.active_count, 0)
+        self.assertEqual(persisted.status, OutboxStatus.PROCESSING)
+        self.assertEqual(persisted.attempt_count, 1)
+        self.assertIsNotNone(persisted.lease_expires_at)
 
 
 if __name__ == "__main__":

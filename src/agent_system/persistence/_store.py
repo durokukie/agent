@@ -603,7 +603,15 @@ class SQLiteStore:
                     "알림 대상 Task 전이의 notification outbox는 교체할 수 없습니다."
                 )
             outbox = automatic_outbox
-        outbox_value = None if outbox is None else self._new_outbox(task, outbox)
+        outbox_value = (
+            None
+            if outbox is None
+            else self._new_outbox(
+                task,
+                outbox,
+                trusted_notification=automatic_outbox is not None,
+            )
+        )
         try:
             with self._session() as session, session.begin():
                 current_row = session.get(TaskRow, task.task_id)
@@ -939,6 +947,25 @@ class SQLiteStore:
         with self._session() as session, session.begin():
             return tuple(_event_from_row(row) for row in session.scalars(statement))
 
+    def get_notification_authority(
+        self,
+        task_id: str,
+        task_version: int,
+    ) -> tuple[Task, TaskEvent] | None:
+        """Notification binding용 현재 Task와 exact-version event를 함께 읽는다."""
+
+        with self._session() as session, session.begin():
+            task_row = session.get(TaskRow, task_id)
+            event_row = session.scalar(
+                select(TaskEventRow).where(
+                    TaskEventRow.task_id == task_id,
+                    TaskEventRow.task_version == task_version,
+                )
+            )
+            if task_row is None or event_row is None:
+                return None
+            return _task_from_row(task_row), _event_from_row(event_row)
+
     def apply_approval(
         self,
         approval: Approval,
@@ -1219,7 +1246,11 @@ class SQLiteStore:
                 )
                 outbox_draft = self._notification_draft(successor)
                 if outbox_draft is not None:
-                    outbox_value = self._new_outbox(successor, outbox_draft)
+                    outbox_value = self._new_outbox(
+                        successor,
+                        outbox_draft,
+                        trusted_notification=True,
+                    )
                     session.add(
                         OutboxRow(
                             outbox_id=outbox_value.outbox_id,
@@ -1640,7 +1671,16 @@ class SQLiteStore:
             )
 
     @staticmethod
-    def _new_outbox(task: Task, draft: OutboxDraft) -> OutboxMessage:
+    def _new_outbox(
+        task: Task,
+        draft: OutboxDraft,
+        *,
+        trusted_notification: bool = False,
+    ) -> OutboxMessage:
+        if draft.topic == _NOTIFICATION_TOPIC and not trusted_notification:
+            raise InvalidPersistenceValueError(
+                "notification topic은 Task 상태 전이에서만 자동 생성할 수 있습니다."
+            )
         return OutboxMessage(
             outbox_id=draft.outbox_id,
             task_id=task.task_id,
