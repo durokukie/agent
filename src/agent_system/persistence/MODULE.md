@@ -14,7 +14,7 @@ persistence 결과 값만 반환한다.
 - SQLAlchemy engine과 짧고 명시적인 transaction을 사용하는 `SQLiteStore`
 - Task snapshot과 append-only Task event
 - WorkflowRun snapshot과 모든 AgentRun 이력
-- Approval 기록, 단일 소비와 승인 결과 snapshot
+- 기존 Approval 기록과 ApprovalResponse 승인·거절 decision의 단일 소비 및 exact 결과 snapshot
 - webhook/request 멱등성 key
 - transactional notification outbox와 상태 전이
 - non-terminal startup recovery 조회
@@ -34,12 +34,17 @@ namespace/key와 같은 fingerprint는 기존 Task를 replay 결과로 반환하
 비교한다. 불일치는 `OptimisticConcurrencyError`이며 snapshot과 event 어느 것도
 부분 commit하지 않는다.
 
-`WAITING_APPROVAL → RUNNING`은 일반 Task 저장으로 우회할 수 없다. 승인 전용
-compare-and-transition이 `Approval.binding`, decision key와 현재 Task snapshot을 한
-write transaction에서 검증하고 Approval 소비, Task snapshot, append-only event와
-선택적 outbox를 함께 commit한다. 같은 승인 replay는 저장한 결과 snapshot을
-`ALREADY_APPLIED`로 반환하고, 같은 decision key를 다른 요청에 재사용하면 명시적
-conflict다.
+`WAITING_APPROVAL → RUNNING`은 일반 Task 저장으로 우회할 수 없다. 기존
+`apply_approval()`은 `Approval` 수락 호출과 outbox 계약을 유지한다.
+`consume_approval()`은 orchestration의 `ApprovalResponse`를 public 입력으로 받아 승인과
+거절을 모두 처리한다. 제시된 Task snapshot, response binding, decision key와 현재 Task를
+한 write transaction에서 비교하고 decision record, exact successor, append-only event를
+함께 commit한다. 승인 successor는 `RUNNING`, 거절 successor는 `HUMAN_REJECTED` failure가
+결합된 `REJECTED`다. 같은 decision/content/binding replay는 저장한 exact successor를
+`ALREADY_APPLIED`로 반환한다. 같은 decision key의 다른 내용·binding, 같은 binding의
+다른 decision은 `ApprovalConflictError`, 아직 소비되지 않은 authoritative version/status
+불일치는 `OptimisticConcurrencyError`다. `list_approval_decisions()`는 감사와 복구를 위해
+저장된 응답·successor·failure를 반환한다.
 
 WorkflowRun 최초 저장과 일반 phase 갱신을 분리한다. AgentRun 발급 저장은 이전
 WorkflowRun snapshot, issuance가 추가된 다음 snapshot과 AgentRun을 받아 세 값의
@@ -66,10 +71,12 @@ FastAPI, Rich와 CLI에는 의존하지 않는다. orchestration은 persistence�
 ## 데이터 및 제어 흐름
 
 Task 명령은 저장된 snapshot을 읽고 optimistic 조건을 검증한 뒤 새 snapshot, event,
-선택적 outbox를 commit한다. WorkflowRun이 발급한 immutable issuance ledger와 해당
-AgentRun은 함께 저장된다. 시작 시 recovery 조회는 terminal Task를 제외하고
+선택적 outbox를 commit한다. ApprovalResponse 소비는 decision replay를 먼저 판별하고,
+새 decision이면 binding과 authoritative Task를 검증해 successor/event/decision record를
+원자 저장한다. WorkflowRun이 발급한 immutable issuance ledger와 해당 AgentRun은 함께
+저장된다. 시작 시 recovery 조회는 terminal Task를 제외하고
 `WAITING_APPROVAL`을 대기 항목으로, 나머지 active Task를 재개 항목으로 구분한다.
-재개 항목의 thread id로 별도 checkpointer가 기존 checkpoint를 읽어 graph 실행을
+재개 항목은 최초 수락부터 안정적인 Task ID를 thread id로 사용하고 별도 checkpointer가 기존 checkpoint를 읽어 graph 실행을
 계속한다.
 
 ## 설계 결정과 제약사항
@@ -93,7 +100,8 @@ Alembic만 생성·변경하며 `MetaData.create_all()`을 migration 대체 수�
 임시 파일 SQLite로 빈 DB와 반복 migration, 저장소 layout 없는 package migration 및
 schema drift, WAL/foreign key/busy timeout, domain snapshot fidelity, optimistic
 rollback, event append-only, request idempotency race, Approval replay/conflict와 동시
-소비, WorkflowRun/AgentRun의 정확한 다음 상태 원자 저장·소유 복원, offset 혼합 목록
+소비, ApprovalResponse 승인·거절의 별도 connection 경합·exact replay·rollback·명시적
+decision/binding/version/terminal conflict, WorkflowRun/AgentRun의 정확한 다음 상태 원자 저장·소유 복원, offset 혼합 목록
 정렬, outbox 전이, terminal 제외 recovery를 통합 테스트한다. 실제 LangGraph graph를
 interrupt한 뒤 checkpointer를 닫고 새 connection에서 resume한다. 외부 서비스는
 사용하지 않는다.

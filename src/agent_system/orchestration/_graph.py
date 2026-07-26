@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
+from types import MappingProxyType
 from typing import Protocol, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -114,6 +115,10 @@ class OrchestrationStateError(RuntimeError):
 
 class OrchestrationDependencyError(RuntimeError):
     """주입된 orchestration seam이 예기치 않게 실패했을 때 발생한다."""
+
+
+class OrchestrationCancellationError(RuntimeError):
+    """Checkpoint Task를 취소할 수 없을 때 발생하는 안정적인 공개 오류."""
 
 
 class OrchestrationRecoveryError(RuntimeError):
@@ -901,6 +906,81 @@ class ExecutionCoordinator(Protocol):
         """획득했던 실행권을 해제한다."""
 
 
+@dataclass(frozen=True, slots=True)
+class OrchestrationJournalEntry:
+    """한 orchestration 변경을 durable adapter에 전달하는 provider 중립 값."""
+
+    task: Task
+    workflow: WorkflowRun | None
+    agent_run: AgentRun | None = None
+    task_event_type: str | None = None
+    task_event_payload: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.task) is not Task:
+            raise TypeError("journal task는 Task여야 합니다.")
+        if self.workflow is not None:
+            if type(self.workflow) is not WorkflowRun:
+                raise TypeError(
+                    "journal workflow는 WorkflowRun 또는 None이어야 합니다."
+                )
+            if self.workflow.task_id != self.task.task_id:
+                raise ValueError("journal Task와 WorkflowRun의 task_id가 다릅니다.")
+        if self.agent_run is not None:
+            if type(self.agent_run) is not AgentRun:
+                raise TypeError("journal agent_run은 AgentRun 또는 None이어야 합니다.")
+            if self.workflow is None:
+                raise ValueError("journal AgentRun에는 소유 WorkflowRun이 필요합니다.")
+            restored = AgentRun.from_snapshot(
+                self.agent_run.to_snapshot(),
+                workflow=self.workflow,
+            )
+            if restored != self.agent_run:
+                raise ValueError("journal AgentRun 소유권이 올바르지 않습니다.")
+        if (self.task_event_type is None) != (self.task_event_payload is None):
+            raise ValueError("task event type과 payload는 함께 지정해야 합니다.")
+        if self.task_event_type is not None:
+            _require_text(self.task_event_type, field_name="task_event_type")
+            if not isinstance(self.task_event_payload, Mapping):
+                raise TypeError("task_event_payload는 mapping이어야 합니다.")
+            object.__setattr__(
+                self,
+                "task_event_payload",
+                MappingProxyType(dict(self.task_event_payload)),
+            )
+
+
+class OrchestrationJournal(Protocol):
+    """Aggregate 변경을 durable application journal에 기록하는 seam."""
+
+    async def record(
+        self, entry: OrchestrationJournalEntry
+    ) -> OrchestrationJournalEntry:
+        """기록되었거나 replay된 authoritative entry를 반환한다."""
+
+
+class NoopOrchestrationJournal:
+    """입력 entry를 그대로 반환하는 명시적 no-op adapter."""
+
+    async def record(
+        self, entry: OrchestrationJournalEntry
+    ) -> OrchestrationJournalEntry:
+        return entry
+
+
+class RecordingOrchestrationJournal:
+    """호출 순서대로 entry를 보존하는 결정 가능한 test adapter."""
+
+    def __init__(self) -> None:
+        self.entries: list[OrchestrationJournalEntry] = []
+
+    async def record(
+        self, entry: OrchestrationJournalEntry
+    ) -> OrchestrationJournalEntry:
+        self.entries.append(entry)
+        return entry
+
+
 class FakeExecutionCoordinator:
     """단일 process thread 실행 경합을 결정 가능하게 조정하는 test adapter다."""
 
@@ -945,6 +1025,7 @@ class OrchestratorService:
         governance: Governance,
         approval_consumer: ApprovalConsumer,
         execution_coordinator: ExecutionCoordinator,
+        journal: OrchestrationJournal,
         registry: AgentRegistry,
         max_agent_runs: int,
         checkpointer: BaseCheckpointSaver,
@@ -955,6 +1036,7 @@ class OrchestratorService:
         self._governance = governance
         self._approval_consumer = approval_consumer
         self._execution_coordinator = execution_coordinator
+        self._journal = journal
         self._registry = registry
         self._max_agent_runs = max_agent_runs
         self._clock = clock
@@ -972,6 +1054,7 @@ class OrchestratorService:
         graph.add_node("issue_agent_run", self._issue_agent_run)
         graph.add_node("call_agent", self._call_agent)
         graph.add_node("escalate", self._escalate)
+        graph.add_node("cancel", self._cancel_terminal)
         graph.add_edge(START, "classify")
         graph.add_conditional_edges(
             "classify",
@@ -1004,7 +1087,123 @@ class OrchestratorService:
             },
         )
         graph.add_edge("escalate", END)
+        graph.add_edge("cancel", END)
         return graph
+
+    @staticmethod
+    def _cancel_terminal(state: _GraphState) -> _GraphState:
+        """Facade의 ``aupdate_state(as_node=...)`` 전용 terminal node."""
+
+        return state
+
+    async def _record_journal_entry(
+        self,
+        entry: OrchestrationJournalEntry,
+    ) -> OrchestrationJournalEntry:
+        """Journal 결과를 public 값으로 다시 구성해 forged instance를 거부한다."""
+
+        try:
+            candidate = await self._journal.record(entry)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - durable adapter 상세를 제거한다.
+            raise OrchestrationDependencyError(
+                "OrchestrationJournal 기록에 실패했습니다."
+            ) from None
+        try:
+            if type(candidate) is not OrchestrationJournalEntry:
+                raise TypeError
+            validated = OrchestrationJournalEntry(
+                task=candidate.task,
+                workflow=candidate.workflow,
+                agent_run=candidate.agent_run,
+                task_event_type=candidate.task_event_type,
+                task_event_payload=candidate.task_event_payload,
+            )
+            return validated
+        except Exception:  # noqa: BLE001 - collaborator 결과를 경계에서 검증한다.
+            raise OrchestrationDependencyError(
+                "OrchestrationJournal이 잘못된 결과를 반환했습니다."
+            ) from None
+
+    async def _record_exact_journal_entry(
+        self,
+        entry: OrchestrationJournalEntry,
+    ) -> OrchestrationJournalEntry:
+        """새 기록 또는 같은 callback의 authoritative replay만 허용한다."""
+
+        validated = await self._record_journal_entry(entry)
+        if not self._is_same_journal_callback(entry, validated):
+            raise OrchestrationDependencyError(
+                "OrchestrationJournal이 잘못된 결과를 반환했습니다."
+            ) from None
+        return validated
+
+    @staticmethod
+    def _is_same_journal_callback(
+        requested: OrchestrationJournalEntry,
+        recorded: OrchestrationJournalEntry,
+    ) -> bool:
+        """재실행 시 달라질 수 있는 clock만 제외하고 callback identity를 비교한다."""
+
+        if (
+            requested.task_event_type != recorded.task_event_type
+            or requested.task_event_payload != recorded.task_event_payload
+            or requested.agent_run != recorded.agent_run
+        ):
+            return False
+        requested_task = requested.task.to_snapshot()
+        recorded_task = recorded.task.to_snapshot()
+        requested_task.pop("updated_at")
+        recorded_task.pop("updated_at")
+        if requested_task != recorded_task:
+            return False
+        if requested.workflow is None or recorded.workflow is None:
+            return requested.workflow is recorded.workflow
+        requested_workflow = requested.workflow.to_snapshot()
+        recorded_workflow = recorded.workflow.to_snapshot()
+        requested_workflow.pop("updated_at")
+        recorded_workflow.pop("updated_at")
+        return requested_workflow == recorded_workflow
+
+    async def _record_issuance_journal_entry(
+        self,
+        *,
+        previous_workflow: WorkflowRun,
+        entry: OrchestrationJournalEntry,
+        agent_id: str,
+        retry: bool,
+    ) -> OrchestrationJournalEntry:
+        """새 issuance 또는 같은 budget slot의 authoritative replay를 검증한다."""
+
+        recorded = await self._record_journal_entry(entry)
+        try:
+            if (
+                recorded.task != entry.task
+                or recorded.workflow is None
+                or recorded.agent_run is None
+                or recorded.task_event_type is not None
+                or recorded.task_event_payload is not None
+                or recorded.agent_run.agent_id != agent_id
+                or recorded.agent_run.is_completed
+            ):
+                raise ValueError
+            expected_workflow, expected_agent_run = previous_workflow.begin_agent_run(
+                agent_run_id=recorded.agent_run.agent_run_id,
+                agent_id=agent_id,
+                at=recorded.agent_run.started_at,
+                retry=retry,
+            )
+            if (
+                recorded.workflow != expected_workflow
+                or recorded.agent_run != expected_agent_run
+            ):
+                raise ValueError
+            return recorded
+        except Exception:  # noqa: BLE001 - authoritative replay를 exact 검증한다.
+            raise OrchestrationDependencyError(
+                "OrchestrationJournal issuance 결과가 올바르지 않습니다."
+            ) from None
 
     async def _classify(self, state: _GraphState) -> _GraphState:
         request = _input_from_snapshot(state["request"])
@@ -1021,12 +1220,30 @@ class OrchestratorService:
         except Exception:  # noqa: BLE001 - classifier 경계의 상세 예외를 정규화한다.
             task = Task.from_snapshot(state["task"])
             task = task.transition(Status.FAILED, at=self._clock())
+            terminal = await self._record_exact_journal_entry(
+                OrchestrationJournalEntry(
+                    task=task,
+                    workflow=workflow,
+                    task_event_type="TASK_FAILED",
+                    task_event_payload={
+                        "errors": [FailureCode.CLASSIFICATION_FAILED.value]
+                    },
+                )
+            )
             return {
-                "task": task.to_snapshot(),
+                "task": terminal.task.to_snapshot(),
                 "errors": [FailureCode.CLASSIFICATION_FAILED.value],
             }
         for phase in (Phase.ANALYZING, Phase.PLANNING):
             workflow = workflow.advance(phase, at=self._clock())
+            recorded = await self._record_exact_journal_entry(
+                OrchestrationJournalEntry(
+                    task=Task.from_snapshot(state["task"]),
+                    workflow=workflow,
+                )
+            )
+            assert recorded.workflow is not None
+            workflow = recorded.workflow
         return {"routing": routing.to_snapshot(), "workflow": workflow.to_snapshot()}
 
     @staticmethod
@@ -1036,10 +1253,21 @@ class OrchestratorService:
         routing = RoutingDecision.from_snapshot(state["routing"])
         return routing.action.value
 
-    def _prepare_read_only(self, state: _GraphState) -> _GraphState:
+    async def _prepare_read_only(self, state: _GraphState) -> _GraphState:
+        task = Task.from_snapshot(state["task"])
         workflow = WorkflowRun.from_snapshot(state["workflow"])
         workflow = workflow.advance(Phase.GOVERNING, at=self._clock())
+        recorded = await self._record_exact_journal_entry(
+            OrchestrationJournalEntry(task=task, workflow=workflow)
+        )
+        assert recorded.workflow is not None
+        workflow = recorded.workflow
         workflow = workflow.advance(Phase.EXECUTING, at=self._clock())
+        recorded = await self._record_exact_journal_entry(
+            OrchestrationJournalEntry(task=task, workflow=workflow)
+        )
+        assert recorded.workflow is not None
+        workflow = recorded.workflow
         return {"workflow": workflow.to_snapshot()}
 
     async def _govern(self, state: _GraphState) -> _GraphState:
@@ -1048,12 +1276,28 @@ class OrchestratorService:
         task = Task.from_snapshot(state["task"])
         workflow = WorkflowRun.from_snapshot(state["workflow"])
         workflow = workflow.advance(Phase.GOVERNING, at=self._clock())
+        recorded = await self._record_exact_journal_entry(
+            OrchestrationJournalEntry(task=task, workflow=workflow)
+        )
+        assert recorded.workflow is not None
+        workflow = recorded.workflow
         try:
             decision = await self._governance.evaluate(request, routing)
             if not isinstance(decision, GovernanceDecision):
                 raise TypeError("governance 결과가 GovernanceDecision이 아닙니다.")
         except Exception:  # noqa: BLE001 - governance 경계 예외를 격리한다.
             task = task.transition(Status.ESCALATED, at=self._clock())
+            terminal = await self._record_exact_journal_entry(
+                OrchestrationJournalEntry(
+                    task=task,
+                    workflow=workflow,
+                    task_event_type="TASK_ESCALATED",
+                    task_event_payload={
+                        "errors": [FailureCode.GOVERNANCE_FAILED.value]
+                    },
+                )
+            )
+            task = terminal.task
             return {
                 "task": task.to_snapshot(),
                 "workflow": workflow.to_snapshot(),
@@ -1061,10 +1305,49 @@ class OrchestratorService:
             }
         if not decision.approved:
             task = task.transition(Status.REJECTED, at=self._clock())
+            terminal = await self._record_exact_journal_entry(
+                OrchestrationJournalEntry(
+                    task=task,
+                    workflow=workflow,
+                    task_event_type="TASK_REJECTED",
+                    task_event_payload={
+                        "errors": [FailureCode.GOVERNANCE_REJECTED.value]
+                    },
+                )
+            )
+            task = terminal.task
         else:
             assert routing.plan is not None
             task = task.update_plan(routing.plan.plan_hash, at=self._clock())
+            planned = await self._record_exact_journal_entry(
+                OrchestrationJournalEntry(
+                    task=task,
+                    workflow=workflow,
+                    task_event_type="TASK_PLAN_UPDATED",
+                    task_event_payload={"plan_hash": routing.plan.plan_hash},
+                )
+            )
+            task = planned.task
             task = task.transition(Status.WAITING_APPROVAL, at=self._clock())
+            approval_request = ApprovalRequest(
+                task_id=task.task_id,
+                task_version=task.version,
+                plan_hash=task.plan_hash or "",
+                plan=routing.plan,
+                agent_id=routing.agent_id,
+                action=routing.action,
+            )
+            waiting = await self._record_exact_journal_entry(
+                OrchestrationJournalEntry(
+                    task=task,
+                    workflow=workflow,
+                    task_event_type="TASK_WAITING_APPROVAL",
+                    task_event_payload={
+                        "approval_request": approval_request.to_snapshot()
+                    },
+                )
+            )
+            task = waiting.task
         return {
             "task": task.to_snapshot(),
             "workflow": workflow.to_snapshot(),
@@ -1079,7 +1362,7 @@ class OrchestratorService:
         task = Task.from_snapshot(state["task"])
         return "approval" if task.status is Status.WAITING_APPROVAL else "terminal"
 
-    def _approval(self, state: _GraphState) -> _GraphState:
+    async def _approval(self, state: _GraphState) -> _GraphState:
         task = Task.from_snapshot(state["task"])
         routing = RoutingDecision.from_snapshot(state["routing"])
         assert routing.plan is not None
@@ -1096,13 +1379,25 @@ class OrchestratorService:
         successor = Task.from_snapshot(payload["successor"])
         failure_value = payload.get("failure")
         failure = None if failure_value is None else FailureCode(failure_value)
+        workflow = WorkflowRun.from_snapshot(state["workflow"])
         if failure is not None:
             expected = task.transition(Status.REJECTED, at=successor.updated_at)
             if successor != expected:
                 raise OrchestrationStateError(
                     "ApprovalConsumer rejected successor가 정확하지 않습니다."
                 )
-            return {"task": successor.to_snapshot(), "errors": [failure.value]}
+            rejected = await self._record_exact_journal_entry(
+                OrchestrationJournalEntry(
+                    task=successor,
+                    workflow=workflow,
+                    task_event_type="TASK_REJECTED",
+                    task_event_payload={
+                        "decision_id": response.decision_id,
+                        "errors": [failure.value],
+                    },
+                )
+            )
+            return {"task": rejected.task.to_snapshot(), "errors": [failure.value]}
         assert response.approval is not None
         expected = task.transition(
             Status.RUNNING,
@@ -1114,9 +1409,24 @@ class OrchestratorService:
                 "ApprovalConsumer approved successor가 정확하지 않습니다."
             )
         task = successor
-        workflow = WorkflowRun.from_snapshot(state["workflow"])
         workflow = workflow.rebind_task(task, at=self._clock())
+        approved = await self._record_exact_journal_entry(
+            OrchestrationJournalEntry(
+                task=task,
+                workflow=workflow,
+                task_event_type="TASK_APPROVED",
+                task_event_payload={"decision_id": response.decision_id},
+            )
+        )
+        task = approved.task
+        assert approved.workflow is not None
+        workflow = approved.workflow
         workflow = workflow.advance(Phase.EXECUTING, at=self._clock())
+        executing = await self._record_exact_journal_entry(
+            OrchestrationJournalEntry(task=task, workflow=workflow)
+        )
+        assert executing.workflow is not None
+        workflow = executing.workflow
         return {
             "task": task.to_snapshot(),
             "workflow": workflow.to_snapshot(),
@@ -1128,15 +1438,32 @@ class OrchestratorService:
         task = Task.from_snapshot(state["task"])
         return "execute" if task.status is Status.RUNNING else "terminal"
 
-    def _issue_agent_run(self, state: _GraphState) -> _GraphState:
+    async def _issue_agent_run(self, state: _GraphState) -> _GraphState:
+        task = Task.from_snapshot(state["task"])
         workflow = WorkflowRun.from_snapshot(state["workflow"])
         routing = RoutingDecision.from_snapshot(state["routing"])
+        previous_workflow = workflow
+        retry = workflow.phase is Phase.VERIFYING
         workflow, agent_run = workflow.begin_agent_run(
             agent_run_id=self._id_factory(),
             agent_id=routing.agent_id,
             at=self._clock(),
-            retry=workflow.phase is Phase.VERIFYING,
+            retry=retry,
         )
+        recorded = await self._record_issuance_journal_entry(
+            previous_workflow=previous_workflow,
+            entry=OrchestrationJournalEntry(
+                task=task,
+                workflow=workflow,
+                agent_run=agent_run,
+            ),
+            agent_id=routing.agent_id,
+            retry=retry,
+        )
+        assert recorded.workflow is not None
+        assert recorded.agent_run is not None
+        workflow = recorded.workflow
+        agent_run = recorded.agent_run
         return {
             "workflow": workflow.to_snapshot(),
             "agent_runs": [*state.get("agent_runs", []), agent_run.to_snapshot()],
@@ -1207,11 +1534,31 @@ class OrchestratorService:
             at=self._clock(),
         )
         workflow = workflow.advance(Phase.VERIFYING, at=self._clock())
-        if result is not None:
-            task = task.transition(Status.COMPLETED, at=self._clock())
+        recorded = await self._record_exact_journal_entry(
+            OrchestrationJournalEntry(
+                task=task,
+                workflow=workflow,
+                agent_run=agent_run,
+            )
+        )
+        assert recorded.workflow is not None
+        assert recorded.agent_run is not None
+        workflow = recorded.workflow
+        agent_run = recorded.agent_run
         errors = list(state.get("errors", []))
         if failure is not None:
             errors.append(failure.value)
+        if result is not None:
+            task = task.transition(Status.COMPLETED, at=self._clock())
+            terminal = await self._record_exact_journal_entry(
+                OrchestrationJournalEntry(
+                    task=task,
+                    workflow=workflow,
+                    task_event_type="TASK_COMPLETED",
+                    task_event_payload={"output": result.output, "errors": errors},
+                )
+            )
+            task = terminal.task
         agent_run_snapshots[-1] = agent_run.to_snapshot()
         return {
             "task": task.to_snapshot(),
@@ -1229,15 +1576,25 @@ class OrchestratorService:
         workflow = WorkflowRun.from_snapshot(state["workflow"])
         return "retry" if workflow.budget.remaining > 0 else "escalate"
 
-    def _escalate(self, state: _GraphState) -> _GraphState:
+    async def _escalate(self, state: _GraphState) -> _GraphState:
         task = Task.from_snapshot(state["task"])
+        workflow = WorkflowRun.from_snapshot(state["workflow"])
         task = task.transition(Status.ESCALATED, at=self._clock())
+        errors = [
+            *state.get("errors", []),
+            FailureCode.RETRY_EXHAUSTED.value,
+        ]
+        terminal = await self._record_exact_journal_entry(
+            OrchestrationJournalEntry(
+                task=task,
+                workflow=workflow,
+                task_event_type="TASK_ESCALATED",
+                task_event_payload={"errors": errors},
+            )
+        )
         return {
-            "task": task.to_snapshot(),
-            "errors": [
-                *state.get("errors", []),
-                FailureCode.RETRY_EXHAUSTED.value,
-            ],
+            "task": terminal.task.to_snapshot(),
+            "errors": errors,
         }
 
     async def start(
@@ -1245,6 +1602,7 @@ class OrchestratorService:
         request: OrchestratorInput,
         *,
         thread_id: str,
+        initial_task: Task | None = None,
     ) -> OrchestrationResult:
         """새 Task를 시작해 terminal 결과 또는 interrupt를 반환한다."""
 
@@ -1263,8 +1621,31 @@ class OrchestratorService:
                 raise OrchestrationStartError(
                     "이미 orchestration 실행이 존재하는 checkpoint thread입니다."
                 )
+            if initial_task is not None and (
+                type(initial_task) is not Task
+                or initial_task.status is not Status.RECEIVED
+                or initial_task.version != 1
+                or initial_task.task_id != request.task_id
+                or initial_task.input != request.text
+            ):
+                raise OrchestrationStartError(
+                    "initial_task가 요청의 exact RECEIVED v1 snapshot이 아닙니다."
+                )
             now = self._clock()
-            task = Task.receive(task_id=request.task_id, input=request.text, at=now)
+            task = (
+                initial_task
+                if initial_task is not None
+                else Task.receive(task_id=request.task_id, input=request.text, at=now)
+            )
+            received = await self._record_exact_journal_entry(
+                OrchestrationJournalEntry(
+                    task=task,
+                    workflow=None,
+                    task_event_type="TASK_RECEIVED",
+                    task_event_payload={},
+                )
+            )
+            task = received.task
             task = task.transition(Status.RUNNING, at=self._clock())
             workflow = WorkflowRun.start(
                 workflow_run_id=self._id_factory(),
@@ -1272,6 +1653,17 @@ class OrchestratorService:
                 max_agent_runs=self._max_agent_runs,
                 at=self._clock(),
             )
+            started = await self._record_exact_journal_entry(
+                OrchestrationJournalEntry(
+                    task=task,
+                    workflow=workflow,
+                    task_event_type="TASK_STARTED",
+                    task_event_payload={},
+                )
+            )
+            assert started.workflow is not None
+            task = started.task
+            workflow = started.workflow
             state: _GraphState = {
                 "request": request.to_snapshot(),
                 "task": task.to_snapshot(),
@@ -1367,6 +1759,60 @@ class OrchestratorService:
         if snapshot.interrupts:
             state["__interrupt__"] = snapshot.interrupts
         return self._result_from_state(state)
+
+    async def cancel(self, *, thread_id: str) -> OrchestrationResult:
+        """Checkpoint의 활성 Task를 terminal cancellation으로 전이한다."""
+
+        _require_text(thread_id, field_name="thread_id")
+        config = {"configurable": {"thread_id": thread_id}}
+        async with (
+            self._thread_locks.setdefault(thread_id, asyncio.Lock()),
+            self._execution_scope(
+                thread_id=thread_id,
+                busy_error=OrchestrationCancellationError,
+                busy_message="다른 runner가 같은 thread를 실행하고 있습니다.",
+            ),
+        ):
+            snapshot = await self._graph.aget_state(config)
+            current = self._recovery_result_from_snapshot(snapshot)
+            if current.task.status not in {
+                Status.RECEIVED,
+                Status.RUNNING,
+                Status.WAITING_APPROVAL,
+            }:
+                raise OrchestrationCancellationError(
+                    "Terminal Task는 취소할 수 없습니다."
+                )
+            cancelled = current.task.cancel(at=self._clock())
+            recorded = await self._record_exact_journal_entry(
+                OrchestrationJournalEntry(
+                    task=cancelled,
+                    workflow=current.workflow,
+                    task_event_type="TASK_CANCELLED",
+                    task_event_payload={"errors": []},
+                )
+            )
+            try:
+                await self._graph.aupdate_state(
+                    config,
+                    {"task": recorded.task.to_snapshot()},
+                    as_node="cancel",
+                )
+                updated = await self._graph.aget_state(config)
+                result = self._recovery_result_from_snapshot(updated)
+                if updated.next or result.task != recorded.task:
+                    raise OrchestrationStateError(
+                        "Cancellation checkpoint가 terminal 상태가 아닙니다."
+                    )
+                return result
+            except asyncio.CancelledError:
+                raise
+            except OrchestrationStateError:
+                raise
+            except Exception:  # noqa: BLE001 - checkpoint 오류를 정규화한다.
+                raise OrchestrationStateError(
+                    "Cancellation checkpoint를 저장할 수 없습니다."
+                ) from None
 
     async def recover(self, *, thread_id: str) -> OrchestrationResult:
         """저장된 non-approval checkpoint의 persisted next node부터 재개한다."""
@@ -1615,13 +2061,18 @@ __all__ = [
     "FakeRequestClassifier",
     "Governance",
     "GovernanceDecision",
+    "NoopOrchestrationJournal",
+    "OrchestrationCancellationError",
     "OrchestrationDependencyError",
+    "OrchestrationJournal",
+    "OrchestrationJournalEntry",
     "OrchestrationRecoveryError",
     "OrchestrationResult",
     "OrchestrationStartError",
     "OrchestrationStateError",
     "OrchestratorInput",
     "OrchestratorService",
+    "RecordingOrchestrationJournal",
     "RequestClassifier",
     "RequestKind",
     "RoutingDecision",

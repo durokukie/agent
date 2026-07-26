@@ -7,7 +7,8 @@
 ## 포함할 구현
 
 Task, event, WorkflowRun, AgentRun, Approval, request idempotency와 outbox table을 만드는
-초기 revision 및 이후 schema 변경 revision을 포함한다.
+`0001_initial`, 승인·거절 `ApprovalResponse`와 exact successor/failure를 decision key 및
+Task binding에 결합하는 `0002_approval_decisions`를 포함한다.
 
 ## 공개 인터페이스와 사용 방법
 
@@ -31,8 +32,8 @@ revision 파일은 이미 배포된 뒤 수정하지 않고 새 revision을 추�
 
 ## 테스트 전략
 
-빈 DB upgrade, head 반복 upgrade와 downgrade/upgrade 왕복에서 schema가 일관적인지
-검증한다.
+빈 DB upgrade, head 반복 upgrade, 0001 데이터 보존 upgrade와 downgrade/upgrade
+왕복에서 schema가 일관적인지 검증한다.
 
 ## 변경 시 문서 갱신 조건
 

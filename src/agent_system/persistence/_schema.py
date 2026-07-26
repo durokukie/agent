@@ -170,8 +170,35 @@ class ApprovalRow(Base):
     result_task_snapshot_json: Mapped[str] = mapped_column(Text)
 
 
+class ApprovalDecisionRow(Base):
+    """승인·거절 응답과 exact successor를 함께 보존하는 row."""
+
+    __tablename__ = "approval_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "task_version",
+            "plan_hash",
+            name="uq_approval_decisions_binding",
+        ),
+    )
+
+    decision_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    task_id: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("tasks.task_id", ondelete="RESTRICT"),
+    )
+    task_version: Mapped[int] = mapped_column(Integer)
+    plan_hash: Mapped[str] = mapped_column(String(255))
+    response_snapshot_json: Mapped[str] = mapped_column(Text)
+    consumed_at: Mapped[str] = mapped_column(Text)
+    result_task_snapshot_json: Mapped[str] = mapped_column(Text)
+    failure: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+
 __all__ = [
     "AgentRunRow",
+    "ApprovalDecisionRow",
     "ApprovalRow",
     "OutboxRow",
     "RequestIdempotencyRow",

@@ -7,7 +7,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
-from agent_system.orchestration import Approval, Task, WorkflowRun
+from agent_system.orchestration import (
+    Approval,
+    ApprovalResponse,
+    FailureCode,
+    Task,
+    WorkflowRun,
+)
 
 
 class PersistenceError(Exception):
@@ -183,6 +189,20 @@ class ApprovalRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ApprovalDecisionRecord:
+    """한 번 소비된 승인·거절 응답과 exact successor 기록."""
+
+    decision_id: str
+    task_id: str
+    task_version: int
+    plan_hash: str
+    response: ApprovalResponse
+    consumed_at: datetime
+    result_task: Task
+    failure: FailureCode | None
+
+
+@dataclass(frozen=True, slots=True)
 class ApprovalApplyResult:
     """최초 승인 적용 또는 replay의 결과."""
 
@@ -207,6 +227,7 @@ __all__ = [
     "ApprovalApplyResult",
     "ApprovalApplyStatus",
     "ApprovalConflictError",
+    "ApprovalDecisionRecord",
     "ApprovalRecord",
     "IdempotencyConflictError",
     "IdempotencyKey",

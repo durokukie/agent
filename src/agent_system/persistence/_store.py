@@ -21,6 +21,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from agent_system.orchestration import (
     AgentRun,
     Approval,
+    ApprovalConsumeResult,
+    ApprovalConsumeStatus,
+    ApprovalResponse,
+    FailureCode,
     Phase,
     Status,
     Task,
@@ -29,6 +33,7 @@ from agent_system.orchestration import (
 
 from ._schema import (
     AgentRunRow,
+    ApprovalDecisionRow,
     ApprovalRow,
     OutboxRow,
     RequestIdempotencyRow,
@@ -40,6 +45,7 @@ from ._values import (
     ApprovalApplyResult,
     ApprovalApplyStatus,
     ApprovalConflictError,
+    ApprovalDecisionRecord,
     ApprovalRecord,
     IdempotencyConflictError,
     IdempotencyKey,
@@ -172,6 +178,19 @@ def _approval_from_row(row: ApprovalRow) -> ApprovalRecord:
         approval=Approval.from_snapshot(_json_load(row.approval_snapshot_json)),
         consumed_at=_parse_datetime(row.consumed_at),
         result_task=Task.from_snapshot(_json_load(row.result_task_snapshot_json)),
+    )
+
+
+def _approval_decision_from_row(row: ApprovalDecisionRow) -> ApprovalDecisionRecord:
+    return ApprovalDecisionRecord(
+        decision_id=row.decision_id,
+        task_id=row.task_id,
+        task_version=row.task_version,
+        plan_hash=row.plan_hash,
+        response=ApprovalResponse.from_snapshot(_json_load(row.response_snapshot_json)),
+        consumed_at=_parse_datetime(row.consumed_at),
+        result_task=Task.from_snapshot(_json_load(row.result_task_snapshot_json)),
+        failure=None if row.failure is None else FailureCode(row.failure),
     )
 
 
@@ -622,6 +641,53 @@ class SQLiteStore:
             row = session.get(WorkflowRunRow, workflow_run_id)
             return None if row is None else _workflow_from_row(row)
 
+    def get_workflow_run_for_task(self, task_id: str) -> WorkflowRun | None:
+        """Task가 소유한 현재 WorkflowRun snapshot을 반환한다."""
+
+        statement = select(WorkflowRunRow).where(WorkflowRunRow.task_id == task_id)
+        with self._session() as session, session.begin():
+            row = session.scalar(statement)
+            return None if row is None else _workflow_from_row(row)
+
+    def rebind_workflow_run(
+        self,
+        previous_workflow: WorkflowRun,
+        workflow: WorkflowRun,
+    ) -> WorkflowRun:
+        """승인 successor에 결합된 exact WorkflowRun rebind를 저장한다."""
+
+        previous_json = _json_dump(previous_workflow.to_snapshot())
+        with self._session() as session, session.begin():
+            task_row = session.get(TaskRow, workflow.task_id)
+            if task_row is None:
+                raise PersistenceNotFoundError(
+                    f"WorkflowRun의 Task가 없습니다: {workflow.task_id}"
+                )
+            expected = previous_workflow.rebind_task(
+                _task_from_row(task_row),
+                at=workflow.updated_at,
+            )
+            if expected != workflow:
+                raise InvalidPersistenceValueError(
+                    "workflow가 현재 승인 Task의 exact rebind 결과가 아닙니다."
+                )
+            result = session.execute(
+                update(WorkflowRunRow)
+                .where(
+                    WorkflowRunRow.workflow_run_id == workflow.workflow_run_id,
+                    WorkflowRunRow.snapshot_json == previous_json,
+                )
+                .values(
+                    snapshot_json=_json_dump(workflow.to_snapshot()),
+                    updated_at=workflow.updated_at.isoformat(),
+                )
+            )
+            if result.rowcount != 1:
+                raise OptimisticConcurrencyError(
+                    "저장된 WorkflowRun이 previous_workflow와 다릅니다."
+                )
+        return workflow
+
     def get_agent_run(self, agent_run_id: str) -> AgentRun | None:
         """저장된 owner 검증과 함께 AgentRun domain snapshot을 반환한다."""
 
@@ -816,6 +882,159 @@ class SQLiteStore:
                 )
             )
 
+    def consume_approval(
+        self,
+        *,
+        task: Task,
+        response: ApprovalResponse,
+        at: datetime,
+        event: TaskEventDraft,
+    ) -> ApprovalConsumeResult:
+        """승인·거절 응답과 exact Task successor를 원자적으로 저장한다."""
+
+        response_json = _json_dump(response.to_snapshot())
+        try:
+            with self._session() as session, session.begin():
+                existing = session.get(ApprovalDecisionRow, response.decision_id)
+                if existing is not None:
+                    record = _approval_decision_from_row(existing)
+                    if existing.response_snapshot_json != response_json or (
+                        record.task_id,
+                        record.task_version,
+                        record.plan_hash,
+                    ) != (task.task_id, task.version, task.plan_hash):
+                        raise ApprovalConflictError(
+                            "같은 decision_id가 다른 응답 또는 binding에 "
+                            "사용되었습니다."
+                        )
+                    return ApprovalConsumeResult(
+                        ApprovalConsumeStatus.ALREADY_APPLIED,
+                        record.result_task,
+                        record.failure,
+                    )
+
+                if task.plan_hash is None:
+                    raise ApprovalConflictError(
+                        "Approval decision에는 plan binding이 필요합니다."
+                    )
+                binding_statement = select(ApprovalDecisionRow).where(
+                    ApprovalDecisionRow.task_id == task.task_id,
+                    ApprovalDecisionRow.task_version == task.version,
+                    ApprovalDecisionRow.plan_hash == task.plan_hash,
+                )
+                if session.scalar(binding_statement) is not None:
+                    raise ApprovalConflictError(
+                        "Approval binding이 다른 decision으로 이미 소비되었습니다."
+                    )
+                current_row = session.get(TaskRow, task.task_id)
+                if current_row is None:
+                    raise PersistenceNotFoundError(
+                        f"Approval의 Task가 없습니다: {task.task_id}"
+                    )
+                current = _task_from_row(current_row)
+                if current != task or current.status is not Status.WAITING_APPROVAL:
+                    raise OptimisticConcurrencyError(
+                        "Approval binding과 현재 Task snapshot이 다릅니다."
+                    )
+                if response.accepted:
+                    approval = response.approval
+                    if approval is None or approval.binding != (
+                        current.task_id,
+                        current.version,
+                        current.plan_hash,
+                    ):
+                        raise ApprovalConflictError(
+                            "승인 응답의 binding이 Task snapshot과 다릅니다."
+                        )
+                    successor = current.transition(
+                        Status.RUNNING,
+                        at=at,
+                        approval=approval,
+                    )
+                    failure = None
+                else:
+                    successor = current.transition(Status.REJECTED, at=at)
+                    failure = FailureCode.HUMAN_REJECTED
+                event_value = TaskEvent(
+                    event_id=event.event_id,
+                    task_id=successor.task_id,
+                    task_version=successor.version,
+                    event_type=event.event_type,
+                    payload=dict(event.payload),
+                    occurred_at=event.occurred_at,
+                )
+                result = session.execute(
+                    update(TaskRow)
+                    .where(
+                        TaskRow.task_id == current.task_id,
+                        TaskRow.status == Status.WAITING_APPROVAL.value,
+                        TaskRow.version == current.version,
+                        TaskRow.plan_hash == current.plan_hash,
+                    )
+                    .values(
+                        status=successor.status.value,
+                        version=successor.version,
+                        updated_at=successor.updated_at.isoformat(),
+                    )
+                )
+                if result.rowcount != 1:
+                    raise OptimisticConcurrencyError(
+                        "Approval binding과 현재 Task snapshot이 다릅니다."
+                    )
+                session.add(
+                    ApprovalDecisionRow(
+                        decision_id=response.decision_id,
+                        task_id=current.task_id,
+                        task_version=current.version,
+                        plan_hash=current.plan_hash,
+                        response_snapshot_json=response_json,
+                        consumed_at=at.isoformat(),
+                        result_task_snapshot_json=_json_dump(successor.to_snapshot()),
+                        failure=None if failure is None else failure.value,
+                    )
+                )
+                session.add(
+                    TaskEventRow(
+                        event_id=event_value.event_id,
+                        task_id=event_value.task_id,
+                        task_version=event_value.task_version,
+                        event_type=event_value.event_type,
+                        payload_json=_json_dump(event_value.payload),
+                        occurred_at=event_value.occurred_at.isoformat(),
+                    )
+                )
+                return ApprovalConsumeResult(
+                    ApprovalConsumeStatus.APPLIED,
+                    successor,
+                    failure,
+                )
+        except IntegrityError as error:
+            raise PersistenceConflictError(
+                "Approval decision 또는 Task event 값이 이미 존재합니다."
+            ) from error
+
+    def list_approval_decisions(
+        self, task_id: str
+    ) -> tuple[ApprovalDecisionRecord, ...]:
+        """Task에 소비된 승인·거절 결정을 소비 시각 순서로 반환한다."""
+
+        statement = select(ApprovalDecisionRow).where(
+            ApprovalDecisionRow.task_id == task_id
+        )
+        with self._session() as session, session.begin():
+            records = tuple(
+                _approval_decision_from_row(row) for row in session.scalars(statement)
+            )
+            return tuple(
+                sorted(
+                    records,
+                    key=lambda record: (
+                        record.consumed_at.astimezone(UTC),
+                        record.decision_id,
+                    ),
+                )
+            )
+
     def list_recovery_candidates(self) -> tuple[RecoveryCandidate, ...]:
         """terminal Task를 제외하고 자동 재개와 승인 대기를 구분한다."""
 
@@ -846,11 +1065,9 @@ class SQLiteStore:
                         task=task,
                         workflow_run=workflow,
                         disposition=disposition,
-                        thread_id=(
-                            task.task_id
-                            if workflow is None
-                            else workflow.workflow_run_id
-                        ),
+                        # Runtime은 최초 수락부터 checkpoint까지 Task ID를
+                        # stable thread identity로 사용한다.
+                        thread_id=task.task_id,
                     )
                 )
             return tuple(

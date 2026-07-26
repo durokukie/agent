@@ -25,8 +25,10 @@ import하지 않는다.
 ## 데이터 및 제어 흐름
 
 빈 데이터베이스 또는 이전 revision에 `upgrade head`를 적용해 app table과 제약을
-만든다. 현재 head에 반복 적용하면 schema 변경 없이 종료한다. 실행 환경은 이 package
-resource의 `env.py`와 `versions`를 직접 사용한다.
+만든다. `0001_initial` 데이터베이스에는 `0002_approval_decisions`가 기존 데이터를
+보존하면서 decision table과 binding 제약을 추가한다. 현재 head에 반복 적용하면 schema
+변경 없이 종료한다. 실행 환경은 이 package resource의 `env.py`와 `versions`를 직접
+사용한다.
 
 ## 설계 결정과 제약사항
 
@@ -36,7 +38,8 @@ app schema와 checkpointer schema의 소유권을 섞지 않는다.
 ## 테스트 전략
 
 임시 빈 파일에 head migration을 적용하고 table, foreign key, index, trigger와 현재
-revision을 검사한다. 같은 파일에 반복 적용해 idempotency를 검증한다. source package를
+revision을 검사한다. 같은 파일에 반복 적용해 idempotency를 검증하고, 기존 0001
+revision의 Task를 보존한 채 0002로 upgrade되는지 확인한다. source package를
 저장소 layout 밖으로 복사한 subprocess에서도 반복 upgrade와 Alembic drift 검사를
 실행한다.
 

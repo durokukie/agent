@@ -2,23 +2,23 @@
 
 ## 목적과 책임
 
-CLI, 애플리케이션 조립, 오케스트레이션, 에이전트, 도구, 모델, 저장 및 관측 기능을 하나의 모듈형 모놀리스로 제공한다.
+HTTP/CLI 전송, 애플리케이션 조립, 오케스트레이션, 에이전트, 도구, 모델, 저장 및 관측 기능을 하나의 모듈형 모놀리스로 제공한다.
 
 ## 포함할 구현
 
-`cli`, `runtime`, `orchestration`, `agents`, `tools`, `models`, `persistence`, `observability`, `schemas`, `config` 모듈을 포함한다.
+`http`, `cli`, `runtime`, `orchestration`, `agents`, `tools`, `models`, `persistence`, `observability`, `schemas`, `config` 모듈을 포함한다.
 
 ## 공개 인터페이스와 사용 방법
 
-초기 공개 진입점은 CLI다. 내부 모듈을 외부에서 직접 조립하지 않고 `runtime`이 제공할 애플리케이션 실행 인터페이스를 사용한다.
+HTTP와 CLI는 내부 모듈을 직접 조립하지 않고 `runtime`의 application interface를 사용한다.
 
 ## 의존성과 허용된 import 방향
 
-의존성 방향은 `cli → runtime → orchestration → agents`를 기본으로 한다. 공용 타입은 `schemas`에 두며 역방향 import를 금지한다.
+의존성 방향은 `http/cli → runtime → orchestration → agents`를 기본으로 한다. 공용 타입은 `schemas`에 두며 역방향 import를 금지한다.
 
 ## 데이터 및 제어 흐름
 
-CLI 요청이 runtime에서 실행 컨텍스트로 조립되고 orchestration graph가 에이전트를 선택해 결과를 반환한다.
+HTTP/CLI 요청은 runtime에서 먼저 영속화되고 background queue를 거쳐 orchestration graph가 에이전트를 선택한다. 조회는 persistence authority에서 조립된다.
 
 ## 설계 결정과 제약사항
 

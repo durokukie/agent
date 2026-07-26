@@ -22,6 +22,9 @@ from agent_system.orchestration import (
     AgentRun,
     AgentRunOwnershipError,
     Approval,
+    ApprovalConsumeStatus,
+    ApprovalResponse,
+    FailureCode,
     Phase,
     PlanChangedError,
     Status,
@@ -78,6 +81,7 @@ class MigrationTests(unittest.TestCase):
             {
                 "agent_runs",
                 "alembic_version",
+                "approval_decisions",
                 "approvals",
                 "outbox_events",
                 "request_idempotency",
@@ -86,10 +90,52 @@ class MigrationTests(unittest.TestCase):
                 "workflow_runs",
             },
         )
-        self.assertEqual(revision, ("0001_initial",))
+        self.assertEqual(revision, ("0002_approval_decisions",))
         self.assertTrue(
             any(row[2] == "tasks" and row[3] == "task_id" for row in event_foreign_keys)
         )
+
+    def test_upgrades_an_existing_0001_database_without_losing_data(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            upgrade_database(database_path)
+            with sqlite3.connect(database_path) as connection:
+                connection.execute(
+                    "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "task-existing",
+                        "기존 요청",
+                        "RECEIVED",
+                        1,
+                        None,
+                        NOW.isoformat(),
+                        NOW.isoformat(),
+                    ),
+                )
+                connection.execute("DROP TABLE approval_decisions")
+                connection.execute(
+                    "UPDATE alembic_version SET version_num = ?",
+                    ("0001_initial",),
+                )
+
+            upgrade_database(database_path)
+
+            with sqlite3.connect(database_path) as connection:
+                revision = connection.execute(
+                    "SELECT version_num FROM alembic_version"
+                ).fetchone()
+                existing = connection.execute(
+                    "SELECT input FROM tasks WHERE task_id = ?",
+                    ("task-existing",),
+                ).fetchone()
+                decision_table = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    ("approval_decisions",),
+                ).fetchone()
+
+        self.assertEqual(revision, ("0002_approval_decisions",))
+        self.assertEqual(existing, ("기존 요청",))
+        self.assertEqual(decision_table, ("approval_decisions",))
 
     def test_upgrades_from_a_repo_layout_free_package_and_has_no_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -124,7 +170,7 @@ with sqlite3.connect(database_path) as connection:
     revision = connection.execute(
         "SELECT version_num FROM alembic_version"
     ).fetchone()
-assert revision == ("0001_initial",)
+assert revision == ("0002_approval_decisions",)
 """
             environment = os.environ.copy()
             environment["PYTHONPATH"] = str(installed_root)
@@ -946,6 +992,248 @@ class ApprovalStoreTests(unittest.TestCase):
         self.assertEqual(approvals[0].approval, approval)
         self.assertEqual(len(outbox), 1)
 
+    def test_atomically_rejects_and_replays_the_exact_successor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            waiting = self._create_waiting_task(database_path)
+            response = ApprovalResponse.reject(
+                decision_id="decision-reject",
+                reason="운영자가 변경을 거절함",
+            )
+            event = TaskEventDraft(
+                "event-rejected",
+                "TASK_REJECTED",
+                {"decision_id": response.decision_id},
+                NOW + timedelta(seconds=5),
+            )
+
+            with SQLiteStore(database_path) as store:
+                applied = store.consume_approval(
+                    task=waiting,
+                    response=response,
+                    at=NOW + timedelta(seconds=5),
+                    event=event,
+                )
+                replayed = store.consume_approval(
+                    task=waiting,
+                    response=response,
+                    at=NOW + timedelta(seconds=6),
+                    event=TaskEventDraft(
+                        "event-rejected-replay",
+                        "TASK_REJECTED",
+                        {"decision_id": response.decision_id},
+                        NOW + timedelta(seconds=6),
+                    ),
+                )
+                current = store.get_task(waiting.task_id)
+                events = store.list_task_events(waiting.task_id)
+                decisions = store.list_approval_decisions(waiting.task_id)
+
+        self.assertEqual(applied.status, ApprovalConsumeStatus.APPLIED)
+        self.assertEqual(applied.task.status, Status.REJECTED)
+        self.assertEqual(applied.failure, FailureCode.HUMAN_REJECTED)
+        self.assertEqual(replayed.status, ApprovalConsumeStatus.ALREADY_APPLIED)
+        self.assertEqual(replayed.task, applied.task)
+        self.assertEqual(replayed.failure, applied.failure)
+        self.assertEqual(current, applied.task)
+        self.assertEqual(len(events), 5)
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].response, response)
+        self.assertEqual(decisions[0].result_task, applied.task)
+
+    def test_concurrently_accepts_once_across_separate_stores(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            waiting = self._create_waiting_task(database_path)
+            response = ApprovalResponse(
+                decision_id="decision-accept",
+                accepted=True,
+                approval=Approval.grant_for(
+                    waiting,
+                    at=NOW + timedelta(seconds=4),
+                ),
+            )
+
+            def consume(suffix: str):
+                with SQLiteStore(database_path) as store:
+                    return store.consume_approval(
+                        task=waiting,
+                        response=response,
+                        at=NOW + timedelta(seconds=5),
+                        event=TaskEventDraft(
+                            f"event-consumed-{suffix}",
+                            "TASK_APPROVED",
+                            {"decision_id": response.decision_id},
+                            NOW + timedelta(seconds=5),
+                        ),
+                    )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = (
+                    executor.submit(consume, "a"),
+                    executor.submit(consume, "b"),
+                )
+                results = tuple(future.result() for future in futures)
+
+            with SQLiteStore(database_path) as store:
+                current = store.get_task(waiting.task_id)
+                decisions = store.list_approval_decisions(waiting.task_id)
+
+        self.assertEqual(
+            sorted(result.status for result in results),
+            [ApprovalConsumeStatus.ALREADY_APPLIED, ApprovalConsumeStatus.APPLIED],
+        )
+        self.assertEqual(results[0].task, results[1].task)
+        self.assertEqual(current, results[0].task)
+        self.assertEqual(current.status, Status.RUNNING)
+        self.assertEqual(current.version, waiting.version + 1)
+        self.assertEqual(len(decisions), 1)
+        self.assertIsNone(decisions[0].failure)
+
+    def test_rolls_back_rejection_when_event_append_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            waiting = self._create_waiting_task(database_path)
+            response = ApprovalResponse.reject(
+                decision_id="decision-reject-rollback",
+                reason="작업 중단",
+            )
+
+            with SQLiteStore(database_path) as store:
+                with self.assertRaises(PersistenceConflictError):
+                    store.consume_approval(
+                        task=waiting,
+                        response=response,
+                        at=NOW + timedelta(seconds=5),
+                        event=TaskEventDraft(
+                            "event-waiting",
+                            "TASK_REJECTED",
+                            {},
+                            NOW + timedelta(seconds=5),
+                        ),
+                    )
+                current = store.get_task(waiting.task_id)
+                decisions = store.list_approval_decisions(waiting.task_id)
+                events = store.list_task_events(waiting.task_id)
+
+        self.assertEqual(current, waiting)
+        self.assertEqual(decisions, ())
+        self.assertEqual(len(events), 4)
+
+    def test_rejects_changed_decision_content_and_binding_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "state.sqlite3"
+            waiting = self._create_waiting_task(database_path)
+            response = ApprovalResponse.reject(
+                decision_id="decision-conflict",
+                reason="승인하지 않음",
+            )
+            with SQLiteStore(database_path) as store:
+                store.consume_approval(
+                    task=waiting,
+                    response=response,
+                    at=NOW + timedelta(seconds=5),
+                    event=TaskEventDraft(
+                        "event-reject-conflict-base",
+                        "TASK_REJECTED",
+                        {},
+                        NOW + timedelta(seconds=5),
+                    ),
+                )
+                with self.assertRaises(ApprovalConflictError):
+                    store.consume_approval(
+                        task=waiting,
+                        response=ApprovalResponse.reject(
+                            decision_id=response.decision_id,
+                            reason="변경된 거절 사유",
+                        ),
+                        at=NOW + timedelta(seconds=6),
+                        event=TaskEventDraft(
+                            "event-changed-content",
+                            "TASK_REJECTED",
+                            {},
+                            NOW + timedelta(seconds=6),
+                        ),
+                    )
+                changed_binding = waiting.update_plan(
+                    "sha256:plan-v2",
+                    at=NOW + timedelta(seconds=6),
+                )
+                with self.assertRaises(ApprovalConflictError):
+                    store.consume_approval(
+                        task=changed_binding,
+                        response=response,
+                        at=NOW + timedelta(seconds=7),
+                        event=TaskEventDraft(
+                            "event-changed-binding",
+                            "TASK_REJECTED",
+                            {},
+                            NOW + timedelta(seconds=7),
+                        ),
+                    )
+                with self.assertRaises(ApprovalConflictError):
+                    store.consume_approval(
+                        task=waiting,
+                        response=ApprovalResponse.reject(
+                            decision_id="decision-other",
+                            reason="승인하지 않음",
+                        ),
+                        at=NOW + timedelta(seconds=7),
+                        event=TaskEventDraft(
+                            "event-binding-reuse",
+                            "TASK_REJECTED",
+                            {},
+                            NOW + timedelta(seconds=7),
+                        ),
+                    )
+
+    def test_rejects_stale_version_and_terminal_task_conflicts(self) -> None:
+        for terminal in (False, True):
+            with (
+                self.subTest(terminal=terminal),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                database_path = Path(directory) / "state.sqlite3"
+                waiting = self._create_waiting_task(database_path)
+                if terminal:
+                    changed = waiting.transition(
+                        Status.CANCELLED,
+                        at=NOW + timedelta(seconds=4),
+                    )
+                    event_type = "TASK_CANCELLED"
+                else:
+                    changed = waiting.update_plan(
+                        "sha256:plan-v2",
+                        at=NOW + timedelta(seconds=4),
+                    )
+                    event_type = "PLAN_UPDATED"
+                with SQLiteStore(database_path) as store:
+                    store.save_task(
+                        changed,
+                        expected_version=waiting.version,
+                        event=TaskEventDraft(
+                            "event-authoritative-change",
+                            event_type,
+                            {},
+                            changed.updated_at,
+                        ),
+                    )
+                    with self.assertRaises(OptimisticConcurrencyError):
+                        store.consume_approval(
+                            task=waiting,
+                            response=ApprovalResponse.reject(
+                                decision_id="decision-stale",
+                                reason="오래된 화면에서 거절",
+                            ),
+                            at=NOW + timedelta(seconds=5),
+                            event=TaskEventDraft(
+                                "event-stale-rejection",
+                                "TASK_REJECTED",
+                                {},
+                                NOW + timedelta(seconds=5),
+                            ),
+                        )
+
     def test_rolls_back_approval_consumption_when_event_append_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "state.sqlite3"
@@ -1130,8 +1418,8 @@ class RecoveryAndCheckpointTests(unittest.TestCase):
                 ("task-waiting", RecoveryDisposition.WAITING_APPROVAL),
             ],
         )
-        self.assertEqual(candidates[0].thread_id, "workflow-running")
-        self.assertEqual(candidates[1].thread_id, "workflow-waiting")
+        self.assertEqual(candidates[0].thread_id, "task-running")
+        self.assertEqual(candidates[1].thread_id, "task-waiting")
 
     def test_resumes_an_interrupted_graph_with_a_new_owned_connection(self) -> None:
         class CheckpointState(TypedDict):
@@ -1160,7 +1448,7 @@ class RecoveryAndCheckpointTests(unittest.TestCase):
                 max_agent_runs=1,
                 at=task.updated_at,
             )
-            config = {"configurable": {"thread_id": workflow.workflow_run_id}}
+            config = {"configurable": {"thread_id": task.task_id}}
 
             with SQLiteStore(database_path) as store:
                 store.create_workflow_run(workflow)
