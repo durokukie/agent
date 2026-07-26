@@ -105,6 +105,10 @@ instant와 안정적인 식별자로 정렬한다.
 거부한다. Dispatcher claim은 notification 전용 topic만 선택하며 ID·Task/version·허용
 status·channel/time·metadata allowlist를 검증한 뒤 같은 DB transaction에서 읽은 현재 Task와
 exact-version append-only event로 status·version·occurred_at·plan_hash를 다시 결합한다.
+자동 notification은 이전 Task와 후보 Task의 status가 실제로 달라질 때만 생성하므로
+WAITING_APPROVAL/RUNNING 상태 안의 plan update는 새 알림을 만들지 않는다. 과거 WAITING 알림의
+plan authority는 해당 version `TASK_WAITING_APPROVAL` event의 `approval_request.plan_hash`이며,
+후속 plan update는 이미 생성된 알림을 무효화하지 않는다.
 `BEGIN IMMEDIATE` transaction 안에서 eligibility와 만료 lease를 실제
 UTC instant로 비교하고 token CAS로 owner를 결합한다. 전달 실패는 Task를 변경하지 않고
 attempt, 안정적인 오류 code와 다음 시각을 기록한다. Active send lease 갱신도 동일 token
@@ -126,7 +130,8 @@ rollback, event append-only, request idempotency race, Approval replay/conflict�
 decision/binding/version/terminal conflict, runtime command의 원자 생성·exact fingerprint
 replay·Task별 pending 순서·failure retry, WorkflowRun/AgentRun의 정확한 다음 상태 원자 저장·소유 복원, offset 혼합 목록
 정렬, 대상 상태 자동 outbox·원자 rollback·replay dedupe, 모든 ingress의 예약 topic 위조 차단,
-authoritative claim binding·101 poison skip 경쟁·stale token·lease renewal/recovery·backoff,
+authoritative claim binding·same-status plan save·later replan delivery·101 poison skip 경쟁·stale
+token·lease renewal/recovery·backoff,
 terminal 제외 recovery를
 통합 테스트한다. 실제 LangGraph graph를
 interrupt한 뒤 checkpointer를 닫고 새 connection에서 resume한다. 외부 서비스는

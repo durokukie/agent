@@ -596,22 +596,7 @@ class SQLiteStore:
             payload=dict(event.payload),
             occurred_at=event.occurred_at,
         )
-        automatic_outbox = self._notification_draft(task)
-        if automatic_outbox is not None:
-            if outbox is not None and outbox != automatic_outbox:
-                raise InvalidPersistenceValueError(
-                    "알림 대상 Task 전이의 notification outbox는 교체할 수 없습니다."
-                )
-            outbox = automatic_outbox
-        outbox_value = (
-            None
-            if outbox is None
-            else self._new_outbox(
-                task,
-                outbox,
-                trusted_notification=automatic_outbox is not None,
-            )
-        )
+        outbox_value = None
         try:
             with self._session() as session, session.begin():
                 current_row = session.get(TaskRow, task.task_id)
@@ -621,6 +606,27 @@ class SQLiteStore:
                     )
                 current = _task_from_row(current_row)
                 self._validate_task_successor(current, task)
+                automatic_outbox = (
+                    self._notification_draft(task)
+                    if current.status is not task.status
+                    else None
+                )
+                selected_outbox = outbox
+                if automatic_outbox is not None:
+                    if (
+                        selected_outbox is not None
+                        and selected_outbox != automatic_outbox
+                    ):
+                        raise InvalidPersistenceValueError(
+                            "알림 대상 Task 전이의 notification outbox는 교체할 수 없습니다."
+                        )
+                    selected_outbox = automatic_outbox
+                if selected_outbox is not None:
+                    outbox_value = self._new_outbox(
+                        task,
+                        selected_outbox,
+                        trusted_notification=automatic_outbox is not None,
+                    )
                 result = session.execute(
                     update(TaskRow)
                     .where(

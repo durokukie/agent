@@ -59,7 +59,8 @@ wakeup은 내구성의 근거가 아니다. 재시작 시 persisted
 불변 wire 값의 deep copy, logging/fake sender, 전달 성공과 실패, backoff eligibility,
 dispatcher 경쟁, cancellation-resistant sender heartbeat, lease 상실, stale finalize, lease 만료
 복구, heartbeat dependency 오류 cleanup, secret-injected malformed/legacy topic,
-authoritative Task/event binding, 101-poison batch와 valid-behind-poison,
+authoritative Task/event binding, later replan 뒤 exact-version WAITING delivery, 101-poison
+batch와 valid-behind-poison,
 stop/drain과 재시작 retry를 실제 임시 SQLite outbox
 adapter와 함께 검증한다. 외부 network는 사용하지 않는다.
 

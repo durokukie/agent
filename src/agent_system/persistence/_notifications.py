@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 
 from agent_system.notifications import (
@@ -144,7 +145,14 @@ class SQLiteNotificationOutbox:
         ):
             raise ValueError("notification Task binding이 올바르지 않습니다.")
         if notification.status == "WAITING_APPROVAL":
-            if task.plan_hash != notification.metadata["plan_hash"]:
+            approval_request = event.payload.get("approval_request")
+            if isinstance(approval_request, Mapping):
+                authority_plan_hash = approval_request.get("plan_hash")
+            elif task.version == notification.task_version:
+                authority_plan_hash = task.plan_hash
+            else:
+                authority_plan_hash = None
+            if authority_plan_hash != notification.metadata["plan_hash"]:
                 raise ValueError("notification plan binding이 올바르지 않습니다.")
         elif (
             task.version != notification.task_version

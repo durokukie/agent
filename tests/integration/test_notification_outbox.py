@@ -260,6 +260,80 @@ class TransactionalNotificationOutboxTests(unittest.TestCase):
             self.assertNotIn("secret", repr(message.payload))
             self.assertEqual(message.next_attempt_at, notification.occurred_at)
 
+    def test_same_status_plan_saves_do_not_create_notifications(self) -> None:
+        """WAITING/RUNNING same-status version 저장이 상태 전이 알림을 만드는 버그를 잡는다."""
+
+        for target_status in (Status.RUNNING, Status.WAITING_APPROVAL):
+            task_id = f"task-same-status-{target_status.value.lower()}"
+            received = Task.receive(task_id=task_id, input="변경", at=NOW)
+            running = received.transition(
+                Status.RUNNING,
+                at=NOW + timedelta(seconds=1),
+            )
+            self.store.create_task(
+                received,
+                event=TaskEventDraft(
+                    f"event:{task_id}:1", "TASK_RECEIVED", {}, received.updated_at
+                ),
+            )
+            self.store.save_task(
+                running,
+                expected_version=1,
+                event=TaskEventDraft(
+                    f"event:{task_id}:2", "TASK_STARTED", {}, running.updated_at
+                ),
+            )
+            current = running
+            if target_status is Status.WAITING_APPROVAL:
+                planned = running.update_plan(
+                    "sha256:initial-plan",
+                    at=NOW + timedelta(seconds=2),
+                )
+                waiting = planned.transition(
+                    Status.WAITING_APPROVAL,
+                    at=NOW + timedelta(seconds=3),
+                )
+                self.store.save_task(
+                    planned,
+                    expected_version=2,
+                    event=TaskEventDraft(
+                        f"event:{task_id}:3",
+                        "TASK_PLAN_UPDATED",
+                        {"plan_hash": "sha256:initial-plan"},
+                        planned.updated_at,
+                    ),
+                )
+                self.store.save_task(
+                    waiting,
+                    expected_version=3,
+                    event=TaskEventDraft(
+                        f"event:{task_id}:4",
+                        "TASK_WAITING_APPROVAL",
+                        {"approval_request": {"plan_hash": "sha256:initial-plan"}},
+                        waiting.updated_at,
+                    ),
+                )
+                current = waiting
+            updated = current.update_plan(
+                "sha256:updated-plan",
+                at=current.updated_at + timedelta(seconds=1),
+            )
+            self.store.save_task(
+                updated,
+                expected_version=current.version,
+                event=TaskEventDraft(
+                    f"event:{task_id}:{updated.version}",
+                    "TASK_PLAN_UPDATED",
+                    {"plan_hash": "sha256:updated-plan"},
+                    updated.updated_at,
+                ),
+            )
+
+        messages = self.store.list_outbox()
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].task_id, "task-same-status-waiting_approval")
+        self.assertEqual(messages[0].task_version, 4)
+
     def test_rolls_back_task_when_automatic_outbox_identity_conflicts(self) -> None:
         """Outbox insert 실패 뒤 Task snapshot만 전진하는 atomicity 파손을 잡는다."""
 
@@ -1085,6 +1159,92 @@ class NotificationDispatcherTests(unittest.IsolatedAsyncioTestCase):
             if item.outbox_id == notification_id
         )
         self.assertEqual(forged.status, OutboxStatus.FAILED)
+
+    async def test_delivers_original_waiting_notification_after_later_plan_update(
+        self,
+    ) -> None:
+        """Later replan이 exact-version WAITING notification authority를 무효화하는 버그를 잡는다."""
+
+        initial = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=FakeNotificationSender(),
+            clock=lambda: self.completed.updated_at,
+            id_factory=lambda: "clear-completed-lease",
+        )
+        self.assertTrue(await initial.dispatch_once())
+        received = Task.receive(
+            task_id="task-waiting-replanned",
+            input="변경",
+            at=NOW + timedelta(seconds=3),
+        )
+        running = received.transition(
+            Status.RUNNING,
+            at=received.updated_at + timedelta(seconds=1),
+        )
+        planned = running.update_plan(
+            "sha256:original-plan",
+            at=running.updated_at + timedelta(seconds=1),
+        )
+        waiting = planned.transition(
+            Status.WAITING_APPROVAL,
+            at=planned.updated_at + timedelta(seconds=1),
+        )
+        replanned = waiting.update_plan(
+            "sha256:replacement-plan",
+            at=waiting.updated_at + timedelta(seconds=1),
+        )
+        snapshots = (received, running, planned, waiting, replanned)
+        event_types = (
+            "TASK_RECEIVED",
+            "TASK_STARTED",
+            "TASK_PLAN_UPDATED",
+            "TASK_WAITING_APPROVAL",
+            "TASK_PLAN_UPDATED",
+        )
+        event_payloads = (
+            {},
+            {},
+            {"plan_hash": "sha256:original-plan"},
+            {"approval_request": {"plan_hash": "sha256:original-plan"}},
+            {"plan_hash": "sha256:replacement-plan"},
+        )
+        for index, (snapshot, event_type, payload) in enumerate(
+            zip(snapshots, event_types, event_payloads, strict=True),
+            start=1,
+        ):
+            event = TaskEventDraft(
+                f"event:waiting-replanned:{index}",
+                event_type,
+                payload,
+                snapshot.updated_at,
+            )
+            if index == 1:
+                self.store.create_task(snapshot, event=event)
+            else:
+                self.store.save_task(snapshot, expected_version=index - 1, event=event)
+        sender = FakeNotificationSender()
+        dispatcher = NotificationDispatcher(
+            outbox=SQLiteNotificationOutbox(self.store),
+            sender=sender,
+            clock=lambda: replanned.updated_at,
+            id_factory=lambda: "waiting-replanned-lease",
+        )
+
+        await dispatcher.drain()
+
+        self.assertEqual(len(sender.sent), 1)
+        self.assertEqual(sender.sent[0].task_version, 4)
+        self.assertEqual(
+            sender.sent[0].metadata,
+            {"plan_hash": "sha256:original-plan"},
+        )
+        messages = [
+            item
+            for item in self.store.list_outbox()
+            if item.task_id == replanned.task_id
+        ]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].status, OutboxStatus.DELIVERED)
 
     async def test_sender_timeout_prevents_slow_delivery_from_crossing_lease(
         self,
