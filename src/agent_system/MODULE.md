@@ -8,18 +8,23 @@ HTTP/CLI 전송, 애플리케이션 조립, 오케스트레이션, 에이전트,
 ## 포함할 구현
 
 `http`, `cli`, `runtime`, `orchestration`, `agents`, `tools`, `models`,
-`persistence`, `notifications`, `observability`, `schemas`, `config` 모듈을 포함한다.
+`persistence`, `notifications`, `observability`, `schemas`, `config` 모듈과 환경 설정에서
+runtime과 FastAPI를 조립하는 `server` 진입점을 포함한다.
 
 ## 공개 인터페이스와 사용 방법
 
 HTTP와 CLI는 내부 모듈을 직접 조립하지 않고 `runtime`의 application interface를 사용한다.
+로컬 서버는 `uvicorn agent_system.server:create_app_from_env --factory`로 실행한다.
 
 ## 의존성과 허용된 import 방향
 
-의존성 방향은 `http/cli → runtime → orchestration → agents`를 기본으로 한다. 공용 타입은 `schemas`에 두며 역방향 import를 금지한다.
+의존성 방향은 `http/cli → runtime → orchestration → agents`를 기본으로 한다. `server`만
+composition entrypoint로 `config`, `runtime`, `http`를 함께 import한다. 공용 타입은
+`schemas`에 두며 역방향 import를 금지한다.
 
 ## 데이터 및 제어 흐름
 
+Server factory는 환경 설정으로 runtime을 만든 뒤 HTTP lifespan에 소유권을 넘긴다.
 HTTP/CLI 요청은 runtime에서 먼저 영속화되고 background queue를 거쳐 orchestration graph가
 에이전트를 선택한다. 조회는 persistence authority에서 조립되며 대상 Task 전이는
 transactional outbox와 dispatcher를 거쳐 알림 sender에 전달된다.
@@ -30,7 +35,8 @@ transactional outbox와 dispatcher를 거쳐 알림 sender에 전달된다.
 
 ## 테스트 전략
 
-모듈별 단위 테스트와 전체 실행 경로 통합 테스트를 분리한다.
+모듈별 단위 테스트와 전체 실행 경로 통합 테스트를 분리한다. Server factory는 임시 SQLite와
+가짜 API key로 lifespan을 열고 닫되 provider 요청이 발생하지 않는 smoke test를 둔다.
 
 ## 변경 시 문서 갱신 조건
 

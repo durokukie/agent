@@ -26,7 +26,7 @@
 
 ## 테스트 전략
 
-패키지를 설치한 환경에서 import와 CLI 진입점을 검증한다.
+패키지를 wheel로 build한 환경에서 import와 FastAPI server factory 진입점을 검증한다.
 
 ## 변경 시 문서 갱신 조건
 

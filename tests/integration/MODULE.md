@@ -6,7 +6,9 @@
 
 ## 포함할 구현
 
-LangGraph graph 연결·분류·routing·오류 정책·interrupt·Command resume·실행 중 issuance checkpoint, SQLite app migration·transaction·checkpoint 재개, runtime 조립과 CLI 실행 테스트를 포함한다.
+LangGraph graph 연결·분류·routing·오류 정책·interrupt·Command resume·실행 중 issuance
+checkpoint, SQLite app migration·transaction·checkpoint 재개, runtime 조립과 실제 FastAPI
+ASGI부터 notification sender까지 잇는 end-to-end 수용 테스트를 포함한다.
 
 ## 공개 인터페이스와 사용 방법
 
@@ -22,7 +24,8 @@ LangGraph graph 연결·분류·routing·오류 정책·interrupt·Command resum
 
 ## 설계 결정과 제약사항
 
-테스트마다 독립된 임시 데이터베이스와 실행 식별자를 사용한다.
+테스트마다 독립된 임시 데이터베이스와 실행 식별자를 사용한다. Application lifespan은
+테스트가 직접 열고 닫으며 외부 network와 실제 provider API를 호출하지 않는다.
 
 ## 테스트 전략
 
@@ -44,6 +47,12 @@ webhook 멱등성, queue 포화 뒤 durable pump, background failure exact retry
 recovery, CAS 뒤 approval 자동 복구, approval/cancel 명령과 취소 사유 감사, DB-ahead 전체
 callback과 completion clock replay, OpenAPI 409/503 계약과
 소유 자원 종료를 검증한다.
+
+End-to-end 수용 테스트는 FastAPI ASGI → bounded runtime → compiled LangGraph → SQLite
+journal/checkpointer/outbox → fake notification sender를 실제로 연결한다. 변경 Alert의 승인
+완료, 사람 거절, Agent retry 소진과 별도 application/SQLite 연결을 이용한 승인 대기·열린
+AgentRun crash 복구를 검증한다. Crash 복구에서는 같은 AgentRun idempotency key가 재사용되고
+외부 effect와 상태 notification이 중복되지 않는지도 확인한다.
 
 ## 변경 시 문서 갱신 조건
 
