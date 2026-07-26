@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -34,6 +35,57 @@ ShortText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=255),
 ]
+
+_STARTUP_CLEANUP_TIMEOUT_SECONDS = 5.0
+_STARTUP_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _retrieve_startup_cleanup(task: asyncio.Task[None]) -> None:
+    """Deadline 뒤 끝난 cleanup 예외를 회수하고 strong reference를 제거한다."""
+
+    _STARTUP_CLEANUP_TASKS.discard(task)
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:  # noqa: BLE001 - background Task 예외를 소비한다.
+        return
+
+
+async def _cleanup_after_start_failure(
+    application: TaskApplication,
+    start_error: BaseException,
+) -> None:
+    """Startup primary 오류를 보존하며 cleanup에 hard grace period를 적용한다."""
+
+    cleanup = asyncio.create_task(
+        application.stop(),
+        name="agent-system-startup-cleanup",
+    )
+    _STARTUP_CLEANUP_TASKS.add(cleanup)
+    cleanup.add_done_callback(_retrieve_startup_cleanup)
+    try:
+        done, _pending = await asyncio.wait(
+            {cleanup},
+            timeout=_STARTUP_CLEANUP_TIMEOUT_SECONDS,
+        )
+    except BaseException:  # noqa: BLE001 - startup primary 오류를 보존한다.
+        cleanup.cancel()
+        start_error.add_note("Startup 실패 뒤 application 정리 대기가 중단되었습니다.")
+        return
+    if cleanup not in done:
+        cleanup.cancel()
+        start_error.add_note(
+            "Startup 실패 뒤 application 정리가 제한 시간 안에 끝나지 않았습니다."
+        )
+        return
+    if cleanup.cancelled():
+        start_error.add_note("Startup 실패 뒤 application 정리도 취소되었습니다.")
+        return
+    try:
+        cleanup.result()
+    except BaseException:  # noqa: BLE001 - cleanup 상세를 startup 오류에 노출하지 않는다.
+        start_error.add_note("Startup 실패 뒤 application 정리도 실패했습니다.")
 
 
 class _StrictModel(BaseModel):
@@ -192,10 +244,7 @@ def create_app(application: TaskApplication) -> FastAPI:
         try:
             await application.start()
         except BaseException as start_error:
-            try:
-                await application.stop()
-            except BaseException:  # noqa: BLE001 - 최초 startup 원인을 primary로 보존한다.
-                start_error.add_note("Startup 실패 뒤 application 정리도 실패했습니다.")
+            await _cleanup_after_start_failure(application, start_error)
             raise
         try:
             yield

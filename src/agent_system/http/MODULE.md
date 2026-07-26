@@ -44,8 +44,11 @@ HTTP body와 header를 strict schema로 검증한 뒤 runtime 명령을 await한
 queue에 넣고 즉시 수락 결과를 돌려주며 handler가 graph를 직접 실행하지 않는다. 조회는
 runtime이 persistence authority에서 만든 공개 snapshot을 직렬화한다. FastAPI lifespan은
 주입된 application의 시작과 종료만 호출한다. `start()`가 일부 자원을 만든 뒤 실패해도
-`stop()`을 정확히 한 번 시도한다. 이 cleanup까지 실패하면 상세 cleanup 오류는 숨기고
-일반화된 note만 남긴 채 최초 startup 오류와 traceback을 primary로 보존한다.
+`stop()`을 별도 Task로 정확히 한 번 시도한다. Cleanup에는 5초 grace period를 적용하며
+완료·오류·timeout·재-cancellation 어느 경우에도 최초 startup 오류와 traceback을 primary로
+보존한다. Deadline 뒤에는 cancel을 요청하되 완료를 무기한 기다리지 않고, strong registry와
+done callback으로 늦은 cleanup의 예외를 회수한다. Cleanup 상세는 외부 오류에 노출하지 않고
+일반화된 note만 추가한다.
 
 ## 설계 결정과 제약사항
 
@@ -57,8 +60,9 @@ HTTP adapter는 Rich 출력이나 색상 설정을 사용하지 않는다.
 
 `httpx.AsyncClient`와 ASGI transport로 실제 FastAPI routing·validation·lifespan 경계를
 검증한다. Startup 성공, startup 실패 뒤 cleanup 성공·실패의 정확히 한 번 호출과 primary
-오류 보존을 runtime fake로 검증한다. 임시 SQLite·compiled graph를 이용한 핵심 수직 통합
-경로를 분리하고 외부 API는 호출하지 않는다.
+오류 보존을 runtime fake로 검증한다. Cancellation-resistant cleanup은 짧은 grace period를
+설정한 subprocess에서 deadline 안에 원래 cancellation을 반환하는지 검증한다. 임시
+SQLite·compiled graph를 이용한 핵심 수직 통합 경로를 분리하고 외부 API는 호출하지 않는다.
 
 ## 변경 시 문서 갱신 조건
 

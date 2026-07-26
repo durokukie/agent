@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
 import unittest
 from collections.abc import Awaitable
@@ -41,21 +44,83 @@ from agent_system.runtime import RuntimeApplication, build_runtime
 NOW = datetime(2026, 7, 27, 3, 0, tzinfo=UTC)
 E2E_TIMEOUT_SECONDS = 10.0
 _T = TypeVar("_T")
+_ORPHAN_TASKS: set[asyncio.Task[object]] = set()
+
+
+async def _run_awaitable(awaitable: Awaitable[_T]) -> _T:
+    return await awaitable
+
+
+def _retrieve_orphan_result(task: asyncio.Task[object]) -> None:
+    """늦게 끝난 watchdog Task의 예외를 회수하고 registry에서 제거한다."""
+
+    _ORPHAN_TASKS.discard(task)
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:  # noqa: BLE001 - background Task 예외를 소비한다.
+        # 원래 호출자는 이미 timeout/cancellation을 관찰했다.
+        return
+
+
+def _register_orphan(task: asyncio.Task[object]) -> None:
+    if task.done():
+        _retrieve_orphan_result(task)
+        return
+    _ORPHAN_TASKS.add(task)
+    task.add_done_callback(_retrieve_orphan_result)
 
 
 async def _await_bounded(operation: str, awaitable: Awaitable[_T]) -> _T:
     """E2E 비동기 경계의 hang을 operation 이름이 있는 실패로 바꾼다."""
 
-    timeout_scope = asyncio.timeout(E2E_TIMEOUT_SECONDS)
+    task = asyncio.create_task(
+        _run_awaitable(awaitable),
+        name=f"e2e-watchdog:{operation}",
+    )
     try:
-        async with timeout_scope:
-            return await awaitable
-    except TimeoutError as error:
-        if not timeout_scope.expired():
-            raise
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=E2E_TIMEOUT_SECONDS,
+        )
+    except BaseException:
+        task.cancel()
+        _register_orphan(task)
+        raise
+    if task in done:
+        return task.result()
+    task.cancel()
+    _register_orphan(task)
+    raise AssertionError(
+        f"{operation}이 {E2E_TIMEOUT_SECONDS:g}초 안에 끝나지 않았습니다."
+    )
+
+
+async def _cleanup_orphan_tasks(operation: str) -> None:
+    """현재 loop의 watchdog orphan을 hard deadline 안에서 회수한다."""
+
+    current_loop = asyncio.get_running_loop()
+    tasks = {
+        task
+        for task in tuple(_ORPHAN_TASKS)
+        if task.get_loop() is current_loop and not task.done()
+    }
+    for task in tuple(_ORPHAN_TASKS):
+        if task.done():
+            _retrieve_orphan_result(task)
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    done, pending = await asyncio.wait(tasks, timeout=E2E_TIMEOUT_SECONDS)
+    for task in done:
+        _retrieve_orphan_result(task)
+    if pending:
         raise AssertionError(
-            f"{operation}이 {E2E_TIMEOUT_SECONDS:g}초 안에 끝나지 않았습니다."
-        ) from error
+            f"{operation} 중 {len(pending)}개 Task가 "
+            f"{E2E_TIMEOUT_SECONDS:g}초 안에 종료되지 않았습니다."
+        )
 
 
 class _StepClock:
@@ -195,6 +260,13 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                     primary_error = error
                 else:
                     primary_error.add_note("다른 E2E session 정리도 실패했습니다.")
+        try:
+            await _cleanup_orphan_tasks("E2E teardown watchdog cleanup")
+        except BaseException as error:  # noqa: BLE001 - 임시 디렉터리도 정리한다.
+            if primary_error is None:
+                primary_error = error
+            else:
+                primary_error.add_note("Watchdog orphan 정리도 실패했습니다.")
         try:
             self.directory.cleanup()
         except BaseException as error:  # noqa: BLE001 - async 정리 오류를 primary로 보존한다.
@@ -516,27 +588,36 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recovered_waiting, waiting)
         self.assertEqual(second_sender.sent, ())
 
-        stopping: asyncio.Task[None] | None = None
         try:
-            await self._decide(
-                second,
-                task_id,
-                recovered_waiting,
-                decision="approve",
-                decision_id="decision-restart",
-            )
-            await _await_bounded("Crash Agent 진입", agent.entered.wait())
-            stopping = asyncio.create_task(second.application.stop())
-            # stop()은 첫 await 전에 admission을 닫고 queue drain을 기다린다.
-            await asyncio.sleep(0)
+            stopping: asyncio.Task[None] | None = None
+            try:
+                await self._decide(
+                    second,
+                    task_id,
+                    recovered_waiting,
+                    decision="approve",
+                    decision_id="decision-restart",
+                )
+                await _await_bounded("Crash Agent 진입", agent.entered.wait())
+                stopping = asyncio.create_task(second.application.stop())
+                # stop()은 첫 await 전에 admission을 닫고 queue drain을 기다린다.
+                await asyncio.sleep(0)
+            finally:
+                # 앞선 assertion/timeout/cancellation에서도 Agent gate를 먼저 연다.
+                agent.release_crash.set()
+            if stopping is None:
+                self.fail(
+                    "Crash Agent 진입 뒤 application stop task가 생성되지 않았습니다."
+                )
+            await _await_bounded("두 번째 application crash-stop", stopping)
         finally:
-            # 앞선 assertion/timeout/cancellation에서도 Agent gate를 반드시 연다.
-            agent.release_crash.set()
-        if stopping is None:
-            self.fail(
-                "Crash Agent 진입 뒤 application stop task가 생성되지 않았습니다."
-            )
-        await _await_bounded("두 번째 application crash-stop", stopping)
+            active_error = sys.exception()
+            try:
+                await _cleanup_orphan_tasks("Restart crash watchdog cleanup")
+            except BaseException:
+                if active_error is None:
+                    raise
+                active_error.add_note("Restart crash watchdog 정리도 실패했습니다.")
         await _await_bounded("두 번째 application lifespan 종료", second.close())
         self.sessions.remove(second)
 
@@ -590,6 +671,9 @@ class EndToEndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 class ServerEntrypointTests(unittest.IsolatedAsyncioTestCase):
     """운영자가 환경 설정만으로 FastAPI factory를 실행할 수 있는지 검증한다."""
 
+    async def asyncTearDown(self) -> None:
+        await _cleanup_orphan_tasks("Server factory watchdog cleanup")
+
     async def test_server_factory_builds_and_closes_runtime_without_provider_call(
         self,
     ) -> None:
@@ -616,6 +700,61 @@ class ServerEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(app.title, "Agent System")
             self.assertTrue(database_path.is_file())
+
+
+class HardWatchdogTests(unittest.IsolatedAsyncioTestCase):
+    """Cancellation을 무시하는 awaitable도 test process를 멈추지 않게 한다."""
+
+    async def test_watchdog_fails_without_waiting_for_cancellation_completion(
+        self,
+    ) -> None:
+        """Timeout 뒤 task cancellation 완료를 기다리면 subprocess가 종료되지 않는다."""
+
+        script = textwrap.dedent(
+            """
+            import asyncio
+            from tests.integration import test_end_to_end_orchestration as target
+
+            target.E2E_TIMEOUT_SECONDS = 0.02
+
+            async def main():
+                release = asyncio.Event()
+
+                async def cancellation_resistant():
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        await release.wait()
+
+                try:
+                    await target._await_bounded(
+                        "cancellation-resistant fake",
+                        cancellation_resistant(),
+                    )
+                except AssertionError as error:
+                    assert "cancellation-resistant fake" in str(error)
+                else:
+                    raise AssertionError("hard watchdog가 timeout을 보고하지 않았습니다.")
+                finally:
+                    release.set()
+
+                await target._cleanup_orphan_tasks("watchdog subprocess cleanup")
+                print("hard-watchdog-bounded")
+
+            asyncio.run(main())
+            """
+        )
+
+        completed = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+
+        self.assertEqual(completed.stdout.strip(), "hard-watchdog-bounded")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import subprocess
+import sys
+import textwrap
 import unittest
 from datetime import UTC, datetime
 
@@ -437,6 +441,61 @@ class HttpApiContractTests(unittest.IsolatedAsyncioTestCase):
                         ["Startup 실패 뒤 application 정리도 실패했습니다."],
                     )
                     self.assertNotIn("cleanup-secret", str(notes))
+
+    async def test_cancelled_start_has_a_hard_cleanup_deadline(self) -> None:
+        """Cancellation 뒤 stop 완료를 무기한 기다리면 subprocess가 종료되지 않는다."""
+
+        script = textwrap.dedent(
+            """
+            import asyncio
+            import agent_system.http as http
+
+            http._STARTUP_CLEANUP_TIMEOUT_SECONDS = 0.02
+
+            class CancellationResistantApplication:
+                def __init__(self):
+                    self.release = asyncio.Event()
+                    self.stop_calls = 0
+
+                async def start(self):
+                    raise asyncio.CancelledError
+
+                async def stop(self):
+                    self.stop_calls += 1
+                    try:
+                        await self.release.wait()
+                    except asyncio.CancelledError:
+                        await self.release.wait()
+
+            async def main():
+                application = CancellationResistantApplication()
+                lifespan = http.create_app(application).router.lifespan_context(None)
+                try:
+                    await lifespan.__aenter__()
+                except asyncio.CancelledError as error:
+                    assert "제한 시간" in str(getattr(error, "__notes__", []))
+                else:
+                    raise AssertionError("startup cancellation이 사라졌습니다.")
+                finally:
+                    application.release.set()
+                await asyncio.sleep(0)
+                assert application.stop_calls == 1
+                print("startup-cleanup-bounded")
+
+            asyncio.run(main())
+            """
+        )
+
+        completed = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+
+        self.assertEqual(completed.stdout.strip(), "startup-cleanup-bounded")
 
 
 class _AlreadyExitedLifespan:
