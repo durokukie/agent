@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Mapping, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 
 class AgentOutcome(StrEnum):
@@ -85,7 +86,9 @@ class AgentRegistry:
         try:
             return self._agents[agent_id]
         except KeyError as error:
-            raise AgentNotFoundError(f"등록되지 않은 Agent ID입니다: {agent_id}") from error
+            raise AgentNotFoundError(
+                f"등록되지 않은 Agent ID입니다: {agent_id}"
+            ) from error
 
 
 class EchoAgent:

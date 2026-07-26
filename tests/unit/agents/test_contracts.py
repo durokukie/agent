@@ -17,7 +17,6 @@ from agent_system.agents import (
     FakeAgent,
 )
 
-
 REQUEST = AgentRequest(
     task_id="task-123",
     input="현재 상태를 분석해 주세요.",

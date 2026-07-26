@@ -10,7 +10,7 @@ Task/WorkflowRun/AgentRun 생명주기, 라우팅, 정책, validation, 변환과
 
 ## 공개 인터페이스와 사용 방법
 
-제품 모듈 구조와 대응되는 테스트 파일명을 사용한다.
+제품 모듈 구조와 대응되는 테스트 파일명을 사용한다. `tests.unit` package marker를 유지해 루트의 표준 `unittest discover`가 단위 테스트를 수집하게 한다.
 
 ## 의존성과 허용된 import 방향
 
