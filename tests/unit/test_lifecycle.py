@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from agent_system.orchestration import (
     AgentRun,
@@ -74,6 +75,19 @@ class TaskLifecycleTests(unittest.TestCase):
             ):
                 Task.receive(**values)
 
+    def test_orders_timezone_aware_datetimes_by_absolute_utc_instant(self) -> None:
+        new_york = ZoneInfo("America/New_York")
+        before_fold = datetime(2024, 11, 3, 1, 30, tzinfo=new_york, fold=0)
+        later_fold = datetime(2024, 11, 3, 1, 15, tzinfo=new_york, fold=1)
+        absolute_earlier = datetime(2024, 11, 3, 1, 45, tzinfo=new_york, fold=0)
+        task = Task.receive(task_id="task-dst", input="요청", at=before_fold)
+
+        running = task.transition(Status.RUNNING, at=later_fold)
+
+        self.assertEqual(running.updated_at, later_fold)
+        with self.assertRaises(InvalidLifecycleValueError):
+            running.transition(Status.COMPLETED, at=absolute_earlier)
+
     def test_all_non_approval_status_transitions_follow_the_documented_matrix(
         self,
     ) -> None:
@@ -108,10 +122,9 @@ class TaskLifecycleTests(unittest.TestCase):
                     with self.subTest(current=current, target=target):
                         transitioned = task.transition(target, at=LATER)
                         self.assertEqual(transitioned.status, target)
-                        self.assertEqual(transitioned.version, 8)
+                        self.assertEqual(transitioned.version, task.version + 1)
                         self.assertEqual(transitioned.updated_at, LATER)
                         self.assertEqual(task.status, current)
-                        self.assertEqual(task.version, 7)
                 else:
                     with (
                         self.subTest(current=current, target=target),
@@ -222,6 +235,34 @@ class TaskLifecycleTests(unittest.TestCase):
                     at=NOW + timedelta(minutes=6),
                 )
 
+    def test_exposes_a_deterministic_binding_for_transactional_replay(self) -> None:
+        waiting = (
+            Task.receive(task_id="task-123", input="변경 요청", at=NOW)
+            .transition(Status.RUNNING, at=NOW + timedelta(minutes=1))
+            .update_plan("sha256:plan-v1", at=NOW + timedelta(minutes=2))
+            .transition(Status.WAITING_APPROVAL, at=NOW + timedelta(minutes=3))
+        )
+        first = Approval.grant_for(waiting, at=NOW + timedelta(minutes=4))
+        repeated_delivery = Approval.grant_for(
+            waiting,
+            at=NOW + timedelta(minutes=5),
+        )
+        changed_plan = waiting.update_plan(
+            "sha256:plan-v2",
+            at=NOW + timedelta(minutes=6),
+        )
+        replacement = Approval.grant_for(
+            changed_plan,
+            at=NOW + timedelta(minutes=7),
+        )
+
+        self.assertEqual(
+            first.binding,
+            ("task-123", 4, "sha256:plan-v1"),
+        )
+        self.assertEqual(repeated_delivery.binding, first.binding)
+        self.assertNotEqual(replacement.binding, first.binding)
+
     def test_cancels_each_active_status_and_rejects_terminal_cancellation(self) -> None:
         for status in (
             Status.RECEIVED,
@@ -231,7 +272,7 @@ class TaskLifecycleTests(unittest.TestCase):
             with self.subTest(status=status):
                 cancelled = self._task_at(status).cancel(at=LATER)
                 self.assertEqual(cancelled.status, Status.CANCELLED)
-                self.assertEqual(cancelled.version, 8)
+                self.assertGreater(cancelled.version, 1)
 
         for status in (
             Status.COMPLETED,
@@ -264,7 +305,7 @@ class TaskLifecycleTests(unittest.TestCase):
             "task_id": "task-123",
             "input": "요청",
             "status": Status.RUNNING,
-            "version": 2,
+            "version": 3,
             "plan_hash": "sha256:plan-v1",
             "created_at": NOW,
             "updated_at": LATER,
@@ -288,6 +329,46 @@ class TaskLifecycleTests(unittest.TestCase):
         task = Task(**valid)
         with self.assertRaises(InvalidLifecycleValueError):
             task.transition(Status.COMPLETED, at=NOW + timedelta(seconds=30))
+
+    def test_rejects_unreachable_status_version_and_plan_combinations(self) -> None:
+        base = {
+            "task_id": "task-corrupt",
+            "input": "요청",
+            "status": Status.RECEIVED,
+            "version": 1,
+            "plan_hash": None,
+            "created_at": NOW,
+            "updated_at": NOW,
+        }
+        impossible_overrides = (
+            {"status": Status.RECEIVED, "version": 7, "plan_hash": "plan-v1"},
+            {"status": Status.RECEIVED, "version": 2, "plan_hash": None},
+            {"status": Status.RUNNING, "version": 1, "plan_hash": None},
+            {"status": Status.RUNNING, "version": 2, "plan_hash": "plan-v1"},
+            {
+                "status": Status.WAITING_APPROVAL,
+                "version": 3,
+                "plan_hash": "plan-v1",
+            },
+            {"status": Status.COMPLETED, "version": 2, "plan_hash": None},
+            {"status": Status.COMPLETED, "version": 3, "plan_hash": "plan-v1"},
+            {"status": Status.CANCELLED, "version": 1, "plan_hash": None},
+        )
+
+        for override in impossible_overrides:
+            with (
+                self.subTest(override=override),
+                self.assertRaises(InvalidLifecycleValueError),
+            ):
+                Task(**(base | override))
+
+        corrupt_snapshot = Task.receive(
+            task_id="task-corrupt",
+            input="요청",
+            at=NOW,
+        ).to_snapshot() | {"version": 7, "plan_hash": "plan-v1"}
+        with self.assertRaises(InvalidLifecycleValueError):
+            Task.from_snapshot(corrupt_snapshot)
 
     def test_normalizes_invalid_persisted_snapshots_to_lifecycle_errors(self) -> None:
         snapshot = Task.receive(
@@ -374,15 +455,18 @@ class TaskLifecycleTests(unittest.TestCase):
 
     @staticmethod
     def _task_at(status: Status) -> Task:
-        return Task(
-            task_id="task-123",
-            input="요청",
-            status=status,
-            version=7,
-            plan_hash="plan-v1",
-            created_at=NOW,
-            updated_at=NOW,
-        )
+        task = Task.receive(task_id="task-123", input="요청", at=NOW)
+        if status is Status.RECEIVED:
+            return task
+        running = task.transition(Status.RUNNING, at=NOW)
+        if status is Status.CANCELLED:
+            return task.cancel(at=NOW)
+        planned = running.update_plan("plan-v1", at=NOW)
+        if status is Status.RUNNING:
+            return planned
+        if status is Status.WAITING_APPROVAL:
+            return planned.transition(Status.WAITING_APPROVAL, at=NOW)
+        return planned.transition(status, at=NOW)
 
 
 class WorkflowRunLifecycleTests(unittest.TestCase):
@@ -403,13 +487,21 @@ class WorkflowRunLifecycleTests(unittest.TestCase):
         self.assertEqual(started.phase, Phase.CLASSIFYING)
         self.assertEqual(started.budget, ExecutionBudget(limit=3))
 
+        with self.assertRaises(InvalidPhaseTransitionError):
+            started.begin_agent_run(
+                agent_run_id="agent-run-invalid-retry",
+                agent_id="executor",
+                retry=True,
+                at=LATER,
+            )
+
         allowed = {
             Phase.CLASSIFYING: {Phase.ANALYZING},
             Phase.ANALYZING: {Phase.PLANNING},
             Phase.PLANNING: {Phase.GOVERNING},
             Phase.GOVERNING: {Phase.EXECUTING},
             Phase.EXECUTING: {Phase.VERIFYING},
-            Phase.VERIFYING: {Phase.EXECUTING},
+            Phase.VERIFYING: set(),
         }
         for current, permitted in allowed.items():
             run = WorkflowRun(
@@ -435,7 +527,7 @@ class WorkflowRunLifecycleTests(unittest.TestCase):
                     ):
                         run.advance(target, at=LATER)
 
-    def test_consumes_the_last_budget_slot_then_reports_exhaustion(self) -> None:
+    def test_agent_run_and_retry_atomically_consume_the_execution_budget(self) -> None:
         run = WorkflowRun.start(
             workflow_run_id="workflow-123",
             task=Task.receive(task_id="task-123", input="요청", at=NOW),
@@ -443,17 +535,53 @@ class WorkflowRunLifecycleTests(unittest.TestCase):
             at=NOW,
         )
 
-        after_first = run.consume_budget(at=NOW + timedelta(minutes=1))
-        after_second = after_first.consume_budget(at=NOW + timedelta(minutes=2))
+        after_first, first_agent_run = run.begin_agent_run(
+            agent_run_id="agent-run-1",
+            agent_id="classifier",
+            at=NOW + timedelta(minutes=1),
+        )
 
-        self.assertEqual(after_first.budget.consumed, 1)
-        self.assertEqual(after_first.budget.remaining, 1)
-        self.assertEqual(after_second.budget.consumed, 2)
-        self.assertEqual(after_second.budget.remaining, 0)
+        self.assertEqual(after_first.budget, ExecutionBudget(limit=2, consumed=1))
+        self.assertEqual(first_agent_run.phase, Phase.CLASSIFYING)
+        self.assertEqual(first_agent_run.budget_sequence, 1)
         self.assertEqual(run.budget.consumed, 0)
 
+        verifying = after_first
+        for phase in (
+            Phase.ANALYZING,
+            Phase.PLANNING,
+            Phase.GOVERNING,
+            Phase.EXECUTING,
+            Phase.VERIFYING,
+        ):
+            verifying = verifying.advance(
+                phase,
+                at=verifying.updated_at + timedelta(minutes=1),
+            )
+
+        after_retry, retry_agent_run = verifying.begin_agent_run(
+            agent_run_id="agent-run-2",
+            agent_id="executor",
+            retry=True,
+            at=verifying.updated_at + timedelta(minutes=1),
+        )
+
+        self.assertEqual(after_retry.phase, Phase.EXECUTING)
+        self.assertEqual(after_retry.budget, ExecutionBudget(limit=2, consumed=2))
+        self.assertEqual(retry_agent_run.phase, Phase.EXECUTING)
+        self.assertEqual(retry_agent_run.budget_sequence, 2)
+
+        exhausted = after_retry.advance(
+            Phase.VERIFYING,
+            at=after_retry.updated_at + timedelta(minutes=1),
+        )
         with self.assertRaises(ExecutionBudgetExhaustedError):
-            after_second.consume_budget(at=NOW + timedelta(minutes=3))
+            exhausted.begin_agent_run(
+                agent_run_id="agent-run-3",
+                agent_id="executor",
+                retry=True,
+                at=exhausted.updated_at + timedelta(minutes=1),
+            )
 
     def test_rejects_invalid_budget_run_identity_and_run_time_reversal(self) -> None:
         invalid_budgets = (
@@ -509,7 +637,11 @@ class WorkflowRunLifecycleTests(unittest.TestCase):
 
         for operation in (
             lambda: run.advance(Phase.ANALYZING, at=NOW),
-            lambda: run.consume_budget(at=NOW),
+            lambda: run.begin_agent_run(
+                agent_run_id="agent-run-123",
+                agent_id="analysis",
+                at=NOW,
+            ),
         ):
             with self.assertRaises(InvalidLifecycleValueError):
                 operation()
@@ -525,9 +657,8 @@ class AgentRunLifecycleTests(unittest.TestCase):
             max_agent_runs=2,
             at=NOW,
         )
-        started = AgentRun.start(
+        workflow, started = workflow.begin_agent_run(
             agent_run_id="agent-run-123",
-            workflow=workflow,
             agent_id="analysis",
             at=NOW,
         )
@@ -590,11 +721,10 @@ class AgentRunLifecycleTests(unittest.TestCase):
                 self.subTest(values=values),
                 self.assertRaises(InvalidLifecycleValueError),
             ):
-                AgentRun.start(workflow=workflow, **values)
+                workflow.begin_agent_run(**values)
 
-        started = AgentRun.start(
+        _, started = workflow.begin_agent_run(
             agent_run_id="agent-run-123",
-            workflow=workflow,
             agent_id="analysis",
             at=LATER,
         )
@@ -621,6 +751,7 @@ class AgentRunLifecycleTests(unittest.TestCase):
                 task_version=1,
                 agent_id="analysis",
                 phase=Phase.CLASSIFYING,
+                budget_sequence=1,
                 started_at=NOW,
                 outcome="success",
             )
@@ -633,5 +764,131 @@ class AgentRunLifecycleTests(unittest.TestCase):
                 task_version=1,
                 agent_id="analysis",
                 phase="CLASSIFYING",
+                budget_sequence=1,
                 started_at=NOW,
             )
+
+
+class SnapshotSerializationTests(unittest.TestCase):
+    """Persisted aggregate가 framework 없는 JSON snapshot으로 왕복된다."""
+
+    def test_round_trips_every_persisted_aggregate_with_literal_wire_values(
+        self,
+    ) -> None:
+        waiting = (
+            Task.receive(task_id="task-123", input="변경 요청", at=NOW)
+            .transition(Status.RUNNING, at=NOW + timedelta(minutes=1))
+            .update_plan("sha256:plan-v1", at=NOW + timedelta(minutes=2))
+            .transition(Status.WAITING_APPROVAL, at=NOW + timedelta(minutes=3))
+        )
+        approval = Approval.grant_for(waiting, at=NOW + timedelta(minutes=4))
+        workflow = WorkflowRun.start(
+            workflow_run_id="workflow-123",
+            task=waiting,
+            max_agent_runs=2,
+            at=NOW + timedelta(minutes=4),
+        )
+        workflow, agent_run = workflow.begin_agent_run(
+            agent_run_id="agent-run-123",
+            agent_id="analysis",
+            at=NOW + timedelta(minutes=5),
+        )
+        agent_run = agent_run.complete(
+            agent_id="analysis",
+            outcome="success",
+            output="결과",
+            at=NOW + timedelta(minutes=6),
+        )
+
+        self.assertEqual(
+            approval.to_snapshot(),
+            {
+                "task_id": "task-123",
+                "task_version": 4,
+                "plan_hash": "sha256:plan-v1",
+                "approved_at": "2026-07-26T09:04:00+00:00",
+            },
+        )
+        self.assertEqual(
+            workflow.to_snapshot(),
+            {
+                "workflow_run_id": "workflow-123",
+                "task_id": "task-123",
+                "task_version": 4,
+                "phase": "CLASSIFYING",
+                "budget": {"limit": 2, "consumed": 1},
+                "started_at": "2026-07-26T09:04:00+00:00",
+                "updated_at": "2026-07-26T09:05:00+00:00",
+            },
+        )
+        self.assertEqual(
+            agent_run.to_snapshot(),
+            {
+                "agent_run_id": "agent-run-123",
+                "workflow_run_id": "workflow-123",
+                "task_id": "task-123",
+                "task_version": 4,
+                "agent_id": "analysis",
+                "phase": "CLASSIFYING",
+                "budget_sequence": 1,
+                "started_at": "2026-07-26T09:05:00+00:00",
+                "outcome": "success",
+                "output": "결과",
+                "completed_at": "2026-07-26T09:06:00+00:00",
+            },
+        )
+
+        round_trips = (
+            (Approval, approval),
+            (ExecutionBudget, workflow.budget),
+            (WorkflowRun, workflow),
+            (AgentRun, agent_run),
+        )
+        for aggregate_type, aggregate in round_trips:
+            with self.subTest(aggregate_type=aggregate_type):
+                encoded = json.dumps(aggregate.to_snapshot())
+                restored = aggregate_type.from_snapshot(json.loads(encoded))
+                self.assertEqual(restored, aggregate)
+
+    def test_rejects_malformed_persisted_aggregate_snapshots(self) -> None:
+        task = Task.receive(task_id="task-123", input="요청", at=NOW)
+        workflow = WorkflowRun.start(
+            workflow_run_id="workflow-123",
+            task=task,
+            max_agent_runs=2,
+            at=NOW,
+        )
+        workflow, agent_run = workflow.begin_agent_run(
+            agent_run_id="agent-run-123",
+            agent_id="analysis",
+            at=NOW,
+        )
+        waiting = (
+            task.transition(Status.RUNNING, at=NOW)
+            .update_plan("sha256:plan-v1", at=NOW)
+            .transition(Status.WAITING_APPROVAL, at=NOW)
+        )
+        approval = Approval.grant_for(waiting, at=NOW)
+        missing_phase = workflow.to_snapshot()
+        del missing_phase["phase"]
+
+        malformed_loaders = (
+            lambda: Approval.from_snapshot(
+                approval.to_snapshot() | {"task_version": True}
+            ),
+            lambda: ExecutionBudget.from_snapshot({"limit": 2, "consumed": 3}),
+            lambda: WorkflowRun.from_snapshot(missing_phase),
+            lambda: WorkflowRun.from_snapshot(
+                workflow.to_snapshot() | {"budget": "two"}
+            ),
+            lambda: AgentRun.from_snapshot(
+                agent_run.to_snapshot() | {"completed_at": "not-a-date"}
+            ),
+            lambda: AgentRun.from_snapshot(
+                agent_run.to_snapshot() | {"budget_sequence": False}
+            ),
+        )
+
+        for load in malformed_loaders:
+            with self.subTest(load=load), self.assertRaises(InvalidLifecycleValueError):
+                load()

@@ -7,88 +7,48 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 
-
-class LifecycleError(Exception):
-    """생명주기 불변 조건 위반의 기본 오류다."""
-
-
-class InvalidLifecycleValueError(LifecycleError, ValueError):
-    """생명주기 snapshot의 값이 유효하지 않을 때 발생한다."""
-
-
-class InvalidStatusTransitionError(LifecycleError):
-    """허용되지 않은 Task 상태 전이를 요청했을 때 발생한다."""
-
-
-class InvalidPhaseTransitionError(LifecycleError):
-    """허용되지 않은 WorkflowRun phase 전이를 요청했을 때 발생한다."""
-
-
-class ExecutionBudgetExhaustedError(LifecycleError):
-    """WorkflowRun이 허용된 Agent 호출 횟수를 모두 소비했을 때 발생한다."""
-
-
-class AgentRunError(LifecycleError):
-    """AgentRun 완료 불변 조건 위반의 기본 오류다."""
-
-
-class AgentRunAgentMismatchError(AgentRunError):
-    """호출한 Agent와 완료 결과의 Agent가 다를 때 발생한다."""
-
-
-class AgentRunAlreadyCompletedError(AgentRunError):
-    """완료된 AgentRun을 다시 완료하려 할 때 발생한다."""
-
-
-class PlanRequiredError(LifecycleError):
-    """승인 대기 전이에 필요한 plan이 없을 때 발생한다."""
-
-
-class PlanUpdateNotAllowedError(LifecycleError):
-    """현재 Task 상태에서 plan을 바꿀 수 없을 때 발생한다."""
-
-
-class ApprovalError(LifecycleError):
-    """Approval이 현재 Task snapshot과 호환되지 않을 때 발생한다."""
-
-
-class ApprovalRequiredError(ApprovalError):
-    """승인 없이 승인 대기 Task를 재개하려 할 때 발생한다."""
-
-
-class ApprovalNotAllowedError(ApprovalError):
-    """승인 대기 상태가 아닌 Task에 Approval을 만들 때 발생한다."""
-
-
-class ApprovalTaskMismatchError(ApprovalError):
-    """Approval의 Task 식별자가 현재 Task와 다를 때 발생한다."""
-
-
-class PlanChangedError(ApprovalError):
-    """Approval 이후 Task plan이 변경되었을 때 발생한다."""
-
-
-class StaleApprovalError(ApprovalError):
-    """Approval의 Task version이 현재 snapshot보다 오래되었을 때 발생한다."""
-
-
-def _require_aware(value: datetime, *, field_name: str) -> None:
-    if not isinstance(value, datetime):
-        raise InvalidLifecycleValueError(f"{field_name}은 datetime이어야 합니다.")
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise InvalidLifecycleValueError(
-            f"{field_name}에는 timezone-aware datetime이 필요합니다."
-        )
-
-
-def _require_not_before(
-    value: datetime, earliest: datetime, *, field_name: str
-) -> None:
-    _require_aware(value, field_name=field_name)
-    if value < earliest:
-        raise InvalidLifecycleValueError(
-            f"{field_name}은 이전 snapshot 시각보다 빠를 수 없습니다."
-        )
+from ._support import (
+    AgentRunAgentMismatchError,
+    AgentRunAlreadyCompletedError,
+    AgentRunError,
+    ApprovalError,
+    ApprovalNotAllowedError,
+    ApprovalRequiredError,
+    ApprovalTaskMismatchError,
+    ExecutionBudgetExhaustedError,
+    InvalidLifecycleValueError,
+    InvalidPhaseTransitionError,
+    InvalidStatusTransitionError,
+    LifecycleError,
+    PlanChangedError,
+    PlanRequiredError,
+    PlanUpdateNotAllowedError,
+    StaleApprovalError,
+)
+from ._support import (
+    require_aware as _require_aware,
+)
+from ._support import (
+    require_not_before as _require_not_before,
+)
+from ._support import (
+    snapshot_datetime as _snapshot_datetime,
+)
+from ._support import (
+    snapshot_enum as _snapshot_enum,
+)
+from ._support import (
+    snapshot_integer as _snapshot_integer,
+)
+from ._support import (
+    snapshot_mapping as _snapshot_mapping,
+)
+from ._support import (
+    snapshot_optional_string as _snapshot_optional_string,
+)
+from ._support import (
+    snapshot_string as _snapshot_string,
+)
 
 
 class Status(StrEnum):
@@ -143,7 +103,7 @@ _PHASE_TRANSITIONS: dict[Phase, frozenset[Phase]] = {
     Phase.PLANNING: frozenset({Phase.GOVERNING}),
     Phase.GOVERNING: frozenset({Phase.EXECUTING}),
     Phase.EXECUTING: frozenset({Phase.VERIFYING}),
-    Phase.VERIFYING: frozenset({Phase.EXECUTING}),
+    Phase.VERIFYING: frozenset(),
 }
 
 
@@ -155,6 +115,12 @@ class Approval:
     task_version: int
     plan_hash: str
     approved_at: datetime
+
+    @property
+    def binding(self) -> tuple[str, int, str]:
+        """멱등 처리에 사용하는 안정적인 Task/version/plan 결합을 반환한다."""
+
+        return self.task_id, self.task_version, self.plan_hash
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_id, str) or not self.task_id.strip():
@@ -191,6 +157,27 @@ class Approval:
             approved_at=at,
         )
 
+    def to_snapshot(self) -> dict[str, object]:
+        """Approval을 JSON 호환 snapshot으로 반환한다."""
+
+        return {
+            "task_id": self.task_id,
+            "task_version": self.task_version,
+            "plan_hash": self.plan_hash,
+            "approved_at": self.approved_at.isoformat(),
+        }
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Mapping[str, object]) -> Approval:
+        """JSON 호환 snapshot에서 Approval을 복원한다."""
+
+        return cls(
+            task_id=_snapshot_string(snapshot, "task_id"),
+            task_version=_snapshot_integer(snapshot, "task_version"),
+            plan_hash=_snapshot_string(snapshot, "plan_hash"),
+            approved_at=_snapshot_datetime(snapshot, "approved_at"),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class Task:
@@ -223,12 +210,44 @@ class Task:
             raise InvalidLifecycleValueError(
                 "WAITING_APPROVAL 상태에는 plan_hash가 필요합니다."
             )
-        _require_aware(self.created_at, field_name="created_at")
-        _require_aware(self.updated_at, field_name="updated_at")
-        if self.updated_at < self.created_at:
+        if self.status is Status.RECEIVED:
+            if self.version != 1 or self.plan_hash is not None:
+                raise InvalidLifecycleValueError(
+                    "RECEIVED Task는 version 1이며 plan이 없어야 합니다."
+                )
+        elif self.version < 2:
             raise InvalidLifecycleValueError(
-                "updated_at은 created_at보다 빠를 수 없습니다."
+                "RECEIVED 이후 status에는 version 2 이상이 필요합니다."
             )
+        if self.status is Status.WAITING_APPROVAL and self.version < 4:
+            raise InvalidLifecycleValueError(
+                "WAITING_APPROVAL status에는 version 4 이상이 필요합니다."
+            )
+        if (
+            self.status
+            in {
+                Status.COMPLETED,
+                Status.REJECTED,
+                Status.FAILED,
+                Status.ESCALATED,
+            }
+            and self.version < 3
+        ):
+            raise InvalidLifecycleValueError(
+                "이 terminal status에는 version 3 이상이 필요합니다."
+            )
+        if self.plan_hash is not None:
+            minimum_plan_version = 3 if self.status is Status.RUNNING else 4
+            if self.version < minimum_plan_version:
+                raise InvalidLifecycleValueError(
+                    "현재 status에서 plan을 가진 Task version이 도달 불가능합니다."
+                )
+        _require_aware(self.created_at, field_name="created_at")
+        _require_not_before(
+            self.updated_at,
+            self.created_at,
+            field_name="updated_at",
+        )
 
     @classmethod
     def receive(cls, *, task_id: str, input: str, at: datetime) -> Task:
@@ -318,52 +337,14 @@ class Task:
     def from_snapshot(cls, snapshot: Mapping[str, object]) -> Task:
         """영속화 경계의 JSON 호환 값에서 Task를 복원한다."""
 
-        try:
-            task_id = snapshot["task_id"]
-            input_value = snapshot["input"]
-            status_value = snapshot["status"]
-            version = snapshot["version"]
-            plan_hash = snapshot["plan_hash"]
-            created_at_value = snapshot["created_at"]
-            updated_at_value = snapshot["updated_at"]
-        except KeyError as error:
-            raise InvalidLifecycleValueError(
-                f"Task snapshot 필드가 없습니다: {error.args[0]}"
-            ) from error
-        if not isinstance(task_id, str) or not isinstance(input_value, str):
-            raise InvalidLifecycleValueError(
-                "Task snapshot의 task_id와 input은 문자열이어야 합니다."
-            )
-        if not isinstance(status_value, str):
-            raise InvalidLifecycleValueError(
-                "Task snapshot의 status는 문자열이어야 합니다."
-            )
-        if plan_hash is not None and not isinstance(plan_hash, str):
-            raise InvalidLifecycleValueError(
-                "Task snapshot의 plan_hash는 문자열 또는 null이어야 합니다."
-            )
-        if not isinstance(created_at_value, str) or not isinstance(
-            updated_at_value, str
-        ):
-            raise InvalidLifecycleValueError(
-                "Task snapshot의 시각은 ISO 8601 문자열이어야 합니다."
-            )
-        try:
-            status = Status(status_value)
-            created_at = datetime.fromisoformat(created_at_value)
-            updated_at = datetime.fromisoformat(updated_at_value)
-        except ValueError as error:
-            raise InvalidLifecycleValueError(
-                "Task snapshot의 status 또는 시각 형식이 올바르지 않습니다."
-            ) from error
         return cls(
-            task_id=task_id,
-            input=input_value,
-            status=status,
-            version=version,
-            plan_hash=plan_hash,
-            created_at=created_at,
-            updated_at=updated_at,
+            task_id=_snapshot_string(snapshot, "task_id"),
+            input=_snapshot_string(snapshot, "input"),
+            status=_snapshot_enum(snapshot, "status", Status),
+            version=_snapshot_integer(snapshot, "version"),
+            plan_hash=_snapshot_optional_string(snapshot, "plan_hash"),
+            created_at=_snapshot_datetime(snapshot, "created_at"),
+            updated_at=_snapshot_datetime(snapshot, "updated_at"),
         )
 
 
@@ -401,6 +382,20 @@ class ExecutionBudget:
             )
         return replace(self, consumed=self.consumed + 1)
 
+    def to_snapshot(self) -> dict[str, int]:
+        """Budget을 JSON 호환 snapshot으로 반환한다."""
+
+        return {"limit": self.limit, "consumed": self.consumed}
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Mapping[str, object]) -> ExecutionBudget:
+        """JSON 호환 snapshot에서 Budget을 복원한다."""
+
+        return cls(
+            limit=_snapshot_integer(snapshot, "limit"),
+            consumed=_snapshot_integer(snapshot, "consumed"),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class WorkflowRun:
@@ -433,11 +428,11 @@ class WorkflowRun:
         if not isinstance(self.budget, ExecutionBudget):
             raise InvalidLifecycleValueError("budget은 ExecutionBudget이어야 합니다.")
         _require_aware(self.started_at, field_name="started_at")
-        _require_aware(self.updated_at, field_name="updated_at")
-        if self.updated_at < self.started_at:
-            raise InvalidLifecycleValueError(
-                "updated_at은 started_at보다 빠를 수 없습니다."
-            )
+        _require_not_before(
+            self.updated_at,
+            self.started_at,
+            field_name="updated_at",
+        )
 
     @classmethod
     def start(
@@ -471,11 +466,67 @@ class WorkflowRun:
             )
         return replace(self, phase=target, updated_at=at)
 
-    def consume_budget(self, *, at: datetime) -> WorkflowRun:
-        """Agent 호출 전에 budget 한 회를 소비한 snapshot을 반환한다."""
+    def begin_agent_run(
+        self,
+        *,
+        agent_run_id: str,
+        agent_id: str,
+        at: datetime,
+        retry: bool = False,
+    ) -> tuple[WorkflowRun, AgentRun]:
+        """Budget을 소비하며 AgentRun과 갱신된 WorkflowRun을 함께 만든다."""
 
         _require_not_before(at, self.updated_at, field_name="at")
-        return replace(self, budget=self.budget.consume(), updated_at=at)
+        if retry and self.phase is not Phase.VERIFYING:
+            raise InvalidPhaseTransitionError(
+                "Agent 재실행은 VERIFYING phase에서만 시작할 수 있습니다."
+            )
+        budget = self.budget.consume()
+        phase = Phase.EXECUTING if retry else self.phase
+        workflow = replace(
+            self,
+            phase=phase,
+            budget=budget,
+            updated_at=at,
+        )
+        agent_run = AgentRun(
+            agent_run_id=agent_run_id,
+            workflow_run_id=workflow.workflow_run_id,
+            task_id=workflow.task_id,
+            task_version=workflow.task_version,
+            agent_id=agent_id,
+            phase=workflow.phase,
+            budget_sequence=workflow.budget.consumed,
+            started_at=at,
+        )
+        return workflow, agent_run
+
+    def to_snapshot(self) -> dict[str, object]:
+        """WorkflowRun을 JSON 호환 snapshot으로 반환한다."""
+
+        return {
+            "workflow_run_id": self.workflow_run_id,
+            "task_id": self.task_id,
+            "task_version": self.task_version,
+            "phase": self.phase.value,
+            "budget": self.budget.to_snapshot(),
+            "started_at": self.started_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Mapping[str, object]) -> WorkflowRun:
+        """JSON 호환 snapshot에서 WorkflowRun을 복원한다."""
+
+        return cls(
+            workflow_run_id=_snapshot_string(snapshot, "workflow_run_id"),
+            task_id=_snapshot_string(snapshot, "task_id"),
+            task_version=_snapshot_integer(snapshot, "task_version"),
+            phase=_snapshot_enum(snapshot, "phase", Phase),
+            budget=ExecutionBudget.from_snapshot(_snapshot_mapping(snapshot, "budget")),
+            started_at=_snapshot_datetime(snapshot, "started_at"),
+            updated_at=_snapshot_datetime(snapshot, "updated_at"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,6 +539,7 @@ class AgentRun:
     task_version: int
     agent_id: str
     phase: Phase
+    budget_sequence: int
     started_at: datetime
     outcome: str | None = None
     output: str | None = None
@@ -513,6 +565,12 @@ class AgentRun:
             raise InvalidLifecycleValueError("task_version은 양의 정수여야 합니다.")
         if not isinstance(self.phase, Phase):
             raise InvalidLifecycleValueError("phase는 Phase 값이어야 합니다.")
+        if isinstance(self.budget_sequence, bool) or not isinstance(
+            self.budget_sequence, int
+        ):
+            raise InvalidLifecycleValueError("budget_sequence는 양의 정수여야 합니다.")
+        if self.budget_sequence <= 0:
+            raise InvalidLifecycleValueError("budget_sequence는 양의 정수여야 합니다.")
         _require_aware(self.started_at, field_name="started_at")
         completion_values = (self.outcome, self.output, self.completed_at)
         if any(value is None for value in completion_values) and any(
@@ -533,28 +591,6 @@ class AgentRun:
                 self.started_at,
                 field_name="completed_at",
             )
-
-    @classmethod
-    def start(
-        cls,
-        *,
-        agent_run_id: str,
-        workflow: WorkflowRun,
-        agent_id: str,
-        at: datetime,
-    ) -> AgentRun:
-        """현재 workflow phase에 결합된 열린 AgentRun을 만든다."""
-
-        _require_not_before(at, workflow.updated_at, field_name="at")
-        return cls(
-            agent_run_id=agent_run_id,
-            workflow_run_id=workflow.workflow_run_id,
-            task_id=workflow.task_id,
-            task_version=workflow.task_version,
-            agent_id=agent_id,
-            phase=workflow.phase,
-            started_at=at,
-        )
 
     @property
     def is_completed(self) -> bool:
@@ -584,6 +620,47 @@ class AgentRun:
             outcome=outcome,
             output=output,
             completed_at=at,
+        )
+
+    def to_snapshot(self) -> dict[str, object]:
+        """AgentRun을 JSON 호환 snapshot으로 반환한다."""
+
+        return {
+            "agent_run_id": self.agent_run_id,
+            "workflow_run_id": self.workflow_run_id,
+            "task_id": self.task_id,
+            "task_version": self.task_version,
+            "agent_id": self.agent_id,
+            "phase": self.phase.value,
+            "budget_sequence": self.budget_sequence,
+            "started_at": self.started_at.isoformat(),
+            "outcome": self.outcome,
+            "output": self.output,
+            "completed_at": (
+                None if self.completed_at is None else self.completed_at.isoformat()
+            ),
+        }
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Mapping[str, object]) -> AgentRun:
+        """JSON 호환 snapshot에서 AgentRun을 복원한다."""
+
+        return cls(
+            agent_run_id=_snapshot_string(snapshot, "agent_run_id"),
+            workflow_run_id=_snapshot_string(snapshot, "workflow_run_id"),
+            task_id=_snapshot_string(snapshot, "task_id"),
+            task_version=_snapshot_integer(snapshot, "task_version"),
+            agent_id=_snapshot_string(snapshot, "agent_id"),
+            phase=_snapshot_enum(snapshot, "phase", Phase),
+            budget_sequence=_snapshot_integer(snapshot, "budget_sequence"),
+            started_at=_snapshot_datetime(snapshot, "started_at"),
+            outcome=_snapshot_optional_string(snapshot, "outcome"),
+            output=_snapshot_optional_string(snapshot, "output"),
+            completed_at=_snapshot_datetime(
+                snapshot,
+                "completed_at",
+                optional=True,
+            ),
         )
 
 
