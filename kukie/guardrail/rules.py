@@ -34,4 +34,14 @@ class RuleEngine:
     @staticmethod
     def _matches(match: dict, cmd: dict) -> bool:
         """조건에 쓴 축은 전부 맞아야 함(AND). flags는 하나라도 포함되면 매칭."""
-        raise NotImplementedError  # TODO
+        for key, expected in match.items():
+            actual = cmd.get(key)
+            if key == "flags":
+                if not set(expected) & set(actual or []):
+                    return False
+            elif isinstance(expected, list):
+                if actual not in expected:
+                    return False
+            elif actual != expected:
+                return False
+        return True
