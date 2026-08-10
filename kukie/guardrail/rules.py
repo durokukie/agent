@@ -13,7 +13,7 @@ from pathlib import Path
 import yaml
 
 
-_SEPARATORS = {"|", "||", "&&", ";", "&", "\n", ">", ">>", "<", "<<"}
+_SEPARATORS = {"|", "||", "&&", ";", "&", "\n"}
 _WRAPPERS = {"sudo", "env"}
 _FLAG_ALIASES = {
     "-n": "--namespace",
@@ -72,6 +72,8 @@ def _canonical_flag(token: str, verb: str) -> str:
 
 
 def _resource(value: str) -> tuple[str, str | None]:
+    if "," in value:
+        raise ValueError("unsupported resource list")
     kind, separator, name = value.partition("/")
     return _RESOURCE_ALIASES.get(kind, kind.removesuffix("s")), name if separator else None
 
@@ -98,8 +100,10 @@ def _find_verb(args: list[str]) -> tuple[int, str]:
 def _parse_kubectl_tokens(tokens: list[str]) -> dict:
     if not tokens or Path(tokens[0]).name != "kubectl":
         raise ValueError("kubectl command not found")
-    if any("$(" in token or "`" in token for token in tokens):
+    if any("$" in token or "`" in token for token in tokens):
         raise ValueError("dynamic kubectl argument")
+    if any("<" in token or ">" in token for token in tokens):
+        raise ValueError("unsupported kubectl redirection")
 
     args = tokens[1:]
     verb_index, verb = _find_verb(args)
@@ -218,11 +222,16 @@ class RuleEngine:
         self.fallbacks = data.get("fallback")
         if not isinstance(self.rules, list) or not isinstance(self.fallbacks, dict):
             raise ValueError("rules.yaml requires rules and fallback")
+        missing = {"parse_error", "no_match", "dynamic_argument"} - self.fallbacks.keys()
+        if missing:
+            raise ValueError(f"rules.yaml missing fallback: {', '.join(sorted(missing))}")
 
         ids: set[str] = set()
         for rule in self.rules:
             if not isinstance(rule, dict) or not {"id", "risk", "match"} <= rule.keys():
                 raise ValueError("each rule requires id, risk, and match")
+            if not isinstance(rule["match"], dict):
+                raise ValueError("rule match must be a mapping")
             if rule["id"] in ids:
                 raise ValueError(f"duplicate rule id: {rule['id']}")
             ids.add(rule["id"])
@@ -312,6 +321,17 @@ def classify_kubectl_command_risk(raw_command: str) -> Classification:
                 engine.fallback("parse_error"), [], [shlex.join(segment)],
                 "parse_error: wrapped kubectl command",
             ))
+        else:
+            index = 0
+            while index < len(segment) and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[index]
+            ):
+                index += 1
+            if index and index < len(segment) and Path(segment[index]).name == "kubectl":
+                results.append(Classification(
+                    engine.fallback("parse_error"), [], [shlex.join(segment)],
+                    "parse_error: assignment-prefixed kubectl command",
+                ))
 
     if not results:
         raise ValueError("kubectl command not found")

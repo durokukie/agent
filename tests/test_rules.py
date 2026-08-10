@@ -52,9 +52,46 @@ def test_sensitive_secret_output_does_not_match_general_get():
 
 def test_invalid_rule_risk_fails_loading(tmp_path: Path):
     path = tmp_path / "rules.yaml"
-    path.write_text("version: 1\nfallback:\n  no_match: review_required\n"
-                    "rules:\n  - id: BAD\n    risk: unknown\n    match: {}\n")
+    path.write_text(
+        "version: 1\n"
+        "fallback:\n"
+        "  parse_error: review_required\n"
+        "  no_match: review_required\n"
+        "  dynamic_argument: review_required\n"
+        "rules:\n  - id: BAD\n    risk: unknown\n    match: {}\n"
+    )
     with pytest.raises(ValueError, match="unknown risk"):
+        RuleEngine(path)
+
+
+@pytest.mark.parametrize("fallback", [
+    "no_match: review_required\n  dynamic_argument: review_required",
+    "parse_error: review_required\n  dynamic_argument: review_required",
+    "parse_error: review_required\n  no_match: review_required",
+])
+def test_missing_required_fallback_fails_loading(tmp_path: Path, fallback: str):
+    path = tmp_path / "rules.yaml"
+    path.write_text(
+        f"version: 1\nfallback:\n  {fallback}\nrules: []\n"
+    )
+    with pytest.raises(ValueError, match="missing fallback"):
+        RuleEngine(path)
+
+
+def test_non_mapping_rule_match_fails_loading(tmp_path: Path):
+    path = tmp_path / "rules.yaml"
+    path.write_text(
+        "version: 1\n"
+        "fallback:\n"
+        "  parse_error: review_required\n"
+        "  no_match: review_required\n"
+        "  dynamic_argument: review_required\n"
+        "rules:\n"
+        "  - id: BAD\n"
+        "    risk: safe\n"
+        "    match: verb=get\n"
+    )
+    with pytest.raises(ValueError, match="match must be a mapping"):
         RuleEngine(path)
 
 
@@ -94,6 +131,38 @@ def test_unknown_inline_kubectl_option_requires_review():
     assert classify_kubectl_command_risk(
         "kubectl get pods --unrecognized=value"
     ).level == Risk.REVIEW_REQUIRED
+
+
+@pytest.mark.parametrize("raw", [
+    "kubectl get secrets >out -o yaml",
+    "kubectl get secrets < <(cat token) -o yaml",
+])
+def test_redirection_cannot_hide_kubectl_arguments(raw):
+    assert classify_kubectl_command_risk(raw).level == Risk.REVIEW_REQUIRED
+
+
+@pytest.mark.parametrize("raw", [
+    'kubectl get secret token -o "$FORMAT"',
+    'kubectl get secret token -o "${FORMAT}"',
+    "kubectl get secret token -o $(format)",
+    "kubectl get secret token -o `format`",
+])
+def test_dynamic_kubectl_argument_requires_review(raw):
+    assert classify_kubectl_command_risk(raw).level == Risk.REVIEW_REQUIRED
+
+
+def test_comma_separated_secret_resource_requires_review():
+    assert classify_kubectl_command_risk(
+        "kubectl get secrets,configmaps -o yaml"
+    ).level == Risk.REVIEW_REQUIRED
+
+
+def test_assignment_prefixed_kubectl_segment_requires_review():
+    result = classify_kubectl_command_risk(
+        "kubectl get pods; KUBECONFIG=x kubectl delete pod api"
+    )
+    assert result.level == Risk.REVIEW_REQUIRED
+    assert len(result.analyzed_commands) == 2
 
 
 @pytest.mark.parametrize("raw,expected,count", [
