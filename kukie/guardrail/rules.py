@@ -1,8 +1,6 @@
-"""룰 엔진 — LLM 밖 순수 함수. 같은 입력이면 항상 같은 출력.
+"""Parsed-command rule engine for kubectl guardrails.
 
-- 룰은 rules.yaml에 데이터로 선언 (4축 매칭: verb/kind/namespace/flags)
-- fail-closed: 매칭되는 룰이 없으면 최고 등급(destructive)
-- evaluate_action(사전 검토)과 훅이 이 코드를 공유한다 — 별도 판정 로직 금지
+Unmatched kubectl forms require review rather than being mislabeled destructive.
 """
 from __future__ import annotations
 
@@ -12,36 +10,68 @@ from pathlib import Path
 import yaml
 
 
-class Risk(IntEnum):     # IntEnum이라 max()로 최고 등급 집계 가능
+class Risk(IntEnum):
     SAFE = 0
     CAUTION = 1
-    DESTRUCTIVE = 2
+    REVIEW_REQUIRED = 2
+    DESTRUCTIVE = 3
 
 
 class RuleEngine:
     def __init__(self, path: Path | None = None):
         path = path or Path(__file__).parent / "rules.yaml"
-        self.rules: list[dict] = yaml.safe_load(path.read_text())["rules"]
+        data = yaml.safe_load(path.read_text())
+        if not isinstance(data, dict) or data.get("version") != 1:
+            raise ValueError("rules.yaml must have version: 1")
+
+        self.rules = data.get("rules")
+        self.fallbacks = data.get("fallback")
+        if not isinstance(self.rules, list) or not isinstance(self.fallbacks, dict):
+            raise ValueError("rules.yaml requires rules and fallback")
+
+        ids: set[str] = set()
+        for rule in self.rules:
+            if not isinstance(rule, dict) or not {"id", "risk", "match"} <= rule.keys():
+                raise ValueError("each rule requires id, risk, and match")
+            if rule["id"] in ids:
+                raise ValueError(f"duplicate rule id: {rule['id']}")
+            ids.add(rule["id"])
+            if rule["risk"].upper() not in {"SAFE", "CAUTION", "DESTRUCTIVE"}:
+                raise ValueError(f"unknown risk: {rule['risk']}")
+
+        for kind, level in self.fallbacks.items():
+            if str(level).upper() != "REVIEW_REQUIRED":
+                raise ValueError(f"fallback {kind} must be review_required")
+
+    def fallback(self, kind: str) -> Risk:
+        try:
+            return Risk[str(self.fallbacks[kind]).upper()]
+        except KeyError as exc:
+            raise ValueError(f"unknown fallback: {kind}") from exc
 
     def classify(self, cmd: dict) -> tuple[Risk, list[str]]:
-        """조립된 명령(dict: verb/kind/namespace/flags) → (등급, 걸린 룰 id들)."""
-        hit = [r for r in self.rules if self._matches(r["match"], cmd)]
+        hit = [rule for rule in self.rules if self._matches(rule["match"], cmd)]
         if not hit:
-            return Risk.DESTRUCTIVE, ["no-match(fail-closed)"]
-        risk = max(Risk[r["risk"].upper()] for r in hit)
-        return risk, [r["id"] for r in hit]
+            return self.fallback("no_match"), ["no-match"]
+        return (
+            max(Risk[rule["risk"].upper()] for rule in hit),
+            [rule["id"] for rule in hit],
+        )
 
     @staticmethod
     def _matches(match: dict, cmd: dict) -> bool:
-        """조건에 쓴 축은 전부 맞아야 함(AND). flags는 하나라도 포함되면 매칭."""
         for key, expected in match.items():
-            actual = cmd.get(key)
-            if key == "flags":
-                if not set(expected) & set(actual or []):
+            if key == "flags_any":
+                if not set(expected) & set(cmd.get("flags", ())):
+                    return False
+            elif key == "options":
+                actual = cmd.get("options", {})
+                if any(str(actual.get(name)) != str(value)
+                       for name, value in expected.items()):
                     return False
             elif isinstance(expected, list):
-                if actual not in expected:
+                if cmd.get(key) not in expected:
                     return False
-            elif actual != expected:
+            elif cmd.get(key) != expected:
                 return False
         return True
