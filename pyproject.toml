@@ -1,0 +1,19 @@
+[project]
+name = "kukie"
+version = "0.1.0"
+description = "쿠버네티스를 배우면서 안전하게 쓰는 에이전트"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic-ai>=1.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio"]
+
+[project.scripts]
+kukie = "kukie.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
