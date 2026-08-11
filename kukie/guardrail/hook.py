@@ -35,7 +35,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
 
     ① 입력 검증     → 부실하면 ModelRetry (재작성 요구)
     ② 명령 조립     → assemble() 1벌 호출 (재조립 금지)
-    ③ 룰 판정       → rule_engine.classify() — 결정론, fail-closed
+    ③ 룰 판정       → classify_kubectl_command_risk() — 결정론, fail-closed
     ④ Plan 생성     → ActionPlan.create_draft()
     ⑤ dry-run       → 실패 시 draft 정리 후 ToolFailed
     ⑥ CLI 승인      → safe 생략 / caution 1회 / destructive 이중.

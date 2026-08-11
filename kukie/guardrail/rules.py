@@ -97,25 +97,9 @@ def _find_verb(args: list[str]) -> tuple[int, str]:
     raise ValueError("kubectl verb not found")
 
 
-def _parse_kubectl_tokens(tokens: list[str]) -> dict:
-    if not tokens or Path(tokens[0]).name != "kubectl":
-        raise ValueError("kubectl command not found")
-    if any("$" in token or "`" in token for token in tokens):
-        raise ValueError("dynamic kubectl argument")
-    if any("<" in token or ">" in token for token in tokens):
-        raise ValueError("unsupported kubectl redirection")
-
-    args = tokens[1:]
-    verb_index, verb = _find_verb(args)
-    command_args = args[:verb_index] + args[verb_index + 1:]
-    try:
-        payload_index = command_args.index("--")
-    except ValueError:
-        payload = []
-    else:
-        payload = command_args[payload_index + 1:]
-        command_args = command_args[:payload_index]
-
+def _parse_kubectl_options(
+    command_args: list[str], verb: str,
+) -> tuple[list[str], set[str], dict[str, str]]:
     positionals: list[str] = []
     flags: set[str] = set()
     options: dict[str, str] = {}
@@ -147,6 +131,36 @@ def _parse_kubectl_tokens(tokens: list[str]) -> dict:
         else:
             raise ValueError(f"unknown kubectl option: {token}")
 
+    return positionals, flags, options
+
+
+def _parse_kubectl_tokens(tokens: list[str]) -> dict:
+    # kubectl 실행 파일인지 확인하고, 원문만으로 확정할 수 없는 인수를 거부한다.
+    if not tokens or Path(tokens[0]).name != "kubectl":
+        raise ValueError("kubectl command not found")
+    if any("$" in token or "`" in token for token in tokens):
+        raise ValueError("dynamic kubectl argument")
+    if any("<" in token or ">" in token for token in tokens):
+        raise ValueError("unsupported kubectl redirection")
+
+    # 전역 옵션을 건너뛰어 kubectl 동사를 찾고, 동사를 제외한 인수만 남긴다.
+    args = tokens[1:]
+    verb_index, verb = _find_verb(args)
+    command_args = args[:verb_index] + args[verb_index + 1:]
+
+    # `--` 뒤의 exec payload를 kubectl 자체 옵션과 분리한다.
+    try:
+        payload_index = command_args.index("--")
+    except ValueError:
+        payload = []
+    else:
+        payload = command_args[payload_index + 1:]
+        command_args = command_args[:payload_index]
+
+    # 나머지 인수를 위치 인수, 불리언 플래그, 값이 있는 옵션으로 정규화한다.
+    positionals, flags, options = _parse_kubectl_options(command_args, verb)
+
+    # 동사별 위치 인수에서 하위 명령, 리소스 종류와 이름을 추출한다.
     resource = name = subcommand = None
     if verb in {"config", "rollout"}:
         if positionals:
@@ -159,6 +173,7 @@ def _parse_kubectl_tokens(tokens: list[str]) -> dict:
         if positionals:
             resource, name = _resource(positionals[0]) if "/" in positionals[0] else ("pod", positionals[0])
 
+    # 규칙 매칭에 필요한 필수 대상이나 옵션이 빠졌는지 검증한다.
     if verb in {"get", "describe", "delete", "logs", "exec"} and resource is None:
         raise ValueError(f"missing resource target: {verb}")
     if verb == "apply" and not ({"--filename", "--kustomize"} & options.keys()):
@@ -166,6 +181,7 @@ def _parse_kubectl_tokens(tokens: list[str]) -> dict:
     if verb == "config" and subcommand is None:
         raise ValueError("config requires subcommand")
 
+    # YAML 규칙이 직접 비교할 수 있는 표준 명령 구조를 만든다.
     return {
         "verb": verb,
         "subcommand": subcommand,
@@ -211,36 +227,43 @@ def _shell_segments(tokens: list[str]) -> list[list[str]]:
     return segments
 
 
+def _load_and_validate_rules(path: Path) -> tuple[list[dict], dict]:
+    """YAML 규칙을 로드하고 필수 구조와 값을 검증한다."""
+    data = yaml.safe_load(path.read_text())
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise ValueError("rules.yaml must have version: 1")
+
+    rules = data.get("rules")
+    fallbacks = data.get("fallback")
+    if not isinstance(rules, list) or not isinstance(fallbacks, dict):
+        raise ValueError("rules.yaml requires rules and fallback")
+    missing = {"parse_error", "no_match", "dynamic_argument"} - fallbacks.keys()
+    if missing:
+        raise ValueError(f"rules.yaml missing fallback: {', '.join(sorted(missing))}")
+
+    ids: set[str] = set()
+    for rule in rules:
+        if not isinstance(rule, dict) or not {"id", "risk", "match"} <= rule.keys():
+            raise ValueError("each rule requires id, risk, and match")
+        if not isinstance(rule["match"], dict):
+            raise ValueError("rule match must be a mapping")
+        if rule["id"] in ids:
+            raise ValueError(f"duplicate rule id: {rule['id']}")
+        ids.add(rule["id"])
+        if rule["risk"].upper() not in {"SAFE", "CAUTION", "DESTRUCTIVE"}:
+            raise ValueError(f"unknown risk: {rule['risk']}")
+
+    for kind, level in fallbacks.items():
+        if str(level).upper() != "REVIEW_REQUIRED":
+            raise ValueError(f"fallback {kind} must be review_required")
+
+    return rules, fallbacks
+
+
 class RuleEngine:
     def __init__(self, path: Path | None = None):
         path = path or Path(__file__).parent / "rules.yaml"
-        data = yaml.safe_load(path.read_text())
-        if not isinstance(data, dict) or data.get("version") != 1:
-            raise ValueError("rules.yaml must have version: 1")
-
-        self.rules = data.get("rules")
-        self.fallbacks = data.get("fallback")
-        if not isinstance(self.rules, list) or not isinstance(self.fallbacks, dict):
-            raise ValueError("rules.yaml requires rules and fallback")
-        missing = {"parse_error", "no_match", "dynamic_argument"} - self.fallbacks.keys()
-        if missing:
-            raise ValueError(f"rules.yaml missing fallback: {', '.join(sorted(missing))}")
-
-        ids: set[str] = set()
-        for rule in self.rules:
-            if not isinstance(rule, dict) or not {"id", "risk", "match"} <= rule.keys():
-                raise ValueError("each rule requires id, risk, and match")
-            if not isinstance(rule["match"], dict):
-                raise ValueError("rule match must be a mapping")
-            if rule["id"] in ids:
-                raise ValueError(f"duplicate rule id: {rule['id']}")
-            ids.add(rule["id"])
-            if rule["risk"].upper() not in {"SAFE", "CAUTION", "DESTRUCTIVE"}:
-                raise ValueError(f"unknown risk: {rule['risk']}")
-
-        for kind, level in self.fallbacks.items():
-            if str(level).upper() != "REVIEW_REQUIRED":
-                raise ValueError(f"fallback {kind} must be review_required")
+        self.rules, self.fallbacks = _load_and_validate_rules(path)
 
     def fallback(self, kind: str) -> Risk:
         try:

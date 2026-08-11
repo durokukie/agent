@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import kukie.guardrail.rules as rules_module
 from kukie.guardrail.rules import (
     Risk,
     RuleEngine,
@@ -11,6 +12,26 @@ from kukie.guardrail.rules import (
 
 
 engine = RuleEngine()
+
+
+def test_yaml_규칙을_별도_함수로_로드하고_검증한다(tmp_path: Path):
+    path = tmp_path / "rules.yaml"
+    path.write_text(
+        "version: 1\n"
+        "fallback:\n"
+        "  parse_error: review_required\n"
+        "  no_match: review_required\n"
+        "  dynamic_argument: review_required\n"
+        "rules:\n"
+        "  - id: GET\n"
+        "    risk: safe\n"
+        "    match: {verb: get}\n"
+    )
+
+    rules, fallbacks = rules_module._load_and_validate_rules(path)
+
+    assert rules == [{"id": "GET", "risk": "safe", "match": {"verb": "get"}}]
+    assert fallbacks["parse_error"] == "review_required"
 
 
 @pytest.mark.parametrize("cmd,expected,rule_id", [
@@ -25,20 +46,20 @@ engine = RuleEngine()
     ({"verb": "delete", "resource": "pod", "flags": set(),
       "options": {}, "sensitive_output": False}, Risk.DESTRUCTIVE, "DELETE-POD"),
 ])
-def test_classify_parsed_command(cmd, expected, rule_id):
+def test_파싱된_명령을_규칙에_따라_분류한다(cmd, expected, rule_id):
     risk, matched = engine.classify(cmd)
     assert risk == expected
     assert rule_id in matched
 
 
-def test_unknown_parsed_command_requires_review():
+def test_알수없는_파싱명령은_승인이_필요하다():
     assert engine.classify({"verb": "frobnicate"}) == (
         Risk.REVIEW_REQUIRED,
         ["no-match"],
     )
 
 
-def test_sensitive_secret_output_does_not_match_general_get():
+def test_시크릿_원문조회는_일반조회_규칙과_매칭되지_않는다():
     risk, matched = engine.classify({
         "verb": "get",
         "resource": "secret",
@@ -50,7 +71,7 @@ def test_sensitive_secret_output_does_not_match_general_get():
     assert matched == ["no-match"]
 
 
-def test_invalid_rule_risk_fails_loading(tmp_path: Path):
+def test_잘못된_위험도_규칙은_로드에_실패한다(tmp_path: Path):
     path = tmp_path / "rules.yaml"
     path.write_text(
         "version: 1\n"
@@ -69,7 +90,7 @@ def test_invalid_rule_risk_fails_loading(tmp_path: Path):
     "parse_error: review_required\n  dynamic_argument: review_required",
     "parse_error: review_required\n  no_match: review_required",
 ])
-def test_missing_required_fallback_fails_loading(tmp_path: Path, fallback: str):
+def test_필수_폴백이_없으면_로드에_실패한다(tmp_path: Path, fallback: str):
     path = tmp_path / "rules.yaml"
     path.write_text(
         f"version: 1\nfallback:\n  {fallback}\nrules: []\n"
@@ -78,7 +99,7 @@ def test_missing_required_fallback_fails_loading(tmp_path: Path, fallback: str):
         RuleEngine(path)
 
 
-def test_non_mapping_rule_match_fails_loading(tmp_path: Path):
+def test_매핑이_아닌_매칭조건은_로드에_실패한다(tmp_path: Path):
     path = tmp_path / "rules.yaml"
     path.write_text(
         "version: 1\n"
@@ -104,7 +125,7 @@ def test_non_mapping_rule_match_fails_loading(tmp_path: Path):
     ("/usr/local/bin/kubectl delete deployment api",
      Risk.DESTRUCTIVE, "DELETE-DEPLOYMENT"),
 ])
-def test_classify_single_kubectl_command(raw, expected, rule_id):
+def test_단일_kubectl_명령의_위험도를_분류한다(raw, expected, rule_id):
     result = classify_kubectl_command_risk(raw)
     assert result.level == expected
     assert rule_id in result.matched_rules
@@ -117,17 +138,17 @@ def test_classify_single_kubectl_command(raw, expected, rule_id):
     "kubectl apply -f app.yaml --dry-run=server",
     "kubectl exec api -- sh",
 ])
-def test_unresolved_kubectl_command_requires_review(raw):
+def test_미확정_kubectl_명령은_승인이_필요하다(raw):
     result = classify_kubectl_command_risk(raw)
     assert result.level == Risk.REVIEW_REQUIRED
 
 
-def test_missing_kubectl_is_out_of_scope():
+def test_kubectl이_없는_명령은_검증범위_밖이다():
     with pytest.raises(ValueError, match="kubectl command not found"):
         classify_kubectl_command_risk("echo kubectl")
 
 
-def test_unknown_inline_kubectl_option_requires_review():
+def test_알수없는_kubectl_옵션은_승인이_필요하다():
     assert classify_kubectl_command_risk(
         "kubectl get pods --unrecognized=value"
     ).level == Risk.REVIEW_REQUIRED
@@ -137,7 +158,7 @@ def test_unknown_inline_kubectl_option_requires_review():
     "kubectl get secrets >out -o yaml",
     "kubectl get secrets < <(cat token) -o yaml",
 ])
-def test_redirection_cannot_hide_kubectl_arguments(raw):
+def test_리다이렉션으로_kubectl_인수를_숨길수_없다(raw):
     assert classify_kubectl_command_risk(raw).level == Risk.REVIEW_REQUIRED
 
 
@@ -147,17 +168,17 @@ def test_redirection_cannot_hide_kubectl_arguments(raw):
     "kubectl get secret token -o $(format)",
     "kubectl get secret token -o `format`",
 ])
-def test_dynamic_kubectl_argument_requires_review(raw):
+def test_동적_kubectl_인수는_승인이_필요하다(raw):
     assert classify_kubectl_command_risk(raw).level == Risk.REVIEW_REQUIRED
 
 
-def test_comma_separated_secret_resource_requires_review():
+def test_쉼표로_구분된_시크릿_리소스는_승인이_필요하다():
     assert classify_kubectl_command_risk(
         "kubectl get secrets,configmaps -o yaml"
     ).level == Risk.REVIEW_REQUIRED
 
 
-def test_assignment_prefixed_kubectl_segment_requires_review():
+def test_환경변수_할당이_앞에_있는_kubectl은_승인이_필요하다():
     result = classify_kubectl_command_risk(
         "kubectl get pods; KUBECONFIG=x kubectl delete pod api"
     )
@@ -172,7 +193,7 @@ def test_assignment_prefixed_kubectl_segment_requires_review():
     ("kubectl frobnicate pods ; kubectl get pods", Risk.REVIEW_REQUIRED, 2),
     ("kubectl frobnicate pods ; kubectl delete pod api", Risk.DESTRUCTIVE, 2),
 ])
-def test_classifies_all_top_level_kubectl_segments(raw, expected, count):
+def test_최상위_kubectl_명령을_모두_분류한다(raw, expected, count):
     result = classify_kubectl_command_risk(raw)
     assert result.level == expected
     assert len(result.analyzed_commands) == count
@@ -183,11 +204,11 @@ def test_classifies_all_top_level_kubectl_segments(raw, expected, count):
     "env KUBECONFIG=test kubectl get pods",
     "kubectl delete pod $(cat name)",
 ])
-def test_ambiguous_kubectl_invocation_requires_review(raw):
+def test_모호한_kubectl_호출은_승인이_필요하다(raw):
     assert classify_kubectl_command_risk(raw).level == Risk.REVIEW_REQUIRED
 
 
-def test_exec_payload_pipe_is_not_a_top_level_separator():
+def test_exec_페이로드의_파이프는_최상위_구분자가_아니다():
     result = classify_kubectl_command_risk(
         "kubectl exec api -- sh -c 'echo hi | grep h'"
     )
