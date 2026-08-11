@@ -14,12 +14,12 @@ rules:
   - id: GET-ALLNS
     description: 전체 네임스페이스 조회
     risk: safe
-    match: {verb: get, sensitive_output: false, flags_any: [--all-namespaces]}
+    match: {verb: get, sensitive_output: false, any_enabled_boolean_flags: [--all-namespaces]}
 
   - id: GET-WATCH
     description: 리소스 변경 감시
     risk: safe
-    match: {verb: get, sensitive_output: false, flags_any: [--watch]}
+    match: {verb: get, sensitive_output: false, any_enabled_boolean_flags: [--watch]}
 
   - id: DESCRIBE
     description: 리소스 상세 조회
@@ -61,7 +61,7 @@ rules:
     match:
       verb: delete
       resource: pod
-      options: {--grace-period: "0"}
+      required_flag_values: {--grace-period: "0"}
 
   - id: DELETE-DEPLOYMENT
     description: Deployment 삭제

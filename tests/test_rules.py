@@ -35,16 +35,16 @@ def test_yaml_규칙을_별도_함수로_로드하고_검증한다(tmp_path: Pat
 
 
 @pytest.mark.parametrize("cmd,expected,rule_id", [
-    ({"verb": "get", "resource": "pod", "flags": set(),
-      "options": {}, "sensitive_output": False}, Risk.SAFE, "GET-BASE"),
-    ({"verb": "logs", "resource": "pod", "flags": {"--follow"},
-      "options": {}, "sensitive_output": False}, Risk.SAFE, "LOGS"),
-    ({"verb": "apply", "dry_run": "none", "flags": set(),
-      "options": {}, "sensitive_output": False}, Risk.CAUTION, "APPLY"),
-    ({"verb": "config", "subcommand": "use-context", "flags": set(),
-      "options": {}, "sensitive_output": False}, Risk.CAUTION, "CONFIG-SWITCH"),
-    ({"verb": "delete", "resource": "pod", "flags": set(),
-      "options": {}, "sensitive_output": False}, Risk.DESTRUCTIVE, "DELETE-POD"),
+    ({"verb": "get", "resource": "pod", "enabled_boolean_flags": set(),
+      "flag_values": {}, "sensitive_output": False}, Risk.SAFE, "GET-BASE"),
+    ({"verb": "logs", "resource": "pod", "enabled_boolean_flags": {"--follow"},
+      "flag_values": {}, "sensitive_output": False}, Risk.SAFE, "LOGS"),
+    ({"verb": "apply", "dry_run": "none", "enabled_boolean_flags": set(),
+      "flag_values": {}, "sensitive_output": False}, Risk.CAUTION, "APPLY"),
+    ({"verb": "config", "subcommand": "use-context", "enabled_boolean_flags": set(),
+      "flag_values": {}, "sensitive_output": False}, Risk.CAUTION, "CONFIG-SWITCH"),
+    ({"verb": "delete", "resource": "pod", "enabled_boolean_flags": set(),
+      "flag_values": {}, "sensitive_output": False}, Risk.DESTRUCTIVE, "DELETE-POD"),
 ])
 def test_파싱된_명령을_규칙에_따라_분류한다(cmd, expected, rule_id):
     risk, matched = engine.classify(cmd)
@@ -63,8 +63,8 @@ def test_시크릿_원문조회는_일반조회_규칙과_매칭되지_않는다
     risk, matched = engine.classify({
         "verb": "get",
         "resource": "secret",
-        "flags": set(),
-        "options": {"--output": "yaml"},
+        "enabled_boolean_flags": set(),
+        "flag_values": {"--output": "yaml"},
         "sensitive_output": True,
     })
     assert risk == Risk.REVIEW_REQUIRED
@@ -117,11 +117,13 @@ def test_매핑이_아닌_매칭조건은_로드에_실패한다(tmp_path: Path)
 
 
 @pytest.mark.parametrize("raw,expected,rule_id", [
-    ("kubectl get pods -A -w", Risk.SAFE, "GET-BASE"),
+    ("kubectl get pods -A -w", Risk.SAFE, "GET-ALLNS"),
     ("kubectl logs -f api --tail=200", Risk.SAFE, "LOGS"),
     ("kubectl apply -f app.yaml", Risk.CAUTION, "APPLY"),
     ("kubectl config use-context production", Risk.CAUTION, "CONFIG-SWITCH"),
     ("kubectl delete pod api", Risk.DESTRUCTIVE, "DELETE-POD"),
+    ("kubectl delete pod api --grace-period=0",
+     Risk.DESTRUCTIVE, "DELETE-POD-NOW"),
     ("/usr/local/bin/kubectl delete deployment api",
      Risk.DESTRUCTIVE, "DELETE-DEPLOYMENT"),
 ])
