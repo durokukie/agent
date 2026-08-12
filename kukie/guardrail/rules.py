@@ -94,13 +94,10 @@ def _find_verb(args: list[str]) -> tuple[int, str]:
             return index, token.lower()
         name = token.split("=", 1)[0]
         name = _FLAG_ALIASES.get(name, name)
-        if name in _VALUE_FLAGS:
-            if "=" in token:
-                index += 1
-            else:
-                if index + 1 >= len(args):
-                    raise ValueError(f"missing option value: {token}")
-                index += 2
+        if "=" not in token and name in _VALUE_FLAGS:
+            if index + 1 >= len(args):
+                raise ValueError(f"missing option value: {token}")
+            index += 2
         elif name in _BOOLEAN_FLAGS:
             index += 1
         else:
