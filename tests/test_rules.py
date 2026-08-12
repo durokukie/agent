@@ -118,9 +118,11 @@ def test_매핑이_아닌_매칭조건은_로드에_실패한다(tmp_path: Path)
 
 @pytest.mark.parametrize("raw,expected,rule_id", [
     ("kubectl get pods -A -w", Risk.SAFE, "GET-ALLNS"),
+    ("kubectl --namespace=study get pods", Risk.SAFE, "GET-BASE"),
     ("kubectl logs -f api --tail=200", Risk.SAFE, "LOGS"),
     ("kubectl apply -f app.yaml", Risk.CAUTION, "APPLY"),
     ("kubectl config use-context production", Risk.CAUTION, "CONFIG-SWITCH"),
+    ("kubectl -n=study delete pod api", Risk.DESTRUCTIVE, "DELETE-POD"),
     ("kubectl delete pod api", Risk.DESTRUCTIVE, "DELETE-POD"),
     ("kubectl delete pod api --grace-period=0",
      Risk.DESTRUCTIVE, "DELETE-POD-NOW"),
