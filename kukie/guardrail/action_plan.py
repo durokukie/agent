@@ -1,7 +1,10 @@
-"""Action Plan — 변경 1건당 1장씩 생기는 .md 계획서/기록 (기능 2 §1.2, 저장 위치 논의 중).
+"""Action Plan — 변경 1건당 1장씩 생기는 .md 계획서/기록.
+
+팀 결정 (가드레일 v2): MVP에서는 **코드가 아는 사실만** 기록한다 —
+명령·대상·등급·dry-run·승인·결과. LLM 작성 필드(intent/영향/부작용)는 제외,
+필요해지면 나중에 추가.
 
 파일 = YAML frontmatter(기계용) + 본문(사람용).
-작성 주체 경계: LLM=intent/영향/부작용, 코드=사실(명령·결과·승인), 룰엔진=위험도.
 상태: draft → executed / failed / rejected. (dry-run 실패한 draft는 삭제 — 팀 합의 필요)
 """
 from __future__ import annotations
@@ -17,10 +20,9 @@ class ActionPlan:
         self.path = path
 
     @classmethod
-    def create_draft(cls, *, tool: str, command: list[str], intent: str,
-                     effects: list[str], side_effects: list[str],
-                     risk: str, rules: list[str], skill: str) -> "ActionPlan":
-        """파이프라인 ④단계 — draft 상태 .md 생성."""
+    def create_draft(cls, *, tool: str, command: list[str],
+                     risk: str, skill: str) -> "ActionPlan":
+        """파이프라인 ③단계 — draft 상태 .md 생성 (사실만)."""
         raise NotImplementedError  # TODO: frontmatter + 본문 렌더링
 
     def record_dry_run(self, output: str) -> None: ...        # ⑤
