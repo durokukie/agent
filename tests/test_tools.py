@@ -48,7 +48,8 @@ def test_읽기_탈출구는_변경_verb를_거부한다():
 
 
 def test_스킬_레지스트리와_공통_툴():
-    assert set(SKILLS) == {"학습", "진단", "실습", "히스토리", "사전검토"}
+    # MVP 스킬 3종 (히스토리·사전검토는 Action Plan 조회 툴과 함께 보류)
+    assert set(SKILLS) == {"학습", "진단", "실습"}
     for skill in SKILLS.values():
         assert COMMON_TOOLS <= skill.allowed_tools
 

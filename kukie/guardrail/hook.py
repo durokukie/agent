@@ -2,8 +2,10 @@
 
 팀 결정 (가드레일 v2):
 - 위험도 판별 시스템 없음. 등급은 RISK_STICKERS(함수에 미리 붙인 스티커) 조회 한 줄.
-- LLM 작성 필드 검증 단계 없음 (intent 등은 MVP 제외).
-- Action Plan에는 코드가 아는 사실만 기록 (명령·대상·dry-run·승인·결과).
+- LLM이 호출하는 Action Plan 툴(조회/평가)은 MVP 제외 —
+  Plan은 이 훅이 내부적으로 생성·기록한다.
+- intent/expected_effects/side_effects는 변경 툴의 필수 인자 (스키마가 강제) —
+  승인 화면과 Plan 본문에 실린다.
 
 트리거: 변경 툴 4종의 호출 (LLM이 쓰려는 시도 자체).
 LLM은 발동 여부에 관여할 수 없다. wrap 훅 하나가 전 단계를 감싼다.
@@ -26,9 +28,11 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
 
     ① 명령 조립   → assemble() 1벌 호출 (재조립 금지)
     ② 등급 조회   → RISK_STICKERS[툴이름]. 미등록이면 DESTRUCTIVE (fail-closed)
-    ③ Plan 생성   → ActionPlan.create_draft() — 코드가 아는 사실만
+    ③ Plan 생성   → ActionPlan.create_draft() — 사실(frontmatter) + intent 등("왜" 본문)
+                   intent가 빈 문자열이면 ModelRetry로 재작성 요구 (한 줄 검사)
     ④ dry-run    → 실패 시 draft 삭제 후 ToolFailed
-    ⑤ CLI 승인   → CAUTION 1회 / DESTRUCTIVE 이중 (대상 이름 타이핑).
+    ⑤ CLI 승인   → 명령·대상·intent·영향·부작용·등급 표시.
+                   CAUTION 1회 / DESTRUCTIVE 이중 (대상 이름 타이핑).
                    거절 시 plan.mark("rejected") + SkipToolExecution
     ⑥ 실행·기록  → handler(조립 args) → record_result() + mark(executed/failed)
 
