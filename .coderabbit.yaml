@@ -6,6 +6,7 @@ language: ko-KR
 
 reviews:
   profile: chill
+  review_status: false      # "Review skipped / Run configuration" 상태 메시지 비활성화
   auto_review:
     enabled: true
     base_branches:
