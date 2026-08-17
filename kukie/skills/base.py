@@ -41,11 +41,11 @@ class KukieResponse(BaseModel):
 
 # ── 스킬 정의 ────────────────────────────────────────────────
 
-# 공통 베이스 툴 — 어떤 스킬이든 항상 포함 (기능 1 §3)
+# 공통 베이스 툴 — 어떤 스킬이든 항상 포함
+# (탈출구 run_readonly_kubectl은 팀 결정으로 제거 — 안내 폴백으로 대체)
 COMMON_TOOLS: frozenset[str] = frozenset({
     "list_resources",
     "explain_command",
-    "run_readonly_kubectl",
 })
 
 

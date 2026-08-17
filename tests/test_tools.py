@@ -3,18 +3,12 @@
 구현(NotImplementedError) 없이도 검증 가능한 것들:
 - 훅 대상 목록이 함수 리스트에서 자동 파생되는지 (수동 관리 사고 방지)
 - 모든 변경 툴에 위험도 스티커가 등록돼 있는지 (미등록 = fail-closed 대상)
-- 읽기 탈출구의 화이트리스트가 변경 verb를 거부하는지
+- LLM이 kubectl args를 직접 조립하는 경로가 없는지 (탈출구 제거 확인)
 """
-from types import SimpleNamespace
-
 from kukie.skills import SKILLS
 from kukie.skills.base import COMMON_TOOLS
 from kukie.tools.mutate import MUTATE_TOOLS, MUTATING_TOOLS, RISK_STICKERS, Risk
-from kukie.tools.read import run_readonly_kubectl
-
-
-def _dummy_ctx():
-    return SimpleNamespace(deps=SimpleNamespace(context="test", namespace="default"))
+from kukie.tools.read import READ_TOOLS
 
 
 def test_훅_대상은_변경_함수_목록에서_자동_파생된다():
@@ -33,18 +27,18 @@ def test_delete만_destructive_나머지_변경은_caution():
         assert RISK_STICKERS[name] is Risk.CAUTION
 
 
-def test_읽기_탈출구는_변경_verb를_거부한다():
-    """fail-closed: 화이트리스트에 없으면 실행하지 않고 거부."""
-    for args in (
-        ["delete", "pod", "nginx"],
-        ["apply", "-f", "x.yaml"],
-        ["scale", "deployment", "nginx", "--replicas=0"],
-        ["rollout", "restart", "deployment/nginx"],  # rollout status만 허용
-        ["config", "use-context", "prod"],           # config view만 허용
-        [],
-    ):
-        result = run_readonly_kubectl(_dummy_ctx(), args)
-        assert result.success is False, f"차단됐어야 함: {args}"
+def test_LLM이_kubectl_args를_직접_조립하는_툴이_없다():
+    """팀 결정: 자유형 args를 받는 툴(탈출구) 없음 — 모든 명령은 코드가 조립."""
+    for tool in [*READ_TOOLS, *MUTATE_TOOLS]:
+        params = tool.__code__.co_varnames[: tool.__code__.co_argcount]
+        assert "args" not in params, f"{tool.__name__}이 자유형 args를 받음"
+
+
+def test_읽기_툴은_5종이다():
+    assert {t.__name__ for t in READ_TOOLS} == {
+        "list_resources", "describe_resource", "get_events",
+        "get_logs", "explain_command",
+    }
 
 
 def test_스킬_레지스트리와_공통_툴():
