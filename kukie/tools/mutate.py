@@ -17,7 +17,7 @@ from enum import IntEnum
 from pydantic_ai import RunContext
 
 from kukie.deps import Deps
-from kukie.kubectl import KubectlResult
+from kukie.kubectl import KubectlResult, assemble, run_kubectl
 
 
 class Risk(IntEnum):
@@ -27,35 +27,54 @@ class Risk(IntEnum):
     DESTRUCTIVE = 2  # 이중 확인
 
 
+# 본체 공통 패턴: 자기 인자로 assemble() 조립 → run_kubectl() 실행.
+# 훅도 같은 assemble()을 승인 화면용으로 부르므로 결과가 항상 동일하다.
+# intent/expected_effects/side_effects는 본체에서 쓰지 않는다 — LLM이 툴을 호출할 때
+# 필수로 채우게 강제해서 훅이 Plan·승인 화면에 쓰게 하는 용도.
+
+
 def apply_manifest(ctx: RunContext[Deps], manifest_yaml: str,
                    intent: str, expected_effects: list[str],
-                   side_effects: list[str]) -> KubectlResult:
-    """매니페스트를 클러스터에 적용한다 (kubectl apply).
+                   side_effects: list[str],
+                   namespace: str | None = None) -> KubectlResult:
+    """매니페스트(YAML)를 클러스터에 적용한다 (kubectl apply -f -).
 
     리소스 생성·수정은 대부분 이 툴로 한다 (선언형 — create/expose/label 등은
-    매니페스트를 만들어 apply하는 것으로 대체).
+    매니페스트를 만들어 apply하는 것으로 대체). 매니페스트에 namespace가 없으면
+    namespace 인자(미지정 시 세션 기본값)를 -n으로 붙인다.
     intent(왜)/expected_effects(예상 영향)/side_effects(부작용)는 사용자가
     이해할 수 있는 말로 구체적으로 채운다 — 승인 화면과 기록에 표시된다.
     """
-    raise NotImplementedError  # TODO: 훅이 전달한 조립 args 실행
+    args = assemble("apply_manifest",
+                    {"namespace": namespace or ctx.deps.namespace})
+    return run_kubectl(args, context=ctx.deps.context, stdin=manifest_yaml)
+
 
 def scale_resource(ctx: RunContext[Deps], kind: str, name: str, replicas: int,
                    namespace: str, intent: str, expected_effects: list[str],
                    side_effects: list[str]) -> KubectlResult:
-    """리소스의 레플리카 수를 조정한다 (kubectl scale)."""
-    raise NotImplementedError  # TODO
+    """리소스의 레플리카 수를 조정한다 (kubectl scale). Deployment/StatefulSet/ReplicaSet 대상."""
+    args = assemble("scale_resource",
+                    {"kind": kind, "name": name, "replicas": replicas, "namespace": namespace})
+    return run_kubectl(args, context=ctx.deps.context)
+
 
 def rollout_restart(ctx: RunContext[Deps], kind: str, name: str, namespace: str,
                     intent: str, expected_effects: list[str],
                     side_effects: list[str]) -> KubectlResult:
-    """Deployment 등을 재시작한다 (kubectl rollout restart)."""
-    raise NotImplementedError  # TODO
+    """Deployment 등을 재시작한다 (kubectl rollout restart). 파드를 순차 교체한다."""
+    args = assemble("rollout_restart",
+                    {"kind": kind, "name": name, "namespace": namespace})
+    return run_kubectl(args, context=ctx.deps.context)
+
 
 def delete_resource(ctx: RunContext[Deps], kind: str, name: str, namespace: str,
                     intent: str, expected_effects: list[str],
                     side_effects: list[str]) -> KubectlResult:
-    """리소스를 삭제한다 (kubectl delete). 이중 승인 대상."""
-    raise NotImplementedError  # TODO
+    """리소스를 삭제한다 (kubectl delete). destructive — 이중 승인 대상."""
+    args = assemble("delete_resource",
+                    {"kind": kind, "name": name, "namespace": namespace})
+    return run_kubectl(args, context=ctx.deps.context)
 
 
 MUTATE_TOOLS = [apply_manifest, scale_resource, rollout_restart, delete_resource]

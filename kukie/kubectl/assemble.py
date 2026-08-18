@@ -1,8 +1,10 @@
 """툴별 kubectl args 조립 함수 — 여기 한 벌만 존재한다.
 
-가드레일 훅(②단계)이 호출하고, 조립 결과가 판정→승인→실행까지
-그대로 전달된다. 다른 곳에서 재조립하면 "승인된 명령 ≠ 실행된 명령"이
-될 수 있으므로 금지 (기능 2 §1.1).
+가드레일 훅(①단계)이 승인 화면용으로, 툴 본체가 실행용으로 각각 호출한다.
+둘이 같은 함수·같은 입력이라 결과가 항상 같다 → "승인된 명령 = 실행된 명령".
+그래서 조립은 **순수 함수**여야 한다 — 시각·랜덤·파일 생성 같은 부수효과 금지.
+(apply의 매니페스트는 임시파일 대신 `-f -` + stdin으로 넘겨 이 원칙을 지킨다.)
+조립 로직을 다른 곳에 한 벌 더 만드는 것도 금지 (기능 2 §1.1 "재조립 금지").
 """
 from __future__ import annotations
 
@@ -22,8 +24,13 @@ def _scale_resource(a: dict) -> list[str]:
 
 
 def _apply_manifest(a: dict) -> list[str]:
-    # TODO: 매니페스트를 임시 파일로 저장 후 -f 경로 전달
-    raise NotImplementedError
+    # 매니페스트 본문은 args에 안 넣는다 — run_kubectl(stdin=manifest_yaml)로 따로 전달.
+    # 임시파일을 만들면 조립이 순수하지 않게 되고(호출마다 경로가 달라짐)
+    # 승인 화면 명령과 실행 명령이 어긋날 수 있다.
+    args = ["apply", "-f", "-"]
+    if a.get("namespace"):
+        args += ["-n", a["namespace"]]
+    return args
 
 
 def _rollout_restart(a: dict) -> list[str]:
