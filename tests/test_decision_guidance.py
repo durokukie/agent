@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,11 @@ def _ready_plan(monkeypatch, tmp_path: Path) -> ActionPlan:
     return plan
 
 
+def test_guidance_agent_uses_luna_with_medium_reasoning():
+    assert guidance_agent.model == "openai:gpt-5.6-luna"
+    assert guidance_agent.model_settings == {"openai_reasoning_effort": "medium"}
+
+
 @pytest.mark.asyncio
 async def test_generate_decision_guidance_returns_stripped_text(monkeypatch, tmp_path):
     plan = _ready_plan(monkeypatch, tmp_path)
@@ -48,6 +54,24 @@ async def test_generate_decision_guidance_returns_stripped_text(monkeypatch, tmp
     assert guidance == "실행 시간과 롤백 기준을 확인한다."
     metadata, _ = plan._read()
     assert metadata["decision_guidance"] is None
+
+
+@pytest.mark.asyncio
+async def test_generate_decision_guidance_loads_openai_key_from_dotenv(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    (tmp_path / ".env").write_text(
+        "OPENAI_API_KEY=test-openai-key\n",
+        encoding="utf-8",
+    )
+    plan = _ready_plan(monkeypatch, tmp_path)
+
+    with guidance_agent.override(model=TestModel(custom_output_text="추가 판단 없음")):
+        await generate_decision_guidance(plan)
+
+    assert os.environ["OPENAI_API_KEY"] == "test-openai-key"
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 """승인 전 Action Plan에서 사용자의 추가 판단 항목을 생성한다."""
 from __future__ import annotations
 
+from dotenv import load_dotenv
 from pydantic_ai import Agent
 
 from kukie.guardrail.action_plan import ActionPlan
@@ -20,15 +21,17 @@ INSTRUCTIONS = """너는 아직 승인되지 않은 Kubernetes Action Plan의 �
 - 설명문만 반환한다."""
 
 guidance_agent = Agent(
-    "anthropic:claude-sonnet-4-6",
+    "openai:gpt-5.6-luna",
     name="action-plan-decision-guidance",
     output_type=str,
     instructions=INSTRUCTIONS,
+    model_settings={"openai_reasoning_effort": "medium"},
     defer_model_check=True,
 )
 
 
 async def generate_decision_guidance(plan: ActionPlan) -> str:
+    load_dotenv(".env")
     plan.validate_for_decision_guidance()
     context = plan.render(include_decision_guidance=False)
     result = await guidance_agent.run(context)
