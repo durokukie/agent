@@ -211,15 +211,12 @@ def test_mark_rejects_unknown_status(monkeypatch, tmp_path):
         plan.mark("approved")
 
 
-def test_guidance_context_uses_in_memory_fields(monkeypatch, tmp_path):
+def test_validate_for_decision_guidance_uses_in_memory_fields(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
     plan.record_dry_run("dry-run ok", True)
     plan.path.write_text("broken", encoding="utf-8")
 
-    context = plan.guidance_context()
-
-    assert "scale_resource" in context
-    assert "nginx 실습 환경의 레플리카를 늘린다." in context
+    plan.validate_for_decision_guidance()
 
 
 def test_write_cleans_up_temp_file_when_write_fails(monkeypatch, tmp_path):
@@ -263,23 +260,25 @@ def test_update_rolls_back_object_when_write_fails(monkeypatch, tmp_path):
     assert plan.status == "draft"
 
 
-def test_guidance_context_requires_successful_dry_run(monkeypatch, tmp_path):
+def test_validate_for_decision_guidance_requires_successful_dry_run(
+    monkeypatch, tmp_path
+):
     plan = _create_plan(monkeypatch, tmp_path)
 
     with pytest.raises(ValueError, match="dry_run_result.success must be true"):
-        plan.guidance_context()
+        plan.validate_for_decision_guidance()
 
     plan.record_dry_run("dry-run rejected", False)
 
     with pytest.raises(ValueError, match="dry_run_result.success must be true"):
-        plan.guidance_context()
+        plan.validate_for_decision_guidance()
 
 
-def test_guidance_context_contains_plan_except_guidance(monkeypatch, tmp_path):
+def test_render_contains_plan_except_guidance(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
     plan.record_dry_run("dry-run ok", True)
 
-    context = plan.guidance_context()
+    context = plan.render(include_decision_guidance=False)
 
     assert "decision_guidance" not in context
     assert "scale_resource" in context
@@ -289,13 +288,15 @@ def test_guidance_context_contains_plan_except_guidance(monkeypatch, tmp_path):
     assert "추가 Pod가 노드 자원을 사용한다." in context
 
 
-def test_guidance_context_names_empty_object_field(monkeypatch, tmp_path):
+def test_validate_for_decision_guidance_names_empty_object_field(
+    monkeypatch, tmp_path
+):
     plan = _create_plan(monkeypatch, tmp_path)
     plan.record_dry_run("dry-run ok", True)
     plan.intent = ""
 
     with pytest.raises(ValueError, match="missing=intent"):
-        plan.guidance_context()
+        plan.validate_for_decision_guidance()
 
 
 @pytest.mark.parametrize(
@@ -308,7 +309,7 @@ def test_guidance_context_names_empty_object_field(monkeypatch, tmp_path):
         ("risk_level", ""),
     ],
 )
-def test_guidance_context_names_missing_required_field(
+def test_validate_for_decision_guidance_names_missing_required_field(
     monkeypatch, tmp_path, key, value
 ):
     plan = _create_plan(monkeypatch, tmp_path)
@@ -316,26 +317,30 @@ def test_guidance_context_names_missing_required_field(
     setattr(plan, key, value)
 
     with pytest.raises(ValueError, match=f"missing={key}"):
-        plan.guidance_context()
+        plan.validate_for_decision_guidance()
 
 
-def test_guidance_context_fails_on_first_missing_field(monkeypatch, tmp_path):
+def test_validate_for_decision_guidance_fails_on_first_missing_field(
+    monkeypatch, tmp_path
+):
     plan = _create_plan(monkeypatch, tmp_path)
     plan.record_dry_run("dry-run ok", True)
     plan.tool = ""
     plan.intent = ""
 
     with pytest.raises(ValueError, match=r"missing=tool$"):
-        plan.guidance_context()
+        plan.validate_for_decision_guidance()
 
 
-def test_guidance_context_rejects_wrong_lifecycle_state(monkeypatch, tmp_path):
+def test_validate_for_decision_guidance_rejects_wrong_lifecycle_state(
+    monkeypatch, tmp_path
+):
     plan = _create_plan(monkeypatch, tmp_path)
     plan.record_dry_run("dry-run ok", True)
     plan.record_approval("single")
 
     with pytest.raises(ValueError, match="approval must be empty"):
-        plan.guidance_context()
+        plan.validate_for_decision_guidance()
 
 
 def test_record_decision_guidance_persists_text(monkeypatch, tmp_path):

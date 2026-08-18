@@ -145,7 +145,7 @@ class ActionPlan:
             f"## Side Effects\n\n{_bullets(self.side_effects)}\n"
         )
 
-    def _render(self, *, include_decision_guidance: bool = True) -> str:
+    def render(self, *, include_decision_guidance: bool = True) -> str:
         metadata = self._metadata()
         if not include_decision_guidance:
             metadata.pop("decision_guidance")
@@ -167,7 +167,7 @@ class ActionPlan:
                 delete=False,
             ) as temp:
                 temp_path = Path(temp.name)
-                temp.write(self._render())
+                temp.write(self.render())
             if exclusive:
                 # hardlink_to는 대상 이름이 이미 존재하면 FileExistsError를 내고 절대 덮어쓰지 않는다.
                 # 이 성질을 "없을 때만 생성"의 원자적 잠금으로 쓴다 (create_draft 전용).
@@ -230,7 +230,7 @@ class ActionPlan:
             setattr(self, key, previous)
             raise
 
-    def guidance_context(self) -> str:
+    def validate_for_decision_guidance(self) -> None:
         required = (
             "id",
             "created_at",
@@ -267,7 +267,6 @@ class ActionPlan:
             raise ValueError(
                 "ActionPlan is not ready for guidance: decision guidance already exists"
             )
-        return self._render(include_decision_guidance=False)
 
     def record_decision_guidance(self, text: str) -> None:
         guidance = text.strip()
