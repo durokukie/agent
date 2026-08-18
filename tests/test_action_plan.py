@@ -69,6 +69,24 @@ def test_create_draft_writes_frontmatter_and_body(monkeypatch, tmp_path):
     assert "## Side Effects\n\n- 추가 Pod가 노드 자원을 사용한다." in body
 
 
+def test_create_draft_keeps_structured_fields_in_memory(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+
+    assert plan.tool == "scale_resource"
+    assert plan.skill == "실습"
+    assert plan.target["name"] == "nginx"
+    assert plan.command[-1] == "study"
+    assert plan.risk_level == "caution"
+    assert plan.status == "draft"
+    assert plan.intent == "nginx 실습 환경의 레플리카를 늘린다."
+    assert plan.expected_effects == ["nginx Deployment의 레플리카가 3개로 변경된다."]
+    assert plan.side_effects == ["추가 Pod가 노드 자원을 사용한다."]
+    assert plan.dry_run_result is None
+    assert plan.decision_guidance is None
+    assert plan.approval is None
+    assert plan.execution_result is None
+
+
 def test_create_draft_uses_minute_and_safe_tool_in_unique_filename(monkeypatch, tmp_path):
     monkeypatch.setattr(
         action_plan,
@@ -153,6 +171,9 @@ def test_record_methods_update_frontmatter_and_preserve_body(monkeypatch, tmp_pa
     assert metadata["execution_result"]["output"] == "scaled"
     assert datetime.fromisoformat(metadata["execution_result"]["at"]).tzinfo is not None
     assert body == original_body
+    assert plan.dry_run_result == metadata["dry_run_result"]
+    assert plan.approval == metadata["approval"]
+    assert plan.execution_result == metadata["execution_result"]
 
 
 def test_dry_run_failure_is_recorded_and_plan_is_kept(monkeypatch, tmp_path):
@@ -168,6 +189,8 @@ def test_dry_run_failure_is_recorded_and_plan_is_kept(monkeypatch, tmp_path):
     assert datetime.fromisoformat(metadata["dry_run_result"]["at"]).tzinfo is not None
     assert metadata["execution_result"] is None
     assert plan.path.exists()
+    assert plan.status == "failed"
+    assert plan.dry_run_result == metadata["dry_run_result"]
 
 
 @pytest.mark.parametrize("status", ["executed", "failed", "rejected"])
@@ -178,6 +201,7 @@ def test_mark_accepts_final_statuses(monkeypatch, tmp_path, status):
 
     metadata, _ = _read_plan(plan.path)
     assert metadata["status"] == status
+    assert plan.status == status
 
 
 def test_mark_rejects_unknown_status(monkeypatch, tmp_path):
@@ -187,15 +211,20 @@ def test_mark_rejects_unknown_status(monkeypatch, tmp_path):
         plan.mark("approved")
 
 
-def test_update_rejects_invalid_frontmatter(monkeypatch, tmp_path):
+def test_guidance_context_uses_in_memory_fields(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
+    plan.record_dry_run("dry-run ok", True)
     plan.path.write_text("broken", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="invalid Action Plan frontmatter"):
-        plan.mark("failed")
+    context = plan.guidance_context()
+
+    assert "scale_resource" in context
+    assert "nginx 실습 환경의 레플리카를 늘린다." in context
 
 
 def test_write_cleans_up_temp_file_when_write_fails(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+    plan.path.unlink()
     real_temp = real_named_temporary_file("w", dir=tmp_path, delete=False)
 
     class FailingTemporaryFile:
@@ -213,12 +242,25 @@ def test_write_cleans_up_temp_file_when_write_fails(monkeypatch, tmp_path):
             raise OSError("simulated write failure")
 
     monkeypatch.setattr(action_plan, "NamedTemporaryFile", lambda *args, **kwargs: FailingTemporaryFile())
-    plan = ActionPlan("ap-test", tmp_path / "plan.md")
 
     with pytest.raises(OSError, match="simulated write failure"):
-        plan._write({}, "body")
+        plan._write()
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_update_rolls_back_object_when_write_fails(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+
+    def fail_write():
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr(plan, "_write", fail_write)
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        plan.mark("failed")
+
+    assert plan.status == "draft"
 
 
 def test_guidance_context_requires_successful_dry_run(monkeypatch, tmp_path):
@@ -247,18 +289,12 @@ def test_guidance_context_contains_plan_except_guidance(monkeypatch, tmp_path):
     assert "추가 Pod가 노드 자원을 사용한다." in context
 
 
-def test_guidance_context_names_empty_body_section(monkeypatch, tmp_path):
+def test_guidance_context_names_empty_object_field(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
     plan.record_dry_run("dry-run ok", True)
-    metadata, _ = plan._read()
-    plan._write(
-        metadata,
-        "# Intent\n\n\n\n"
-        "## Expected Effects\n\n- 레플리카가 3개가 된다.\n\n"
-        "## Side Effects\n\n- 추가 Pod가 자원을 사용한다.\n",
-    )
+    plan.intent = ""
 
-    with pytest.raises(ValueError, match="intent"):
+    with pytest.raises(ValueError, match="missing=intent"):
         plan.guidance_context()
 
 
@@ -272,16 +308,24 @@ def test_guidance_context_names_empty_body_section(monkeypatch, tmp_path):
         ("risk_level", ""),
     ],
 )
-def test_guidance_context_names_missing_required_metadata(
+def test_guidance_context_names_missing_required_field(
     monkeypatch, tmp_path, key, value
 ):
     plan = _create_plan(monkeypatch, tmp_path)
     plan.record_dry_run("dry-run ok", True)
-    metadata, body = plan._read()
-    metadata[key] = value
-    plan._write(metadata, body)
+    setattr(plan, key, value)
 
-    with pytest.raises(ValueError, match=key):
+    with pytest.raises(ValueError, match=f"missing={key}"):
+        plan.guidance_context()
+
+
+def test_guidance_context_fails_on_first_missing_field(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+    plan.record_dry_run("dry-run ok", True)
+    plan.tool = ""
+    plan.intent = ""
+
+    with pytest.raises(ValueError, match=r"missing=tool$"):
         plan.guidance_context()
 
 
@@ -301,6 +345,7 @@ def test_record_decision_guidance_persists_text(monkeypatch, tmp_path):
 
     metadata, _ = _read_plan(plan.path)
     assert metadata["decision_guidance"] == "배포 시간과 롤백 기준을 확인한다."
+    assert plan.decision_guidance == "배포 시간과 롤백 기준을 확인한다."
 
 
 def test_record_decision_guidance_rejects_empty_or_overwrite(monkeypatch, tmp_path):
@@ -313,3 +358,26 @@ def test_record_decision_guidance_rejects_empty_or_overwrite(monkeypatch, tmp_pa
 
     with pytest.raises(ValueError, match="decision guidance already exists"):
         plan.record_decision_guidance("두 번째 판단")
+
+
+def test_load_reconstructs_structured_plan(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+    plan.record_dry_run("dry-run ok", True)
+    plan.record_decision_guidance("배포 시간과 롤백 기준을 확인한다.")
+
+    loaded = ActionPlan.load(plan.path)
+
+    assert loaded.id == plan.id
+    assert loaded.path == plan.path
+    assert loaded.created_at == plan.created_at
+    assert loaded.tool == plan.tool
+    assert loaded.skill == plan.skill
+    assert loaded.target == plan.target
+    assert loaded.command == plan.command
+    assert loaded.risk_level == plan.risk_level
+    assert loaded.status == "draft"
+    assert loaded.intent == plan.intent
+    assert loaded.expected_effects == plan.expected_effects
+    assert loaded.side_effects == plan.side_effects
+    assert loaded.dry_run_result == plan.dry_run_result
+    assert loaded.decision_guidance == plan.decision_guidance
