@@ -59,6 +59,7 @@ def test_create_draft_writes_frontmatter_and_body(monkeypatch, tmp_path):
         "risk_level": "caution",
         "status": "draft",
         "dry_run_result": None,
+        "decision_guidance": None,
         "approval": None,
         "execution_result": None,
     }
@@ -218,3 +219,97 @@ def test_write_cleans_up_temp_file_when_write_fails(monkeypatch, tmp_path):
         plan._write({}, "body")
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_guidance_context_requires_successful_dry_run(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError, match="dry_run_result.success must be true"):
+        plan.guidance_context()
+
+    plan.record_dry_run("dry-run rejected", False)
+
+    with pytest.raises(ValueError, match="dry_run_result.success must be true"):
+        plan.guidance_context()
+
+
+def test_guidance_context_contains_plan_except_guidance(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+    plan.record_dry_run("dry-run ok", True)
+
+    context = plan.guidance_context()
+
+    assert "decision_guidance" not in context
+    assert "scale_resource" in context
+    assert "--replicas=3" in context
+    assert "dry-run ok" in context
+    assert "nginx 실습 환경의 레플리카를 늘린다." in context
+    assert "추가 Pod가 노드 자원을 사용한다." in context
+
+
+def test_guidance_context_names_empty_body_section(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+    plan.record_dry_run("dry-run ok", True)
+    metadata, _ = plan._read()
+    plan._write(
+        metadata,
+        "# Intent\n\n\n\n"
+        "## Expected Effects\n\n- 레플리카가 3개가 된다.\n\n"
+        "## Side Effects\n\n- 추가 Pod가 자원을 사용한다.\n",
+    )
+
+    with pytest.raises(ValueError, match="intent"):
+        plan.guidance_context()
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("tool", ""),
+        ("skill", ""),
+        ("target", {}),
+        ("command", []),
+        ("risk_level", ""),
+    ],
+)
+def test_guidance_context_names_missing_required_metadata(
+    monkeypatch, tmp_path, key, value
+):
+    plan = _create_plan(monkeypatch, tmp_path)
+    plan.record_dry_run("dry-run ok", True)
+    metadata, body = plan._read()
+    metadata[key] = value
+    plan._write(metadata, body)
+
+    with pytest.raises(ValueError, match=key):
+        plan.guidance_context()
+
+
+def test_guidance_context_rejects_wrong_lifecycle_state(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+    plan.record_dry_run("dry-run ok", True)
+    plan.record_approval("single")
+
+    with pytest.raises(ValueError, match="approval must be empty"):
+        plan.guidance_context()
+
+
+def test_record_decision_guidance_persists_text(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+
+    plan.record_decision_guidance("  배포 시간과 롤백 기준을 확인한다.  ")
+
+    metadata, _ = _read_plan(plan.path)
+    assert metadata["decision_guidance"] == "배포 시간과 롤백 기준을 확인한다."
+
+
+def test_record_decision_guidance_rejects_empty_or_overwrite(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError, match="decision guidance must not be empty"):
+        plan.record_decision_guidance("   ")
+
+    plan.record_decision_guidance("첫 판단")
+
+    with pytest.raises(ValueError, match="decision guidance already exists"):
+        plan.record_decision_guidance("두 번째 판단")

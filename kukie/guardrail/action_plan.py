@@ -61,6 +61,7 @@ class ActionPlan:
             "risk_level": risk,
             "status": "draft",
             "dry_run_result": None,
+            "decision_guidance": None,
             "approval": None,
             "execution_result": None,
         }
@@ -135,6 +136,82 @@ class ActionPlan:
     def _update(self, key: str, value: object) -> None:
         metadata, body = self._read()
         metadata[key] = value
+        self._write(metadata, body)
+
+    def guidance_context(self) -> str:
+        metadata, body = self._read()
+        required = (
+            "id",
+            "created_at",
+            "tool",
+            "skill",
+            "target",
+            "command",
+            "risk_level",
+        )
+        missing = [key for key in required if not metadata.get(key)]
+
+        prefix = "# Intent\n\n"
+        effects_marker = "\n\n## Expected Effects\n\n"
+        side_effects_marker = "\n\n## Side Effects\n\n"
+        try:
+            if not body.startswith(prefix):
+                raise ValueError
+            intent, rest = body.removeprefix(prefix).split(effects_marker, 1)
+            expected_effects, side_effects = rest.split(side_effects_marker, 1)
+        except ValueError:
+            missing.extend(("intent", "expected_effects", "side_effects"))
+        else:
+            sections = {
+                "intent": intent,
+                "expected_effects": expected_effects.strip().strip("-").strip(),
+                "side_effects": side_effects.strip().strip("-").strip(),
+            }
+            missing.extend(name for name, value in sections.items() if not value)
+
+        if missing:
+            raise ValueError(
+                f"ActionPlan is not ready for guidance: missing={missing}"
+            )
+        if metadata.get("status") != "draft":
+            raise ValueError("ActionPlan is not ready for guidance: status must be draft")
+
+        dry_run = metadata.get("dry_run_result")
+        if not isinstance(dry_run, dict) or dry_run.get("success") is not True:
+            raise ValueError(
+                "ActionPlan is not ready for guidance: "
+                "dry_run_result.success must be true"
+            )
+        if metadata.get("approval") is not None:
+            raise ValueError("ActionPlan is not ready for guidance: approval must be empty")
+        if metadata.get("execution_result") is not None:
+            raise ValueError(
+                "ActionPlan is not ready for guidance: execution_result must be empty"
+            )
+        if metadata.get("decision_guidance") is not None:
+            raise ValueError(
+                "ActionPlan is not ready for guidance: decision guidance already exists"
+            )
+
+        context = dict(metadata)
+        context.pop("decision_guidance", None)
+        return (
+            "---\n"
+            f"{yaml.safe_dump(context, sort_keys=False, allow_unicode=True)}"
+            "---\n"
+            f"{body}"
+        )
+
+    def record_decision_guidance(self, text: str) -> None:
+        guidance = text.strip()
+        if not guidance:
+            raise ValueError("decision guidance must not be empty")
+
+        metadata, body = self._read()
+        if metadata.get("decision_guidance") is not None:
+            raise ValueError("decision guidance already exists")
+
+        metadata["decision_guidance"] = guidance
         self._write(metadata, body)
 
     def record_dry_run(self, output: str, ok: bool) -> None:
