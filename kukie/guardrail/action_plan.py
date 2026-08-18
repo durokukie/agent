@@ -69,6 +69,9 @@ class ActionPlan:
             f"## Expected Effects\n\n{_bullets(expected_effects)}\n\n"
             f"## Side Effects\n\n{_bullets(side_effects)}\n"
         )
+        # 파일명 원자적 예약: "있나 확인 → 쓰기"로 나누면 확인과 쓰기 사이에 다른 프로세스가
+        # 같은 이름을 잡을 수 있다. 확인 없이 exclusive 쓰기를 시도하고, 이미 있으면(FileExistsError)
+        # 다음 번호로 재시도한다 — 판단이 "쓰는 순간" OS에서 이뤄져 틈이 없다.
         suffix = 1
         while True:
             plan_id = base_id if suffix == 1 else f"{base_id}-{suffix}"
@@ -76,7 +79,7 @@ class ActionPlan:
             metadata["id"] = plan_id
             try:
                 plan._write(metadata, body, exclusive=True)
-            except FileExistsError:
+            except FileExistsError:   # 누군가 먼저 이 이름을 썼음 → -2, -3 …
                 suffix += 1
             else:
                 return plan
@@ -106,8 +109,12 @@ class ActionPlan:
                 temp_path = Path(temp.name)
                 temp.write(content)
             if exclusive:
+                # hardlink_to는 대상 이름이 이미 존재하면 FileExistsError를 내고 절대 덮어쓰지 않는다.
+                # 이 성질을 "없을 때만 생성"의 원자적 잠금으로 쓴다 (create_draft 전용).
+                # 임시파일에 먼저 다 쓰고 이름을 붙이므로 반쪽 파일도 남지 않는다.
                 self.path.hardlink_to(temp_path)
             else:
+                # replace는 대상이 있으면 덮어쓴다 — 기존 Plan 갱신용 (record_*, mark).
                 temp_path.replace(self.path)
         finally:
             if temp_path is not None:
