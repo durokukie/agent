@@ -44,7 +44,7 @@
 
 `run_kubectl`을 가로채 조립된 명령을 검사했다. 전부 기대대로 조립됨.
 
-```
+```text
 list_resources 기본      kubectl --context kind-dev get pods -n study -o wide
 list_resources 전체ns    kubectl --context kind-dev get pods --all-namespaces -o wide
 describe                 kubectl --context kind-dev describe pod nginx-1 -n study

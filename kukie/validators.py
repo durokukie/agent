@@ -35,13 +35,24 @@ def _flags_in(command: str) -> set[str]:
         if skip_next:
             skip_next = False
             continue
-        if tok == "--context":
-            skip_next = True
+        if tok == "--context" or tok.startswith("--context="):
+            skip_next = tok == "--context"        # 띄어쓰기 형식이면 다음 토큰(값)도 건너뜀
             continue
         if tok in _SKIP_TOKENS or not tok.startswith("-"):
             continue
         flags.add(tok.split("=", 1)[0])
     return flags
+
+
+def _flags_explained(explanations) -> set[str]:
+    """explanations의 field들에서 플래그를 뽑아 집합으로. 부분 문자열 비교를 피하기 위해
+    field 하나하나를 토큰화한다 ('-c'가 '--context' 안에 들어 있다고 통과되지 않게)."""
+    found: set[str] = set()
+    for e in explanations:
+        for tok in e.field.split():
+            if tok.startswith("-"):
+                found.add(tok.split("=", 1)[0])
+    return found
 
 
 def enforce_explanations(ctx: RunContext[Deps], output: KukieResponse) -> KukieResponse:
@@ -60,8 +71,7 @@ def enforce_explanations(ctx: RunContext[Deps], output: KukieResponse) -> KukieR
                 "명령의 각 플래그·필드가 무엇을 하는지 연수생이 이해할 수 있게 채워라."
             )
 
-        explained = " ".join(e.field for e in step.explanations)
-        missing = sorted(f for f in _flags_in(step.command) if f not in explained)
+        missing = sorted(_flags_in(step.command) - _flags_explained(step.explanations))
         if missing:
             raise ModelRetry(
                 f"step {i} ('{step.command}')의 explanations에 다음 플래그 설명이 빠졌다: "

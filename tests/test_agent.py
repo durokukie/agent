@@ -93,3 +93,29 @@ def test_명령을_실행하지_않은_응답은_설명_없이도_통과한다()
     with agent.override(model=m):
         result = agent.run_sync("Deployment가 뭐예요?", deps=_deps())
     assert result.output.steps == []
+
+
+# ── 3. 검증기 세부 (CodeRabbit 지적 반영) ────────────────────
+
+def test_context_등호_형식은_설명_대상에서_제외된다():
+    """--context=kind-dev 처럼 =로 붙은 형식도 세션 정보라 설명을 요구하지 않는다."""
+    step = {**GOOD_STEP,
+            "command": "kubectl --context=kind-dev get pods -n study -o wide"}
+    m = TestModel(call_tools=[], custom_output_args=_response(step))
+    with agent.override(model=m):
+        result = agent.run_sync("파드 보여줘", deps=_deps())
+    assert result.output.steps                       # 반려 없이 통과
+
+
+def test_플래그는_부분_문자열이_아니라_토큰_단위로_비교한다():
+    """'-c'가 '--context' 안에 들어 있다는 이유로 통과되면 안 된다."""
+    step = {**GOOD_STEP,
+            "command": "kubectl --context kind-dev logs nginx -n study -c app",
+            "explanations": [
+                {"field": "logs", "meaning": "로그"},
+                {"field": "-n study", "meaning": "ns"},
+                {"field": "--context 설명", "meaning": "..."},   # -c 는 없음. --context 로 속이려 함
+            ]}
+    m = TestModel(call_tools=[], custom_output_args=_response(step))
+    with agent.override(model=m), pytest.raises(UnexpectedModelBehavior):
+        agent.run_sync("로그 봐줘", deps=_deps())

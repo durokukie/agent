@@ -1,6 +1,6 @@
 # Kukie 에이전트 호출 흐름 (함수 단위)
 
-> 기준: 가드레일 v2 코드 (2026-08-17). "파드 뭐 떠있어?" 한 문장이 처리되는 전 과정.
+> 기준: 가드레일 v2 코드 + PR #18/#19 (2026-08-18). "파드 뭐 떠있어?" 한 문장이 처리되는 전 과정.
 > 범례: 실선 = 우리 코드 / 점선 = pydantic-ai 내부(우리가 안 짬) / 회색 = 미구현
 
 ## 1. 전체 흐름 (읽기 요청)
@@ -24,8 +24,8 @@ flowchart TD
         L1 -->|"list_resources(kind='pods')"| T
         T["③ 툴 실행"] --> L2["④ LLM 2차 호출<br/>(툴 결과 첨부)<br/>'결과 보고 설명 작성'"]
         L2 -->|"툴 더 쓸래"| T
-        L2 -->|"최종 답: KukieResponse"| V["⑤ output_validator<br/>enforce_explanations()"]
-        V -->|"explanations 비면 ModelRetry"| L2
+        L2 -->|"최종 답: KukieResponse"| V["⑤ output_validator<br/>enforce_explanations()<br/>· 실행 step마다 explanations 필수<br/>· 명령 플래그(-x/--xx) 설명 필수<br/>· kubectl, --context 값은 제외"]
+        V -->|"설명 누락 또는 플래그 미설명 → ModelRetry"| L2
     end
 
     T -.->|"실제 호출"| RT
@@ -94,16 +94,16 @@ flowchart LR
 |---|---|---|---|
 | 세션·루프·렌더 | `main()` | `cli.py` | ❌ |
 | 스킬 결정 | `pick_skill()` | `router.py` | ✅ (/mode + sticky) |
-| 에이전트 설정 | `Agent(...)`, `add_target()`, `add_skill_prompt()` | `agent.py` | ✅ (툴 등록만 ❌) |
-| 툴 등록 | `FunctionToolset(READ_TOOLS).filtered(...)` | `agent.py` | ❌ 다음 작업 |
+| 에이전트 설정 | `Agent(...)`, `add_target()`, `add_skill_prompt()` | `agent.py` | ✅ |
+| 툴 등록 | `FunctionToolset(READ_TOOLS).filtered(...)` | `agent.py` | ✅ PR #19 (읽기 5종만) |
 | 읽기 툴 5종 | `list_resources` 등 | `tools/read.py` | ✅ |
 | 변경 툴 4종 | `delete_resource` 등 | `tools/mutate.py` | ❌ (훅 이후) |
 | 명령 조립 | `assemble()` | `kubectl/assemble.py` | 부분 (apply TODO) |
 | 실행 | `run_kubectl()` | `kubectl/runner.py` | ✅ |
 | 훅 파이프라인 | `guardrail()` | `guardrail/hook.py` | ❌ (팀원) |
-| Action Plan | `create_draft()`, `record_*()`, `mark()` | `guardrail/action_plan.py` | ✅ PR #18 (리뷰 중) |
+| Action Plan | `create_draft()`, `record_*()`, `mark()` | `guardrail/action_plan.py` | ✅ PR #18 머지 |
 | 승인 | `cli_approve()` | `guardrail/approval.py` | ❌ (앱 전환 시 ApprovalRequired 재설계) |
-| 설명 강제 | `enforce_explanations()` | `validators.py` | ❌ 다음 작업 |
+| 설명 강제 | `enforce_explanations()` | `validators.py` | ✅ PR #19 |
 | LLM 왕복 루프 | — | pydantic-ai 내부 | (우리 코드 아님) |
 
 ## 5. 누가 뭘 결정하나
