@@ -1,6 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile as real_named_temporary_file
+from threading import Barrier
 
 import pytest
 import yaml
@@ -83,6 +85,53 @@ def test_create_draft_uses_minute_and_safe_tool_in_unique_filename(monkeypatch, 
     assert second.path.name == f"{second.id}.md"
     assert metadata["tool"] == "scale resource/now"
     assert metadata["created_at"] == "2026-08-17T15:30:45.123456+00:00"
+
+
+def test_create_draft_reserves_unique_filename_atomically(monkeypatch, tmp_path):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    monkeypatch.setattr(
+        action_plan,
+        "_utc_now",
+        lambda: "2026-08-17T15:30:45.123456+00:00",
+    )
+    candidate = tmp_path / "ap-260817-1530-scale-resource.md"
+    barrier = Barrier(2)
+    original_exists = Path.exists
+
+    def raced_exists(path):
+        exists = original_exists(path)
+        if path == candidate:
+            barrier.wait(timeout=2)
+        return exists
+
+    def create_plan(label):
+        return ActionPlan.create_draft(
+            tool="scale resource",
+            command=["scale", label],
+            risk="caution",
+            skill="실습",
+            target={"name": label},
+            intent=label,
+            expected_effects=[],
+            side_effects=[],
+        )
+
+    monkeypatch.setattr(Path, "exists", raced_exists)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        plans = list(executor.map(create_plan, ["first", "second"]))
+
+    assert {plan.id for plan in plans} == {
+        "ap-260817-1530-scale-resource",
+        "ap-260817-1530-scale-resource-2",
+    }
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "ap-260817-1530-scale-resource.md",
+        "ap-260817-1530-scale-resource-2.md",
+    }
+    assert {
+        tuple(_read_plan(plan.path)[0]["command"])
+        for plan in plans
+    } == {("scale", "first"), ("scale", "second")}
 
 
 def test_record_methods_update_frontmatter_and_preserve_body(monkeypatch, tmp_path):

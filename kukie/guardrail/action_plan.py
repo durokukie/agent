@@ -51,17 +51,8 @@ class ActionPlan:
         timestamp = datetime.fromisoformat(created_at).strftime("%y%m%d-%H%M")
         tool_name = sub(r"[^\w-]+", "-", tool).strip("-") or "tool"
         base_id = f"ap-{timestamp}-{tool_name}"
-        plan_id = base_id
-        path = PLAN_DIR / f"{plan_id}.md"
-        suffix = 2
-        # ponytail: local single-writer naming; use O_EXCL if concurrent hooks are introduced.
-        while path.exists():
-            plan_id = f"{base_id}-{suffix}"
-            path = PLAN_DIR / f"{plan_id}.md"
-            suffix += 1
-        plan = cls(plan_id, path)
         metadata = {
-            "id": plan_id,
+            "id": base_id,
             "created_at": created_at,
             "tool": tool,
             "skill": skill,
@@ -78,10 +69,25 @@ class ActionPlan:
             f"## Expected Effects\n\n{_bullets(expected_effects)}\n\n"
             f"## Side Effects\n\n{_bullets(side_effects)}\n"
         )
-        plan._write(metadata, body)
-        return plan
+        suffix = 1
+        while True:
+            plan_id = base_id if suffix == 1 else f"{base_id}-{suffix}"
+            plan = cls(plan_id, PLAN_DIR / f"{plan_id}.md")
+            metadata["id"] = plan_id
+            try:
+                plan._write(metadata, body, exclusive=True)
+            except FileExistsError:
+                suffix += 1
+            else:
+                return plan
 
-    def _write(self, metadata: dict, body: str) -> None:
+    def _write(
+        self,
+        metadata: dict,
+        body: str,
+        *,
+        exclusive: bool = False,
+    ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         content = (
             "---\n"
@@ -99,7 +105,10 @@ class ActionPlan:
             ) as temp:
                 temp_path = Path(temp.name)
                 temp.write(content)
-            temp_path.replace(self.path)
+            if exclusive:
+                self.path.hardlink_to(temp_path)
+            else:
+                temp_path.replace(self.path)
         finally:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
