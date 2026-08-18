@@ -5,6 +5,7 @@
   MVP 제외 — 필요해지면 히스토리 기능과 함께 추가.
 - frontmatter(기계용) = 코드가 아는 사실 (명령·대상·등급·dry-run·승인·결과)
 - 본문(사람용) = LLM이 툴 인자로 제출한 intent/예상 영향/부작용 ("왜"의 기록)
+- decision_guidance = 승인 전 별도 LLM 검토가 작성하는 판단 보조 필드
 
 상태: draft → executed / failed / rejected. dry-run 실패도 failed 기록으로 보관한다.
 """
