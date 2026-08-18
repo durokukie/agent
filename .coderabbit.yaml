@@ -1,0 +1,14 @@
+# CodeRabbit 설정 — https://docs.coderabbit.ai/reference/configuration
+# 기본값은 기본 브랜치(main) 대상 PR만 자동 리뷰한다.
+# 이 저장소는 develop 대상 PR이 기본 흐름이므로 develop을 명시한다.
+
+language: ko-KR
+
+reviews:
+  profile: chill
+  review_status: false      # "Review skipped / Run configuration" 상태 메시지 비활성화
+  auto_review:
+    enabled: true
+    base_branches:
+      - develop
+      - main

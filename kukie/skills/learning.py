@@ -8,5 +8,5 @@ PROMPT = """지금은 학습 모드다. 클러스터를 변경하지 말고 개�
 SKILL = Skill(
     name="학습",
     prompt=PROMPT,
-    # 추가 툴 없음 — 공통 툴(list/explain/run_readonly)만으로 동작
+    # 추가 툴 없음 — 공통 툴(list_resources/explain_command)만으로 동작
 )
