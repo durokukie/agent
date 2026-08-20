@@ -4,12 +4,16 @@
 """
 from __future__ import annotations
 
+import os
+
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.tools import ToolDefinition
+from pydantic_ai.toolsets import FunctionToolset
 
 from kukie.deps import Deps
 from kukie.guardrail.hook import hooks as guardrail_hooks
 from kukie.skills.base import KukieResponse
-from kukie.validators import enforce_explanations
+from kukie.tools.read import READ_TOOLS
 
 BASE_PROMPT = """너는 쿠버네티스를 처음 배우는 연수생을 돕는 조수 Kukie다.
 1. kubectl 명령을 다룰 때는 각 플래그·필드의 의미를 explanations에 반드시 채운다.
@@ -20,29 +24,78 @@ BASE_PROMPT = """너는 쿠버네티스를 처음 배우는 연수생을 돕는 
    위험도는 시스템이 판정한다 — 네가 판정하거나 우회하거나 실행됐다고 말하지 마라.
    승인은 사용자가 CLI에서 직접 입력해야 성립한다."""
 
+# ── 툴 등록 ──────────────────────────────────────────────────
+# 읽기 5종만 등록한다. 변경 4종은 가드레일 훅 본체가 완성된 뒤 추가 (마일스톤 2) —
+# 훅 없이 등록하면 승인 없이 delete가 나갈 수 있다.
+_read_toolset: FunctionToolset[Deps] = FunctionToolset(READ_TOOLS)
+
+
+def _only_skill_tools(ctx: RunContext[Deps], tool_def: ToolDefinition) -> bool:
+    """현재 스킬(deps.skill)에 허용된 툴만 LLM에게 노출한다 (스킬 = 프롬프트+툴+응답형식)."""
+    return tool_def.name in ctx.deps.skill.allowed_tools
+
+
+toolset = _read_toolset.filtered(_only_skill_tools)
+
+
+# 모델은 환경변수로 지정한다. 미지정 시 'test'(TestModel) — 키 없이 import·테스트 가능.
+#   예: KUKIE_MODEL=anthropic:claude-sonnet-4-6  (ANTHROPIC_API_KEY 필요)
+# TODO: Model Adapter로 Upstage 등 교체 경계 정리 (Architecture.md 6.5)
+MODEL = os.environ.get("KUKIE_MODEL", "test")
+
 agent = Agent(
-    "anthropic:claude-sonnet-4-6",   # TODO: Model Adapter로 교체 가능하게 (Upstage 등)
+    MODEL,
     name="kukie",
     deps_type=Deps,
     output_type=KukieResponse,        # run마다 skill.output_type으로 오버라이드
     instructions=BASE_PROMPT,
+    toolsets=[toolset],               # 스킬 필터를 거친 툴 목록
     capabilities=[guardrail_hooks],   # 가드레일 훅 장착
 )
 
 
+# ── 동적 프롬프트 (등록형 함수) ────────────────────────────────
+# 아래 두 함수는 코드 어디에서도 직접 호출하지 않는다. 그런데도 매 run마다 실행된다.
+#
+# 이유는 `@agent.instructions` 데코레이터 때문이다.
+#   @agent.instructions
+#   def f(ctx): ...
+# 는 사실
+#   def f(ctx): ...
+#   f = agent.instructions(f)
+# 와 같다. 즉 정의 직후 f를 agent.instructions()에 넘겨서 "이 함수를 프롬프트 생성기로
+# 등록해라"라고 알려주는 것. 그 뒤로는 pydantic-ai가 run을 시작할 때마다 등록된 함수를
+# 전부 호출해 반환 문자열을 BASE_PROMPT 뒤에 이어 붙인다 (agent-flow.md 그림1 ①).
+#
+# 그래서 grep으로 호출부를 찾으면 안 나오지만 "미사용"이 아니다 — 지우면 그 프롬프트가
+# 조용히 사라진다. add_skill_prompt를 지우면 학습/진단/실습이 전부 똑같이 행동한다.
+#
+# 이 파일에서 같은 원리로 동작하는 등록형 함수:
+#   @agent.instructions      → 프롬프트 생성기 (아래 둘)
+#   FunctionToolset(...)     → 툴 (READ_TOOLS의 함수들; LLM이 이름으로 호출)
+#   @hooks.on.tool_execute   → 훅 (guardrail/hook.py의 guardrail())
+#   agent.output_validator() → 최종 출력 검사기 — 현재 미등록.
+#     explanations를 코드(FLAG_GLOSSARY)가 채우는 방향 확정(DURO-44)으로
+#     LLM 감시형 검증기는 제외. DURO-44에서 "사전 미등록 플래그 로그"로 부활 예정.
+#
+# 함수형(문자열 대신 함수)으로 두는 이유: BASE_PROMPT는 고정값이라 문자열로 충분하지만,
+# 아래 둘은 run마다 달라지는 값(현재 대상, 현재 스킬)을 ctx.deps에서 읽어야 하므로
+# 실행 시점에 계산돼야 한다.
+
 @agent.instructions
 def add_target(ctx: RunContext[Deps]) -> str:
-    """현재 작업 대상 주입 — 대화만으로 대상을 바꾸지 않는다."""
+    """현재 작업 대상 주입 — 대화만으로 대상을 바꾸지 않는다.
+
+    매 run 시작 시 pydantic-ai가 자동 호출. 반환값이 시스템 프롬프트에 추가된다.
+    """
     return f"현재 작업 대상: context={ctx.deps.context}, namespace={ctx.deps.namespace}"
 
 
 @agent.instructions
 def add_skill_prompt(ctx: RunContext[Deps]) -> str:
-    """현재 스킬의 전용 프롬프트 주입 (스킬 = 프롬프트+툴+응답형식)."""
+    """현재 스킬의 전용 프롬프트 주입 (스킬 = 프롬프트+툴+응답형식).
+
+    매 run 시작 시 pydantic-ai가 자동 호출. deps.skill이 학습이면 학습 프롬프트,
+    진단이면 진단 프롬프트가 붙는다 — 이게 "에이전트 하나로 모드를 갈아끼우는" 장치.
+    """
     return ctx.deps.skill.prompt
-
-
-agent.output_validator(enforce_explanations)
-
-# TODO: 툴 등록 — read.READ_TOOLS / mutate.MUTATE_TOOLS 를 @agent.tool로 연결
-# TODO: prepare(툴 필터)는 MVP 미적용 (프롬프트 유도) — 논의사항 1 참고
