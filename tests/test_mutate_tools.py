@@ -85,3 +85,23 @@ def test_assemble은_결정론적이다(tool, args):
 def test_모든_변경_툴에_위험도_스티커가_있다():
     for fn in mutate.MUTATE_TOOLS:
         assert fn.__name__ in mutate.RISK_STICKERS
+
+
+# ── kubectl 옵션 파싱 방어 (CodeRabbit 지적) ─────────────────
+
+@pytest.mark.parametrize("field,args", [
+    ("name",      {"kind": "deployment", "name": "--all", "namespace": "study"}),
+    ("name",      {"kind": "deployment", "name": "-n", "namespace": "study"}),
+    ("kind",      {"kind": "--all", "name": "nginx", "namespace": "study"}),
+    ("namespace", {"kind": "deployment", "name": "nginx", "namespace": "--all-namespaces"}),
+])
+def test_플래그_모양_값은_조립에서_거부된다(field, args):
+    """name="--all"이 kubectl 옵션으로 해석돼 전체 삭제되는 것을 차단 (shell=False와 별개 층)."""
+    with pytest.raises(ValueError, match=field):
+        assemble("delete_resource", args)
+
+
+def test_툴_본체를_통해서도_플래그_모양_값은_거부된다(captured):
+    with pytest.raises(ValueError):
+        mutate.delete_resource(_ctx(), "deployment", "--all", "study", **INTENT)
+    assert "args" not in captured        # run_kubectl까지 도달하지 못함

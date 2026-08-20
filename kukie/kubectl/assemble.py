@@ -9,8 +9,23 @@
 from __future__ import annotations
 
 
+def _guard(args: dict, *fields: str) -> None:
+    """값 자리에 플래그 모양(-로 시작) 값이 오면 거부한다.
+
+    shell=False로 셸 인젝션은 막았지만, kubectl 자체의 옵션 파싱은 별개다 —
+    예: name="--all"이면 `delete deployment --all`이 되어 해당 종류 전체가 삭제된다.
+    LLM이 채우는 값(kind/name/namespace)은 리소스 식별자여야 하므로 '-' 시작은
+    정상 입력에 존재하지 않는다. (CodeRabbit 지적 반영)
+    """
+    for f in fields:
+        v = args.get(f)
+        if isinstance(v, str) and v.startswith("-"):
+            raise ValueError(f"{f}에 플래그 형태의 값은 허용되지 않는다: {v!r}")
+
+
 def assemble(tool_name: str, args: dict) -> list[str]:
     """툴 이름 + 구조화 인자 → kubectl args 리스트 ("kubectl" 제외)."""
+    _guard(args, "kind", "name", "namespace")
     fn = _ASSEMBLERS[tool_name]
     return fn(args)
 
