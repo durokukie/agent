@@ -24,8 +24,7 @@ flowchart TD
         L1 -->|"list_resources(kind='pods')"| T
         T["③ 툴 실행"] --> L2["④ LLM 2차 호출<br/>(툴 결과 첨부)<br/>'결과 보고 설명 작성'"]
         L2 -->|"툴 더 쓸래"| T
-        L2 -->|"최종 답: KukieResponse"| V["⑤ output_validator<br/>enforce_explanations()<br/>· 실행 step마다 explanations 필수<br/>· 명령 플래그(-x/--xx) 설명 필수<br/>· kubectl, --context 값은 제외"]
-        V -->|"설명 누락 또는 플래그 미설명 → ModelRetry"| L2
+        L2 -->|"최종 답: KukieResponse"| V["⑤ (예정: DURO-44)<br/>build_response — 코드가 조립<br/>· command/output/access ← 툴 기록<br/>· explanations ← FLAG_GLOSSARY 사전<br/>· 사전 미등록 플래그는 로그"]
     end
 
     T -.->|"실제 호출"| RT
@@ -103,7 +102,7 @@ flowchart LR
 | 훅 파이프라인 | `guardrail()` | `guardrail/hook.py` | ❌ (팀원) |
 | Action Plan | `create_draft()`, `record_*()`, `mark()` | `guardrail/action_plan.py` | ✅ PR #18 머지 |
 | 승인 | `cli_approve()` | `guardrail/approval.py` | ❌ (앱 전환 시 ApprovalRequired 재설계) |
-| 설명 강제 | `enforce_explanations()` | `validators.py` | ✅ PR #19 |
+| 설명 채우기 | `build_response()` + `FLAG_GLOSSARY` (코드가 사전에서) | `agent.py` (예정) | ❌ DURO-44 |
 | LLM 왕복 루프 | — | pydantic-ai 내부 | (우리 코드 아님) |
 
 ## 5. 누가 뭘 결정하나

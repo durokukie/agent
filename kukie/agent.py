@@ -14,7 +14,6 @@ from kukie.deps import Deps
 from kukie.guardrail.hook import hooks as guardrail_hooks
 from kukie.skills.base import KukieResponse
 from kukie.tools.read import READ_TOOLS
-from kukie.validators import enforce_explanations
 
 BASE_PROMPT = """너는 쿠버네티스를 처음 배우는 연수생을 돕는 조수 Kukie다.
 1. kubectl 명령을 다룰 때는 각 플래그·필드의 의미를 explanations에 반드시 채운다.
@@ -73,9 +72,11 @@ agent = Agent(
 #
 # 이 파일에서 같은 원리로 동작하는 등록형 함수:
 #   @agent.instructions      → 프롬프트 생성기 (아래 둘)
-#   agent.output_validator() → 최종 출력 검사기 (맨 아래 enforce_explanations)
 #   FunctionToolset(...)     → 툴 (READ_TOOLS의 함수들; LLM이 이름으로 호출)
 #   @hooks.on.tool_execute   → 훅 (guardrail/hook.py의 guardrail())
+#   agent.output_validator() → 최종 출력 검사기 — 현재 미등록.
+#     explanations를 코드(FLAG_GLOSSARY)가 채우는 방향 확정(DURO-44)으로
+#     LLM 감시형 검증기는 제외. DURO-44에서 "사전 미등록 플래그 로그"로 부활 예정.
 #
 # 함수형(문자열 대신 함수)으로 두는 이유: BASE_PROMPT는 고정값이라 문자열로 충분하지만,
 # 아래 둘은 run마다 달라지는 값(현재 대상, 현재 스킬)을 ctx.deps에서 읽어야 하므로
@@ -98,9 +99,3 @@ def add_skill_prompt(ctx: RunContext[Deps]) -> str:
     진단이면 진단 프롬프트가 붙는다 — 이게 "에이전트 하나로 모드를 갈아끼우는" 장치.
     """
     return ctx.deps.skill.prompt
-
-
-# 데코레이터 대신 함수 호출 형태로 등록한 것 — 의미는 @agent.output_validator와 동일.
-# (validators.py에 정의된 함수를 가져와 쓰므로 데코레이터를 붙일 자리가 여기 없어서 이 형태.)
-# 모델이 최종 답을 낼 때마다 자동 실행되어 explanations 누락 시 ModelRetry로 되돌린다.
-agent.output_validator(enforce_explanations)
