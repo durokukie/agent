@@ -363,26 +363,3 @@ def test_record_decision_guidance_rejects_empty_or_overwrite(monkeypatch, tmp_pa
 
     with pytest.raises(ValueError, match="decision guidance already exists"):
         plan.record_decision_guidance("두 번째 판단")
-
-
-def test_load_reconstructs_structured_plan(monkeypatch, tmp_path):
-    plan = _create_plan(monkeypatch, tmp_path)
-    plan.record_dry_run("dry-run ok", True)
-    plan.record_decision_guidance("배포 시간과 롤백 기준을 확인한다.")
-
-    loaded = ActionPlan.load(plan.path)
-
-    assert loaded.id == plan.id
-    assert loaded.path == plan.path
-    assert loaded.created_at == plan.created_at
-    assert loaded.tool == plan.tool
-    assert loaded.skill == plan.skill
-    assert loaded.target == plan.target
-    assert loaded.command == plan.command
-    assert loaded.risk_level == plan.risk_level
-    assert loaded.status == "draft"
-    assert loaded.intent == plan.intent
-    assert loaded.expected_effects == plan.expected_effects
-    assert loaded.side_effects == plan.side_effects
-    assert loaded.dry_run_result == plan.dry_run_result
-    assert loaded.decision_guidance == plan.decision_guidance

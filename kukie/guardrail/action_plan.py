@@ -95,33 +95,6 @@ class ActionPlan:
             else:
                 return plan
 
-    @classmethod
-    def load(cls, path: Path) -> "ActionPlan":
-        path = Path(path)
-        metadata, body = cls._read_path(path)
-        intent, expected_effects, side_effects = cls._parse_body(body, path)
-        try:
-            return cls(
-                id=metadata["id"],
-                path=path,
-                created_at=metadata["created_at"],
-                tool=metadata["tool"],
-                skill=metadata["skill"],
-                target=dict(metadata["target"]),
-                command=list(metadata["command"]),
-                risk_level=metadata["risk_level"],
-                status=metadata["status"],
-                intent=intent,
-                expected_effects=expected_effects,
-                side_effects=side_effects,
-                dry_run_result=metadata.get("dry_run_result"),
-                decision_guidance=metadata.get("decision_guidance"),
-                approval=metadata.get("approval"),
-                execution_result=metadata.get("execution_result"),
-            )
-        except (KeyError, TypeError) as exc:
-            raise ValueError(f"invalid Action Plan frontmatter: {path}") from exc
-
     def _metadata(self) -> dict[str, object]:
         return {
             "id": self.id,
@@ -180,46 +153,20 @@ class ActionPlan:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
 
-    @staticmethod
-    def _read_path(path: Path) -> tuple[dict, str]:
-        text = path.read_text(encoding="utf-8")
+    def _read(self) -> tuple[dict, str]:
+        text = self.path.read_text(encoding="utf-8")
         if not text.startswith("---\n"):
-            raise ValueError(f"invalid Action Plan frontmatter: {path}")
+            raise ValueError(f"invalid Action Plan frontmatter: {self.path}")
         frontmatter, separator, body = text[4:].partition("\n---\n")
         if not separator:
-            raise ValueError(f"invalid Action Plan frontmatter: {path}")
+            raise ValueError(f"invalid Action Plan frontmatter: {self.path}")
         try:
             metadata = yaml.safe_load(frontmatter)
         except yaml.YAMLError as exc:
-            raise ValueError(f"invalid Action Plan frontmatter: {path}") from exc
+            raise ValueError(f"invalid Action Plan frontmatter: {self.path}") from exc
         if not isinstance(metadata, dict):
-            raise ValueError(f"invalid Action Plan frontmatter: {path}")
+            raise ValueError(f"invalid Action Plan frontmatter: {self.path}")
         return metadata, body
-
-    def _read(self) -> tuple[dict, str]:
-        return self._read_path(self.path)
-
-    @staticmethod
-    def _parse_body(body: str, path: Path) -> tuple[str, list[str], list[str]]:
-        prefix = "# Intent\n\n"
-        effects_marker = "\n\n## Expected Effects\n\n"
-        side_effects_marker = "\n\n## Side Effects\n\n"
-        if not body.startswith(prefix):
-            raise ValueError(f"invalid Action Plan body: {path}")
-        intent, separator, rest = body.removeprefix(prefix).partition(effects_marker)
-        if not separator:
-            raise ValueError(f"invalid Action Plan body: {path}")
-        effects, separator, side_effects = rest.partition(side_effects_marker)
-        if not separator:
-            raise ValueError(f"invalid Action Plan body: {path}")
-
-        def parse_bullets(section: str) -> list[str]:
-            lines = [line for line in section.strip().splitlines() if line.strip()]
-            if any(not line.startswith("- ") for line in lines):
-                raise ValueError(f"invalid Action Plan body: {path}")
-            return [line.removeprefix("- ").strip() for line in lines]
-
-        return intent.strip(), parse_bullets(effects), parse_bullets(side_effects)
 
     def _update(self, key: str, value: object) -> None:
         previous = getattr(self, key)
