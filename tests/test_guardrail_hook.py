@@ -1,4 +1,5 @@
 from pathlib import Path
+from subprocess import TimeoutExpired
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -9,6 +10,7 @@ from pydantic_ai.messages import ToolCallPart
 
 from kukie.guardrail import action_plan, hook
 from kukie.kubectl import KubectlResult
+from kukie.kubectl import runner as kubectl_runner
 
 
 BASE_ARGS = {
@@ -330,6 +332,43 @@ async def test_dry_run_실패는_Plan을_failed로_남기고_중단한다(monkey
     assert metadata["dry_run_result"]["status"] == "failed"
     assert metadata["dry_run_result"]["stdout"] == ""
     assert metadata["dry_run_result"]["stderr"] == "deployment nginx not found\n"
+    assert metadata["approval"] is None
+    assert metadata["execution_result"] is None
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_stderr"),
+    [
+        (
+            TimeoutExpired(cmd=["kubectl"], timeout=30),
+            "timed out after 30 seconds",
+        ),
+        (FileNotFoundError("kubectl을 찾을 수 없음"), "kubectl을 찾을 수 없음"),
+    ],
+)
+async def test_dry_run_실행_예외도_Plan을_failed로_남긴다(
+    monkeypatch, tmp_path, error, expected_stderr
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+
+    def raise_error(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(kubectl_runner.subprocess, "run", raise_error)
+    handler = AsyncMock()
+
+    with pytest.raises(ToolFailed, match="dry-run failed"):
+        await hook.guardrail(
+            _ctx(), call=_call(), tool_def=None, args=BASE_ARGS, handler=handler
+        )
+
+    metadata = _read_plan(next(tmp_path.glob("*.md")))
+    assert metadata["status"] == "failed"
+    assert metadata["dry_run_result"]["status"] == "failed"
+    assert metadata["dry_run_result"]["stdout"] == ""
+    assert expected_stderr in metadata["dry_run_result"]["stderr"]
     assert metadata["approval"] is None
     assert metadata["execution_result"] is None
     handler.assert_not_awaited()

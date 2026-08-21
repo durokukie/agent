@@ -27,8 +27,16 @@ def run_kubectl(args: list[str], *, context: str, dry_run: bool = False,
     full = ["kubectl", "--context", context, *args]
     if dry_run:
         full += ["--dry-run=server", "-o", "yaml"]
-    proc = subprocess.run(full, capture_output=True, text=True, timeout=timeout,
-                          input=stdin)
+    try:
+        proc = subprocess.run(full, capture_output=True, text=True, timeout=timeout,
+                              input=stdin)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return KubectlResult(
+            command=shlex.join(full),
+            stdout="",
+            stderr=str(exc),
+            success=False,
+        )
     return KubectlResult(
         command=shlex.join(full),
         stdout=proc.stdout,
