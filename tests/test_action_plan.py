@@ -189,7 +189,7 @@ def test_record_methods_update_frontmatter_and_preserve_body(monkeypatch, tmp_pa
         ("unsupported", "", "server does not support dry run\n"),
     ],
 )
-def test_record_dry_run_persists_status_and_streams(
+def test_dry_run_상태와_출력_stream을_분리해_저장한다(
     monkeypatch, tmp_path, status, stdout, stderr
 ):
     plan = _create_plan(monkeypatch, tmp_path)
@@ -203,7 +203,7 @@ def test_record_dry_run_persists_status_and_streams(
     assert datetime.fromisoformat(metadata["dry_run_result"]["at"]).tzinfo is not None
 
 
-def test_record_dry_run_rejects_unknown_status(monkeypatch, tmp_path):
+def test_정의되지_않은_dry_run_상태를_거부한다(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
 
     with pytest.raises(ValueError, match="invalid dry-run status"):
@@ -405,7 +405,7 @@ def test_record_decision_guidance_rejects_empty_or_overwrite(monkeypatch, tmp_pa
         plan.record_decision_guidance("두 번째 판단")
 
 
-def test_load_reconstructs_structured_plan(monkeypatch, tmp_path):
+def test_Plan_파일에서_구조화된_객체를_복원한다(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
     plan.record_dry_run("succeeded", "dry-run ok", "")
     plan.record_decision_guidance("배포 시간과 롤백 기준을 확인한다.")
@@ -429,7 +429,7 @@ def test_load_reconstructs_structured_plan(monkeypatch, tmp_path):
     assert loaded.decision_guidance == plan.decision_guidance
 
 
-def test_find_by_call_id_restores_matching_plan(monkeypatch, tmp_path):
+def test_call_id로_일치하는_Plan을_복원한다(monkeypatch, tmp_path):
     first = _create_plan(monkeypatch, tmp_path)
     second = ActionPlan.create_draft(
         call_id="call-456",
@@ -457,7 +457,7 @@ def test_find_by_call_id_restores_matching_plan(monkeypatch, tmp_path):
     assert first.id != found.id
 
 
-def test_find_by_call_id_fails_when_plan_is_missing(monkeypatch, tmp_path):
+def test_call_id에_일치하는_Plan이_없으면_실패한다(monkeypatch, tmp_path):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
 
     with pytest.raises(FileNotFoundError, match="missing-call"):

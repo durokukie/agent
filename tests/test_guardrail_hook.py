@@ -78,7 +78,7 @@ def successful_dry_run(monkeypatch):
         ("side_effects", []),
     ],
 )
-async def test_invalid_explanation_fields_are_rejected_before_plan(
+async def test_설명_필드가_유효하지_않으면_Plan_생성_전에_거부한다(
     monkeypatch, tmp_path, field, value
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
@@ -98,7 +98,7 @@ async def test_invalid_explanation_fields_are_rejected_before_plan(
 
 
 @pytest.mark.asyncio
-async def test_unregistered_mutation_is_rejected_before_plan(monkeypatch, tmp_path):
+async def test_미등록_mutation은_Plan_생성_전에_거부한다(monkeypatch, tmp_path):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     handler = AsyncMock()
 
@@ -116,7 +116,7 @@ async def test_unregistered_mutation_is_rejected_before_plan(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_missing_risk_sticker_is_rejected_before_plan(monkeypatch, tmp_path):
+async def test_RISK_STICKER_누락은_Plan_생성_전에_거부한다(monkeypatch, tmp_path):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     monkeypatch.delitem(hook.RISK_STICKERS, "scale_resource")
     handler = AsyncMock()
@@ -131,7 +131,7 @@ async def test_missing_risk_sticker_is_rejected_before_plan(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_missing_call_id_is_rejected_before_plan(monkeypatch, tmp_path):
+async def test_call_id_누락은_Plan_생성_전에_거부한다(monkeypatch, tmp_path):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     handler = AsyncMock()
 
@@ -172,7 +172,7 @@ async def test_missing_call_id_is_rejected_before_plan(monkeypatch, tmp_path):
         ),
     ],
 )
-async def test_hook_uses_only_fixed_risk_stickers(
+async def test_위험도는_RISK_STICKERS의_고정값만_사용한다(
     monkeypatch, tmp_path, successful_dry_run, tool_name, args, expected_risk
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
@@ -194,7 +194,7 @@ async def test_hook_uses_only_fixed_risk_stickers(
 
 
 @pytest.mark.asyncio
-async def test_protected_namespace_keeps_fixed_caution_risk(
+async def test_보호_namespace도_CAUTION_위험도를_유지한다(
     monkeypatch, tmp_path, successful_dry_run
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
@@ -214,7 +214,7 @@ async def test_protected_namespace_keeps_fixed_caution_risk(
 
 
 @pytest.mark.asyncio
-async def test_apply_manifest_uses_session_namespace_in_plan(
+async def test_apply_manifest는_세션_namespace를_Plan에_사용한다(
     monkeypatch, tmp_path, successful_dry_run
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
@@ -243,7 +243,7 @@ async def test_apply_manifest_uses_session_namespace_in_plan(
 
 
 @pytest.mark.asyncio
-async def test_successful_dry_run_is_recorded_without_execution(
+async def test_dry_run_성공은_실행_없이_Plan에_기록한다(
     monkeypatch, tmp_path, successful_dry_run
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
@@ -279,7 +279,7 @@ async def test_successful_dry_run_is_recorded_without_execution(
 
 
 @pytest.mark.asyncio
-async def test_plan_is_saved_before_server_dry_run(monkeypatch, tmp_path):
+async def test_Plan은_server_dry_run_전에_저장된다(monkeypatch, tmp_path):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
 
     def fake_run(*args, **kwargs):
@@ -306,7 +306,7 @@ async def test_plan_is_saved_before_server_dry_run(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_failed_dry_run_marks_plan_failed_and_stops(monkeypatch, tmp_path):
+async def test_dry_run_실패는_Plan을_failed로_남기고_중단한다(monkeypatch, tmp_path):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     monkeypatch.setattr(
         hook,
@@ -343,7 +343,7 @@ async def test_failed_dry_run_marks_plan_failed_and_stops(monkeypatch, tmp_path)
         "error: unknown flag: --dry-run\n",
     ],
 )
-async def test_unsupported_dry_run_remains_draft_for_issue_25(
+async def test_dry_run_미지원은_다음_승인을_위해_draft를_유지한다(
     monkeypatch, tmp_path, stderr
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
@@ -373,7 +373,7 @@ async def test_unsupported_dry_run_remains_draft_for_issue_25(
 
 
 @pytest.mark.asyncio
-async def test_other_dry_run_error_is_not_treated_as_unsupported(
+async def test_일반_dry_run_오류를_미지원으로_오인하지_않는다(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
