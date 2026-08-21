@@ -4,8 +4,8 @@
 - Action Plan은 훅이 내부적으로 생성·기록한다. LLM이 호출하는 Plan 툴(조회/평가)은
   MVP 제외 — 필요해지면 히스토리 기능과 함께 추가.
 - 실행 중에는 ActionPlan 객체가 기준이고, 변경할 때마다 .md 스냅샷을 갱신한다.
-- frontmatter(기계용) = 명령·대상·등급·dry-run·승인·결과
-- 본문(사람용) = 객체의 intent/예상 영향/부작용을 렌더링한 기록
+- frontmatter(기계용) = 모든 필드의 단일 저장 원본
+- Markdown(사람용) = 객체 필드를 표시할 때만 동적으로 조합
 - decision_guidance = 승인 전 별도 LLM 검토가 작성하는 판단 보조 필드
 
 상태: draft → executed / failed / rejected. dry-run 실패도 failed 기록으로 보관한다.
@@ -180,16 +180,16 @@ class ActionPlan:
             f"## Side Effects\n\n{_bullets(self.side_effects)}\n"
         )
 
-    def render(self, *, include_decision_guidance: bool = True) -> str:
+    def render_markdown(self, *, include_decision_guidance: bool = True) -> str:
         metadata = self._metadata()
+        for field in ("intent", "expected_effects", "side_effects"):
+            metadata.pop(field)
         if not include_decision_guidance:
             metadata.pop("decision_guidance")
-        return (
-            "---\n"
-            f"{yaml.safe_dump(metadata, sort_keys=False, allow_unicode=True)}"
-            "---\n"
-            f"{self._body()}"
-        )
+        details = yaml.safe_dump(
+            metadata, sort_keys=False, allow_unicode=True
+        ).rstrip()
+        return f"# Action Plan\n\n```yaml\n{details}\n```\n\n{self._body()}"
 
     def _write(self, *, exclusive: bool = False) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

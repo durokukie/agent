@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 from pydantic_ai import models
+from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
@@ -55,6 +56,27 @@ async def test_generate_decision_guidance_returns_stripped_text(monkeypatch, tmp
     assert guidance == "실행 시간과 롤백 기준을 확인한다."
     metadata, _ = plan._read()
     assert metadata["decision_guidance"] is None
+
+
+@pytest.mark.asyncio
+async def test_판단_보조_모델은_동적으로_조합한_Markdown을_받는다(
+    monkeypatch, tmp_path
+):
+    plan = _ready_plan(monkeypatch, tmp_path)
+    received_context = ""
+
+    def capture_context(messages, info):
+        nonlocal received_context
+        received_context = str(messages)
+        return ModelResponse(parts=[TextPart("추가 판단 없음")])
+
+    with guidance_agent.override(model=FunctionModel(capture_context)):
+        await generate_decision_guidance(plan)
+
+    assert "# Action Plan" in received_context
+    assert "## Expected Effects" in received_context
+    assert received_context.count(plan.intent) == 1
+    assert "decision_guidance" not in received_context
 
 
 @pytest.mark.asyncio

@@ -33,7 +33,7 @@ guidance_agent = Agent(
 async def generate_decision_guidance(plan: ActionPlan) -> str:
     load_dotenv(".env")
     plan.validate_for_decision_guidance()
-    context = plan.render(include_decision_guidance=False)
+    context = plan.render_markdown(include_decision_guidance=False)
     result = await guidance_agent.run(context)
     guidance = result.output.strip()
     if not guidance:

@@ -316,18 +316,21 @@ def test_validate_for_decision_guidance_requires_successful_dry_run(
         plan.validate_for_decision_guidance()
 
 
-def test_render_contains_plan_except_guidance(monkeypatch, tmp_path):
+def test_Markdown_표시는_각_설명_필드를_한_번만_조합한다(
+    monkeypatch, tmp_path
+):
     plan = _create_plan(monkeypatch, tmp_path)
     plan.record_dry_run("succeeded", "dry-run ok", "")
 
-    context = plan.render(include_decision_guidance=False)
+    markdown = plan.render_markdown(include_decision_guidance=False)
 
-    assert "decision_guidance" not in context
-    assert "scale_resource" in context
-    assert "--replicas=3" in context
-    assert "dry-run ok" in context
-    assert "nginx 실습 환경의 레플리카를 늘린다." in context
-    assert "추가 Pod가 노드 자원을 사용한다." in context
+    assert "decision_guidance" not in markdown
+    assert "scale_resource" in markdown
+    assert "--replicas=3" in markdown
+    assert "dry-run ok" in markdown
+    assert markdown.count(plan.intent) == 1
+    assert markdown.count(plan.expected_effects[0]) == 1
+    assert markdown.count(plan.side_effects[0]) == 1
 
 
 def test_validate_for_decision_guidance_names_empty_object_field(
