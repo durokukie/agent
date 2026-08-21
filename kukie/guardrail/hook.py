@@ -22,6 +22,14 @@ from kukie.tools.mutate import MUTATING_TOOLS, RISK_STICKERS
 hooks = Hooks()
 
 
+def _dry_run_unsupported(stderr: str) -> bool:
+    message = stderr.lower()
+    return (
+        "does not support dry run" in message
+        or "unknown flag: --dry-run" in message
+    )
+
+
 @hooks.on.tool_execute(tools=sorted(MUTATING_TOOLS))
 async def guardrail(ctx, *, call, tool_def, args, handler):
     """승인 전 1차 Hook의 입력 검증, Plan 생성, server dry-run을 수행한다.
@@ -59,7 +67,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
             if normalized_args.get(key) is not None
         },
     }
-    ActionPlan.create_draft(
+    plan = ActionPlan.create_draft(
         call_id=call.tool_call_id,
         tool=tool_name,
         command=command,
@@ -71,4 +79,32 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
         side_effects=args["side_effects"],
     )
 
-    raise NotImplementedError("#24 server dry-run")
+    stdin = (
+        normalized_args.get("manifest_yaml")
+        if tool_name == "apply_manifest"
+        else None
+    )
+    rehearsal = run_kubectl(
+        command,
+        context=ctx.deps.context,
+        dry_run=True,
+        stdin=stdin,
+    )
+
+    if rehearsal.success:
+        dry_run_status = "succeeded"
+    elif _dry_run_unsupported(rehearsal.stderr):
+        dry_run_status = "unsupported"
+    else:
+        dry_run_status = "failed"
+
+    plan.record_dry_run(
+        dry_run_status,
+        rehearsal.stdout,
+        rehearsal.stderr,
+    )
+    if dry_run_status == "failed":
+        plan.mark("failed")
+        raise ToolFailed(f"dry-run failed: {rehearsal.stderr.strip()}")
+
+    raise NotImplementedError("#25 decision guidance and ApprovalRequired")
