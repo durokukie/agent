@@ -21,6 +21,7 @@ def _read_plan(path: Path) -> tuple[dict, str]:
 def _create_plan(monkeypatch, tmp_path: Path, tool: str = "scale_resource") -> ActionPlan:
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     return ActionPlan.create_draft(
+        call_id="call-123",
         tool=tool,
         command=["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
         risk="caution",
@@ -47,6 +48,7 @@ def test_create_draft_writes_frontmatter_and_body(monkeypatch, tmp_path):
     assert metadata == {
         "id": plan.id,
         "created_at": metadata["created_at"],
+        "call_id": "call-123",
         "tool": "scale_resource",
         "skill": "실습",
         "target": {
@@ -73,6 +75,7 @@ def test_create_draft_keeps_structured_fields_in_memory(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
 
     assert plan.tool == "scale_resource"
+    assert plan.call_id == "call-123"
     assert plan.skill == "실습"
     assert plan.target["name"] == "nginx"
     assert plan.command[-1] == "study"
@@ -125,6 +128,7 @@ def test_create_draft_reserves_unique_filename_atomically(monkeypatch, tmp_path)
 
     def create_plan(label):
         return ActionPlan.create_draft(
+            call_id=f"call-{label}",
             tool="scale resource",
             command=["scale", label],
             risk="caution",
@@ -157,13 +161,14 @@ def test_record_methods_update_frontmatter_and_preserve_body(monkeypatch, tmp_pa
     plan = _create_plan(monkeypatch, tmp_path)
     _, original_body = _read_plan(plan.path)
 
-    plan.record_dry_run("dry-run ok", True)
+    plan.record_dry_run("succeeded", "dry-run ok", "")
     plan.record_approval("single")
     plan.record_result("scaled", True)
 
     metadata, body = _read_plan(plan.path)
-    assert metadata["dry_run_result"]["success"] is True
-    assert metadata["dry_run_result"]["output"] == "dry-run ok"
+    assert metadata["dry_run_result"]["status"] == "succeeded"
+    assert metadata["dry_run_result"]["stdout"] == "dry-run ok"
+    assert metadata["dry_run_result"]["stderr"] == ""
     assert datetime.fromisoformat(metadata["dry_run_result"]["at"]).tzinfo is not None
     assert metadata["approval"]["mode"] == "single"
     assert datetime.fromisoformat(metadata["approval"]["at"]).tzinfo is not None
@@ -176,16 +181,46 @@ def test_record_methods_update_frontmatter_and_preserve_body(monkeypatch, tmp_pa
     assert plan.execution_result == metadata["execution_result"]
 
 
+@pytest.mark.parametrize(
+    ("status", "stdout", "stderr"),
+    [
+        ("succeeded", "deployment.apps/nginx configured\n", ""),
+        ("failed", "", "deployment nginx not found\n"),
+        ("unsupported", "", "server does not support dry run\n"),
+    ],
+)
+def test_record_dry_run_persists_status_and_streams(
+    monkeypatch, tmp_path, status, stdout, stderr
+):
+    plan = _create_plan(monkeypatch, tmp_path)
+
+    plan.record_dry_run(status, stdout, stderr)
+
+    metadata, _ = _read_plan(plan.path)
+    assert metadata["dry_run_result"]["status"] == status
+    assert metadata["dry_run_result"]["stdout"] == stdout
+    assert metadata["dry_run_result"]["stderr"] == stderr
+    assert datetime.fromisoformat(metadata["dry_run_result"]["at"]).tzinfo is not None
+
+
+def test_record_dry_run_rejects_unknown_status(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError, match="invalid dry-run status"):
+        plan.record_dry_run("skipped", "", "")
+
+
 def test_dry_run_failure_is_recorded_and_plan_is_kept(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
 
-    plan.record_dry_run("deployment nginx not found", False)
+    plan.record_dry_run("failed", "", "deployment nginx not found")
     plan.mark("failed")
 
     metadata, _ = _read_plan(plan.path)
     assert metadata["status"] == "failed"
-    assert metadata["dry_run_result"]["success"] is False
-    assert metadata["dry_run_result"]["output"] == "deployment nginx not found"
+    assert metadata["dry_run_result"]["status"] == "failed"
+    assert metadata["dry_run_result"]["stdout"] == ""
+    assert metadata["dry_run_result"]["stderr"] == "deployment nginx not found"
     assert datetime.fromisoformat(metadata["dry_run_result"]["at"]).tzinfo is not None
     assert metadata["execution_result"] is None
     assert plan.path.exists()
@@ -213,7 +248,7 @@ def test_mark_rejects_unknown_status(monkeypatch, tmp_path):
 
 def test_validate_for_decision_guidance_uses_in_memory_fields(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
-    plan.record_dry_run("dry-run ok", True)
+    plan.record_dry_run("succeeded", "dry-run ok", "")
     plan.path.write_text("broken", encoding="utf-8")
 
     plan.validate_for_decision_guidance()
@@ -265,18 +300,23 @@ def test_validate_for_decision_guidance_requires_successful_dry_run(
 ):
     plan = _create_plan(monkeypatch, tmp_path)
 
-    with pytest.raises(ValueError, match="dry_run_result.success must be true"):
+    with pytest.raises(ValueError, match="dry_run_result.status must be succeeded"):
         plan.validate_for_decision_guidance()
 
-    plan.record_dry_run("dry-run rejected", False)
+    plan.record_dry_run("unsupported", "", "server does not support dry run")
 
-    with pytest.raises(ValueError, match="dry_run_result.success must be true"):
+    with pytest.raises(ValueError, match="dry_run_result.status must be succeeded"):
+        plan.validate_for_decision_guidance()
+
+    plan.record_dry_run("failed", "", "dry-run rejected")
+
+    with pytest.raises(ValueError, match="dry_run_result.status must be succeeded"):
         plan.validate_for_decision_guidance()
 
 
 def test_render_contains_plan_except_guidance(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
-    plan.record_dry_run("dry-run ok", True)
+    plan.record_dry_run("succeeded", "dry-run ok", "")
 
     context = plan.render(include_decision_guidance=False)
 
@@ -292,7 +332,7 @@ def test_validate_for_decision_guidance_names_empty_object_field(
     monkeypatch, tmp_path
 ):
     plan = _create_plan(monkeypatch, tmp_path)
-    plan.record_dry_run("dry-run ok", True)
+    plan.record_dry_run("succeeded", "dry-run ok", "")
     plan.intent = ""
 
     with pytest.raises(ValueError, match="missing=intent"):
@@ -313,7 +353,7 @@ def test_validate_for_decision_guidance_names_missing_required_field(
     monkeypatch, tmp_path, key, value
 ):
     plan = _create_plan(monkeypatch, tmp_path)
-    plan.record_dry_run("dry-run ok", True)
+    plan.record_dry_run("succeeded", "dry-run ok", "")
     setattr(plan, key, value)
 
     with pytest.raises(ValueError, match=f"missing={key}"):
@@ -324,7 +364,7 @@ def test_validate_for_decision_guidance_fails_on_first_missing_field(
     monkeypatch, tmp_path
 ):
     plan = _create_plan(monkeypatch, tmp_path)
-    plan.record_dry_run("dry-run ok", True)
+    plan.record_dry_run("succeeded", "dry-run ok", "")
     plan.tool = ""
     plan.intent = ""
 
@@ -336,7 +376,7 @@ def test_validate_for_decision_guidance_rejects_wrong_lifecycle_state(
     monkeypatch, tmp_path
 ):
     plan = _create_plan(monkeypatch, tmp_path)
-    plan.record_dry_run("dry-run ok", True)
+    plan.record_dry_run("succeeded", "dry-run ok", "")
     plan.record_approval("single")
 
     with pytest.raises(ValueError, match="approval must be empty"):
@@ -363,3 +403,62 @@ def test_record_decision_guidance_rejects_empty_or_overwrite(monkeypatch, tmp_pa
 
     with pytest.raises(ValueError, match="decision guidance already exists"):
         plan.record_decision_guidance("두 번째 판단")
+
+
+def test_load_reconstructs_structured_plan(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+    plan.record_dry_run("succeeded", "dry-run ok", "")
+    plan.record_decision_guidance("배포 시간과 롤백 기준을 확인한다.")
+
+    loaded = ActionPlan.load(plan.path)
+
+    assert loaded.id == plan.id
+    assert loaded.path == plan.path
+    assert loaded.created_at == plan.created_at
+    assert loaded.call_id == plan.call_id
+    assert loaded.tool == plan.tool
+    assert loaded.skill == plan.skill
+    assert loaded.target == plan.target
+    assert loaded.command == plan.command
+    assert loaded.risk_level == plan.risk_level
+    assert loaded.status == "draft"
+    assert loaded.intent == plan.intent
+    assert loaded.expected_effects == plan.expected_effects
+    assert loaded.side_effects == plan.side_effects
+    assert loaded.dry_run_result == plan.dry_run_result
+    assert loaded.decision_guidance == plan.decision_guidance
+
+
+def test_find_by_call_id_restores_matching_plan(monkeypatch, tmp_path):
+    first = _create_plan(monkeypatch, tmp_path)
+    second = ActionPlan.create_draft(
+        call_id="call-456",
+        tool="delete_resource",
+        command=["delete", "pod", "old", "-n", "study"],
+        risk="destructive",
+        skill="실습",
+        target={
+            "context": "minikube",
+            "namespace": "study",
+            "kind": "pod",
+            "name": "old",
+        },
+        intent="오래된 실습 Pod를 지운다.",
+        expected_effects=["Pod가 삭제된다."],
+        side_effects=["Pod의 임시 데이터가 사라진다."],
+    )
+
+    found = ActionPlan.find_by_call_id("call-456")
+
+    assert found.id == second.id
+    assert found.call_id == "call-456"
+    assert found.path == second.path
+    assert found.intent == "오래된 실습 Pod를 지운다."
+    assert first.id != found.id
+
+
+def test_find_by_call_id_fails_when_plan_is_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="missing-call"):
+        ActionPlan.find_by_call_id("missing-call")

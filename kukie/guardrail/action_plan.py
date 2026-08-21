@@ -22,6 +22,7 @@ import yaml
 
 PLAN_DIR = Path.home() / ".kukie" / "plans"
 FINAL_STATUSES = frozenset({"executed", "failed", "rejected"})
+DRY_RUN_STATUSES = frozenset({"succeeded", "failed", "unsupported"})
 
 
 def _utc_now() -> str:
@@ -37,6 +38,7 @@ class ActionPlan:
     id: str
     path: Path
     created_at: str
+    call_id: str
     tool: str
     skill: str
     target: dict[str, str]
@@ -55,6 +57,7 @@ class ActionPlan:
     def create_draft(
         cls,
         *,
+        call_id: str,
         tool: str,
         command: list[str],
         risk: str,
@@ -78,6 +81,7 @@ class ActionPlan:
                 id=plan_id,
                 path=PLAN_DIR / f"{plan_id}.md",
                 created_at=created_at,
+                call_id=call_id,
                 tool=tool,
                 skill=skill,
                 target=dict(target),
@@ -95,10 +99,48 @@ class ActionPlan:
             else:
                 return plan
 
+    @classmethod
+    def load(cls, path: Path) -> "ActionPlan":
+        path = Path(path)
+        metadata, body = cls._read_path(path)
+        intent, expected_effects, side_effects = cls._parse_body(body, path)
+        try:
+            return cls(
+                id=metadata["id"],
+                path=path,
+                created_at=metadata["created_at"],
+                call_id=metadata["call_id"],
+                tool=metadata["tool"],
+                skill=metadata["skill"],
+                target=dict(metadata["target"]),
+                command=list(metadata["command"]),
+                risk_level=metadata["risk_level"],
+                status=metadata["status"],
+                intent=intent,
+                expected_effects=expected_effects,
+                side_effects=side_effects,
+                dry_run_result=metadata.get("dry_run_result"),
+                decision_guidance=metadata.get("decision_guidance"),
+                approval=metadata.get("approval"),
+                execution_result=metadata.get("execution_result"),
+            )
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"invalid Action Plan frontmatter: {path}") from exc
+
+    @classmethod
+    def find_by_call_id(cls, call_id: str) -> "ActionPlan":
+        # ponytail: 로컬 MVP에서는 선형 탐색이면 충분하다. 실제 병목일 때만 인덱스를 추가한다.
+        for path in PLAN_DIR.glob("*.md"):
+            metadata, _ = cls._read_path(path)
+            if metadata.get("call_id") == call_id:
+                return cls.load(path)
+        raise FileNotFoundError(f"Action Plan not found for call_id={call_id}")
+
     def _metadata(self) -> dict[str, object]:
         return {
             "id": self.id,
             "created_at": self.created_at,
+            "call_id": self.call_id,
             "tool": self.tool,
             "skill": self.skill,
             "target": self.target,
@@ -153,20 +195,46 @@ class ActionPlan:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
 
-    def _read(self) -> tuple[dict, str]:
-        text = self.path.read_text(encoding="utf-8")
+    @staticmethod
+    def _read_path(path: Path) -> tuple[dict, str]:
+        text = path.read_text(encoding="utf-8")
         if not text.startswith("---\n"):
-            raise ValueError(f"invalid Action Plan frontmatter: {self.path}")
+            raise ValueError(f"invalid Action Plan frontmatter: {path}")
         frontmatter, separator, body = text[4:].partition("\n---\n")
         if not separator:
-            raise ValueError(f"invalid Action Plan frontmatter: {self.path}")
+            raise ValueError(f"invalid Action Plan frontmatter: {path}")
         try:
             metadata = yaml.safe_load(frontmatter)
         except yaml.YAMLError as exc:
-            raise ValueError(f"invalid Action Plan frontmatter: {self.path}") from exc
+            raise ValueError(f"invalid Action Plan frontmatter: {path}") from exc
         if not isinstance(metadata, dict):
-            raise ValueError(f"invalid Action Plan frontmatter: {self.path}")
+            raise ValueError(f"invalid Action Plan frontmatter: {path}")
         return metadata, body
+
+    def _read(self) -> tuple[dict, str]:
+        return self._read_path(self.path)
+
+    @staticmethod
+    def _parse_body(body: str, path: Path) -> tuple[str, list[str], list[str]]:
+        prefix = "# Intent\n\n"
+        effects_marker = "\n\n## Expected Effects\n\n"
+        side_effects_marker = "\n\n## Side Effects\n\n"
+        if not body.startswith(prefix):
+            raise ValueError(f"invalid Action Plan body: {path}")
+        intent, separator, rest = body.removeprefix(prefix).partition(effects_marker)
+        if not separator:
+            raise ValueError(f"invalid Action Plan body: {path}")
+        effects, separator, side_effects = rest.partition(side_effects_marker)
+        if not separator:
+            raise ValueError(f"invalid Action Plan body: {path}")
+
+        def parse_bullets(section: str) -> list[str]:
+            lines = [line for line in section.strip().splitlines() if line.strip()]
+            if any(not line.startswith("- ") for line in lines):
+                raise ValueError(f"invalid Action Plan body: {path}")
+            return [line.removeprefix("- ").strip() for line in lines]
+
+        return intent.strip(), parse_bullets(effects), parse_bullets(side_effects)
 
     def _update(self, key: str, value: object) -> None:
         previous = getattr(self, key)
@@ -181,6 +249,7 @@ class ActionPlan:
         required = (
             "id",
             "created_at",
+            "call_id",
             "tool",
             "skill",
             "target",
@@ -199,10 +268,10 @@ class ActionPlan:
             raise ValueError("ActionPlan is not ready for guidance: status must be draft")
 
         dry_run = self.dry_run_result
-        if not isinstance(dry_run, dict) or dry_run.get("success") is not True:
+        if not isinstance(dry_run, dict) or dry_run.get("status") != "succeeded":
             raise ValueError(
                 "ActionPlan is not ready for guidance: "
-                "dry_run_result.success must be true"
+                "dry_run_result.status must be succeeded"
             )
         if self.approval is not None:
             raise ValueError("ActionPlan is not ready for guidance: approval must be empty")
@@ -224,10 +293,17 @@ class ActionPlan:
             raise ValueError("decision guidance already exists")
         self._update("decision_guidance", guidance)
 
-    def record_dry_run(self, output: str, ok: bool) -> None:
+    def record_dry_run(self, status: str, stdout: str, stderr: str) -> None:
+        if status not in DRY_RUN_STATUSES:
+            raise ValueError(f"invalid dry-run status: {status}")
         self._update(
             "dry_run_result",
-            {"success": ok, "output": output, "at": _utc_now()},
+            {
+                "status": status,
+                "stdout": stdout,
+                "stderr": stderr,
+                "at": _utc_now(),
+            },
         )
 
     def record_approval(self, mode: str) -> None:

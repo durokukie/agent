@@ -19,6 +19,7 @@ models.ALLOW_MODEL_REQUESTS = False
 def _ready_plan(monkeypatch, tmp_path: Path) -> ActionPlan:
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     plan = ActionPlan.create_draft(
+        call_id="call-123",
         tool="scale_resource",
         command=["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
         risk="caution",
@@ -33,7 +34,7 @@ def _ready_plan(monkeypatch, tmp_path: Path) -> ActionPlan:
         expected_effects=["레플리카가 3개가 된다."],
         side_effects=["추가 Pod가 자원을 사용한다."],
     )
-    plan.record_dry_run("dry-run ok", True)
+    plan.record_dry_run("succeeded", "dry-run ok", "")
     return plan
 
 
@@ -80,6 +81,7 @@ async def test_generate_decision_guidance_validates_before_model_call(
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     plan = ActionPlan.create_draft(
+        call_id="call-123",
         tool="scale_resource",
         command=["scale", "deployment", "nginx", "--replicas=3"],
         risk="caution",
@@ -94,7 +96,7 @@ async def test_generate_decision_guidance_validates_before_model_call(
         pytest.fail("검증 실패 뒤 모델이 호출됨")
 
     with guidance_agent.override(model=FunctionModel(unexpected_model_call)):
-        with pytest.raises(ValueError, match="dry_run_result.success must be true"):
+        with pytest.raises(ValueError, match="dry_run_result.status must be succeeded"):
             await generate_decision_guidance(plan)
 
 
