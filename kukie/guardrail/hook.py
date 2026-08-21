@@ -30,7 +30,8 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
     ② 등급 조회   → RISK_STICKERS[툴이름]. 미등록이면 DESTRUCTIVE (fail-closed)
     ③ Plan 생성   → ActionPlan.create_draft() — 사실(frontmatter) + intent 등("왜" 본문)
                    intent가 빈 문자열이면 ModelRetry로 재작성 요구 (한 줄 검사)
-    ④ dry-run    → 실패 시 draft 삭제 후 ToolFailed
+    ④ dry-run    → 결과 기록. 실패 시 plan.mark("failed") 후 ToolFailed
+                   실패한 Plan도 삭제하지 않고 히스토리로 보관
     ⑤ CLI 승인   → 명령·대상·intent·영향·부작용·등급 표시.
                    CAUTION 1회 / DESTRUCTIVE 이중 (대상 이름 타이핑).
                    거절 시 plan.mark("rejected") + SkipToolExecution
