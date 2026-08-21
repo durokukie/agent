@@ -102,9 +102,19 @@ class ActionPlan:
     @classmethod
     def load(cls, path: Path) -> "ActionPlan":
         path = Path(path)
-        metadata, body = cls._read_path(path)
-        intent, expected_effects, side_effects = cls._parse_body(body, path)
+        metadata, _ = cls._read_path(path)
         try:
+            intent = metadata["intent"]
+            expected_effects = metadata["expected_effects"]
+            side_effects = metadata["side_effects"]
+            if (
+                not isinstance(intent, str)
+                or not isinstance(expected_effects, list)
+                or not all(isinstance(item, str) for item in expected_effects)
+                or not isinstance(side_effects, list)
+                or not all(isinstance(item, str) for item in side_effects)
+            ):
+                raise TypeError
             return cls(
                 id=metadata["id"],
                 path=path,
@@ -147,11 +157,21 @@ class ActionPlan:
             "command": self.command,
             "risk_level": self.risk_level,
             "status": self.status,
+            "intent": self.intent,
+            "expected_effects": self.expected_effects,
+            "side_effects": self.side_effects,
             "dry_run_result": self.dry_run_result,
             "decision_guidance": self.decision_guidance,
             "approval": self.approval,
             "execution_result": self.execution_result,
         }
+
+    def _serialize(self) -> str:
+        return (
+            "---\n"
+            f"{yaml.safe_dump(self._metadata(), sort_keys=False, allow_unicode=True)}"
+            "---\n"
+        )
 
     def _body(self) -> str:
         return (
@@ -182,7 +202,7 @@ class ActionPlan:
                 delete=False,
             ) as temp:
                 temp_path = Path(temp.name)
-                temp.write(self.render())
+                temp.write(self._serialize())
             if exclusive:
                 # hardlink_to는 대상 이름이 이미 존재하면 FileExistsError를 내고 절대 덮어쓰지 않는다.
                 # 이 성질을 "없을 때만 생성"의 원자적 잠금으로 쓴다 (create_draft 전용).
@@ -213,28 +233,6 @@ class ActionPlan:
 
     def _read(self) -> tuple[dict, str]:
         return self._read_path(self.path)
-
-    @staticmethod
-    def _parse_body(body: str, path: Path) -> tuple[str, list[str], list[str]]:
-        prefix = "# Intent\n\n"
-        effects_marker = "\n\n## Expected Effects\n\n"
-        side_effects_marker = "\n\n## Side Effects\n\n"
-        if not body.startswith(prefix):
-            raise ValueError(f"invalid Action Plan body: {path}")
-        intent, separator, rest = body.removeprefix(prefix).partition(effects_marker)
-        if not separator:
-            raise ValueError(f"invalid Action Plan body: {path}")
-        effects, separator, side_effects = rest.partition(side_effects_marker)
-        if not separator:
-            raise ValueError(f"invalid Action Plan body: {path}")
-
-        def parse_bullets(section: str) -> list[str]:
-            lines = [line for line in section.strip().splitlines() if line.strip()]
-            if any(not line.startswith("- ") for line in lines):
-                raise ValueError(f"invalid Action Plan body: {path}")
-            return [line.removeprefix("- ").strip() for line in lines]
-
-        return intent.strip(), parse_bullets(effects), parse_bullets(side_effects)
 
     def _update(self, key: str, value: object) -> None:
         previous = getattr(self, key)

@@ -38,7 +38,7 @@ def _create_plan(monkeypatch, tmp_path: Path, tool: str = "scale_resource") -> A
     )
 
 
-def test_create_draft_writes_frontmatter_and_body(monkeypatch, tmp_path):
+def test_초안은_모든_필드를_frontmatter에만_저장한다(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
 
     metadata, body = _read_plan(plan.path)
@@ -60,15 +60,16 @@ def test_create_draft_writes_frontmatter_and_body(monkeypatch, tmp_path):
         "command": ["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
         "risk_level": "caution",
         "status": "draft",
+        "intent": "nginx 실습 환경의 레플리카를 늘린다.",
+        "expected_effects": ["nginx Deployment의 레플리카가 3개로 변경된다."],
+        "side_effects": ["추가 Pod가 노드 자원을 사용한다."],
         "dry_run_result": None,
         "decision_guidance": None,
         "approval": None,
         "execution_result": None,
     }
     assert datetime.fromisoformat(metadata["created_at"]).tzinfo is not None
-    assert "# Intent\n\nnginx 실습 환경의 레플리카를 늘린다." in body
-    assert "## Expected Effects\n\n- nginx Deployment의 레플리카가 3개로 변경된다." in body
-    assert "## Side Effects\n\n- 추가 Pod가 노드 자원을 사용한다." in body
+    assert body == ""
 
 
 def test_create_draft_keeps_structured_fields_in_memory(monkeypatch, tmp_path):
@@ -157,9 +158,10 @@ def test_create_draft_reserves_unique_filename_atomically(monkeypatch, tmp_path)
     } == {("scale", "first"), ("scale", "second")}
 
 
-def test_record_methods_update_frontmatter_and_preserve_body(monkeypatch, tmp_path):
+def test_record_메서드는_frontmatter를_갱신하고_본문을_비워둔다(
+    monkeypatch, tmp_path
+):
     plan = _create_plan(monkeypatch, tmp_path)
-    _, original_body = _read_plan(plan.path)
 
     plan.record_dry_run("succeeded", "dry-run ok", "")
     plan.record_approval("single")
@@ -175,7 +177,7 @@ def test_record_methods_update_frontmatter_and_preserve_body(monkeypatch, tmp_pa
     assert metadata["execution_result"]["success"] is True
     assert metadata["execution_result"]["output"] == "scaled"
     assert datetime.fromisoformat(metadata["execution_result"]["at"]).tzinfo is not None
-    assert body == original_body
+    assert body == ""
     assert plan.dry_run_result == metadata["dry_run_result"]
     assert plan.approval == metadata["approval"]
     assert plan.execution_result == metadata["execution_result"]
@@ -427,6 +429,94 @@ def test_Plan_파일에서_구조화된_객체를_복원한다(monkeypatch, tmp_
     assert loaded.side_effects == plan.side_effects
     assert loaded.dry_run_result == plan.dry_run_result
     assert loaded.decision_guidance == plan.decision_guidance
+
+
+def test_예약_제목과_여러_줄_effect도_손실_없이_복원한다(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    intent = "변경 결과\n\n## Expected Effects\n\n이 제목도 의도의 일부다."
+    expected_effects = ["상태를 확인한다.\n- Ready Pod는 3개여야 한다."]
+    side_effects = ["롤링 업데이트가 진행된다.\n- Pod가 교체된다."]
+    plan = ActionPlan.create_draft(
+        call_id="call-special",
+        tool="scale_resource",
+        command=["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
+        risk="caution",
+        skill="실습",
+        target={"context": "minikube", "namespace": "study"},
+        intent=intent,
+        expected_effects=expected_effects,
+        side_effects=side_effects,
+    )
+
+    loaded = ActionPlan.load(plan.path)
+
+    assert loaded.intent == intent
+    assert loaded.expected_effects == expected_effects
+    assert loaded.side_effects == side_effects
+
+
+def test_새_Plan은_Markdown_본문을_복원에_사용하지_않는다(
+    monkeypatch, tmp_path
+):
+    plan = _create_plan(monkeypatch, tmp_path)
+    metadata, _ = _read_plan(plan.path)
+    plan.path.write_text(
+        "---\n"
+        + yaml.safe_dump(metadata, sort_keys=False, allow_unicode=True)
+        + "---\n임의로 추가된 본문\n",
+        encoding="utf-8",
+    )
+
+    loaded = ActionPlan.load(plan.path)
+
+    assert loaded.intent == plan.intent
+    assert loaded.expected_effects == plan.expected_effects
+    assert loaded.side_effects == plan.side_effects
+
+
+def test_설명_frontmatter_필드가_누락되면_거부한다(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+    metadata, body = _read_plan(plan.path)
+    metadata.update(
+        intent=plan.intent,
+        expected_effects=plan.expected_effects,
+        side_effects=plan.side_effects,
+    )
+    metadata.pop("intent")
+    plan.path.write_text(
+        "---\n"
+        + yaml.safe_dump(metadata, sort_keys=False, allow_unicode=True)
+        + "---\n"
+        + body,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid Action Plan frontmatter"):
+        ActionPlan.load(plan.path)
+
+
+def test_설명_frontmatter_필드의_타입이_잘못되면_거부한다(
+    monkeypatch, tmp_path
+):
+    plan = _create_plan(monkeypatch, tmp_path)
+    metadata, body = _read_plan(plan.path)
+    metadata.update(
+        intent=plan.intent,
+        expected_effects="목록이 아닌 문자열",
+        side_effects=plan.side_effects,
+    )
+    plan.path.write_text(
+        "---\n"
+        + yaml.safe_dump(metadata, sort_keys=False, allow_unicode=True)
+        + "---\n"
+        + body,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid Action Plan frontmatter"):
+        ActionPlan.load(plan.path)
 
 
 def test_call_id로_일치하는_Plan을_복원한다(monkeypatch, tmp_path):
