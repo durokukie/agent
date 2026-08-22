@@ -236,7 +236,7 @@ async def test_보호_namespace도_CAUTION_위험도를_유지한다(
 
 
 @pytest.mark.asyncio
-async def test_apply_manifest는_세션_namespace를_Plan에_사용한다(
+async def test_apply_manifest는_리소스_식별정보를_Plan에_저장한다(
     monkeypatch, tmp_path, successful_dry_run, successful_guidance
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
@@ -258,10 +258,138 @@ async def test_apply_manifest는_세션_namespace를_Plan에_사용한다(
         )
 
     metadata = _read_plan(next(tmp_path.glob("*.md")))
-    assert metadata["target"] == {"context": "kind-dev", "namespace": "study"}
+    assert metadata["target"] == {
+        "context": "kind-dev",
+        "namespace": "study",
+        "resources": [{"kind": "Pod", "name": "nginx"}],
+    }
     assert metadata["command"] == ["apply", "-f", "-", "-n", "study"]
     assert successful_dry_run[0]["args"] == ["apply", "-f", "-", "-n", "study"]
     assert successful_dry_run[0]["stdin"] == args["manifest_yaml"]
+
+
+@pytest.mark.asyncio
+async def test_apply_manifest는_여러_YAML문서의_대상을_순서대로_저장한다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    args = {
+        "manifest_yaml": (
+            "apiVersion: apps/v1\n"
+            "kind: Deployment\n"
+            "metadata:\n"
+            "  name: nginx\n"
+            "---\n"
+            "apiVersion: v1\n"
+            "kind: Service\n"
+            "metadata:\n"
+            "  name: nginx\n"
+            "  namespace: study\n"
+        ),
+        "namespace": "study",
+        "intent": "nginx Deployment와 Service를 적용한다.",
+        "expected_effects": ["두 리소스가 적용된다."],
+        "side_effects": ["클러스터 구성이 변경된다."],
+    }
+
+    with pytest.raises(ApprovalRequired):
+        await hook.guardrail(
+            _ctx(),
+            call=_call("apply_manifest"),
+            tool_def=None,
+            args=args,
+            handler=AsyncMock(),
+        )
+
+    loaded = action_plan.ActionPlan.load(next(tmp_path.glob("*.md")))
+    assert loaded.target["resources"] == [
+        {"kind": "Deployment", "name": "nginx"},
+        {"kind": "Service", "name": "nginx", "namespace": "study"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_apply_manifest는_List의_items를_개별_대상으로_저장한다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    args = {
+        "manifest_yaml": (
+            "apiVersion: v1\n"
+            "kind: List\n"
+            "items:\n"
+            "  - apiVersion: v1\n"
+            "    kind: ConfigMap\n"
+            "    metadata:\n"
+            "      name: settings\n"
+            "  - apiVersion: v1\n"
+            "    kind: Service\n"
+            "    metadata:\n"
+            "      name: nginx\n"
+            "      namespace: study\n"
+        ),
+        "namespace": "study",
+        "intent": "ConfigMap과 Service를 적용한다.",
+        "expected_effects": ["두 리소스가 적용된다."],
+        "side_effects": ["클러스터 구성이 변경된다."],
+    }
+
+    with pytest.raises(ApprovalRequired):
+        await hook.guardrail(
+            _ctx(),
+            call=_call("apply_manifest"),
+            tool_def=None,
+            args=args,
+            handler=AsyncMock(),
+        )
+
+    metadata = _read_plan(next(tmp_path.glob("*.md")))
+    assert metadata["target"]["resources"] == [
+        {"kind": "ConfigMap", "name": "settings"},
+        {"kind": "Service", "name": "nginx", "namespace": "study"},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "manifest_yaml",
+    [
+        "kind: [",
+        "metadata:\n  name: nginx\n",
+        "kind: Pod\nmetadata: {}\n",
+        " \n---\n",
+        "kind: List\nitems:\n  - invalid\n",
+    ],
+)
+async def test_apply_manifest는_식별할_수_없는_리소스를_Plan_생성_전에_거부한다(
+    monkeypatch, tmp_path, manifest_yaml
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    handler = AsyncMock()
+
+    def unexpected_dry_run(*args, **kwargs):
+        pytest.fail("식별할 수 없는 manifest는 dry-run하면 안 된다")
+
+    monkeypatch.setattr(hook, "run_kubectl", unexpected_dry_run)
+    args = {
+        "manifest_yaml": manifest_yaml,
+        "namespace": "study",
+        "intent": "리소스를 적용한다.",
+        "expected_effects": ["리소스가 적용된다."],
+        "side_effects": ["클러스터 구성이 변경된다."],
+    }
+
+    with pytest.raises(ModelRetry, match="manifest"):
+        await hook.guardrail(
+            _ctx(),
+            call=_call("apply_manifest"),
+            tool_def=None,
+            args=args,
+            handler=handler,
+        )
+
+    assert list(tmp_path.iterdir()) == []
+    handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio

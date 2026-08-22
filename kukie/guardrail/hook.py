@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import logging
 
+import yaml
 from pydantic_ai import ApprovalRequired, ModelRetry, ToolFailed
 from pydantic_ai.capabilities.hooks import Hooks
 
-from kukie.guardrail.action_plan import ActionPlan
+from kukie.guardrail.action_plan import ActionPlan, PlanTarget
 from kukie.guardrail.decision_guidance import generate_decision_guidance
 from kukie.kubectl import assemble, run_kubectl
 from kukie.tools.mutate import MUTATING_TOOLS, RISK_STICKERS
@@ -32,6 +33,50 @@ def _dry_run_unsupported(stderr: str) -> bool:
         "does not support dry run" in message
         or "unknown flag: --dry-run" in message
     )
+
+
+def _manifest_resources(manifest_yaml: str) -> list[dict[str, str]]:
+    error = "manifest_yaml must contain resources with kind and metadata.name"
+    try:
+        documents = list(yaml.safe_load_all(manifest_yaml))
+    except yaml.YAMLError as exc:
+        raise ModelRetry("manifest_yaml must be valid YAML") from exc
+
+    resources = []
+    for document in documents:
+        if document is None:
+            continue
+        if not isinstance(document, dict):
+            raise ModelRetry(error)
+        items = (
+            document.get("items")
+            if document.get("kind") == "List"
+            else [document]
+        )
+        if not isinstance(items, list):
+            raise ModelRetry(error)
+        for resource in items:
+            if not isinstance(resource, dict):
+                raise ModelRetry(error)
+            kind = resource.get("kind")
+            metadata = resource.get("metadata")
+            name = metadata.get("name") if isinstance(metadata, dict) else None
+            if (
+                not isinstance(kind, str)
+                or not kind
+                or not isinstance(name, str)
+                or not name
+            ):
+                raise ModelRetry(error)
+            target = {"kind": kind, "name": name}
+            if namespace := metadata.get("namespace"):
+                if not isinstance(namespace, str):
+                    raise ModelRetry(error)
+                target["namespace"] = namespace
+            resources.append(target)
+    if not resources:
+        raise ModelRetry(error)
+    return resources
 
 
 @hooks.on.tool_execute(tools=sorted(MUTATING_TOOLS))
@@ -63,7 +108,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
         )
 
     command = assemble(tool_name, normalized_args)
-    target = {
+    target: PlanTarget = {
         "context": ctx.deps.context,
         **{
             key: normalized_args[key]
@@ -71,6 +116,8 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
             if normalized_args.get(key) is not None
         },
     }
+    if tool_name == "apply_manifest":
+        target["resources"] = _manifest_resources(normalized_args["manifest_yaml"])
     plan = ActionPlan.create_draft(
         call_id=call.tool_call_id,
         tool=tool_name,
