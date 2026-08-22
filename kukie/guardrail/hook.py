@@ -12,32 +12,99 @@ LLM은 발동 여부에 관여할 수 없다. wrap 훅 하나가 전 단계를 �
 """
 from __future__ import annotations
 
+from pydantic_ai import ModelRetry, ToolFailed
 from pydantic_ai.capabilities.hooks import Hooks
 
 from kukie.guardrail.action_plan import ActionPlan
-from kukie.guardrail.approval import cli_approve
 from kukie.kubectl import assemble, run_kubectl
-from kukie.tools.mutate import MUTATING_TOOLS, RISK_STICKERS, Risk
+from kukie.tools.mutate import MUTATING_TOOLS, RISK_STICKERS
 
 hooks = Hooks()
 
 
+def _dry_run_unsupported(stderr: str) -> bool:
+    message = stderr.lower()
+    return (
+        "does not support dry run" in message
+        or "unknown flag: --dry-run" in message
+    )
+
+
 @hooks.on.tool_execute(tools=sorted(MUTATING_TOOLS))
 async def guardrail(ctx, *, call, tool_def, args, handler):
-    """파이프라인 (6단계).
+    """승인 전 1차 Hook의 입력 검증, Plan 생성, server dry-run을 수행한다.
 
-    ① 명령 조립   → assemble() 1벌 호출 (재조립 금지)
-    ② 등급 조회   → RISK_STICKERS[툴이름]. 미등록이면 DESTRUCTIVE (fail-closed)
-    ③ Plan 생성   → ActionPlan.create_draft() — 사실(frontmatter) + intent 등("왜" 본문)
-                   intent가 빈 문자열이면 ModelRetry로 재작성 요구 (한 줄 검사)
-    ④ dry-run    → 결과 기록. 실패 시 plan.mark("failed") 후 ToolFailed
-                   실패한 Plan도 삭제하지 않고 히스토리로 보관
-    ⑤ CLI 승인   → 명령·대상·intent·영향·부작용·등급 표시.
-                   CAUTION 1회 / DESTRUCTIVE 이중 (대상 이름 타이핑).
-                   거절 시 plan.mark("rejected") + SkipToolExecution
-    ⑥ 실행·기록  → handler(조립 args) → record_result() + mark(executed/failed)
-
-    비고: kube-system 등 보호 네임스페이스 승격(if문 2줄)은 옵션으로 보류 —
-    필요해지면 ② 옆에 추가한다 (팀 결정 대기).
+    decision_guidance와 ApprovalRequired는 #25, 승인 후 실행은 #26의 책임이다.
     """
-    raise NotImplementedError  # TODO
+    tool_name = call.tool_name
+    if tool_name not in MUTATING_TOOLS:
+        raise ToolFailed(f"unregistered mutation tool: {tool_name}")
+    if tool_name not in RISK_STICKERS:
+        raise ToolFailed(f"missing RISK_STICKER for mutation tool: {tool_name}")
+    if not call.tool_call_id:
+        raise ToolFailed(f"missing tool_call_id for mutation tool: {tool_name}")
+
+    intent = args["intent"]
+    if not intent.strip():
+        raise ModelRetry("intent must not be blank")
+    if not args["expected_effects"]:
+        raise ModelRetry("expected_effects must not be empty")
+    if not args["side_effects"]:
+        raise ModelRetry("side_effects must not be empty")
+
+    normalized_args = dict(args)
+    if tool_name == "apply_manifest":
+        normalized_args["namespace"] = (
+            normalized_args.get("namespace") or ctx.deps.namespace
+        )
+
+    command = assemble(tool_name, normalized_args)
+    target = {
+        "context": ctx.deps.context,
+        **{
+            key: normalized_args[key]
+            for key in ("namespace", "kind", "name")
+            if normalized_args.get(key) is not None
+        },
+    }
+    plan = ActionPlan.create_draft(
+        call_id=call.tool_call_id,
+        tool=tool_name,
+        command=command,
+        risk=RISK_STICKERS[tool_name].name.lower(),
+        skill=ctx.deps.skill.name,
+        target=target,
+        intent=intent,
+        expected_effects=args["expected_effects"],
+        side_effects=args["side_effects"],
+    )
+
+    stdin = (
+        normalized_args.get("manifest_yaml")
+        if tool_name == "apply_manifest"
+        else None
+    )
+    rehearsal = run_kubectl(
+        command,
+        context=ctx.deps.context,
+        dry_run=True,
+        stdin=stdin,
+    )
+
+    if rehearsal.success:
+        dry_run_status = "succeeded"
+    elif _dry_run_unsupported(rehearsal.stderr):
+        dry_run_status = "unsupported"
+    else:
+        dry_run_status = "failed"
+
+    plan.record_dry_run(
+        dry_run_status,
+        rehearsal.stdout,
+        rehearsal.stderr,
+    )
+    if dry_run_status == "failed":
+        plan.mark("failed")
+        raise ToolFailed(f"dry-run failed: {rehearsal.stderr.strip()}")
+
+    raise NotImplementedError("#25 decision guidance and ApprovalRequired")

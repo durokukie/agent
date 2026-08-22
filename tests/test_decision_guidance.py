@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 from pydantic_ai import models
+from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
@@ -19,6 +20,7 @@ models.ALLOW_MODEL_REQUESTS = False
 def _ready_plan(monkeypatch, tmp_path: Path) -> ActionPlan:
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     plan = ActionPlan.create_draft(
+        call_id="call-123",
         tool="scale_resource",
         command=["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
         risk="caution",
@@ -33,7 +35,7 @@ def _ready_plan(monkeypatch, tmp_path: Path) -> ActionPlan:
         expected_effects=["레플리카가 3개가 된다."],
         side_effects=["추가 Pod가 자원을 사용한다."],
     )
-    plan.record_dry_run("dry-run ok", True)
+    plan.record_dry_run("succeeded", "dry-run ok", "")
     return plan
 
 
@@ -54,6 +56,27 @@ async def test_generate_decision_guidance_returns_stripped_text(monkeypatch, tmp
     assert guidance == "실행 시간과 롤백 기준을 확인한다."
     metadata, _ = plan._read()
     assert metadata["decision_guidance"] is None
+
+
+@pytest.mark.asyncio
+async def test_판단_보조_모델은_동적으로_조합한_Markdown을_받는다(
+    monkeypatch, tmp_path
+):
+    plan = _ready_plan(monkeypatch, tmp_path)
+    received_context = ""
+
+    def capture_context(messages, info):
+        nonlocal received_context
+        received_context = str(messages)
+        return ModelResponse(parts=[TextPart("추가 판단 없음")])
+
+    with guidance_agent.override(model=FunctionModel(capture_context)):
+        await generate_decision_guidance(plan)
+
+    assert "# Action Plan" in received_context
+    assert "## Expected Effects" in received_context
+    assert received_context.count(plan.intent) == 1
+    assert "decision_guidance" not in received_context
 
 
 @pytest.mark.asyncio
@@ -80,6 +103,7 @@ async def test_generate_decision_guidance_validates_before_model_call(
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     plan = ActionPlan.create_draft(
+        call_id="call-123",
         tool="scale_resource",
         command=["scale", "deployment", "nginx", "--replicas=3"],
         risk="caution",
@@ -94,7 +118,7 @@ async def test_generate_decision_guidance_validates_before_model_call(
         pytest.fail("검증 실패 뒤 모델이 호출됨")
 
     with guidance_agent.override(model=FunctionModel(unexpected_model_call)):
-        with pytest.raises(ValueError, match="dry_run_result.success must be true"):
+        with pytest.raises(ValueError, match="dry_run_result.status must be succeeded"):
             await generate_decision_guidance(plan)
 
 

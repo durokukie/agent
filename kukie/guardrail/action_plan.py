@@ -4,8 +4,8 @@
 - Action Plan은 훅이 내부적으로 생성·기록한다. LLM이 호출하는 Plan 툴(조회/평가)은
   MVP 제외 — 필요해지면 히스토리 기능과 함께 추가.
 - 실행 중에는 ActionPlan 객체가 기준이고, 변경할 때마다 .md 스냅샷을 갱신한다.
-- frontmatter(기계용) = 명령·대상·등급·dry-run·승인·결과
-- 본문(사람용) = 객체의 intent/예상 영향/부작용을 렌더링한 기록
+- frontmatter(기계용) = 모든 필드의 단일 저장 원본
+- Markdown(사람용) = 객체 필드를 표시할 때만 동적으로 조합
 - decision_guidance = 승인 전 별도 LLM 검토가 작성하는 판단 보조 필드
 
 상태: draft → executed / failed / rejected. dry-run 실패도 failed 기록으로 보관한다.
@@ -22,6 +22,7 @@ import yaml
 
 PLAN_DIR = Path.home() / ".kukie" / "plans"
 FINAL_STATUSES = frozenset({"executed", "failed", "rejected"})
+DRY_RUN_STATUSES = frozenset({"succeeded", "failed", "unsupported"})
 
 
 def _utc_now() -> str:
@@ -37,6 +38,7 @@ class ActionPlan:
     id: str
     path: Path
     created_at: str
+    call_id: str
     tool: str
     skill: str
     target: dict[str, str]
@@ -55,6 +57,7 @@ class ActionPlan:
     def create_draft(
         cls,
         *,
+        call_id: str,
         tool: str,
         command: list[str],
         risk: str,
@@ -78,6 +81,7 @@ class ActionPlan:
                 id=plan_id,
                 path=PLAN_DIR / f"{plan_id}.md",
                 created_at=created_at,
+                call_id=call_id,
                 tool=tool,
                 skill=skill,
                 target=dict(target),
@@ -95,21 +99,79 @@ class ActionPlan:
             else:
                 return plan
 
+    @classmethod
+    def load(cls, path: Path) -> "ActionPlan":
+        path = Path(path)
+        metadata, _ = cls._read_path(path)
+        try:
+            intent = metadata["intent"]
+            expected_effects = metadata["expected_effects"]
+            side_effects = metadata["side_effects"]
+            if (
+                not isinstance(intent, str)
+                or not isinstance(expected_effects, list)
+                or not all(isinstance(item, str) for item in expected_effects)
+                or not isinstance(side_effects, list)
+                or not all(isinstance(item, str) for item in side_effects)
+            ):
+                raise TypeError
+            return cls(
+                id=metadata["id"],
+                path=path,
+                created_at=metadata["created_at"],
+                call_id=metadata["call_id"],
+                tool=metadata["tool"],
+                skill=metadata["skill"],
+                target=dict(metadata["target"]),
+                command=list(metadata["command"]),
+                risk_level=metadata["risk_level"],
+                status=metadata["status"],
+                intent=intent,
+                expected_effects=expected_effects,
+                side_effects=side_effects,
+                dry_run_result=metadata.get("dry_run_result"),
+                decision_guidance=metadata.get("decision_guidance"),
+                approval=metadata.get("approval"),
+                execution_result=metadata.get("execution_result"),
+            )
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"invalid Action Plan frontmatter: {path}") from exc
+
+    @classmethod
+    def find_by_call_id(cls, call_id: str) -> "ActionPlan":
+        # ponytail: 로컬 MVP에서는 선형 탐색이면 충분하다. 실제 병목일 때만 인덱스를 추가한다.
+        for path in PLAN_DIR.glob("*.md"):
+            metadata, _ = cls._read_path(path)
+            if metadata.get("call_id") == call_id:
+                return cls.load(path)
+        raise FileNotFoundError(f"Action Plan not found for call_id={call_id}")
+
     def _metadata(self) -> dict[str, object]:
         return {
             "id": self.id,
             "created_at": self.created_at,
+            "call_id": self.call_id,
             "tool": self.tool,
             "skill": self.skill,
             "target": self.target,
             "command": self.command,
             "risk_level": self.risk_level,
             "status": self.status,
+            "intent": self.intent,
+            "expected_effects": self.expected_effects,
+            "side_effects": self.side_effects,
             "dry_run_result": self.dry_run_result,
             "decision_guidance": self.decision_guidance,
             "approval": self.approval,
             "execution_result": self.execution_result,
         }
+
+    def _serialize(self) -> str:
+        return (
+            "---\n"
+            f"{yaml.safe_dump(self._metadata(), sort_keys=False, allow_unicode=True)}"
+            "---\n"
+        )
 
     def _body(self) -> str:
         return (
@@ -118,16 +180,16 @@ class ActionPlan:
             f"## Side Effects\n\n{_bullets(self.side_effects)}\n"
         )
 
-    def render(self, *, include_decision_guidance: bool = True) -> str:
+    def render_markdown(self, *, include_decision_guidance: bool = True) -> str:
         metadata = self._metadata()
+        for field in ("intent", "expected_effects", "side_effects"):
+            metadata.pop(field)
         if not include_decision_guidance:
             metadata.pop("decision_guidance")
-        return (
-            "---\n"
-            f"{yaml.safe_dump(metadata, sort_keys=False, allow_unicode=True)}"
-            "---\n"
-            f"{self._body()}"
-        )
+        details = yaml.safe_dump(
+            metadata, sort_keys=False, allow_unicode=True
+        ).rstrip()
+        return f"# Action Plan\n\n```yaml\n{details}\n```\n\n{self._body()}"
 
     def _write(self, *, exclusive: bool = False) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,7 +202,7 @@ class ActionPlan:
                 delete=False,
             ) as temp:
                 temp_path = Path(temp.name)
-                temp.write(self.render())
+                temp.write(self._serialize())
             if exclusive:
                 # hardlink_to는 대상 이름이 이미 존재하면 FileExistsError를 내고 절대 덮어쓰지 않는다.
                 # 이 성질을 "없을 때만 생성"의 원자적 잠금으로 쓴다 (create_draft 전용).
@@ -153,20 +215,24 @@ class ActionPlan:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
 
-    def _read(self) -> tuple[dict, str]:
-        text = self.path.read_text(encoding="utf-8")
+    @staticmethod
+    def _read_path(path: Path) -> tuple[dict, str]:
+        text = path.read_text(encoding="utf-8")
         if not text.startswith("---\n"):
-            raise ValueError(f"invalid Action Plan frontmatter: {self.path}")
+            raise ValueError(f"invalid Action Plan frontmatter: {path}")
         frontmatter, separator, body = text[4:].partition("\n---\n")
         if not separator:
-            raise ValueError(f"invalid Action Plan frontmatter: {self.path}")
+            raise ValueError(f"invalid Action Plan frontmatter: {path}")
         try:
             metadata = yaml.safe_load(frontmatter)
         except yaml.YAMLError as exc:
-            raise ValueError(f"invalid Action Plan frontmatter: {self.path}") from exc
+            raise ValueError(f"invalid Action Plan frontmatter: {path}") from exc
         if not isinstance(metadata, dict):
-            raise ValueError(f"invalid Action Plan frontmatter: {self.path}")
+            raise ValueError(f"invalid Action Plan frontmatter: {path}")
         return metadata, body
+
+    def _read(self) -> tuple[dict, str]:
+        return self._read_path(self.path)
 
     def _update(self, key: str, value: object) -> None:
         previous = getattr(self, key)
@@ -181,6 +247,7 @@ class ActionPlan:
         required = (
             "id",
             "created_at",
+            "call_id",
             "tool",
             "skill",
             "target",
@@ -199,10 +266,10 @@ class ActionPlan:
             raise ValueError("ActionPlan is not ready for guidance: status must be draft")
 
         dry_run = self.dry_run_result
-        if not isinstance(dry_run, dict) or dry_run.get("success") is not True:
+        if not isinstance(dry_run, dict) or dry_run.get("status") != "succeeded":
             raise ValueError(
                 "ActionPlan is not ready for guidance: "
-                "dry_run_result.success must be true"
+                "dry_run_result.status must be succeeded"
             )
         if self.approval is not None:
             raise ValueError("ActionPlan is not ready for guidance: approval must be empty")
@@ -224,10 +291,17 @@ class ActionPlan:
             raise ValueError("decision guidance already exists")
         self._update("decision_guidance", guidance)
 
-    def record_dry_run(self, output: str, ok: bool) -> None:
+    def record_dry_run(self, status: str, stdout: str, stderr: str) -> None:
+        if status not in DRY_RUN_STATUSES:
+            raise ValueError(f"invalid dry-run status: {status}")
         self._update(
             "dry_run_result",
-            {"success": ok, "output": output, "at": _utc_now()},
+            {
+                "status": status,
+                "stdout": stdout,
+                "stderr": stderr,
+                "at": _utc_now(),
+            },
         )
 
     def record_approval(self, mode: str) -> None:

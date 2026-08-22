@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "쿠버네티스를 배우면서 안전하게 쓰는 에이전트"
 requires-python = ">=3.10"
 dependencies = [
-    "pydantic-ai>=1.0",
+    "pydantic-ai>=2.16",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
 ]
