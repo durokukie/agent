@@ -12,13 +12,17 @@ LLM은 발동 여부에 관여할 수 없다. wrap 훅 하나가 전 단계를 �
 """
 from __future__ import annotations
 
-from pydantic_ai import ModelRetry, ToolFailed
+import logging
+
+from pydantic_ai import ApprovalRequired, ModelRetry, ToolFailed
 from pydantic_ai.capabilities.hooks import Hooks
 
 from kukie.guardrail.action_plan import ActionPlan
+from kukie.guardrail.decision_guidance import generate_decision_guidance
 from kukie.kubectl import assemble, run_kubectl
 from kukie.tools.mutate import MUTATING_TOOLS, RISK_STICKERS
 
+logger = logging.getLogger(__name__)
 hooks = Hooks()
 
 
@@ -32,9 +36,9 @@ def _dry_run_unsupported(stderr: str) -> bool:
 
 @hooks.on.tool_execute(tools=sorted(MUTATING_TOOLS))
 async def guardrail(ctx, *, call, tool_def, args, handler):
-    """승인 전 1차 Hook의 입력 검증, Plan 생성, server dry-run을 수행한다.
+    """승인 전 1차 Hook의 Plan 생성, dry-run, guidance, 승인 요청을 수행한다.
 
-    decision_guidance와 ApprovalRequired는 #25, 승인 후 실행은 #26의 책임이다.
+    승인 후 실제 실행과 결과 기록은 #26의 책임이다.
     """
     tool_name = call.tool_name
     if tool_name not in MUTATING_TOOLS:
@@ -107,4 +111,12 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
         plan.mark("failed")
         raise ToolFailed(f"dry-run failed: {rehearsal.stderr.strip()}")
 
-    raise NotImplementedError("#25 decision guidance and ApprovalRequired")
+    guidance = "guidance unavailable"
+    if dry_run_status == "succeeded":
+        try:
+            guidance = await generate_decision_guidance(plan)
+        except Exception:
+            logger.exception("decision guidance unavailable: plan_id=%s", plan.id)
+
+    plan.record_decision_guidance(guidance)
+    raise ApprovalRequired({"plan_id": plan.id})

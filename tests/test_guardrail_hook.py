@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from subprocess import TimeoutExpired
 from types import SimpleNamespace
@@ -5,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import yaml
-from pydantic_ai import ModelRetry, ToolFailed
+from pydantic_ai import ApprovalRequired, ModelRetry, ToolFailed
 from pydantic_ai.messages import ToolCallPart
 
 from kukie.guardrail import action_plan, hook
@@ -68,6 +69,18 @@ def successful_dry_run(monkeypatch):
 
     monkeypatch.setattr(hook, "run_kubectl", fake_run)
     return calls
+
+
+@pytest.fixture
+def successful_guidance(monkeypatch):
+    generate = AsyncMock(return_value="배포 시간과 롤백 기준을 확인한다.")
+    monkeypatch.setattr(
+        hook,
+        "generate_decision_guidance",
+        generate,
+        raising=False,
+    )
+    return generate
 
 
 @pytest.mark.asyncio
@@ -174,13 +187,19 @@ async def test_call_id_누락은_Plan_생성_전에_거부한다(monkeypatch, tm
         ),
     ],
 )
-async def test_위험도는_RISK_STICKERS의_고정값만_사용한다(
-    monkeypatch, tmp_path, successful_dry_run, tool_name, args, expected_risk
+async def test_CAUTION과_DESTRUCTIVE는_고정_위험도로_ApprovalRequired를_한번_발생시킨다(
+    monkeypatch,
+    tmp_path,
+    successful_dry_run,
+    successful_guidance,
+    tool_name,
+    args,
+    expected_risk,
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     handler = AsyncMock()
 
-    with pytest.raises(NotImplementedError, match="#25"):
+    with pytest.raises(ApprovalRequired) as approval_required:
         await hook.guardrail(
             _ctx(),
             call=_call(tool_name),
@@ -192,17 +211,18 @@ async def test_위험도는_RISK_STICKERS의_고정값만_사용한다(
     metadata = _read_plan(next(tmp_path.glob("*.md")))
     assert metadata["risk_level"] == expected_risk
     assert metadata["call_id"] == "call-123"
+    assert approval_required.value.metadata == {"plan_id": metadata["id"]}
     handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_보호_namespace도_CAUTION_위험도를_유지한다(
-    monkeypatch, tmp_path, successful_dry_run
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     args = {**BASE_ARGS, "namespace": "kube-system"}
 
-    with pytest.raises(NotImplementedError, match="#25"):
+    with pytest.raises(ApprovalRequired):
         await hook.guardrail(
             _ctx(),
             call=_call(),
@@ -217,7 +237,7 @@ async def test_보호_namespace도_CAUTION_위험도를_유지한다(
 
 @pytest.mark.asyncio
 async def test_apply_manifest는_세션_namespace를_Plan에_사용한다(
-    monkeypatch, tmp_path, successful_dry_run
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     args = {
@@ -228,7 +248,7 @@ async def test_apply_manifest는_세션_namespace를_Plan에_사용한다(
         "side_effects": ["노드 자원을 사용한다."],
     }
 
-    with pytest.raises(NotImplementedError, match="#25"):
+    with pytest.raises(ApprovalRequired):
         await hook.guardrail(
             _ctx(namespace="study"),
             call=_call("apply_manifest"),
@@ -245,13 +265,19 @@ async def test_apply_manifest는_세션_namespace를_Plan에_사용한다(
 
 
 @pytest.mark.asyncio
-async def test_dry_run_성공은_실행_없이_Plan에_기록한다(
-    monkeypatch, tmp_path, successful_dry_run
+async def test_dry_run_성공은_판단_가이드를_저장하고_Plan으로_승인을_연결한다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     handler = AsyncMock()
 
-    with pytest.raises(NotImplementedError, match="#25"):
+    def unexpected_cli(*args, **kwargs):
+        pytest.fail("CLI 입력이나 cli_approve를 호출하면 안 된다")
+
+    monkeypatch.setattr("builtins.input", unexpected_cli)
+    monkeypatch.setattr(hook, "cli_approve", unexpected_cli, raising=False)
+
+    with pytest.raises(ApprovalRequired) as approval_required:
         await hook.guardrail(
             _ctx(), call=_call(), tool_def=None, args=BASE_ARGS, handler=handler
         )
@@ -262,6 +288,8 @@ async def test_dry_run_성공은_실행_없이_Plan에_기록한다(
     assert metadata["dry_run_result"]["status"] == "succeeded"
     assert metadata["dry_run_result"]["stdout"] == "ok\n"
     assert metadata["dry_run_result"]["stderr"] == ""
+    assert metadata["decision_guidance"] == "배포 시간과 롤백 기준을 확인한다."
+    assert approval_required.value.metadata == {"plan_id": metadata["id"]}
     assert successful_dry_run == [
         {
             "args": [
@@ -281,7 +309,46 @@ async def test_dry_run_성공은_실행_없이_Plan에_기록한다(
 
 
 @pytest.mark.asyncio
-async def test_Plan은_server_dry_run_전에_저장된다(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("guidance model unavailable"),
+        ValueError("LLM returned empty decision guidance"),
+    ],
+)
+async def test_판단_가이드_예외와_빈_출력은_대체문구를_저장하고_승인을_계속한다(
+    monkeypatch, tmp_path, successful_dry_run, caplog, error
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+
+    async def fail_guidance(plan):
+        raise error
+
+    monkeypatch.setattr(hook, "generate_decision_guidance", fail_guidance)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(ApprovalRequired):
+            await hook.guardrail(
+                _ctx(),
+                call=_call(),
+                tool_def=None,
+                args=BASE_ARGS,
+                handler=AsyncMock(),
+            )
+
+    metadata = _read_plan(next(tmp_path.glob("*.md")))
+    assert metadata["decision_guidance"] == "guidance unavailable"
+    assert metadata["risk_level"] == "caution"
+    assert metadata["status"] == "draft"
+    assert metadata["approval"] is None
+    assert metadata["execution_result"] is None
+    assert str(error) in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_Plan은_server_dry_run_전에_저장된다(
+    monkeypatch, tmp_path, successful_guidance
+):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
 
     def fake_run(*args, **kwargs):
@@ -297,7 +364,7 @@ async def test_Plan은_server_dry_run_전에_저장된다(monkeypatch, tmp_path)
 
     monkeypatch.setattr(hook, "run_kubectl", fake_run)
 
-    with pytest.raises(NotImplementedError, match="#25"):
+    with pytest.raises(ApprovalRequired):
         await hook.guardrail(
             _ctx(),
             call=_call(),
@@ -310,6 +377,11 @@ async def test_Plan은_server_dry_run_전에_저장된다(monkeypatch, tmp_path)
 @pytest.mark.asyncio
 async def test_dry_run_실패는_Plan을_failed로_남기고_중단한다(monkeypatch, tmp_path):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+
+    async def unexpected_guidance(plan):
+        pytest.fail("dry-run 실패에서는 guidance를 생성하면 안 된다")
+
+    monkeypatch.setattr(hook, "generate_decision_guidance", unexpected_guidance)
     monkeypatch.setattr(
         hook,
         "run_kubectl",
@@ -382,7 +454,7 @@ async def test_dry_run_실행_예외도_Plan을_failed로_남긴다(
         "error: unknown flag: --dry-run\n",
     ],
 )
-async def test_dry_run_미지원은_다음_승인을_위해_draft를_유지한다(
+async def test_dry_run_미지원은_판단_가이드_없이_원인을_남기고_승인을_요청한다(
     monkeypatch, tmp_path, stderr
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
@@ -398,7 +470,16 @@ async def test_dry_run_미지원은_다음_승인을_위해_draft를_유지한�
     )
     handler = AsyncMock()
 
-    with pytest.raises(NotImplementedError, match="#25"):
+    async def unexpected_guidance(plan):
+        pytest.fail("dry-run 미지원에서는 guidance를 생성하면 안 된다")
+
+    monkeypatch.setattr(
+        hook,
+        "generate_decision_guidance",
+        unexpected_guidance,
+    )
+
+    with pytest.raises(ApprovalRequired) as approval_required:
         await hook.guardrail(
             _ctx(), call=_call(), tool_def=None, args=BASE_ARGS, handler=handler
         )
@@ -407,7 +488,9 @@ async def test_dry_run_미지원은_다음_승인을_위해_draft를_유지한�
     assert metadata["status"] == "draft"
     assert metadata["dry_run_result"]["status"] == "unsupported"
     assert metadata["dry_run_result"]["stderr"] == stderr
+    assert metadata["decision_guidance"] == "guidance unavailable"
     assert metadata["approval"] is None
+    assert approval_required.value.metadata == {"plan_id": metadata["id"]}
     handler.assert_not_awaited()
 
 
