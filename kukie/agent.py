@@ -12,11 +12,12 @@ from pydantic_ai.toolsets import FunctionToolset
 
 from kukie.deps import Deps
 from kukie.guardrail.hook import hooks as guardrail_hooks
-from kukie.skills.base import KukieResponse
+from kukie.response import build_response
 from kukie.tools.read import READ_TOOLS
 
 BASE_PROMPT = """너는 쿠버네티스를 처음 배우는 연수생을 돕는 조수 Kukie다.
-1. kubectl 명령을 다룰 때는 각 플래그·필드의 의미를 explanations에 반드시 채운다.
+1. 실행한 명령·결과·플래그 설명은 시스템이 자동으로 화면에 붙인다 — 너는 narration에서
+   그 결과가 무엇을 뜻하는지 연수생 눈높이로 풀어 설명해라. 명령어를 다시 옮겨 적지 마라.
 2. '무엇을' 하는지와 '왜' 하는지를 항상 함께 설명한다.
 3. 제공된 툴로 할 수 없는 작업은 실행하려 하지 말고, 사용자가 직접 터미널에
    실행할 kubectl 명령을 만들어 안내하고 각 플래그의 의미를 설명해라.
@@ -47,7 +48,8 @@ agent = Agent(
     MODEL,
     name="kukie",
     deps_type=Deps,
-    output_type=KukieResponse,        # run마다 skill.output_type으로 오버라이드
+    output_type=build_response,       # 함수 output_type — LLM은 narration 등 해석 칸만, steps는 코드가 (DURO-44)
+                                      # 스킬 특화 응답은 run마다 output_type=skill.output_fn 으로 오버라이드
     instructions=BASE_PROMPT,
     toolsets=[toolset],               # 스킬 필터를 거친 툴 목록
     capabilities=[guardrail_hooks],   # 가드레일 훅 장착
@@ -74,9 +76,9 @@ agent = Agent(
 #   @agent.instructions      → 프롬프트 생성기 (아래 둘)
 #   FunctionToolset(...)     → 툴 (READ_TOOLS의 함수들; LLM이 이름으로 호출)
 #   @hooks.on.tool_execute   → 훅 (guardrail/hook.py의 guardrail())
-#   agent.output_validator() → 최종 출력 검사기 — 현재 미등록.
-#     explanations를 코드(FLAG_GLOSSARY)가 채우는 방향 확정(DURO-44)으로
-#     LLM 감시형 검증기는 제외. DURO-44에서 "사전 미등록 플래그 로그"로 부활 예정.
+#   output_type=build_response → 최종 응답 조립기 (response.py). 함수라서 LLM 스키마는
+#     매개변수(narration, suggested_transition)뿐이고, steps는 본문에서 코드가 실행 기록으로 채운다.
+#     사전에 없는 플래그는 validators.log_unregistered_flags가 로그만 남긴다 (반려 없음).
 #
 # 함수형(문자열 대신 함수)으로 두는 이유: BASE_PROMPT는 고정값이라 문자열로 충분하지만,
 # 아래 둘은 run마다 달라지는 값(현재 대상, 현재 스킬)을 ctx.deps에서 읽어야 하므로

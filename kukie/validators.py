@@ -1,12 +1,22 @@
-"""출력 검증 — 현재 비어 있음 (역할은 DURO-44에서 확정).
+"""출력 검증 — 사전 미등록 플래그 로그 (DURO-44).
 
-원래 이 PR에서 "explanations 비면/플래그 빠지면 ModelRetry" 검증기를 구현했으나,
-explanations를 LLM이 아니라 코드(FLAG_GLOSSARY 사전)가 채우는 방향이 확정되어
-(GitHub #20 · Linear DURO-44) LLM 감시형 검증기는 넣지 않는다 —
-코드가 채우는 값을 검증하는 것은 무의미하다.
-
-DURO-44에서의 새 역할: 사전에 없는 플래그를 감지해 로그로 남긴다
-(반려가 아니라 사전 보강 목록용). 그때까지 explanations는 프롬프트 유도로만
-채워진다 — 이 공백 기간에는 실사용 경로(CLI는 DURO-43)가 없어 위험 없음.
+explanations 는 코드가 FLAG_GLOSSARY 사전으로 채우므로(response.py) "LLM이 설명을 빠뜨렸나"를
+감시하던 검증기는 필요 없다. 남는 역할은 하나 — 실제 실행된 명령에 사전에 없는 토큰이
+있었는지 기록하는 것. 반려하지 않는다 (사용자 응답은 그대로 나간다). 이 로그가 사전 보강
+목록이 된다.
 """
 from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def log_unregistered_flags(tool_name: str, command: str, unknown: list[str]) -> None:
+    """사전에 없던 플래그를 경고 로그로 남긴다. 비어 있으면 아무것도 하지 않는다."""
+    if not unknown:
+        return
+    logger.warning(
+        "FLAG_GLOSSARY 미등록 플래그 — tool=%s flags=%s command=%s",
+        tool_name, unknown, command,
+    )

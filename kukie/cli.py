@@ -19,7 +19,7 @@ def main() -> None:
     #   result = agent.run_sync(
     #       user_input,
     #       deps=Deps(context=..., namespace=..., skill=skill),
-    #       output_type=skill.output_type,        # 스킬별 응답 스키마
+    #       output_type=skill.output_fn,          # 스킬별 응답 조립 함수 (steps는 코드가 채움, DURO-44)
     #       message_history=history,              # 턴 간 연결
     #   )
     #   render(result.output)                     # [모드 라벨] + steps 블록 렌더링
