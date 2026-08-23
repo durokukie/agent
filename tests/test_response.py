@@ -134,6 +134,43 @@ def test_이어지는_턴에서도_steps는_그_턴의_실행_기록과_일치�
     assert len(second.output.steps) == calls_in_second   # 지난 턴 것이 섞이면 이 등식이 깨진다
 
 
+def test_승인_후_재개된_턴의_변경_실행은_mutating_블록으로_잡힌다():
+    """2차 run: 새 사용자 발화 없이 이어지므로 1차 발화부터가 이번 턴 — 실행 기록이 steps 에 들어간다.
+    dry-run 은 훅이 직접 실행한 것이라 콜 기록이 아니므로 블록이 되지 않는다."""
+    from types import SimpleNamespace
+    from pydantic_ai.messages import (ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart,
+                                      UserPromptPart)
+
+    executed = KubectlResult(command="kubectl --context kind-dev delete deployment nginx -n study",
+                             stdout="deployment.apps/nginx deleted", stderr="", success=True)
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="nginx 지워줘")]),           # 1차 run 시작
+        ModelResponse(parts=[ToolCallPart(tool_name="delete_resource", args={}, tool_call_id="c1")]),
+        # (1차: ApprovalRequired 로 멈춤 — 콜에 답이 없는 상태로 기록됨)
+        # (2차: 재개 — 새 UserPromptPart 없이 실행 결과만 추가됨)
+        ModelRequest(parts=[ToolReturnPart(tool_name="delete_resource", content=executed,
+                                           tool_call_id="c1")]),
+    ]
+    steps = response_mod.collect_steps(SimpleNamespace(messages=messages))
+    assert len(steps) == 1
+    assert steps[0].access == "mutating"
+    assert steps[0].step_label == "리소스 삭제"
+    assert steps[0].command == executed.command
+    assert {e.field for e in steps[0].explanations} >= {"delete", "-n study"}
+
+
+def test_거부되거나_실패한_호출은_블록이_되지_않는다():
+    from types import SimpleNamespace
+    from pydantic_ai.messages import ModelRequest, ToolReturnPart, UserPromptPart
+
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="nginx 지워줘")]),
+        ModelRequest(parts=[ToolReturnPart(tool_name="delete_resource", content="사용자가 거절함",
+                                           tool_call_id="c1")]),   # content 가 KubectlResult 가 아님
+    ]
+    assert response_mod.collect_steps(SimpleNamespace(messages=messages)) == []
+
+
 # ── 5. 스킬 특화 응답도 같은 방식 ──────────────────────────────
 
 def test_스킬_특화_응답은_특화_필드만_LLM이_채우고_steps는_코드가_채운다(fake_kubectl):
