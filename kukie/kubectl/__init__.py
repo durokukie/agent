@@ -7,5 +7,6 @@
 """
 from kukie.kubectl.runner import KubectlResult, run_kubectl
 from kukie.kubectl.assemble import assemble
+from kukie.kubectl.config import KubeconfigError, read_kubeconfig
 
-__all__ = ["KubectlResult", "run_kubectl", "assemble"]
+__all__ = ["KubectlResult", "run_kubectl", "assemble", "read_kubeconfig", "KubeconfigError"]
