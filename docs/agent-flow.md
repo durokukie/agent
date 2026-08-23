@@ -12,7 +12,7 @@ flowchart TD
     subgraph CLI_["cli.py (미구현)"]
         CLI["main() 대화 루프<br/>입력 받기"]
         CLI --> R["router.pick_skill(msg, current)<br/>→ 학습 스킬 (코드가 결정, LLM 아님)"]
-        R --> RUN["agent.run_sync(msg,<br/>deps=Deps(context, namespace, skill),<br/>output_type=skill.output_type)"]
+        R --> RUN["agent.run_sync(msg,<br/>deps=Deps(context, namespace, skill),<br/>output_type=skill.output_fn)"]
     end
 
     RUN --> PA
