@@ -63,14 +63,14 @@ def _manifest_resources(manifest_yaml: str) -> list[dict[str, str]]:
             name = metadata.get("name") if isinstance(metadata, dict) else None
             if (
                 not isinstance(kind, str)
-                or not kind
+                or not kind.strip()
                 or not isinstance(name, str)
-                or not name
+                or not name.strip()
             ):
                 raise ModelRetry(error)
             target = {"kind": kind, "name": name}
             if namespace := metadata.get("namespace"):
-                if not isinstance(namespace, str):
+                if not isinstance(namespace, str) or not namespace.strip():
                     raise ModelRetry(error)
                 target["namespace"] = namespace
             resources.append(target)

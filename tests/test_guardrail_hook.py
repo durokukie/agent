@@ -359,6 +359,9 @@ async def test_apply_manifest는_List의_items를_개별_대상으로_저장한�
         "kind: Pod\nmetadata: {}\n",
         " \n---\n",
         "kind: List\nitems:\n  - invalid\n",
+        "kind: '   '\nmetadata:\n  name: nginx\n",
+        "kind: Pod\nmetadata:\n  name: '   '\n",
+        "kind: Pod\nmetadata:\n  name: nginx\n  namespace: '   '\n",
     ],
 )
 async def test_apply_manifest는_식별할_수_없는_리소스를_Plan_생성_전에_거부한다(
