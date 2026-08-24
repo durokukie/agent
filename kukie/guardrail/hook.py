@@ -69,7 +69,8 @@ def _manifest_resources(manifest_yaml: str) -> list[dict[str, str]]:
             ):
                 raise ModelRetry(error)
             target = {"kind": kind, "name": name}
-            if namespace := metadata.get("namespace"):
+            if "namespace" in metadata:
+                namespace = metadata["namespace"]
                 if not isinstance(namespace, str) or not namespace.strip():
                     raise ModelRetry(error)
                 target["namespace"] = namespace
