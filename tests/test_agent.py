@@ -2,9 +2,7 @@
 
 TestModel로 결정론적으로 돌린다 (실제 LLM 호출·API 키 없음).
 
-검증기(enforce_explanations) 테스트는 제거됨 — explanations를 코드(FLAG_GLOSSARY)가
-채우는 방향 확정(DURO-44)으로 LLM 감시형 검증기를 이 PR에서 뺐다.
-DURO-44에서 "사전 미등록 플래그 로그" 테스트로 대체된다.
+응답 조립(steps를 코드가 채우는 것)은 tests/test_response.py 에서 검증한다 (DURO-44).
 """
 import pytest
 from pydantic_ai.models.test import TestModel
@@ -18,9 +16,9 @@ def _deps(skill_name: str = "학습") -> Deps:
     return Deps(context="kind-dev", namespace="study", skill=SKILLS[skill_name])
 
 
+# LLM이 채우는 칸만 — steps 는 스키마에 없다 (코드가 채움)
 GOOD_RESPONSE = {
     "narration": "결과입니다.",
-    "steps": [],
     "suggested_transition": None,
 }
 

@@ -22,8 +22,8 @@ class FieldExplanation(BaseModel):
 class ToolStep(BaseModel):
     """화면의 명령 실행 블록 하나.
 
-    command/output/access는 코드가 채운다 (LLM 자기신고 금지).
-    explanations만 LLM 몫.
+    네 칸 전부 코드가 채운다 (response.collect_steps) — LLM은 이 블록의 존재를 모른다.
+    command/output/access 는 실제 툴 실행 기록에서, explanations 는 FLAG_GLOSSARY 사전에서.
     """
     step_label: str
     access: Literal["read-only", "mutating"]
@@ -59,3 +59,10 @@ class Skill:
     @property
     def allowed_tools(self) -> frozenset[str]:
         return COMMON_TOOLS | self.extra_tools
+
+    @property
+    def output_fn(self):
+        """run 에 꽂을 조립 함수 — output_type 클래스에서 steps 를 뺀 시그니처로 LLM 스키마를 만들고,
+        steps 는 코드가 실행 기록에서 채운다 (DURO-44). 호출부: agent.run(..., output_type=skill.output_fn)."""
+        from kukie.response import build_response_for   # 순환 import 회피 (response → base)
+        return build_response_for(self.output_type)
