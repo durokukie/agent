@@ -23,6 +23,7 @@ import yaml
 PLAN_DIR = Path.home() / ".kukie" / "plans"
 FINAL_STATUSES = frozenset({"executed", "failed", "rejected"})
 DRY_RUN_STATUSES = frozenset({"succeeded", "failed", "unsupported"})
+PlanTarget = dict[str, str | list[dict[str, str]]]
 
 
 def _utc_now() -> str:
@@ -41,7 +42,7 @@ class ActionPlan:
     call_id: str
     tool: str
     skill: str
-    target: dict[str, str]
+    target: PlanTarget
     command: list[str]
     risk_level: str
     status: str
@@ -62,7 +63,7 @@ class ActionPlan:
         command: list[str],
         risk: str,
         skill: str,
-        target: dict[str, str],
+        target: PlanTarget,
         intent: str,
         expected_effects: list[str],
         side_effects: list[str],
