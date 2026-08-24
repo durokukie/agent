@@ -22,6 +22,12 @@ def _ready_plan(monkeypatch, tmp_path: Path) -> ActionPlan:
     plan = ActionPlan.create_draft(
         call_id="call-123",
         tool="scale_resource",
+        args={
+            "kind": "deployment",
+            "name": "nginx",
+            "replicas": 3,
+            "namespace": "study",
+        },
         command=["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
         risk="caution",
         skill="실습",
@@ -105,6 +111,7 @@ async def test_generate_decision_guidance_validates_before_model_call(
     plan = ActionPlan.create_draft(
         call_id="call-123",
         tool="scale_resource",
+        args={"kind": "deployment", "name": "nginx", "replicas": 3},
         command=["scale", "deployment", "nginx", "--replicas=3"],
         risk="caution",
         skill="실습",

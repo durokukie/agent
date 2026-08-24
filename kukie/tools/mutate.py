@@ -21,10 +21,10 @@ from kukie.kubectl import KubectlResult, assemble, run_kubectl
 
 
 class Risk(IntEnum):
-    """위험도 등급 — 승인 횟수를 결정한다."""
+    """승인 화면에 표시할 고정 위험도 등급."""
     SAFE = 0         # 승인 없음 (읽기 툴)
-    CAUTION = 1      # 1회 확인
-    DESTRUCTIVE = 2  # 이중 확인
+    CAUTION = 1      # 단일 승인
+    DESTRUCTIVE = 2  # 단일 승인, 더 높은 위험 표시
 
 
 # 본체 공통 패턴: 자기 인자로 assemble() 조립 → run_kubectl() 실행.
@@ -71,7 +71,7 @@ def rollout_restart(ctx: RunContext[Deps], kind: str, name: str, namespace: str,
 def delete_resource(ctx: RunContext[Deps], kind: str, name: str, namespace: str,
                     intent: str, expected_effects: list[str],
                     side_effects: list[str]) -> KubectlResult:
-    """리소스를 삭제한다 (kubectl delete). destructive — 이중 승인 대상."""
+    """리소스를 삭제한다 (kubectl delete). destructive 위험도로 단일 승인한다."""
     args = assemble("delete_resource",
                     {"kind": kind, "name": name, "namespace": namespace})
     return run_kubectl(args, context=ctx.deps.context)

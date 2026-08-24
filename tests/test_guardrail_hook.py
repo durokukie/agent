@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 from pathlib import Path
 from subprocess import TimeoutExpired
 from types import SimpleNamespace
@@ -24,6 +25,15 @@ BASE_ARGS = {
     "side_effects": ["추가 노드 자원을 사용한다."],
 }
 
+DELETE_ARGS = {
+    "kind": "deployment",
+    "name": "nginx",
+    "namespace": "study",
+    "intent": "nginx deployment를 삭제한다.",
+    "expected_effects": ["deployment가 삭제된다."],
+    "side_effects": ["서비스가 중단될 수 있다."],
+}
+
 
 def _ctx(*, namespace="study", approved=False):
     return SimpleNamespace(
@@ -45,6 +55,17 @@ def _read_plan(path: Path) -> dict:
     frontmatter, separator, _ = text.removeprefix("---\n").partition("\n---\n")
     assert separator
     return yaml.safe_load(frontmatter)
+
+
+async def _create_pending_plan(*, ctx=None, call=None, args=None) -> None:
+    with pytest.raises(ApprovalRequired):
+        await hook.guardrail(
+            ctx or _ctx(),
+            call=call or _call(),
+            tool_def=None,
+            args=args if args is not None else BASE_ARGS,
+            handler=AsyncMock(),
+        )
 
 
 @pytest.fixture
@@ -211,6 +232,9 @@ async def test_CAUTION과_DESTRUCTIVE는_고정_위험도로_ApprovalRequired를
     metadata = _read_plan(next(tmp_path.glob("*.md")))
     assert metadata["risk_level"] == expected_risk
     assert metadata["call_id"] == "call-123"
+    assert set(metadata["args"]).isdisjoint(
+        {"intent", "expected_effects", "side_effects"}
+    )
     assert approval_required.value.metadata == {"plan_id": metadata["id"]}
     handler.assert_not_awaited()
 
@@ -258,6 +282,10 @@ async def test_apply_manifest는_리소스_식별정보를_Plan에_저장한다(
         )
 
     metadata = _read_plan(next(tmp_path.glob("*.md")))
+    assert metadata["args"] == {
+        "namespace": "study",
+        "manifest_sha256": "7844a377da8301123db998e13ee9ff005ba1022db463e2316fb95b6f681c34fb",
+    }
     assert metadata["target"] == {
         "context": "kind-dev",
         "namespace": "study",
@@ -266,6 +294,9 @@ async def test_apply_manifest는_리소스_식별정보를_Plan에_저장한다(
     assert metadata["command"] == ["apply", "-f", "-", "-n", "study"]
     assert successful_dry_run[0]["args"] == ["apply", "-f", "-", "-n", "study"]
     assert successful_dry_run[0]["stdin"] == args["manifest_yaml"]
+    assert args["manifest_yaml"] not in next(tmp_path.glob("*.md")).read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.asyncio
@@ -655,3 +686,360 @@ async def test_일반_dry_run_오류를_미지원으로_오인하지_않는다(
     metadata = _read_plan(next(tmp_path.glob("*.md")))
     assert metadata["status"] == "failed"
     assert metadata["dry_run_result"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_ToolApproved_재개는_기존_Plan의_handler를_한번_실행한다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    await _create_pending_plan()
+    handler = AsyncMock(
+        return_value=KubectlResult(
+            command="kubectl scale deployment nginx --replicas=3 -n study",
+            stdout="scaled\n",
+            stderr="",
+            success=True,
+            exit_code=0,
+        )
+    )
+
+    result = await hook.guardrail(
+        _ctx(approved=True),
+        call=_call(),
+        tool_def=None,
+        args=BASE_ARGS,
+        handler=handler,
+    )
+
+    assert result.success is True
+    handler.assert_awaited_once_with(BASE_ARGS)
+    assert len(successful_dry_run) == 1
+    successful_guidance.assert_awaited_once()
+    metadata = _read_plan(next(tmp_path.glob("*.md")))
+    assert metadata["approval"]["mode"] == "single"
+    assert metadata["status"] == "executed"
+    assert metadata["args"] == {
+        "kind": "deployment",
+        "name": "nginx",
+        "replicas": 3,
+        "namespace": "study",
+    }
+    assert metadata["execution_result"]["success"] is True
+    assert metadata["execution_result"]["stdout"] == "scaled\n"
+    assert metadata["execution_result"]["stderr"] == ""
+    assert metadata["execution_result"]["exit_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_DESTRUCTIVE도_단일_승인_후_handler를_한번_실행한다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    call = _call("delete_resource")
+    await _create_pending_plan(call=call, args=DELETE_ARGS)
+    handler = AsyncMock(
+        return_value=KubectlResult(
+            command="kubectl delete deployment nginx -n study",
+            stdout="deployment.apps/nginx deleted\n",
+            stderr="",
+            success=True,
+            exit_code=0,
+        )
+    )
+
+    await hook.guardrail(
+        _ctx(approved=True),
+        call=call,
+        tool_def=None,
+        args=DELETE_ARGS,
+        handler=handler,
+    )
+
+    handler.assert_awaited_once_with(DELETE_ARGS)
+    metadata = _read_plan(next(tmp_path.glob("*.md")))
+    assert metadata["risk_level"] == "destructive"
+    assert metadata["approval"]["mode"] == "single"
+    assert datetime.fromisoformat(metadata["approval"]["at"]).tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_ToolApproved에_해당하는_Plan이_없으면_handler를_실행하지_않는다(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    handler = AsyncMock()
+
+    with pytest.raises(ToolFailed, match="Action Plan not found"):
+        await hook.guardrail(
+            _ctx(approved=True),
+            call=_call(),
+            tool_def=None,
+            args=BASE_ARGS,
+            handler=handler,
+        )
+
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handler_예외는_failed로_기록하고_원래_예외를_유지한다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    await _create_pending_plan()
+    handler = AsyncMock(side_effect=RuntimeError("cluster disconnected"))
+
+    with pytest.raises(RuntimeError, match="cluster disconnected"):
+        await hook.guardrail(
+            _ctx(approved=True),
+            call=_call(),
+            tool_def=None,
+            args=BASE_ARGS,
+            handler=handler,
+        )
+
+    handler.assert_awaited_once_with(BASE_ARGS)
+    metadata = _read_plan(next(tmp_path.glob("*.md")))
+    assert metadata["status"] == "failed"
+    assert metadata["execution_result"]["success"] is False
+    assert metadata["execution_result"]["stdout"] == ""
+    assert metadata["execution_result"]["stderr"] == "cluster disconnected"
+    assert metadata["execution_result"]["exit_code"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["tool", "args", "command", "risk", "target"])
+async def test_승인_후_요청이_달라지면_handler를_실행하지_않는다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance, field
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    await _create_pending_plan()
+    ctx = _ctx(approved=True)
+    call = _call()
+    args = BASE_ARGS
+
+    if field == "tool":
+        call = _call("rollout_restart")
+    elif field == "args":
+        args = {**BASE_ARGS, "replicas": 4}
+    elif field == "command":
+        original_assemble = hook.assemble
+        monkeypatch.setattr(
+            hook,
+            "assemble",
+            lambda tool_name, values: [*original_assemble(tool_name, values), "--changed"],
+        )
+    elif field == "risk":
+        monkeypatch.setitem(
+            hook.RISK_STICKERS,
+            "scale_resource",
+            hook.RISK_STICKERS["delete_resource"],
+        )
+    else:
+        ctx.deps.context = "other-cluster"
+
+    handler = AsyncMock()
+    with pytest.raises(ToolFailed, match=f"approved request mismatch: {field}"):
+        await hook.guardrail(
+            ctx,
+            call=call,
+            tool_def=None,
+            args=args,
+            handler=handler,
+        )
+
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_manifest_원문이_달라지면_해시_불일치로_실행하지_않는다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    original = {
+        "manifest_yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: nginx\n",
+        "namespace": "study",
+        "intent": "Pod를 적용한다.",
+        "expected_effects": ["Pod가 생성된다."],
+        "side_effects": ["노드 자원을 사용한다."],
+    }
+    await _create_pending_plan(call=_call("apply_manifest"), args=original)
+    changed = {
+        **original,
+        "manifest_yaml": original["manifest_yaml"] + "  labels:\n    app: changed\n",
+    }
+    handler = AsyncMock()
+
+    with pytest.raises(ToolFailed, match="approved request mismatch: args") as exc:
+        await hook.guardrail(
+            _ctx(approved=True),
+            call=_call("apply_manifest"),
+            tool_def=None,
+            args=changed,
+            handler=handler,
+        )
+
+    handler.assert_not_awaited()
+    assert changed["manifest_yaml"] not in str(exc.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["executed", "failed", "rejected"])
+async def test_terminal_Plan은_handler를_실행하지_않는다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance, status
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    await _create_pending_plan()
+    plan = action_plan.ActionPlan.load(next(tmp_path.glob("*.md")))
+    plan.mark(status)
+    handler = AsyncMock()
+
+    with pytest.raises(ToolFailed, match="not ready for execution"):
+        await hook.guardrail(
+            _ctx(approved=True),
+            call=_call(),
+            tool_def=None,
+            args=BASE_ARGS,
+            handler=handler,
+        )
+
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_같은_Deferred_결과를_재전달해도_handler를_다시_실행하지_않는다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    await _create_pending_plan()
+    result = KubectlResult(
+        command="kubectl scale deployment nginx --replicas=3 -n study",
+        stdout="scaled\n",
+        stderr="",
+        success=True,
+        exit_code=0,
+    )
+    await hook.guardrail(
+        _ctx(approved=True),
+        call=_call(),
+        tool_def=None,
+        args=BASE_ARGS,
+        handler=AsyncMock(return_value=result),
+    )
+    duplicate_handler = AsyncMock()
+
+    with pytest.raises(ToolFailed, match="not ready for execution"):
+        await hook.guardrail(
+            _ctx(approved=True),
+            call=_call(),
+            tool_def=None,
+            args=BASE_ARGS,
+            handler=duplicate_handler,
+        )
+
+    duplicate_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handler_non_zero_결과는_failed로_기록한다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    await _create_pending_plan()
+    result = KubectlResult(
+        command="kubectl scale deployment nginx --replicas=3 -n study",
+        stdout="",
+        stderr="deployment not found\n",
+        success=False,
+        exit_code=1,
+    )
+
+    returned = await hook.guardrail(
+        _ctx(approved=True),
+        call=_call(),
+        tool_def=None,
+        args=BASE_ARGS,
+        handler=AsyncMock(return_value=result),
+    )
+
+    assert returned is result
+    metadata = _read_plan(next(tmp_path.glob("*.md")))
+    assert metadata["status"] == "failed"
+    assert metadata["execution_result"]["success"] is False
+    assert metadata["execution_result"]["stderr"] == "deployment not found\n"
+    assert metadata["execution_result"]["exit_code"] == 1
+
+
+@pytest.mark.asyncio
+async def test_실패_기록_오류가_handler의_원래_예외를_숨기지_않는다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance, caplog
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    await _create_pending_plan()
+    monkeypatch.setattr(
+        action_plan.ActionPlan,
+        "record_execution",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError, match="cluster disconnected"):
+            await hook.guardrail(
+                _ctx(approved=True),
+                call=_call(),
+                tool_def=None,
+                args=BASE_ARGS,
+                handler=AsyncMock(side_effect=RuntimeError("cluster disconnected")),
+            )
+
+    assert "disk full" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_non_zero_기록_실패는_원래_결과에_경고하고_재실행을_차단한다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance, caplog
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    await _create_pending_plan()
+    result = KubectlResult(
+        command="kubectl scale deployment nginx --replicas=3 -n study",
+        stdout="",
+        stderr="deployment not found\n",
+        success=False,
+        exit_code=1,
+    )
+    monkeypatch.setattr(
+        action_plan.ActionPlan,
+        "record_execution",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with caplog.at_level(logging.ERROR):
+        returned = await hook.guardrail(
+            _ctx(approved=True),
+            call=_call(),
+            tool_def=None,
+            args=BASE_ARGS,
+            handler=AsyncMock(return_value=result),
+        )
+
+    assert returned.success is False
+    assert returned.exit_code == 1
+    assert "deployment not found" in returned.stderr
+    assert "실행 결과를 Action Plan에 기록하지 못했습니다" in returned.stderr
+    assert "동일 요청의 재실행은 차단되었습니다" in returned.stderr
+    assert "disk full" not in returned.stderr
+    assert "disk full" in caplog.text
+
+    duplicate_handler = AsyncMock()
+    with pytest.raises(ToolFailed, match="not ready for execution"):
+        await hook.guardrail(
+            _ctx(approved=True),
+            call=_call(),
+            tool_def=None,
+            args=BASE_ARGS,
+            handler=duplicate_handler,
+        )
+
+    duplicate_handler.assert_not_awaited()

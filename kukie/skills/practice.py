@@ -15,7 +15,7 @@ SKILL = Skill(
     prompt=PROMPT,
     extra_tools=frozenset({
         "apply_manifest", "scale_resource", "rollout_restart",
-        "delete_resource",   # destructive — 훅에서 이중 승인
+        "delete_resource",   # destructive — 훅에서 단일 승인
         "describe_resource",  # 실행 후 결과 확인용 (매트릭스 검토 반영)
     }),
 )
