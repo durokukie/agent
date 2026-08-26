@@ -124,6 +124,11 @@ def test_등록된_mutation은_모두_Hook을_거쳐_Deferred요청이된다(
 
     monkeypatch.setattr(hook, "generate_decision_guidance", fixed_guidance)
 
+    def forbidden_handler(*args, **kwargs):
+        pytest.fail("승인 전에 mutation handler를 실행하면 안 된다")
+
+    monkeypatch.setattr(mutate, "run_kubectl", forbidden_handler)
+
     def model_call(messages, info):
         return ModelResponse(parts=[ToolCallPart(
             tool_name=tool_name,
@@ -218,6 +223,11 @@ def test_ToolDenied_재개는_2차Hook과_handler를_호출하지않는다(
 
     monkeypatch.setattr(hook, "generate_decision_guidance", fixed_guidance)
 
+    def forbidden_handler(*args, **kwargs):
+        pytest.fail("거절 전·후에 mutation handler나 2차 Hook을 실행하면 안 된다")
+
+    monkeypatch.setattr(mutate, "run_kubectl", forbidden_handler)
+
     def model_call(messages, info):
         return ModelResponse(parts=[ToolCallPart(
             tool_name="scale_resource",
@@ -229,11 +239,7 @@ def test_ToolDenied_재개는_2차Hook과_handler를_호출하지않는다(
         pending_result = agent.run_sync("변경해줘", deps=_deps("실습"))
     assert isinstance(pending_result.output, DeferredToolRequests)
 
-    def forbidden_run(*args, **kwargs):
-        pytest.fail("ToolDenied 재개에서 kubectl이나 2차 Hook을 실행하면 안 된다")
-
-    monkeypatch.setattr(hook, "run_kubectl", forbidden_run)
-    monkeypatch.setattr(mutate, "run_kubectl", forbidden_run)
+    monkeypatch.setattr(hook, "run_kubectl", forbidden_handler)
 
     with agent.override(model=TestModel(call_tools=[], custom_output_args=GOOD_RESPONSE)):
         resumed = agent.run_sync(
