@@ -14,6 +14,7 @@ from pydantic_ai.tools import DeferredToolRequests
 from kukie import server
 from kukie.agent import agent
 from kukie.guardrail import action_plan
+from kukie.guardrail.action_plan import ActionPlan
 from kukie.kubectl import KubectlResult
 from kukie.tools import read as read_tools
 
@@ -116,24 +117,141 @@ def _fake_result(output):
     return SimpleNamespace(output=output, all_messages=lambda: ["기록"])
 
 
-def test_티켓이_오면_approval_payload와_pending이_생긴다(client):
+def _ready_plan_for_server(call_id: str) -> ActionPlan:
+    plan = ActionPlan.create_draft(
+        call_id=call_id,
+        tool="scale_resource",
+        args={
+            "kind": "deployment",
+            "name": "nginx",
+            "replicas": 3,
+            "namespace": "study",
+        },
+        command=["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
+        risk="caution",
+        skill="실습",
+        target={
+            "context": "kind-dev",
+            "namespace": "study",
+            "kind": "deployment",
+            "name": "nginx",
+        },
+        intent="nginx 레플리카를 늘린다.",
+        expected_effects=["레플리카가 3개가 된다."],
+        side_effects=["추가 노드 자원을 사용한다."],
+    )
+    plan.record_dry_run("succeeded", "deployment.apps/nginx configured\n", "")
+    plan.record_decision_guidance("현재 replica와 가용 자원을 확인한다.")
+    return plan
+
+
+def _pending_ticket_for_server(
+    call_id: str,
+) -> tuple[ActionPlan, DeferredToolRequests]:
+    plan = _ready_plan_for_server(call_id)
+    call = ToolCallPart(
+        tool_name="scale_resource",
+        args={
+            "kind": "deployment",
+            "name": "nginx",
+            "replicas": 3,
+            "namespace": "study",
+            "intent": plan.intent,
+            "expected_effects": plan.expected_effects,
+            "side_effects": plan.side_effects,
+        },
+        tool_call_id=call_id,
+    )
+    return plan, DeferredToolRequests(
+        approvals=[call],
+        metadata={call_id: {"plan_id": plan.id}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_서버_run은_스킬응답과_Deferred출력을_모두_유지한다(client, monkeypatch):
     client.post("/session")
-    call = ToolCallPart(tool_name="delete_resource",
-                        args={"kind": "deployment", "name": "nginx", "namespace": "study"},
-                        tool_call_id="c1")
-    ticket = DeferredToolRequests(approvals=[call], metadata={"c1": {"plan_id": "ap-x"}})
+    seen = {}
+
+    async def fake_agent_run(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(server.agent, "run", fake_agent_run)
+
+    await server._run_agent(server._session, user_prompt="nginx를 늘려줘")
+
+    assert seen["output_type"] == [
+        server._session.skill.output_fn,
+        DeferredToolRequests,
+    ]
+
+
+def test_티켓은_Plan_DTO와_원본_Deferred요청을_보관한다(client):
+    client.post("/session")
+    plan, ticket = _pending_ticket_for_server("c1")
+
     payload = server._to_payload(server._session, _fake_result(ticket))
+
     assert payload["kind"] == "approval"
-    assert payload["approvals"][0]["call_id"] == "c1"
-    assert payload["approvals"][0]["tool"] == "delete_resource"
-    assert payload["approvals"][0]["plan"] is None          # 계획서 파일이 없으면 None (뼈대)
-    assert server._session.pending == ["c1"]
+    approval = payload["approvals"][0]
+    assert approval["tool_call_id"] == "c1"
+    assert approval["plan_id"] == plan.id
+    assert approval["tool"] == "scale_resource"
+    assert "args" not in approval
+    assert server._session.pending is ticket
     assert server._session.history == ["기록"]
+    assert client.get("/session").json()["pending"] == ["c1"]
+
+
+def test_renderer는_call_id와_결정외_필드를_제출할수없다(client):
+    client.post("/session")
+    response = client.post(
+        "/approve",
+        json={
+            "call_id": "c1",
+            "approved": True,
+            "tool": "delete_resource",
+            "args": {"name": "other"},
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_Plan과_다른_pending_args는_승인카드로_내보내지않는다(client):
+    client.post("/session")
+    plan = _ready_plan_for_server("c1")
+    call = ToolCallPart(
+        tool_name="scale_resource",
+        args={
+            "kind": "deployment",
+            "name": "nginx",
+            "replicas": 99,
+            "namespace": "study",
+            "intent": plan.intent,
+            "expected_effects": plan.expected_effects,
+            "side_effects": plan.side_effects,
+        },
+        tool_call_id="c1",
+    )
+    ticket = DeferredToolRequests(
+        approvals=[call],
+        metadata={"c1": {"plan_id": plan.id}},
+    )
+
+    with pytest.raises(ValueError, match="pending approval mismatch"):
+        server._to_payload(server._session, _fake_result(ticket))
 
 
 def test_승인_대기_중에는_채팅이_409로_막힌다(client):
     client.post("/session")
-    server._session.pending = ["c1"]
+    _, server._session.pending = _pending_ticket_for_server("c1")
+    assert client.post("/chat", json={"text": "딴 얘기"}).status_code == 409
+
+
+def test_승인_처리_중에도_채팅이_409로_막힌다(client):
+    client.post("/session")
+    server._session.processing = True
     assert client.post("/chat", json={"text": "딴 얘기"}).status_code == 409
 
 
@@ -144,7 +262,7 @@ def test_대기_중이_아닌_call_id로_승인하면_409(client):
 
 def test_승인은_재개_run을_돌리고_답변이_오면_잠금이_풀린다(client, monkeypatch):
     client.post("/session")
-    server._session.pending = ["c1"]
+    _, server._session.pending = _pending_ticket_for_server("c1")
     seen = {}
 
     async def fake_run(session, **kwargs):
@@ -157,17 +275,20 @@ def test_승인은_재개_run을_돌리고_답변이_오면_잠금이_풀린다(
     assert r.json()["kind"] == "answer"
     assert r.json()["response"]["narration"] == "삭제했어요"
     assert seen["deferred_tool_results"].approvals == {"c1": True}   # 번호 + O/X 만 전달
-    assert server._session.pending == []                              # 잠금 해제
+    assert server._session.pending is None                            # 잠금 해제
+    assert server._session.processing is False
 
 
 def test_승인_call_id는_재개_시작_전에_예약된다(client, monkeypatch):
     """run 이 도는 동안 같은 call_id 의 두 번째 /approve 가 검사를 통과하면 같은 승인이
-    두 번 재개된다 (CodeRabbit 지적). 예약(제거)이 run 전에 일어나야 둘째가 409 로 걸린다."""
+    두 번 재개된다 (CodeRabbit 지적). 원본 티켓은 유지하되 처리 표시를 run 전에 예약한다."""
     client.post("/session")
-    server._session.pending = ["c1"]
+    _, ticket = _pending_ticket_for_server("c1")
+    server._session.pending = ticket
 
     async def fake_run(session, **kwargs):
-        assert "c1" not in session.pending   # run 시작 시점에 이미 예약(제거)되어 있어야 한다
+        assert session.pending is ticket
+        assert session.processing is True
         from kukie.skills.base import KukieResponse
         return _fake_result(KukieResponse(narration="ok"))
 
@@ -179,7 +300,8 @@ def test_승인_call_id는_재개_시작_전에_예약된다(client, monkeypatch
 
 def test_재개가_실패하면_예약이_복원되어_재시도할_수_있다(client, monkeypatch):
     client.post("/session")
-    server._session.pending = ["c1"]
+    _, ticket = _pending_ticket_for_server("c1")
+    server._session.pending = ticket
 
     async def boom(session, **kwargs):
         raise RuntimeError("LLM 연결 실패")
@@ -187,8 +309,8 @@ def test_재개가_실패하면_예약이_복원되어_재시도할_수_있다(c
     monkeypatch.setattr(server, "_run_agent", boom)
     with pytest.raises(RuntimeError):
         client.post("/approve", json={"call_id": "c1", "approved": True})
-    assert server._session.pending == ["c1"]   # 예약 반환 — 승인 건이 증발하지 않는다
-    assert server._session.processing is False  # 잠금도 해제 — 재시도가 가능해야 한다
+    assert server._session.pending is ticket
+    assert server._session.processing is False
 
 
 # ── 6. 실행 잠금 — run 이 도는 동안 새 요청은 409 ─────────────
@@ -199,15 +321,17 @@ def _ok_result():
 
 
 def test_승인_재개_중에는_채팅이_409로_막힌다(client, monkeypatch):
-    """예약(remove) 때문에 재개 중 pending 이 비므로 pending 검사로는 /chat 을 못 막는다
-    (리뷰 지적 P1). processing 잠금이 재개가 도는 동안의 끼어들기를 막아야 한다."""
+    """승인 재개가 도는 동안은 processing 잠금이 다른 run을 막아야 한다."""
     from fastapi import HTTPException
 
     client.post("/session")
-    server._session.pending = ["c1"]
+    _, ticket = _pending_ticket_for_server("c1")
+    server._session.pending = ticket
     seen = {}
 
     async def fake_run(session, **kwargs):
+        assert session.pending is ticket
+        assert session.processing is True
         with pytest.raises(HTTPException) as exc:          # 재개 도중 /chat 끼어들기
             await server.chat(server.ChatIn(text="딴 얘기"))
         seen["chat_blocked"] = exc.value.status_code

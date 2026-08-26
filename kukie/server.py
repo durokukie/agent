@@ -23,13 +23,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults
 
 from kukie.agent import agent
 from kukie.deps import Deps
-from kukie.guardrail.action_plan import ActionPlan
+from kukie.guardrail.approval import ApprovalRequest, build_approval_request
 from kukie.kubectl.config import KubeconfigError, read_kubeconfig
 from kukie.router import pick_skill
 from kukie.skills import DEFAULT_SKILL, SKILLS
@@ -41,15 +41,20 @@ from kukie.skills import DEFAULT_SKILL, SKILLS
 class Session:
     deps: Deps
     history: list[ModelMessage] = field(default_factory=list)   # 턴 간 대화 기록 (재개에도 필요)
-    pending: list[str] = field(default_factory=list)            # 승인 대기 중인 call_id
+    pending: DeferredToolRequests | None = None
     # 실행 잠금 — run 이 도는 동안(await) 두 번째 run 이 같은 history 를 쓰면 늦게 끝난
-    # 쪽이 기록을 덮어쓴다. pending 은 승인 목록일 뿐 이 잠금을 겸할 수 없다: 승인 재개는
-    # call_id 를 예약(제거)한 채 돌므로 그동안 pending 이 비어 /chat 이 뚫린다 (리뷰 지적).
+    # 쪽이 기록을 덮어쓴다. pending 은 승인 대기 상태만 표현하므로 실행 잠금을 겸할 수 없다.
     processing: bool = False
 
     @property
     def skill(self):
         return self.deps.skill
+
+    @property
+    def pending_ids(self) -> list[str]:
+        if self.pending is None:
+            return []
+        return [call.tool_call_id for call in self.pending.approvals]
 
 
 _session: Session | None = None   # MVP: 프로세스당 세션 하나
@@ -68,6 +73,8 @@ class ChatIn(BaseModel):
 
 
 class ApproveIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     call_id: str
     approved: bool
 
@@ -78,55 +85,35 @@ async def _run_agent(session: Session, **kwargs: Any):
     """agent.run 호출 자리. 세션의 deps·스킬·기록을 항상 같이 싣는다 (테스트에서 바꿔치기하는 이음매)."""
     return await agent.run(
         deps=session.deps,
-        output_type=session.skill.output_fn,
+        output_type=[session.skill.output_fn, DeferredToolRequests],
         message_history=session.history or None,
         **kwargs,
     )
 
 
-def _plan_payload(call_id: str) -> dict[str, Any] | None:
-    """승인 카드에 실을 계획서 내용. 훅이 저장한 파일을 call_id 로 찾는다."""
-    try:
-        plan = ActionPlan.find_by_call_id(call_id)
-    except FileNotFoundError:
-        return None
-    return {
-        "id": plan.id,
-        "tool": plan.tool,
-        "command": plan.command,
-        "risk_level": plan.risk_level,
-        "target": plan.target,
-        "intent": plan.intent,
-        "expected_effects": plan.expected_effects,
-        "side_effects": plan.side_effects,
-        "dry_run_result": plan.dry_run_result,
-        "decision_guidance": plan.decision_guidance,
-        "status": plan.status,
-    }
-
-
 def _to_payload(session: Session, result) -> dict[str, Any]:
     """run 결과를 앱이 그릴 형태로. 기록 보관과 대기 티켓 갱신도 여기서."""
-    session.history = result.all_messages()
     output = result.output
 
     if isinstance(output, DeferredToolRequests):
-        session.pending = [call.tool_call_id for call in output.approvals]
+        approvals: list[ApprovalRequest] = [
+            build_approval_request(
+                call,
+                output.metadata.get(call.tool_call_id, {}),
+                default_namespace=session.deps.namespace,
+            )
+            for call in output.approvals
+        ]
+        session.history = result.all_messages()
+        session.pending = output
         return {
             "kind": "approval",
             "skill": session.skill.name,
-            "approvals": [
-                {
-                    "call_id": call.tool_call_id,
-                    "tool": call.tool_name,
-                    "args": call.args,
-                    "plan": _plan_payload(call.tool_call_id),
-                }
-                for call in output.approvals
-            ],
+            "approvals": [approval.model_dump() for approval in approvals],
         }
 
-    session.pending = []
+    session.history = result.all_messages()
+    session.pending = None
     return {"kind": "answer", "skill": session.skill.name, "response": output.model_dump()}
 
 
@@ -166,7 +153,7 @@ def _session_view(session: Session) -> dict[str, Any]:
         "context": session.deps.context,
         "namespace": session.deps.namespace,
         "skill": session.skill.name,
-        "pending": list(session.pending),
+        "pending": session.pending_ids,
     }
 
 
@@ -175,7 +162,7 @@ async def chat(body: ChatIn) -> dict[str, Any]:
     session = _require_session()
     if session.processing:
         raise HTTPException(409, "이전 요청 처리 중 — 끝난 뒤 다시 보내라")
-    if session.pending:
+    if session.pending is not None:
         raise HTTPException(409, "승인 대기 중 — /approve 로 먼저 결정")
 
     skill = pick_skill(body.text, session.skill)
@@ -199,23 +186,15 @@ async def approve(body: ApproveIn) -> dict[str, Any]:
     session = _require_session()
     if session.processing:
         raise HTTPException(409, "이전 요청 처리 중 — 끝난 뒤 다시 보내라")
-    try:
-        # 검사와 예약을 한 동작으로 — run 이 도는 동안(await) 같은 call_id 의 두 번째
-        # 요청이 검사를 통과해 같은 승인을 두 번 재개하는 것을 막는다 (CodeRabbit 지적).
-        session.pending.remove(body.call_id)
-    except ValueError:
+    if body.call_id not in session.pending_ids:
         raise HTTPException(409, f"대기 중인 승인 건이 아니다: {body.call_id}") from None
 
     session.processing = True
     try:
-        try:
-            result = await _run_agent(
-                session,
-                deferred_tool_results=DeferredToolResults(approvals={body.call_id: body.approved}),
-            )
-        except Exception:
-            session.pending.append(body.call_id)   # 재개 실패 → 예약 반환, 재시도 가능하게
-            raise
+        result = await _run_agent(
+            session,
+            deferred_tool_results=DeferredToolResults(approvals={body.call_id: body.approved}),
+        )
         return _to_payload(session, result)
     finally:
         session.processing = False
