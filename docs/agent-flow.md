@@ -96,11 +96,11 @@ flowchart LR
 | 단계 | 함수 | 파일 | 상태 |
 |---|---|---|---|
 | 세션 시작 | `start_session()`, `read_kubeconfig()` | `server.py`, `kubectl/config.py` | ✅ DURO-49 |
-| 채팅·결과 분기·승인 재개 | `chat()`, `_to_payload()`, `approve()` | `server.py` | ✅ DURO-49 (승인 연결은 #27 후) |
+| 채팅·결과 분기·승인 재개 | `chat()`, `_to_payload()`, `approve()` | `server.py` | ✅ DURO-49 + #27 승인 연결 |
 | 렌더링 | — | 앱 (2단계) | ❌ |
 | 스킬 결정 | `pick_skill()` | `router.py` | ✅ (/mode + sticky) |
 | 에이전트 설정 | `Agent(...)`, `add_target()`, `add_skill_prompt()` | `agent.py` | ✅ |
-| 툴 등록 | `FunctionToolset(READ_TOOLS).filtered(...)` | `agent.py` | ✅ PR #19 (읽기 5종만) |
+| 툴 등록 | `FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS]).filtered(_only_skill_tools)` | `agent.py` | ✅ 스킬별 필터; 변경 4종은 실습만 + Hook |
 | 읽기 툴 5종 | `list_resources` 등 | `tools/read.py` | ✅ |
 | 변경 툴 4종 | `delete_resource` 등 | `tools/mutate.py` | ✅ 실습에만 노출, 가드레일 훅 대상 |
 | 명령 조립 | `assemble()` | `kubectl/assemble.py` | 부분 (apply TODO) |
