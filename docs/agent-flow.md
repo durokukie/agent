@@ -12,7 +12,7 @@ flowchart TD
     subgraph CLI_["server.py — 로컬 FastAPI (DURO-49)"]
         CLI["POST /chat {text}<br/>(승인 대기 중이면 409)"]
         CLI --> R["router.pick_skill(msg, current)<br/>→ 학습 스킬 (코드가 결정, LLM 아님)"]
-        R --> RUN["agent.run(msg,<br/>deps=Deps(context, namespace, skill),<br/>output_type=skill.output_fn,<br/>message_history=session.history)"]
+        R --> RUN["agent.run(msg,<br/>deps=Deps(context, namespace, skill),<br/>output_type=[skill.output_fn, DeferredToolRequests],<br/>message_history=session.history)"]
     end
 
     RUN --> PA

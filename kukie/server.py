@@ -24,7 +24,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import ModelMessage, ToolCallPart
 from pydantic_ai.tools import DeferredToolRequests, ToolApproved, ToolDenied
 
 from kukie.agent import agent
@@ -43,6 +43,7 @@ class Session:
     deps: Deps
     history: list[ModelMessage] = field(default_factory=list)   # 턴 간 대화 기록 (재개에도 필요)
     pending: DeferredToolRequests | None = None
+    decisions: dict[str, ToolApproved | ToolDenied] = field(default_factory=dict)
     # 실행 잠금 — run 이 도는 동안(await) 두 번째 run 이 같은 history 를 쓰면 늦게 끝난
     # 쪽이 기록을 덮어쓴다. pending 은 승인 대기 상태만 표현하므로 실행 잠금을 겸할 수 없다.
     processing: bool = False
@@ -55,7 +56,11 @@ class Session:
     def pending_ids(self) -> list[str]:
         if self.pending is None:
             return []
-        return [call.tool_call_id for call in self.pending.approvals]
+        return [
+            call.tool_call_id
+            for call in self.pending.approvals
+            if call.tool_call_id not in self.decisions
+        ]
 
 
 _session: Session | None = None   # MVP: 프로세스당 세션 하나
@@ -92,29 +97,41 @@ async def _run_agent(session: Session, **kwargs: Any):
     )
 
 
+def _approval_payload(
+    session: Session,
+    requests: DeferredToolRequests,
+    calls: list[ToolCallPart] | None = None,
+) -> dict[str, Any]:
+    calls = requests.approvals if calls is None else calls
+    approvals: list[ApprovalRequest] = [
+        build_approval_request(
+            call,
+            requests.metadata.get(call.tool_call_id, {}),
+            default_namespace=session.deps.namespace,
+        )
+        for call in calls
+    ]
+    return {
+        "kind": "approval",
+        "skill": session.skill.name,
+        "approvals": [approval.model_dump() for approval in approvals],
+    }
+
+
 def _to_payload(session: Session, result) -> dict[str, Any]:
     """run 결과를 앱이 그릴 형태로. 기록 보관과 대기 티켓 갱신도 여기서."""
     output = result.output
 
     if isinstance(output, DeferredToolRequests):
-        approvals: list[ApprovalRequest] = [
-            build_approval_request(
-                call,
-                output.metadata.get(call.tool_call_id, {}),
-                default_namespace=session.deps.namespace,
-            )
-            for call in output.approvals
-        ]
+        payload = _approval_payload(session, output)
         session.history = result.all_messages()
         session.pending = output
-        return {
-            "kind": "approval",
-            "skill": session.skill.name,
-            "approvals": [approval.model_dump() for approval in approvals],
-        }
+        session.decisions.clear()
+        return payload
 
     session.history = result.all_messages()
     session.pending = None
+    session.decisions.clear()
     return {"kind": "answer", "skill": session.skill.name, "response": output.model_dump()}
 
 
@@ -191,6 +208,8 @@ async def approve(body: ApproveIn) -> dict[str, Any]:
     requests = session.pending
     if requests is None:
         raise HTTPException(409, f"대기 중인 승인 건이 아니다: {body.call_id}")
+    if body.call_id in session.decisions:
+        raise HTTPException(409, f"이미 결정한 승인 건이다: {body.call_id}")
 
     call = next(
         (
@@ -212,19 +231,26 @@ async def approve(body: ApproveIn) -> dict[str, Any]:
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(409, str(exc)) from None
 
-    decision = (
-        ToolApproved()
-        if body.approved
-        else ToolDenied("사용자가 변경 요청을 거절했습니다.")
-    )
-    results = requests.build_results(
-        approvals={body.call_id: decision},
-    )
-
     session.processing = True
     try:
+        decision = (
+            ToolApproved()
+            if body.approved
+            else ToolDenied("사용자가 변경 요청을 거절했습니다.")
+        )
         if not body.approved:
             ActionPlan.find_by_call_id(approval_request.tool_call_id).reject()
+        session.decisions[body.call_id] = decision
+
+        remaining = [
+            call
+            for call in requests.approvals
+            if call.tool_call_id not in session.decisions
+        ]
+        if remaining:
+            return _approval_payload(session, requests, remaining)
+
+        results = requests.build_results(approvals=session.decisions)
         result = await _run_agent(
             session,
             deferred_tool_results=results,
