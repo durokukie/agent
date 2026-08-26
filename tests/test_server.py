@@ -56,6 +56,21 @@ def test_kubeconfig를_못_읽으면_503(client, monkeypatch):
     assert client.post("/session").status_code == 503
 
 
+@pytest.mark.parametrize("raised", [
+    FileNotFoundError("kubectl 없음"),                      # 미설치 (OSError 계열)
+    __import__("subprocess").TimeoutExpired("kubectl", 10),  # 응답 없음
+])
+def test_kubectl_실행_자체가_실패해도_KubeconfigError로_잡힌다(monkeypatch, raised):
+    """returncode 검사를 못 가보는 예외(미설치·타임아웃)도 503 경로에 태운다 — 500 으로 새지 않게."""
+    from kukie.kubectl import config as kubeconfig
+
+    def boom(*a, **kw):
+        raise raised
+    monkeypatch.setattr(kubeconfig.subprocess, "run", boom)
+    with pytest.raises(kubeconfig.KubeconfigError):
+        kubeconfig.read_kubeconfig()
+
+
 # ── 채팅: 답변 경로 ─────────────────────────────────────────
 
 def test_채팅은_answer와_조립된_KukieResponse를_돌려준다(client):
@@ -143,3 +158,33 @@ def test_승인은_재개_run을_돌리고_답변이_오면_잠금이_풀린다(
     assert r.json()["response"]["narration"] == "삭제했어요"
     assert seen["deferred_tool_results"].approvals == {"c1": True}   # 번호 + O/X 만 전달
     assert server._session.pending == []                              # 잠금 해제
+
+
+def test_승인_call_id는_재개_시작_전에_예약된다(client, monkeypatch):
+    """run 이 도는 동안 같은 call_id 의 두 번째 /approve 가 검사를 통과하면 같은 승인이
+    두 번 재개된다 (CodeRabbit 지적). 예약(제거)이 run 전에 일어나야 둘째가 409 로 걸린다."""
+    client.post("/session")
+    server._session.pending = ["c1"]
+
+    async def fake_run(session, **kwargs):
+        assert "c1" not in session.pending   # run 시작 시점에 이미 예약(제거)되어 있어야 한다
+        from kukie.skills.base import KukieResponse
+        return _fake_result(KukieResponse(narration="ok"))
+
+    monkeypatch.setattr(server, "_run_agent", fake_run)
+    assert client.post("/approve", json={"call_id": "c1", "approved": True}).status_code == 200
+    # 소비된 call_id 로 다시 오면 (동시든 재전송이든) 409
+    assert client.post("/approve", json={"call_id": "c1", "approved": True}).status_code == 409
+
+
+def test_재개가_실패하면_예약이_복원되어_재시도할_수_있다(client, monkeypatch):
+    client.post("/session")
+    server._session.pending = ["c1"]
+
+    async def boom(session, **kwargs):
+        raise RuntimeError("LLM 연결 실패")
+
+    monkeypatch.setattr(server, "_run_agent", boom)
+    with pytest.raises(RuntimeError):
+        client.post("/approve", json={"call_id": "c1", "approved": True})
+    assert server._session.pending == ["c1"]   # 예약 반환 — 승인 건이 증발하지 않는다

@@ -176,11 +176,19 @@ async def chat(body: ChatIn) -> dict[str, Any]:
 @app.post("/approve")
 async def approve(body: ApproveIn) -> dict[str, Any]:
     session = _require_session()
-    if body.call_id not in session.pending:
-        raise HTTPException(409, f"대기 중인 승인 건이 아니다: {body.call_id}")
+    try:
+        # 검사와 예약을 한 동작으로 — run 이 도는 동안(await) 같은 call_id 의 두 번째
+        # 요청이 검사를 통과해 같은 승인을 두 번 재개하는 것을 막는다 (CodeRabbit 지적).
+        session.pending.remove(body.call_id)
+    except ValueError:
+        raise HTTPException(409, f"대기 중인 승인 건이 아니다: {body.call_id}") from None
 
-    result = await _run_agent(
-        session,
-        deferred_tool_results=DeferredToolResults(approvals={body.call_id: body.approved}),
-    )
+    try:
+        result = await _run_agent(
+            session,
+            deferred_tool_results=DeferredToolResults(approvals={body.call_id: body.approved}),
+        )
+    except Exception:
+        session.pending.append(body.call_id)   # 재개 실패 → 예약 반환, 재시도 가능하게
+        raise
     return _to_payload(session, result)

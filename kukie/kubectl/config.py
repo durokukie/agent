@@ -14,7 +14,12 @@ class KubeconfigError(RuntimeError):
 
 
 def _kubectl_config(*args: str) -> str:
-    proc = subprocess.run(["kubectl", "config", *args], capture_output=True, text=True, timeout=10)
+    try:
+        proc = subprocess.run(["kubectl", "config", *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # kubectl 미설치(FileNotFoundError ⊂ OSError)·응답 없음도 같은 실패다 —
+        # 여기서 감싸야 /session 이 503 안내를 주지, 새는 예외는 500 이 된다 (runner.py 와 같은 패턴).
+        raise KubeconfigError(str(exc)) from exc
     if proc.returncode != 0:
         raise KubeconfigError(proc.stderr.strip() or "kubectl config 실패")
     return proc.stdout.strip()
