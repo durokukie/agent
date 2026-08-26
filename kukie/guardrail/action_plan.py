@@ -390,6 +390,15 @@ class ActionPlan:
             status="executed" if success else "failed",
         )
 
+    def reject(self) -> None:
+        if (
+            self.status != "draft"
+            or self.approval is not None
+            or self.execution_result is not None
+        ):
+            raise ValueError("ActionPlan is not ready for rejection")
+        self._update_fields(status="rejected")
+
     def mark(self, status: str) -> None:
         if status not in FINAL_STATUSES:
             raise ValueError(f"invalid Action Plan status: {status}")

@@ -12,7 +12,6 @@ LLM은 발동 여부에 관여할 수 없다. wrap 훅 하나가 전 단계를 �
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 
 import yaml
@@ -21,12 +20,12 @@ from pydantic_ai.capabilities.hooks import Hooks
 
 from kukie.guardrail.action_plan import ActionPlan, PlanTarget
 from kukie.guardrail.decision_guidance import generate_decision_guidance
+from kukie.guardrail.mutation_request import canonicalize_mutation_args
 from kukie.kubectl import assemble, run_kubectl
 from kukie.tools.mutate import MUTATING_TOOLS, RISK_STICKERS
 
 logger = logging.getLogger(__name__)
 hooks = Hooks()
-_DESCRIPTION_FIELDS = frozenset({"intent", "expected_effects", "side_effects"})
 
 
 def _dry_run_unsupported(stderr: str) -> bool:
@@ -82,20 +81,6 @@ def _manifest_resources(manifest_yaml: str) -> list[dict[str, str]]:
     return resources
 
 
-def _plan_args(tool_name: str, normalized_args: dict) -> dict[str, object]:
-    plan_args = {
-        key: value
-        for key, value in normalized_args.items()
-        if key not in _DESCRIPTION_FIELDS
-    }
-    if tool_name == "apply_manifest":
-        manifest_yaml = plan_args.pop("manifest_yaml")
-        plan_args["manifest_sha256"] = hashlib.sha256(
-            manifest_yaml.encode("utf-8")
-        ).hexdigest()
-    return plan_args
-
-
 @hooks.on.tool_execute(tools=sorted(MUTATING_TOOLS))
 async def guardrail(ctx, *, call, tool_def, args, handler):
     """변경 요청을 승인 전 검토하고, 승인 후 한 번 실행해 결과를 기록한다."""
@@ -115,11 +100,13 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
     if not args["side_effects"]:
         raise ModelRetry("side_effects must not be empty")
 
-    normalized_args = dict(args)
-    if tool_name == "apply_manifest":
-        normalized_args["namespace"] = (
-            normalized_args.get("namespace") or ctx.deps.namespace
-        )
+    canonical = canonicalize_mutation_args(
+        tool_name,
+        args,
+        ctx.deps.namespace,
+    )
+    normalized_args = canonical.normalized
+    plan_args = canonical.plan
 
     command = assemble(tool_name, normalized_args)
     target: PlanTarget = {
@@ -132,7 +119,6 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
     }
     if tool_name == "apply_manifest":
         target["resources"] = _manifest_resources(normalized_args["manifest_yaml"])
-    plan_args = _plan_args(tool_name, normalized_args)
     risk = RISK_STICKERS[tool_name].name.lower()
 
     if ctx.tool_call_approved:
