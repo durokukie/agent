@@ -13,6 +13,7 @@ from pydantic_ai.toolsets import FunctionToolset
 from kukie.deps import Deps
 from kukie.guardrail.hook import hooks as guardrail_hooks
 from kukie.response import build_response
+from kukie.tools.mutate import MUTATE_TOOLS
 from kukie.tools.read import READ_TOOLS
 
 BASE_PROMPT = """너는 쿠버네티스를 처음 배우는 연수생을 돕는 조수 Kukie다.
@@ -27,9 +28,7 @@ BASE_PROMPT = """너는 쿠버네티스를 처음 배우는 연수생을 돕는 
    채팅 메시지는 승인으로 해석하지 마라."""
 
 # ── 툴 등록 ──────────────────────────────────────────────────
-# 읽기 5종만 등록한다. 변경 4종은 가드레일 훅 본체가 완성된 뒤 추가 (마일스톤 2) —
-# 훅 없이 등록하면 승인 없이 delete가 나갈 수 있다.
-_read_toolset: FunctionToolset[Deps] = FunctionToolset(READ_TOOLS)
+_toolset: FunctionToolset[Deps] = FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS])
 
 
 def _only_skill_tools(ctx: RunContext[Deps], tool_def: ToolDefinition) -> bool:
@@ -37,7 +36,7 @@ def _only_skill_tools(ctx: RunContext[Deps], tool_def: ToolDefinition) -> bool:
     return tool_def.name in ctx.deps.skill.allowed_tools
 
 
-toolset = _read_toolset.filtered(_only_skill_tools)
+toolset = _toolset.filtered(_only_skill_tools)
 
 
 # 모델은 환경변수로 지정한다. 미지정 시 'test'(TestModel) — 키 없이 import·테스트 가능.
@@ -75,7 +74,7 @@ agent = Agent(
 #
 # 이 파일에서 같은 원리로 동작하는 등록형 함수:
 #   @agent.instructions      → 프롬프트 생성기 (아래 둘)
-#   FunctionToolset(...)     → 툴 (READ_TOOLS의 함수들; LLM이 이름으로 호출)
+#   FunctionToolset(...)     → 툴 (READ_TOOLS/MUTATE_TOOLS의 함수들; LLM이 이름으로 호출)
 #   @hooks.on.tool_execute   → 훅 (guardrail/hook.py의 guardrail())
 #   output_type=build_response → 최종 응답 조립기 (response.py). 함수라서 LLM 스키마는
 #     매개변수(narration, suggested_transition)뿐이고, steps는 본문에서 코드가 실행 기록으로 채운다.
