@@ -3,7 +3,7 @@
 MVP에서 자동 라우팅은 하지 않는다. LLM이 suggested_transition으로 제안하면
 사용자가 y 한 번으로 전환한다. (전환 제안 수락률 데이터가 쌓이면 자동 라우팅 검토)
 
-주의: 승인 대기 중의 y/n 입력은 이 라우터를 타지 않는다 (approval.py 별도 채널).
+채팅 메시지는 승인으로 해석하지 않는다. 승인은 Electron 화면이 `/approve`로 전달한다.
 """
 from __future__ import annotations
 
