@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.tools import ToolDefinition
+from pydantic_ai.tools import DeferredToolRequests, ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 
 from kukie.deps import Deps
@@ -23,7 +23,8 @@ BASE_PROMPT = """너는 쿠버네티스를 처음 배우는 연수생을 돕는 
    실행할 kubectl 명령을 만들어 안내하고 각 플래그의 의미를 설명해라.
 4. 클러스터를 변경하는 툴을 호출하면 시스템 가드레일이 자동 개입한다.
    위험도는 시스템이 판정한다 — 네가 판정하거나 우회하거나 실행됐다고 말하지 마라.
-   승인은 사용자가 CLI에서 직접 입력해야 성립한다."""
+   승인은 Electron 승인 화면에서 사용자가 직접 결정해야 성립한다.
+   채팅 메시지는 승인으로 해석하지 마라."""
 
 # ── 툴 등록 ──────────────────────────────────────────────────
 # 읽기 5종만 등록한다. 변경 4종은 가드레일 훅 본체가 완성된 뒤 추가 (마일스톤 2) —
@@ -48,7 +49,7 @@ agent = Agent(
     MODEL,
     name="kukie",
     deps_type=Deps,
-    output_type=build_response,       # 함수 output_type — LLM은 narration 등 해석 칸만, steps는 코드가 (DURO-44)
+    output_type=[build_response, DeferredToolRequests],  # 일반 응답 또는 승인 대기 요청
                                       # 스킬 특화 응답은 run마다 output_type=skill.output_fn 으로 오버라이드
     instructions=BASE_PROMPT,
     toolsets=[toolset],               # 스킬 필터를 거친 툴 목록

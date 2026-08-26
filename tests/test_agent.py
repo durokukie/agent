@@ -6,9 +6,11 @@ TestModel로 결정론적으로 돌린다 (실제 LLM 호출·API 키 없음).
 """
 import pytest
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.tools import DeferredToolRequests
 
 from kukie.agent import agent
 from kukie.deps import Deps
+from kukie.response import build_response
 from kukie.skills import SKILLS
 
 
@@ -55,3 +57,7 @@ def test_응답은_KukieResponse_형식으로_강제된다():
         result = agent.run_sync("파드 보여줘", deps=_deps())
     assert result.output.narration
     assert result.output.steps == []
+
+
+def test_Agent는_일반응답과_Deferred요청을_output으로_허용한다():
+    assert agent.output_type == [build_response, DeferredToolRequests]
