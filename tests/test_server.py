@@ -9,7 +9,12 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.tools import DeferredToolRequests
+from pydantic_ai.tools import (
+    DeferredToolRequests,
+    DeferredToolResults,
+    ToolApproved,
+    ToolDenied,
+)
 
 from kukie import server
 from kukie.agent import agent
@@ -260,23 +265,30 @@ def test_대기_중이_아닌_call_id로_승인하면_409(client):
     assert client.post("/approve", json={"call_id": "없음", "approved": True}).status_code == 409
 
 
-def test_승인은_재개_run을_돌리고_답변이_오면_잠금이_풀린다(client, monkeypatch):
+def test_승인은_원본_history와_ToolApproved로_재개한다(client, monkeypatch):
     client.post("/session")
-    _, server._session.pending = _pending_ticket_for_server("c1")
+    plan, ticket = _pending_ticket_for_server("c1")
+    server._to_payload(server._session, _fake_result(ticket))
+    original_history = list(server._session.history)
     seen = {}
 
     async def fake_run(session, **kwargs):
-        seen.update(kwargs)
+        assert session.processing is True
+        assert session.pending is ticket
+        seen["history"] = list(session.history)
+        seen["results"] = kwargs["deferred_tool_results"]
         from kukie.skills.base import KukieResponse
-        return _fake_result(KukieResponse(narration="삭제했어요"))
+        return _fake_result(KukieResponse(narration="실행했습니다."))
 
     monkeypatch.setattr(server, "_run_agent", fake_run)
-    r = client.post("/approve", json={"call_id": "c1", "approved": True})
-    assert r.json()["kind"] == "answer"
-    assert r.json()["response"]["narration"] == "삭제했어요"
-    assert seen["deferred_tool_results"].approvals == {"c1": True}   # 번호 + O/X 만 전달
-    assert server._session.pending is None                            # 잠금 해제
-    assert server._session.processing is False
+    response = client.post("/approve", json={"call_id": "c1", "approved": True})
+
+    assert response.status_code == 200
+    assert seen["history"] == original_history
+    assert isinstance(seen["results"], DeferredToolResults)
+    assert seen["results"].approvals == {"c1": ToolApproved()}
+    assert ActionPlan.load(plan.path).status == "draft"
+    assert client.get("/session").json()["pending"] == []
 
 
 def test_승인_call_id는_재개_시작_전에_예약된다(client, monkeypatch):
@@ -289,6 +301,10 @@ def test_승인_call_id는_재개_시작_전에_예약된다(client, monkeypatch
     async def fake_run(session, **kwargs):
         assert session.pending is ticket
         assert session.processing is True
+        assert client.post(
+            "/approve", json={"call_id": "c1", "approved": True}
+        ).status_code == 409
+        assert client.post("/chat", json={"text": "딴 얘기"}).status_code == 409
         from kukie.skills.base import KukieResponse
         return _fake_result(KukieResponse(narration="ok"))
 
@@ -298,19 +314,60 @@ def test_승인_call_id는_재개_시작_전에_예약된다(client, monkeypatch
     assert client.post("/approve", json={"call_id": "c1", "approved": True}).status_code == 409
 
 
-def test_재개가_실패하면_예약이_복원되어_재시도할_수_있다(client, monkeypatch):
+def test_거절은_Plan을_한번만_기록하고_ToolDenied로_재개한다(
+    client, monkeypatch
+):
     client.post("/session")
-    _, ticket = _pending_ticket_for_server("c1")
-    server._session.pending = ticket
+    plan, ticket = _pending_ticket_for_server("c1")
+    server._to_payload(server._session, _fake_result(ticket))
+    seen = {}
+
+    async def fake_run(session, **kwargs):
+        seen["results"] = kwargs["deferred_tool_results"]
+        from kukie.skills.base import KukieResponse
+        return _fake_result(KukieResponse(narration="요청을 취소했습니다."))
+
+    monkeypatch.setattr(server, "_run_agent", fake_run)
+    first = client.post("/approve", json={"call_id": "c1", "approved": False})
+    second = client.post("/approve", json={"call_id": "c1", "approved": False})
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert isinstance(seen["results"], DeferredToolResults)
+    assert isinstance(seen["results"].approvals["c1"], ToolDenied)
+    loaded = ActionPlan.load(plan.path)
+    assert loaded.status == "rejected"
+    assert loaded.approval is None
+    assert loaded.execution_result is None
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_재개실패는_pending을_복원하지않고_세션을_무효화한다(
+    client, monkeypatch, approved
+):
+    client.post("/session")
+    plan, ticket = _pending_ticket_for_server("c1")
+    server._to_payload(server._session, _fake_result(ticket))
 
     async def boom(session, **kwargs):
-        raise RuntimeError("LLM 연결 실패")
+        raise RuntimeError("resume failed")
 
     monkeypatch.setattr(server, "_run_agent", boom)
-    with pytest.raises(RuntimeError):
-        client.post("/approve", json={"call_id": "c1", "approved": True})
-    assert server._session.pending is ticket
-    assert server._session.processing is False
+    response = client.post(
+        "/approve",
+        json={"call_id": "c1", "approved": approved},
+    )
+
+    assert response.status_code == 503
+    assert server._session is None
+    assert client.post("/chat", json={"text": "다음 질문"}).status_code == 409
+    assert client.post(
+        "/approve",
+        json={"call_id": "c1", "approved": approved},
+    ).status_code == 409
+    assert ActionPlan.load(plan.path).status == (
+        "draft" if approved else "rejected"
+    )
 
 
 # ── 6. 실행 잠금 — run 이 도는 동안 새 요청은 409 ─────────────

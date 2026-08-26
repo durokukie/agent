@@ -25,10 +25,11 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict
 from pydantic_ai.messages import ModelMessage
-from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults
+from pydantic_ai.tools import DeferredToolRequests, ToolApproved, ToolDenied
 
 from kukie.agent import agent
 from kukie.deps import Deps
+from kukie.guardrail.action_plan import ActionPlan
 from kukie.guardrail.approval import ApprovalRequest, build_approval_request
 from kukie.kubectl.config import KubeconfigError, read_kubeconfig
 from kukie.router import pick_skill
@@ -183,18 +184,57 @@ async def chat(body: ChatIn) -> dict[str, Any]:
 
 @app.post("/approve")
 async def approve(body: ApproveIn) -> dict[str, Any]:
+    global _session
     session = _require_session()
     if session.processing:
         raise HTTPException(409, "이전 요청 처리 중 — 끝난 뒤 다시 보내라")
-    if body.call_id not in session.pending_ids:
-        raise HTTPException(409, f"대기 중인 승인 건이 아니다: {body.call_id}") from None
+    requests = session.pending
+    if requests is None:
+        raise HTTPException(409, f"대기 중인 승인 건이 아니다: {body.call_id}")
+
+    call = next(
+        (
+            item
+            for item in requests.approvals
+            if item.tool_call_id == body.call_id
+        ),
+        None,
+    )
+    if call is None:
+        raise HTTPException(409, f"대기 중인 승인 건이 아니다: {body.call_id}")
+
+    try:
+        approval_request = build_approval_request(
+            call,
+            requests.metadata.get(body.call_id, {}),
+            default_namespace=session.deps.namespace,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from None
+
+    decision = (
+        ToolApproved()
+        if body.approved
+        else ToolDenied("사용자가 변경 요청을 거절했습니다.")
+    )
+    results = requests.build_results(
+        approvals={body.call_id: decision},
+    )
 
     session.processing = True
     try:
+        if not body.approved:
+            ActionPlan.find_by_call_id(approval_request.tool_call_id).reject()
         result = await _run_agent(
             session,
-            deferred_tool_results=DeferredToolResults(approvals={body.call_id: body.approved}),
+            deferred_tool_results=results,
         )
         return _to_payload(session, result)
+    except Exception as exc:
+        _session = None
+        raise HTTPException(
+            503,
+            "승인 결과 처리에 실패했다. POST /session으로 새 세션을 시작해야 한다",
+        ) from exc
     finally:
         session.processing = False
