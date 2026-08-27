@@ -352,11 +352,12 @@ def test_apply_manifest_승인_DTO는_지나치게_깊은_YAML을_거부한다(m
     nested = "value: leaf"
     for _ in range(120):
         nested = "child:\n" + "\n".join(f"  {line}" for line in nested.splitlines())
+    indented = "\n".join(f"  {line}" for line in nested.splitlines())
     manifest = (
         "apiVersion: example.com/v1\n"
         "kind: DeepResource\n"
         "metadata: {name: deep}\n"
-        f"spec:\n{'\n'.join(f'  {line}' for line in nested.splitlines())}\n"
+        f"spec:\n{indented}\n"
     )
 
     with pytest.raises(ValueError, match="manifest is too deeply nested"):
