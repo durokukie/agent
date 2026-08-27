@@ -136,8 +136,15 @@ app = FastAPI(title="Kukie local server")
 
 
 @app.post("/session")
-def start_session() -> dict[str, Any]:
-    """kubeconfig 의 현재 대상을 읽어 세션을 연다. 앱은 이 값을 "맞나요?" 화면에 띄운다."""
+async def start_session() -> dict[str, Any]:
+    """kubeconfig 의 현재 대상을 읽어 세션을 연다. 앱은 이 값을 "맞나요?" 화면에 띄운다.
+
+    async def 인 것이 동기화의 일부다: 동기 def 면 FastAPI 가 스레드풀에서 돌려서
+    processing 검사와 _session 교체 사이에 이벤트 루프의 /chat 이 낄 수 있다 (리뷰 지적).
+    async def 면 본문에 await 가 없어 검사→교체가 루프에서 통째로 원자적이다.
+    read_kubeconfig 의 블로킹(수백 ms)은 그동안 루프를 세우지만, 로컬 단일 사용자 MVP 에서
+    수용한다 — run_kubectl 이 동기인 것과 같은 결정.
+    """
     global _session
     if _session is not None and _session.processing:
         raise HTTPException(409, "요청 처리 중 — 지금은 세션을 교체할 수 없다")

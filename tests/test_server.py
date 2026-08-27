@@ -246,7 +246,7 @@ def test_실행_중에는_세션_교체도_409(client, monkeypatch):
 
     async def fake_run(session, **kwargs):
         with pytest.raises(HTTPException) as exc:
-            server.start_session()
+            await server.start_session()   # async def — 루프에서 돌므로 이 직접 호출이 실전과 동일 경로
         seen["session_blocked"] = exc.value.status_code
         return _ok_result()
 
