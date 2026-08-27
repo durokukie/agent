@@ -12,6 +12,7 @@ LLM은 발동 여부에 관여할 수 없다. wrap 훅 하나가 전 단계를 �
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 
 import yaml
@@ -25,6 +26,7 @@ from kukie.tools.mutate import MUTATING_TOOLS, RISK_STICKERS
 
 logger = logging.getLogger(__name__)
 hooks = Hooks()
+_DESCRIPTION_FIELDS = frozenset({"intent", "expected_effects", "side_effects"})
 
 
 def _dry_run_unsupported(stderr: str) -> bool:
@@ -80,12 +82,23 @@ def _manifest_resources(manifest_yaml: str) -> list[dict[str, str]]:
     return resources
 
 
+def _plan_args(tool_name: str, normalized_args: dict) -> dict[str, object]:
+    plan_args = {
+        key: value
+        for key, value in normalized_args.items()
+        if key not in _DESCRIPTION_FIELDS
+    }
+    if tool_name == "apply_manifest":
+        manifest_yaml = plan_args.pop("manifest_yaml")
+        plan_args["manifest_sha256"] = hashlib.sha256(
+            manifest_yaml.encode("utf-8")
+        ).hexdigest()
+    return plan_args
+
+
 @hooks.on.tool_execute(tools=sorted(MUTATING_TOOLS))
 async def guardrail(ctx, *, call, tool_def, args, handler):
-    """승인 전 1차 Hook의 Plan 생성, dry-run, guidance, 승인 요청을 수행한다.
-
-    승인 후 실제 실행과 결과 기록은 #26의 책임이다.
-    """
+    """변경 요청을 승인 전 검토하고, 승인 후 한 번 실행해 결과를 기록한다."""
     tool_name = call.tool_name
     if tool_name not in MUTATING_TOOLS:
         raise ToolFailed(f"unregistered mutation tool: {tool_name}")
@@ -119,11 +132,62 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
     }
     if tool_name == "apply_manifest":
         target["resources"] = _manifest_resources(normalized_args["manifest_yaml"])
+    plan_args = _plan_args(tool_name, normalized_args)
+    risk = RISK_STICKERS[tool_name].name.lower()
+
+    if ctx.tool_call_approved:
+        try:
+            plan = ActionPlan.find_by_call_id(call.tool_call_id)
+            plan.approve_for_execution(
+                tool=tool_name,
+                args=plan_args,
+                command=command,
+                risk=risk,
+                target=target,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise ToolFailed(str(exc)) from None
+        try:
+            result = await handler(args)
+        except Exception as exc:
+            try:
+                plan.record_execution(
+                    success=False,
+                    stdout="",
+                    stderr=str(exc),
+                    exit_code=None,
+                )
+            except Exception:
+                logger.exception("failed to record execution error: plan_id=%s", plan.id)
+            raise
+        try:
+            plan.record_execution(
+                success=result.success,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.exit_code,
+            )
+        except Exception:
+            logger.exception(
+                "failed to record execution result: plan_id=%s",
+                plan.id,
+            )
+            stderr = result.stderr.rstrip("\n")
+            if stderr:
+                stderr += "\n\n"
+            stderr += (
+                "[guardrail] 실행 결과를 Action Plan에 기록하지 못했습니다.\n"
+                "동일 요청의 재실행은 차단되었습니다."
+            )
+            return result.model_copy(update={"stderr": stderr})
+        return result
+
     plan = ActionPlan.create_draft(
         call_id=call.tool_call_id,
         tool=tool_name,
+        args=plan_args,
         command=command,
-        risk=RISK_STICKERS[tool_name].name.lower(),
+        risk=risk,
         skill=ctx.deps.skill.name,
         target=target,
         intent=intent,

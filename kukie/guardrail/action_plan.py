@@ -41,6 +41,7 @@ class ActionPlan:
     created_at: str
     call_id: str
     tool: str
+    args: dict[str, object]
     skill: str
     target: PlanTarget
     command: list[str]
@@ -60,6 +61,7 @@ class ActionPlan:
         *,
         call_id: str,
         tool: str,
+        args: dict[str, object],
         command: list[str],
         risk: str,
         skill: str,
@@ -68,6 +70,8 @@ class ActionPlan:
         expected_effects: list[str],
         side_effects: list[str],
     ) -> "ActionPlan":
+        if not isinstance(args, dict):
+            raise TypeError("args must be a dict")
         created_at = _utc_now()
         timestamp = datetime.fromisoformat(created_at).strftime("%y%m%d-%H%M")
         tool_name = sub(r"[^\w-]+", "-", tool).strip("-") or "tool"
@@ -84,6 +88,7 @@ class ActionPlan:
                 created_at=created_at,
                 call_id=call_id,
                 tool=tool,
+                args=dict(args),
                 skill=skill,
                 target=dict(target),
                 command=list(command),
@@ -108,8 +113,10 @@ class ActionPlan:
             intent = metadata["intent"]
             expected_effects = metadata["expected_effects"]
             side_effects = metadata["side_effects"]
+            args = metadata["args"]
             if (
-                not isinstance(intent, str)
+                not isinstance(args, dict)
+                or not isinstance(intent, str)
                 or not isinstance(expected_effects, list)
                 or not all(isinstance(item, str) for item in expected_effects)
                 or not isinstance(side_effects, list)
@@ -122,6 +129,7 @@ class ActionPlan:
                 created_at=metadata["created_at"],
                 call_id=metadata["call_id"],
                 tool=metadata["tool"],
+                args=dict(args),
                 skill=metadata["skill"],
                 target=dict(metadata["target"]),
                 command=list(metadata["command"]),
@@ -141,11 +149,16 @@ class ActionPlan:
     @classmethod
     def find_by_call_id(cls, call_id: str) -> "ActionPlan":
         # ponytail: 로컬 MVP에서는 선형 탐색이면 충분하다. 실제 병목일 때만 인덱스를 추가한다.
-        for path in PLAN_DIR.glob("*.md"):
-            metadata, _ = cls._read_path(path)
-            if metadata.get("call_id") == call_id:
-                return cls.load(path)
-        raise FileNotFoundError(f"Action Plan not found for call_id={call_id}")
+        matches = [
+            path
+            for path in PLAN_DIR.glob("*.md")
+            if cls._read_path(path)[0].get("call_id") == call_id
+        ]
+        if not matches:
+            raise FileNotFoundError(f"Action Plan not found for call_id={call_id}")
+        if len(matches) > 1:
+            raise ValueError(f"multiple Action Plans found for call_id={call_id}")
+        return cls.load(matches[0])
 
     def _metadata(self) -> dict[str, object]:
         return {
@@ -153,6 +166,7 @@ class ActionPlan:
             "created_at": self.created_at,
             "call_id": self.call_id,
             "tool": self.tool,
+            "args": self.args,
             "skill": self.skill,
             "target": self.target,
             "command": self.command,
@@ -235,16 +249,20 @@ class ActionPlan:
     def _read(self) -> tuple[dict, str]:
         return self._read_path(self.path)
 
-    def _update(self, key: str, value: object) -> None:
-        previous = getattr(self, key)
-        setattr(self, key, value)
+    def _update_fields(self, **changes: object) -> None:
+        previous = {key: getattr(self, key) for key in changes}
+        for key, value in changes.items():
+            setattr(self, key, value)
         try:
             self._write()
         except Exception:
-            setattr(self, key, previous)
+            for key, value in previous.items():
+                setattr(self, key, value)
             raise
 
     def validate_for_decision_guidance(self) -> None:
+        if not isinstance(self.args, dict):
+            raise ValueError("ActionPlan is not ready for guidance: missing=args")
         required = (
             "id",
             "created_at",
@@ -290,34 +308,92 @@ class ActionPlan:
 
         if self.decision_guidance is not None:
             raise ValueError("decision guidance already exists")
-        self._update("decision_guidance", guidance)
+        self._update_fields(decision_guidance=guidance)
 
     def record_dry_run(self, status: str, stdout: str, stderr: str) -> None:
         if status not in DRY_RUN_STATUSES:
             raise ValueError(f"invalid dry-run status: {status}")
-        self._update(
-            "dry_run_result",
-            {
+        self._update_fields(
+            dry_run_result={
                 "status": status,
                 "stdout": stdout,
                 "stderr": stderr,
                 "at": _utc_now(),
-            },
+            }
         )
 
     def record_approval(self, mode: str) -> None:
-        self._update("approval", {"mode": mode, "at": _utc_now()})
+        self._update_fields(approval={"mode": mode, "at": _utc_now()})
 
-    def record_result(self, output: str, ok: bool) -> None:
-        self._update(
-            "execution_result",
-            {"success": ok, "output": output, "at": _utc_now()},
+    def approve_for_execution(
+        self,
+        *,
+        tool: str,
+        args: dict[str, object],
+        command: list[str],
+        risk: str,
+        target: PlanTarget,
+    ) -> None:
+        dry_run = self.dry_run_result
+        if (
+            self.status != "draft"
+            or not isinstance(dry_run, dict)
+            or dry_run.get("status") not in {"succeeded", "unsupported"}
+            or not self.decision_guidance
+            or self.approval is not None
+            or self.execution_result is not None
+        ):
+            raise ValueError("ActionPlan is not ready for execution")
+
+        current = {
+            "tool": tool,
+            "args": args,
+            "command": command,
+            "risk": risk,
+            "target": target,
+        }
+        approved = {
+            "tool": self.tool,
+            "args": self.args,
+            "command": self.command,
+            "risk": self.risk_level,
+            "target": self.target,
+        }
+        for field, value in current.items():
+            if value != approved[field]:
+                raise ValueError(f"approved request mismatch: {field}")
+
+        self.record_approval("single")
+
+    def record_execution(
+        self,
+        *,
+        success: bool,
+        stdout: str,
+        stderr: str,
+        exit_code: int | None,
+    ) -> None:
+        if (
+            self.status != "draft"
+            or self.approval is None
+            or self.execution_result is not None
+        ):
+            raise ValueError("ActionPlan is not ready to record execution")
+        self._update_fields(
+            execution_result={
+                "success": success,
+                "stdout": stdout,
+                "stderr": stderr,
+                "exit_code": exit_code,
+                "at": _utc_now(),
+            },
+            status="executed" if success else "failed",
         )
 
     def mark(self, status: str) -> None:
         if status not in FINAL_STATUSES:
             raise ValueError(f"invalid Action Plan status: {status}")
-        self._update("status", status)
+        self._update_fields(status=status)
 
 def list_plans(**filters) -> list[dict]:
     """히스토리 스킬용 — frontmatter만 파싱해 요약 목록 반환 (본문 안 읽음, 토큰 절약)."""
