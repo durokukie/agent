@@ -168,10 +168,8 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
                 exit_code=result.exit_code,
             )
         except Exception:
-            if result.success:
-                raise
             logger.exception(
-                "failed to record non-zero execution result: plan_id=%s",
+                "failed to record execution result: plan_id=%s",
                 plan.id,
             )
             stderr = result.stderr.rstrip("\n")

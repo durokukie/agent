@@ -997,17 +997,48 @@ async def test_실패_기록_오류가_handler의_원래_예외를_숨기지_않
 
 
 @pytest.mark.asyncio
-async def test_non_zero_기록_실패는_원래_결과에_경고하고_재실행을_차단한다(
-    monkeypatch, tmp_path, successful_dry_run, successful_guidance, caplog
+@pytest.mark.parametrize(
+    ("success", "stdout", "stderr", "exit_code", "expected_stderr"),
+    [
+        (
+            True,
+            "scaled\n",
+            "",
+            0,
+            "[guardrail] 실행 결과를 Action Plan에 기록하지 못했습니다.\n"
+            "동일 요청의 재실행은 차단되었습니다.",
+        ),
+        (
+            False,
+            "",
+            "deployment not found\n",
+            1,
+            "deployment not found\n\n"
+            "[guardrail] 실행 결과를 Action Plan에 기록하지 못했습니다.\n"
+            "동일 요청의 재실행은 차단되었습니다.",
+        ),
+    ],
+)
+async def test_기록_실패는_원래_결과에_경고하고_재실행을_차단한다(
+    monkeypatch,
+    tmp_path,
+    successful_dry_run,
+    successful_guidance,
+    caplog,
+    success,
+    stdout,
+    stderr,
+    exit_code,
+    expected_stderr,
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     await _create_pending_plan()
     result = KubectlResult(
         command="kubectl scale deployment nginx --replicas=3 -n study",
-        stdout="",
-        stderr="deployment not found\n",
-        success=False,
-        exit_code=1,
+        stdout=stdout,
+        stderr=stderr,
+        success=success,
+        exit_code=exit_code,
     )
     monkeypatch.setattr(
         action_plan.ActionPlan,
@@ -1024,11 +1055,10 @@ async def test_non_zero_기록_실패는_원래_결과에_경고하고_재실행
             handler=AsyncMock(return_value=result),
         )
 
-    assert returned.success is False
-    assert returned.exit_code == 1
-    assert "deployment not found" in returned.stderr
-    assert "실행 결과를 Action Plan에 기록하지 못했습니다" in returned.stderr
-    assert "동일 요청의 재실행은 차단되었습니다" in returned.stderr
+    assert returned.success is success
+    assert returned.stdout == stdout
+    assert returned.exit_code == exit_code
+    assert returned.stderr == expected_stderr
     assert "disk full" not in returned.stderr
     assert "disk full" in caplog.text
 
