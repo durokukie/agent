@@ -19,6 +19,7 @@ run 이 끝나는 방식은 둘뿐이다 — 답변(KukieResponse) 또는 승인
 from __future__ import annotations
 
 import dataclasses
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,6 +35,8 @@ from kukie.guardrail.approval import ApprovalRequest, build_approval_request
 from kukie.kubectl.config import KubeconfigError, read_kubeconfig
 from kukie.router import pick_skill
 from kukie.skills import DEFAULT_SKILL, SKILLS
+
+logger = logging.getLogger(__name__)
 
 
 # ── 세션 ─────────────────────────────────────────────────────
@@ -257,6 +260,13 @@ async def approve(body: ApproveIn) -> dict[str, Any]:
         )
         return _to_payload(session, result)
     except Exception as exc:
+        logger.exception(
+            "승인 재개 실패로 세션 무효화 "
+            "(call_id=%s, plan_id=%s, approved=%s)",
+            body.call_id,
+            approval_request.plan_id,
+            body.approved,
+        )
         _session = None
         raise HTTPException(
             503,

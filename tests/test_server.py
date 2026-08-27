@@ -1,4 +1,5 @@
 """로컬 서버 검증 — 가짜 의존성과 실제 mutation 승인 batch를 함께 다룬다."""
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -528,7 +529,7 @@ def test_여러_승인을_모은뒤_승인과_거절을_한번만_재개한다(
 
 @pytest.mark.parametrize("approved", [True, False])
 def test_재개실패는_pending을_복원하지않고_세션을_무효화한다(
-    client, monkeypatch, approved
+    client, monkeypatch, caplog, approved
 ):
     client.post("/session")
     plan, ticket = _pending_ticket_for_server("c1")
@@ -538,10 +539,11 @@ def test_재개실패는_pending을_복원하지않고_세션을_무효화한다
         raise RuntimeError("resume failed")
 
     monkeypatch.setattr(server, "_run_agent", boom)
-    response = client.post(
-        "/approve",
-        json={"call_id": "c1", "approved": approved},
-    )
+    with caplog.at_level(logging.ERROR, logger="kukie.server"):
+        response = client.post(
+            "/approve",
+            json={"call_id": "c1", "approved": approved},
+        )
 
     assert response.status_code == 503
     assert server._session is None
@@ -553,6 +555,14 @@ def test_재개실패는_pending을_복원하지않고_세션을_무효화한다
     assert ActionPlan.load(plan.path).status == (
         "draft" if approved else "rejected"
     )
+    [record] = [
+        record for record in caplog.records
+        if record.name == "kukie.server" and record.levelno == logging.ERROR
+    ]
+    assert "call_id=c1" in record.getMessage()
+    assert f"plan_id={plan.id}" in record.getMessage()
+    assert f"approved={approved}" in record.getMessage()
+    assert isinstance(record.exc_info[1], RuntimeError)
 
 
 # ── 6. 실행 잠금 — run 이 도는 동안 새 요청은 409 ─────────────
