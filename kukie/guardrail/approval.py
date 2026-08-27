@@ -116,6 +116,12 @@ def _redact_sensitive_scalar(key: Any, value: Any) -> Any:
     return _REDACTED
 
 
+def _consume_preview_budget(budget: list[int], count: int = 1) -> None:
+    budget[0] -= count
+    if budget[0] < 0:
+        raise ValueError("pending approval mismatch: manifest is too large")
+
+
 def _redact_manifest_value(
     value: Any,
     ancestors: set[int] | None = None,
@@ -124,9 +130,7 @@ def _redact_manifest_value(
     depth: int = 0,
 ) -> Any:
     budget = [_MAX_PREVIEW_NODES] if budget is None else budget
-    budget[0] -= 1
-    if budget[0] < 0:
-        raise ValueError("pending approval mismatch: manifest is too large")
+    _consume_preview_budget(budget)
     if not isinstance(value, (dict, list)):
         return _REDACTED if redact_scalars else _safe_scalar(value)
     if depth >= _MAX_PREVIEW_DEPTH:
@@ -155,14 +159,20 @@ def _redact_manifest_value(
         redacted = {}
         for key, item in value.items():
             if is_secret and key in {"data", "stringData", "binaryData"}:
+                _consume_preview_budget(
+                    budget,
+                    len(item) + 1 if isinstance(item, dict) else 1,
+                )
                 redacted[key] = (
                     {item_key: _REDACTED for item_key in item}
                     if isinstance(item, dict)
                     else _REDACTED
                 )
             elif key in _SENSITIVE_ANNOTATIONS:
+                _consume_preview_budget(budget)
                 redacted[key] = _REDACTED
             elif named_value and key == "value":
+                _consume_preview_budget(budget)
                 redacted[key] = _REDACTED
             elif isinstance(item, (dict, list)):
                 normalized = _normalized_key(str(key))
@@ -183,6 +193,7 @@ def _redact_manifest_value(
                 or _normalized_key(str(key)) in _SENSITIVE_VALUE_KEYS
                 or redact_scalars
             ):
+                _consume_preview_budget(budget)
                 redacted[key] = _redact_sensitive_scalar(key, item)
             else:
                 redacted[key] = _redact_manifest_value(item, ancestors, budget)

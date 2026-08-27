@@ -383,6 +383,24 @@ def test_apply_manifest_승인_DTO는_별칭_확장이_너무_크면_거부한�
         _manifest_dto(monkeypatch, tmp_path, "alias-dag", manifest)
 
 
+@pytest.mark.parametrize("resource_kind", ["Secret", "SensitiveFields"])
+def test_apply_manifest_승인_DTO는_즉시_마스킹되는_값도_노드예산을_적용한다(
+    monkeypatch, tmp_path, resource_kind
+):
+    field = "data" if resource_kind == "Secret" else "spec"
+    prefix = "key" if resource_kind == "Secret" else "token"
+    values = "\n".join(f"  {prefix}-{index}: value" for index in range(20_001))
+    manifest = (
+        "apiVersion: example.com/v1\n"
+        f"kind: {resource_kind}\n"
+        "metadata: {name: oversized}\n"
+        f"{field}:\n{values}\n"
+    )
+
+    with pytest.raises(ValueError, match="manifest is too large"):
+        _manifest_dto(monkeypatch, tmp_path, resource_kind, manifest)
+
+
 @pytest.mark.parametrize("dry_run_status", ["succeeded", "unsupported"])
 def test_Plan과_pending_call로_승인_DTO를_만든다(
     monkeypatch, tmp_path, dry_run_status
