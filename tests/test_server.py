@@ -188,3 +188,68 @@ def test_재개가_실패하면_예약이_복원되어_재시도할_수_있다(c
     with pytest.raises(RuntimeError):
         client.post("/approve", json={"call_id": "c1", "approved": True})
     assert server._session.pending == ["c1"]   # 예약 반환 — 승인 건이 증발하지 않는다
+    assert server._session.processing is False  # 잠금도 해제 — 재시도가 가능해야 한다
+
+
+# ── 6. 실행 잠금 — run 이 도는 동안 새 요청은 409 ─────────────
+
+def _ok_result():
+    from kukie.skills.base import KukieResponse
+    return _fake_result(KukieResponse(narration="ok"))
+
+
+def test_승인_재개_중에는_채팅이_409로_막힌다(client, monkeypatch):
+    """예약(remove) 때문에 재개 중 pending 이 비므로 pending 검사로는 /chat 을 못 막는다
+    (리뷰 지적 P1). processing 잠금이 재개가 도는 동안의 끼어들기를 막아야 한다."""
+    from fastapi import HTTPException
+
+    client.post("/session")
+    server._session.pending = ["c1"]
+    seen = {}
+
+    async def fake_run(session, **kwargs):
+        with pytest.raises(HTTPException) as exc:          # 재개 도중 /chat 끼어들기
+            await server.chat(server.ChatIn(text="딴 얘기"))
+        seen["chat_blocked"] = exc.value.status_code
+        return _ok_result()
+
+    monkeypatch.setattr(server, "_run_agent", fake_run)
+    assert client.post("/approve", json={"call_id": "c1", "approved": True}).status_code == 200
+    assert seen["chat_blocked"] == 409
+    assert server._session.processing is False             # 끝나면 잠금 해제
+
+
+def test_채팅_실행_중_두번째_채팅은_409(client, monkeypatch):
+    from fastapi import HTTPException
+
+    client.post("/session")
+    seen = {}
+
+    async def fake_run(session, **kwargs):
+        with pytest.raises(HTTPException) as exc:          # 첫 run 도중 둘째 /chat
+            await server.chat(server.ChatIn(text="동시 요청"))
+        seen["second_blocked"] = exc.value.status_code
+        return _ok_result()
+
+    monkeypatch.setattr(server, "_run_agent", fake_run)
+    assert client.post("/chat", json={"text": "첫 요청"}).status_code == 200
+    assert seen["second_blocked"] == 409
+    assert server._session.processing is False
+
+
+def test_실행_중에는_세션_교체도_409(client, monkeypatch):
+    """run 도중 /session 이 세션을 갈아치우면 진행 중 run 의 결과가 새 세션에 섞인다."""
+    from fastapi import HTTPException
+
+    client.post("/session")
+    seen = {}
+
+    async def fake_run(session, **kwargs):
+        with pytest.raises(HTTPException) as exc:
+            server.start_session()
+        seen["session_blocked"] = exc.value.status_code
+        return _ok_result()
+
+    monkeypatch.setattr(server, "_run_agent", fake_run)
+    assert client.post("/chat", json={"text": "안녕"}).status_code == 200
+    assert seen["session_blocked"] == 409

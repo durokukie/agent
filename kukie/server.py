@@ -10,7 +10,9 @@
 
 run 이 끝나는 방식은 둘뿐이다 — 답변(KukieResponse) 또는 승인 대기 티켓(DeferredToolRequests).
 어느 쪽이 왔는지는 _to_payload 가 한 번만 판단하고, 앱은 kind 로 갈라 그린다.
-승인 대기 중에는 /chat 을 409 로 막는다 — 입력 잠금을 서버가 보장한다.
+잠금은 두 겹이다: 승인 대기 중 /chat 409 (pending), run 실행 중 모든 진입 409 (processing).
+단일 프로세스 MVP 라 플래그면 충분하다 — asyncio 는 await 지점에서만 끼어들 수 있으므로
+"검사 → True 설정" 사이에 다른 요청이 낄 수 없다.
 
 세션 상태(대화 기록·대기 티켓)는 메모리에만 있다. 서버가 꺼지면 대기 중인 승인은 만료된다 (MVP 결정).
 """
@@ -40,6 +42,10 @@ class Session:
     deps: Deps
     history: list[ModelMessage] = field(default_factory=list)   # 턴 간 대화 기록 (재개에도 필요)
     pending: list[str] = field(default_factory=list)            # 승인 대기 중인 call_id
+    # 실행 잠금 — run 이 도는 동안(await) 두 번째 run 이 같은 history 를 쓰면 늦게 끝난
+    # 쪽이 기록을 덮어쓴다. pending 은 승인 목록일 뿐 이 잠금을 겸할 수 없다: 승인 재개는
+    # call_id 를 예약(제거)한 채 돌므로 그동안 pending 이 비어 /chat 이 뚫린다 (리뷰 지적).
+    processing: bool = False
 
     @property
     def skill(self):
@@ -133,6 +139,8 @@ app = FastAPI(title="Kukie local server")
 def start_session() -> dict[str, Any]:
     """kubeconfig 의 현재 대상을 읽어 세션을 연다. 앱은 이 값을 "맞나요?" 화면에 띄운다."""
     global _session
+    if _session is not None and _session.processing:
+        raise HTTPException(409, "요청 처리 중 — 지금은 세션을 교체할 수 없다")
     try:
         context, namespace = read_kubeconfig()
     except KubeconfigError as exc:
@@ -158,6 +166,8 @@ def _session_view(session: Session) -> dict[str, Any]:
 @app.post("/chat")
 async def chat(body: ChatIn) -> dict[str, Any]:
     session = _require_session()
+    if session.processing:
+        raise HTTPException(409, "이전 요청 처리 중 — 끝난 뒤 다시 보내라")
     if session.pending:
         raise HTTPException(409, "승인 대기 중 — /approve 로 먼저 결정")
 
@@ -169,13 +179,19 @@ async def chat(body: ChatIn) -> dict[str, Any]:
         return {"kind": "mode", "skill": session.skill.name,
                 "known": requested in SKILLS}   # 모르는 모드면 현재 스킬 유지 + known=False
 
-    result = await _run_agent(session, user_prompt=body.text)
-    return _to_payload(session, result)
+    session.processing = True
+    try:
+        result = await _run_agent(session, user_prompt=body.text)
+        return _to_payload(session, result)
+    finally:
+        session.processing = False
 
 
 @app.post("/approve")
 async def approve(body: ApproveIn) -> dict[str, Any]:
     session = _require_session()
+    if session.processing:
+        raise HTTPException(409, "이전 요청 처리 중 — 끝난 뒤 다시 보내라")
     try:
         # 검사와 예약을 한 동작으로 — run 이 도는 동안(await) 같은 call_id 의 두 번째
         # 요청이 검사를 통과해 같은 승인을 두 번 재개하는 것을 막는다 (CodeRabbit 지적).
@@ -183,12 +199,16 @@ async def approve(body: ApproveIn) -> dict[str, Any]:
     except ValueError:
         raise HTTPException(409, f"대기 중인 승인 건이 아니다: {body.call_id}") from None
 
+    session.processing = True
     try:
-        result = await _run_agent(
-            session,
-            deferred_tool_results=DeferredToolResults(approvals={body.call_id: body.approved}),
-        )
-    except Exception:
-        session.pending.append(body.call_id)   # 재개 실패 → 예약 반환, 재시도 가능하게
-        raise
-    return _to_payload(session, result)
+        try:
+            result = await _run_agent(
+                session,
+                deferred_tool_results=DeferredToolResults(approvals={body.call_id: body.approved}),
+            )
+        except Exception:
+            session.pending.append(body.call_id)   # 재개 실패 → 예약 반환, 재시도 가능하게
+            raise
+        return _to_payload(session, result)
+    finally:
+        session.processing = False
