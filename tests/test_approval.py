@@ -341,7 +341,7 @@ data:
     assert dto.manifest_preview[0]["binaryData"]["archive"] == "<binary: 5 bytes>"
     assert dto.manifest_preview[0]["data"]["recursive"] == ["<recursive-reference>"]
     assert dto.manifest_preview[0]["data"]["shared"] == {"enabled": True}
-    assert dto.manifest_preview[0]["data"]["repeated"] == "<shared-reference>"
+    assert dto.manifest_preview[0]["data"]["repeated"] == {"enabled": True}
     assert dto.manifest_preview[0]["data"]["positiveInfinity"] == "<non-finite: inf>"
     assert dto.manifest_preview[0]["data"]["negativeInfinity"] == "<non-finite: -inf>"
     assert dto.manifest_preview[0]["data"]["notANumber"] == "<non-finite: nan>"
@@ -362,6 +362,25 @@ def test_apply_manifest_승인_DTO는_지나치게_깊은_YAML을_거부한다(m
 
     with pytest.raises(ValueError, match="manifest is too deeply nested"):
         _manifest_dto(monkeypatch, tmp_path, "deep", manifest)
+
+
+def test_apply_manifest_승인_DTO는_별칭_확장이_너무_크면_거부한다(monkeypatch, tmp_path):
+    aliases = ["  a0: &a0 [leaf, leaf]"]
+    for level in range(1, 16):
+        aliases.append(
+            f"  a{level}: &a{level} [*a{level - 1}, *a{level - 1}]"
+        )
+    manifest = (
+        "apiVersion: v1\n"
+        "kind: ConfigMap\n"
+        "metadata: {name: alias-dag}\n"
+        "data:\n"
+        + "\n".join(aliases)
+        + "\n"
+    )
+
+    with pytest.raises(ValueError, match="manifest is too large"):
+        _manifest_dto(monkeypatch, tmp_path, "alias-dag", manifest)
 
 
 @pytest.mark.parametrize("dry_run_status", ["succeeded", "unsupported"])

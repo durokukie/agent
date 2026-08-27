@@ -15,8 +15,8 @@ from kukie.guardrail.mutation_request import canonicalize_mutation_args
 
 _REDACTED = "<redacted>"
 _RECURSIVE_REFERENCE = "<recursive-reference>"
-_SHARED_REFERENCE = "<shared-reference>"
 _MAX_PREVIEW_DEPTH = 100
+_MAX_PREVIEW_NODES = 20_000
 _SENSITIVE_MARKERS = (
     "accesskey",
     "apikey",
@@ -119,23 +119,23 @@ def _redact_sensitive_scalar(key: Any, value: Any) -> Any:
 def _redact_manifest_value(
     value: Any,
     ancestors: set[int] | None = None,
-    seen: set[int] | None = None,
+    budget: list[int] | None = None,
     redact_scalars: bool = False,
     depth: int = 0,
 ) -> Any:
+    budget = [_MAX_PREVIEW_NODES] if budget is None else budget
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise ValueError("pending approval mismatch: manifest is too large")
     if not isinstance(value, (dict, list)):
         return _REDACTED if redact_scalars else _safe_scalar(value)
     if depth >= _MAX_PREVIEW_DEPTH:
         raise ValueError("pending approval mismatch: manifest is too deeply nested")
 
     ancestors = set() if ancestors is None else ancestors
-    seen = set() if seen is None else seen
     value_id = id(value)
     if value_id in ancestors:
         return _RECURSIVE_REFERENCE
-    if value_id in seen:
-        return _SHARED_REFERENCE
-    seen.add(value_id)
     ancestors.add(value_id)
     try:
         if isinstance(value, list):
@@ -143,7 +143,7 @@ def _redact_manifest_value(
                 _redact_manifest_value(
                     item,
                     ancestors,
-                    seen,
+                    budget,
                     redact_scalars,
                     depth + 1,
                 )
@@ -174,7 +174,7 @@ def _redact_manifest_value(
                 redacted[key] = _redact_manifest_value(
                     item,
                     ancestors,
-                    seen,
+                    budget,
                     child_redacts_scalars,
                     depth + 1,
                 )
@@ -185,7 +185,7 @@ def _redact_manifest_value(
             ):
                 redacted[key] = _redact_sensitive_scalar(key, item)
             else:
-                redacted[key] = _redact_manifest_value(item, ancestors, seen)
+                redacted[key] = _redact_manifest_value(item, ancestors, budget)
         return redacted
     finally:
         ancestors.remove(value_id)
@@ -202,7 +202,11 @@ def _manifest_preview(manifest_yaml: str) -> list[dict[str, Any]]:
         raise ValueError("pending approval mismatch: manifest_yaml") from exc
     if not documents or any(not isinstance(document, dict) for document in documents):
         raise ValueError("pending approval mismatch: manifest_yaml")
-    return [_redact_manifest_value(document) for document in documents]
+    budget = [_MAX_PREVIEW_NODES]
+    return [
+        _redact_manifest_value(document, budget=budget)
+        for document in documents
+    ]
 
 
 class ApprovalRequest(BaseModel):
