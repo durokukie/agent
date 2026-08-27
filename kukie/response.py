@@ -25,8 +25,13 @@ from kukie.deps import Deps
 from kukie.glossary import explain_command
 from kukie.kubectl import KubectlResult
 from kukie.skills.base import KukieResponse, ToolStep
-from kukie.tools.mutate import MUTATING_TOOLS
+from kukie.tools.read import READ_TOOLS
 from kukie.validators import log_unregistered_flags
+
+# access 판정 기준 — 읽기 툴 목록에 있어야만 read-only. 모르는 툴은 mutating 으로 본다.
+# 안전 표시는 보수적으로 (DURO-44 결정 · fail-closed): 틀렸을 때 "읽기"로 잘못 표시하면
+# 사용자가 안심하고 넘기지만, "변경"으로 잘못 표시하면 한 번 더 확인할 뿐이다.
+READ_TOOL_NAMES: frozenset[str] = frozenset(tool.__name__ for tool in READ_TOOLS)
 
 # 화면 블록 제목 — 툴 이름을 사람 말로. 미등록 툴은 이름 그대로.
 STEP_LABELS: dict[str, str] = {
@@ -63,7 +68,7 @@ def collect_steps(ctx: RunContext[Deps]) -> list[ToolStep]:
             log_unregistered_flags(part.tool_name, result.command, unknown)
             steps.append(ToolStep(
                 step_label=STEP_LABELS.get(part.tool_name, part.tool_name),
-                access="mutating" if part.tool_name in MUTATING_TOOLS else "read-only",
+                access="read-only" if part.tool_name in READ_TOOL_NAMES else "mutating",
                 command=result.command,
                 output=result.stdout if result.success else (result.stderr or result.stdout),
                 explanations=explanations,

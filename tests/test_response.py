@@ -159,6 +159,24 @@ def test_승인_후_재개된_턴의_변경_실행은_mutating_블록으로_잡�
     assert {e.field for e in steps[0].explanations} >= {"delete", "-n study"}
 
 
+def test_읽기_목록에_없는_툴은_mutating_으로_표시한다():
+    """access 는 READ_TOOL_NAMES 기준이다 — 모르는 툴은 보수적으로 mutating.
+    변경 툴 목록 등록을 빠뜨려도 화면에 read-only 로 안심시키지 않는다 (fail-closed)."""
+    from types import SimpleNamespace
+    from pydantic_ai.messages import ModelRequest, ToolReturnPart, UserPromptPart
+
+    result = KubectlResult(command="kubectl --context kind-dev cordon node-1",
+                           stdout="node/node-1 cordoned", stderr="", success=True)
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="노드 격리해줘")]),
+        ModelRequest(parts=[ToolReturnPart(tool_name="cordon_node", content=result,
+                                           tool_call_id="c1")]),   # 어느 목록에도 없는 툴
+    ]
+    steps = response_mod.collect_steps(SimpleNamespace(messages=messages))
+    assert steps[0].access == "mutating"
+    assert steps[0].step_label == "cordon_node"   # 라벨 미등록이면 툴 이름 그대로
+
+
 def test_거부되거나_실패한_호출은_블록이_되지_않는다():
     from types import SimpleNamespace
     from pydantic_ai.messages import ModelRequest, ToolReturnPart, UserPromptPart
