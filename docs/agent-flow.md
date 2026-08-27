@@ -9,10 +9,10 @@
 flowchart TD
     U["👤 사용자<br/>'파드 뭐 떠있어?'"] --> CLI
 
-    subgraph CLI_["cli.py (미구현)"]
-        CLI["main() 대화 루프<br/>입력 받기"]
+    subgraph CLI_["server.py — 로컬 FastAPI (DURO-49)"]
+        CLI["POST /chat {text}<br/>(승인 대기 중이면 409)"]
         CLI --> R["router.pick_skill(msg, current)<br/>→ 학습 스킬 (코드가 결정, LLM 아님)"]
-        R --> RUN["agent.run_sync(msg,<br/>deps=Deps(context, namespace, skill),<br/>output_type=skill.output_fn)"]
+        R --> RUN["agent.run(msg,<br/>deps=Deps(context, namespace, skill),<br/>output_type=skill.output_fn,<br/>message_history=session.history)"]
     end
 
     RUN --> PA
@@ -38,7 +38,7 @@ flowchart TD
 
     KR -.-> T
     V -->|"통과"| OUT["result.output (KukieResponse)<br/>narration + steps[command, output, explanations]"]
-    OUT --> CLI2["cli.py 렌더링<br/>[학습 모드] + 명령 블록 + 설명 표"]
+    OUT --> CLI2["server._to_payload → {kind: answer}<br/>앱이 [학습 모드] + 명령 블록 + 설명 표 렌더링"]
     CLI2 --> U
 
     style CLI_ fill:#f5f5f5,stroke:#999,stroke-dasharray: 5 5
@@ -77,11 +77,11 @@ flowchart TD
 
 훅 안에서 LLM 호출: **0번.** LLM은 훅 전(툴 호출)과 후(결과 설명)에만 등장.
 
-## 3. 세션 시작 (cli.py, 미구현)
+## 3. 세션 시작 (server.py)
 
 ```mermaid
 flowchart LR
-    S["kukie chat"] --> K["kubeconfig 읽기<br/>context / namespace"]
+    S["POST /session"] --> K["kubectl/config.read_kubeconfig()<br/>current-context / namespace"]
     K --> C["사용자 확인<br/>'kind-dev / study 맞나요?'"]
     C -->|"y"| D["Deps(context, namespace,<br/>skill=DEFAULT_SKILL)"]
     D --> LOOP["대화 루프 진입<br/>(그림 1)"]
@@ -91,7 +91,9 @@ flowchart LR
 
 | 단계 | 함수 | 파일 | 상태 |
 |---|---|---|---|
-| 세션·루프·렌더 | `main()` | `cli.py` | ❌ |
+| 세션 시작 | `start_session()`, `read_kubeconfig()` | `server.py`, `kubectl/config.py` | ✅ DURO-49 |
+| 채팅·결과 분기·승인 재개 | `chat()`, `_to_payload()`, `approve()` | `server.py` | ✅ DURO-49 (승인 연결은 #27 후) |
+| 렌더링 | — | 앱 (2단계) | ❌ |
 | 스킬 결정 | `pick_skill()` | `router.py` | ✅ (/mode + sticky) |
 | 에이전트 설정 | `Agent(...)`, `add_target()`, `add_skill_prompt()` | `agent.py` | ✅ |
 | 툴 등록 | `FunctionToolset(READ_TOOLS).filtered(...)` | `agent.py` | ✅ PR #19 (읽기 5종만) |
