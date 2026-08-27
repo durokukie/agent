@@ -1,8 +1,4 @@
-"""로컬 서버 검증 (DURO-49) — TestModel + 가짜 kubectl + 가짜 kubeconfig.
-
-세션 시작, 채팅(답변 경로), 모드 전환, 승인 대기 잠금, 승인 재개 뼈대.
-변경 툴이 아직 미등록이라 승인 티켓은 에이전트로 못 만든다 — 티켓 분기는 가짜 결과로 검증한다.
-"""
+"""로컬 서버 검증 — 가짜 의존성과 실제 mutation 승인 batch를 함께 다룬다."""
 from types import SimpleNamespace
 
 import pytest
