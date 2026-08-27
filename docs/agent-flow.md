@@ -12,7 +12,7 @@ flowchart TD
     subgraph CLI_["server.py — 로컬 FastAPI (DURO-49)"]
         CLI["POST /chat {text}<br/>(승인 대기 중이면 409)"]
         CLI --> R["router.pick_skill(msg, current)<br/>→ 학습 스킬 (코드가 결정, LLM 아님)"]
-        R --> RUN["agent.run(msg,<br/>deps=Deps(context, namespace, skill),<br/>output_type=skill.output_fn,<br/>message_history=session.history)"]
+        R --> RUN["agent.run(msg,<br/>deps=Deps(context, namespace, skill),<br/>output_type=[skill.output_fn, DeferredToolRequests],<br/>message_history=session.history)"]
     end
 
     RUN --> PA
@@ -53,18 +53,22 @@ flowchart TD
     L1["② LLM 1차<br/>delete_resource(kind, name, ns,<br/>intent, expected_effects, side_effects)"]
     L1 -->|"툴 호출 = 트리거 🔔"| H
 
-    subgraph H["guardrail/hook.py :: guardrail() — wrap 훅 (미구현)"]
+    subgraph H["guardrail/hook.py :: guardrail() — ApprovalRequired 2-pass"]
         direction TB
-        H1["① kubectl/assemble.assemble(tool_name, args)<br/>→ ['delete','deployment','nginx','-n','study']<br/>조립은 여기 1벌만 (재조립 금지)"]
+        H1["① 실행 args 정규화·보관<br/>apply_manifest는 원문 대신 manifest_sha256"]
         H1 --> H2["② RISK_STICKERS[tool_name]<br/>→ DESTRUCTIVE (미등록이면 fail-closed)"]
-        H2 --> H3["③ ActionPlan.create_draft(tool, command, risk,<br/>skill, target, intent, effects, side_effects)<br/>→ ~/.kukie/plans/ap-YYMMDD-HHMM-tool.md (draft)"]
-        H3 --> H4["④ run_kubectl(args, dry_run=True)<br/>plan.record_dry_run(out, ok)"]
+        H2 --> H3["③ ActionPlan.create_draft(tool, args, command, risk,<br/>skill, target, intent, effects, side_effects)<br/>→ ~/.kukie/plans/ap-YYMMDD-HHMM-tool.md (draft)"]
+        H3 --> H4["④ run_kubectl(command, context, dry_run=True)<br/>plan.record_dry_run(status, stdout, stderr)"]
         H4 -->|"실패"| H4F["plan.mark('failed')<br/>raise ToolFailed"]
-        H4 -->|"성공"| H5["⑤ approval.cli_approve(plan, double=DESTRUCTIVE)<br/>승인 화면: 명령/왜/영향/부작용/등급"]
-        H5 -->|"거절"| H5R["plan.mark('rejected')<br/>raise SkipToolExecution"]
-        H5 -->|"승인 (사람 입력)"| H5A["plan.record_approval(mode)"]
-        H5A --> H6["⑥ handler(조립 args)<br/>= 툴 본체 실행 (delete_resource)"]
-        H6 --> H7["plan.record_result(out, ok)<br/>plan.mark('executed' | 'failed')"]
+        H4 -->|"성공·미지원"| H5["⑤ decision guidance 기록<br/>raise ApprovalRequired(plan_id)"]
+        H5 --> P["DeferredToolRequests<br/>metadata(plan_id)"]
+        P --> E["Electron 승인 화면<br/>apply_manifest: 민감값을 가린 구조적 preview + SHA-256"]
+        E --> A["POST /approve<br/>{call_id, approved}"]
+        A --> D["DeferredToolResults<br/>ToolApproved | ToolDenied"]
+        D -->|"ToolApproved"| H5A["⑥ call_id로 기존 Plan 조회<br/>tool/args/command/risk/target 검증<br/>single approval 기록"]
+        D -->|"ToolDenied"| H5R["Plan mark rejected (1회)<br/>handler 실행 안 함"]
+        H5A --> H6["⑦ 기존 handler(args) 정확히 1회"]
+        H6 --> H7["⑧ execution_result와<br/>executed | failed 상태를 함께 기록"]
     end
 
     H7 --> L2["④ LLM 2차<br/>결과 보고 설명"]
@@ -75,7 +79,7 @@ flowchart TD
     style H5 fill:#ffe0e0,stroke:#c00,stroke-width:2px
 ```
 
-훅 안에서 LLM 호출: **0번.** LLM은 훅 전(툴 호출)과 후(결과 설명)에만 등장.
+성공한 dry-run 뒤 승인 전에 decision guidance용 LLM 호출이 한 번 발생한다.
 
 ## 3. 세션 시작 (server.py)
 
@@ -92,18 +96,18 @@ flowchart LR
 | 단계 | 함수 | 파일 | 상태 |
 |---|---|---|---|
 | 세션 시작 | `start_session()`, `read_kubeconfig()` | `server.py`, `kubectl/config.py` | ✅ DURO-49 |
-| 채팅·결과 분기·승인 재개 | `chat()`, `_to_payload()`, `approve()` | `server.py` | ✅ DURO-49 (승인 연결은 #27 후) |
+| 채팅·결과 분기·승인 재개 | `chat()`, `_to_payload()`, `approve()` | `server.py` | ✅ DURO-49 + #27 승인 연결 |
 | 렌더링 | — | 앱 (2단계) | ❌ |
 | 스킬 결정 | `pick_skill()` | `router.py` | ✅ (/mode + sticky) |
 | 에이전트 설정 | `Agent(...)`, `add_target()`, `add_skill_prompt()` | `agent.py` | ✅ |
-| 툴 등록 | `FunctionToolset(READ_TOOLS).filtered(...)` | `agent.py` | ✅ PR #19 (읽기 5종만) |
+| 툴 등록 | `FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS]).filtered(_only_skill_tools)` | `agent.py` | ✅ 스킬별 필터; 변경 4종은 실습만 + Hook |
 | 읽기 툴 5종 | `list_resources` 등 | `tools/read.py` | ✅ |
-| 변경 툴 4종 | `delete_resource` 등 | `tools/mutate.py` | ❌ (훅 이후) |
+| 변경 툴 4종 | `delete_resource` 등 | `tools/mutate.py` | ✅ 실습에만 노출, 가드레일 훅 대상 |
 | 명령 조립 | `assemble()` | `kubectl/assemble.py` | 부분 (apply TODO) |
 | 실행 | `run_kubectl()` | `kubectl/runner.py` | ✅ |
-| 훅 파이프라인 | `guardrail()` | `guardrail/hook.py` | ❌ (팀원) |
-| Action Plan | `create_draft()`, `record_*()`, `mark()` | `guardrail/action_plan.py` | ✅ PR #18 머지 |
-| 승인 | `cli_approve()` | `guardrail/approval.py` | ❌ (앱 전환 시 ApprovalRequired 재설계) |
+| 훅 파이프라인 | `guardrail()` | `guardrail/hook.py` | ✅ 2-pass 승인·실행·기록 |
+| Action Plan | `create_draft()`, `approve_for_execution()`, `record_execution()` | `guardrail/action_plan.py` | ✅ |
+| 승인 | `DeferredToolRequests → Electron → /approve → DeferredToolResults` | `server.py`, `guardrail/approval.py` | ✅ #27 |
 | 응답 조립 (steps·설명) | `build_response_for()`, `collect_steps()` + `FLAG_GLOSSARY` | `response.py`, `glossary.py` | ✅ DURO-44 |
 | 사전 미등록 플래그 로그 | `log_unregistered_flags()` | `validators.py` | ✅ DURO-44 |
 | LLM 왕복 루프 | — | pydantic-ai 내부 | (우리 코드 아님) |

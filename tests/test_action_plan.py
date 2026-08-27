@@ -300,6 +300,16 @@ def test_mark_rejects_unknown_status(monkeypatch, tmp_path):
         plan.mark("approved")
 
 
+def test_reject는_draft를_한번만_rejected로_바꾼다(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+
+    plan.reject()
+
+    assert ActionPlan.load(plan.path).status == "rejected"
+    with pytest.raises(ValueError, match="not ready for rejection"):
+        plan.reject()
+
+
 def test_validate_for_decision_guidance_uses_in_memory_fields(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
     plan.record_dry_run("succeeded", "dry-run ok", "")

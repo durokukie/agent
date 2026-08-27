@@ -7,12 +7,13 @@ from __future__ import annotations
 import os
 
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.tools import ToolDefinition
+from pydantic_ai.tools import DeferredToolRequests, ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 
 from kukie.deps import Deps
 from kukie.guardrail.hook import hooks as guardrail_hooks
 from kukie.response import build_response
+from kukie.tools.mutate import MUTATE_TOOLS
 from kukie.tools.read import READ_TOOLS
 
 BASE_PROMPT = """너는 쿠버네티스를 처음 배우는 연수생을 돕는 조수 Kukie다.
@@ -23,12 +24,11 @@ BASE_PROMPT = """너는 쿠버네티스를 처음 배우는 연수생을 돕는 
    실행할 kubectl 명령을 만들어 안내하고 각 플래그의 의미를 설명해라.
 4. 클러스터를 변경하는 툴을 호출하면 시스템 가드레일이 자동 개입한다.
    위험도는 시스템이 판정한다 — 네가 판정하거나 우회하거나 실행됐다고 말하지 마라.
-   승인은 사용자가 CLI에서 직접 입력해야 성립한다."""
+   승인은 Electron 승인 화면에서 사용자가 직접 결정해야 성립한다.
+   채팅 메시지는 승인으로 해석하지 마라."""
 
 # ── 툴 등록 ──────────────────────────────────────────────────
-# 읽기 5종만 등록한다. 변경 4종은 가드레일 훅 본체가 완성된 뒤 추가 (마일스톤 2) —
-# 훅 없이 등록하면 승인 없이 delete가 나갈 수 있다.
-_read_toolset: FunctionToolset[Deps] = FunctionToolset(READ_TOOLS)
+_toolset: FunctionToolset[Deps] = FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS])
 
 
 def _only_skill_tools(ctx: RunContext[Deps], tool_def: ToolDefinition) -> bool:
@@ -36,7 +36,7 @@ def _only_skill_tools(ctx: RunContext[Deps], tool_def: ToolDefinition) -> bool:
     return tool_def.name in ctx.deps.skill.allowed_tools
 
 
-toolset = _read_toolset.filtered(_only_skill_tools)
+toolset = _toolset.filtered(_only_skill_tools)
 
 
 # 모델은 환경변수로 지정한다. 미지정 시 'test'(TestModel) — 키 없이 import·테스트 가능.
@@ -48,7 +48,7 @@ agent = Agent(
     MODEL,
     name="kukie",
     deps_type=Deps,
-    output_type=build_response,       # 함수 output_type — LLM은 narration 등 해석 칸만, steps는 코드가 (DURO-44)
+    output_type=[build_response, DeferredToolRequests],  # 일반 응답 또는 승인 대기 요청
                                       # 스킬 특화 응답은 run마다 output_type=skill.output_fn 으로 오버라이드
     instructions=BASE_PROMPT,
     toolsets=[toolset],               # 스킬 필터를 거친 툴 목록
@@ -74,7 +74,7 @@ agent = Agent(
 #
 # 이 파일에서 같은 원리로 동작하는 등록형 함수:
 #   @agent.instructions      → 프롬프트 생성기 (아래 둘)
-#   FunctionToolset(...)     → 툴 (READ_TOOLS의 함수들; LLM이 이름으로 호출)
+#   FunctionToolset(...)     → 툴 (READ_TOOLS/MUTATE_TOOLS의 함수들; LLM이 이름으로 호출)
 #   @hooks.on.tool_execute   → 훅 (guardrail/hook.py의 guardrail())
 #   output_type=build_response → 최종 응답 조립기 (response.py). 함수라서 LLM 스키마는
 #     매개변수(narration, suggested_transition)뿐이고, steps는 본문에서 코드가 실행 기록으로 채운다.
