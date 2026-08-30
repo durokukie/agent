@@ -8,6 +8,7 @@ from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
 from kukie.guardrail import action_plan
+from kukie.guardrail import decision_guidance
 from kukie.guardrail.action_plan import ActionPlan
 from kukie.guardrail.decision_guidance import (
     generate_decision_guidance,
@@ -136,3 +137,21 @@ async def test_generate_decision_guidance_rejects_empty_output(monkeypatch, tmp_
     with guidance_agent.override(model=TestModel(custom_output_text="   ")):
         with pytest.raises(ValueError, match="LLM returned empty decision guidance"):
             await generate_decision_guidance(plan)
+
+
+def test_판단_가이드_모델은_환경변수로_바꿀_수_있다(monkeypatch):
+    """메인 모델과 다른 제공사에 고정돼 있으면 키를 두 벌 요구하게 된다.
+    실패해도 훅이 삼켜서 조용히 빈칸이 되는 자리라 설정 가능해야 한다."""
+    import importlib
+
+    monkeypatch.setenv("KUKIE_GUIDANCE_MODEL", "openrouter:openai/gpt-5-mini")
+    reloaded = importlib.reload(decision_guidance)
+    try:
+        assert reloaded.GUIDANCE_MODEL == "openrouter:openai/gpt-5-mini"
+    finally:
+        monkeypatch.delenv("KUKIE_GUIDANCE_MODEL", raising=False)
+        importlib.reload(decision_guidance)   # 다른 테스트를 위해 원상 복구
+
+
+def test_판단_가이드_모델_기본값은_기존_동작을_유지한다():
+    assert decision_guidance.GUIDANCE_MODEL == "openai:gpt-5.6-luna"

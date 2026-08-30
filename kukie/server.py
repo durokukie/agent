@@ -33,10 +33,15 @@ from kukie.deps import Deps
 from kukie.guardrail.action_plan import ActionPlan
 from kukie.guardrail.approval import ApprovalRequest, build_approval_request
 from kukie.kubectl.config import KubeconfigError, read_kubeconfig
+from kukie.observability import setup as setup_observability
 from kukie.router import pick_skill
 from kukie.skills import DEFAULT_SKILL, SKILLS
 
 logger = logging.getLogger(__name__)
+
+# 계측은 opt-in — LOGFIRE_TOKEN·OTEL 엔드포인트가 없으면 아무 일도 하지 않는다.
+# 테스트가 이 모듈을 import 해도 무해하다.
+setup_observability()
 
 
 # ── 세션 ─────────────────────────────────────────────────────
