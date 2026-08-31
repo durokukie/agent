@@ -18,20 +18,24 @@ def test_설정이_없으면_계측을_켜지_않는다(monkeypatch):
     """평상시·테스트에서 켜지면 안 된다 — logfire 를 import 조차 하지 않아야 한다.
 
     logfire.configure 를 패치하는 방식은 이 계약을 못 지킨다: 테스트가 먼저 logfire 를
-    import 해버리면 sys.modules 에 남아, 구현이 모듈 수준 import 로 바뀌어도 통과한다
-    (CodeRabbit 지적). import 자체를 막아 "시도조차 없음"을 검증한다.
+    import 해버리면 sys.modules 에 남아, 구현이 모듈 수준 import 로 바뀌어도 통과한다.
+    예외를 던지는 방식도 안 된다: setup() 의 except Exception("실패해도 안 새어나감"
+    원칙)이 감지용 예외까지 삼켜 False 를 돌려주므로 테스트가 그대로 통과한다
+    (CodeRabbit 지적 2건). 시도를 기록만 하고 밖에서 단언한다.
     """
     import builtins
 
     real_import = builtins.__import__
+    attempted: list[str] = []
 
-    def guard(name, *args, **kwargs):
+    def record(name, *args, **kwargs):
         if name == "logfire":
-            raise AssertionError("계측이 꺼진 상황에서 logfire 를 import 했다")
+            attempted.append(name)
         return real_import(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", guard)
+    monkeypatch.setattr(builtins, "__import__", record)
     assert observability.setup() is False
+    assert not attempted, "계측이 꺼진 상황에서 logfire import 를 시도했다"
 
 
 @pytest.mark.parametrize("key,value", [
