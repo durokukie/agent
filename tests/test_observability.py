@@ -15,12 +15,22 @@ def clean_env(monkeypatch):
 
 
 def test_설정이_없으면_계측을_켜지_않는다(monkeypatch):
-    """평상시·테스트에서 켜지면 안 된다 — logfire 를 import 조차 하지 않아야 한다."""
-    def boom(*a, **kw):
-        raise AssertionError("계측이 켜지면 안 되는 상황에서 configure 가 불렸다")
+    """평상시·테스트에서 켜지면 안 된다 — logfire 를 import 조차 하지 않아야 한다.
 
-    import logfire
-    monkeypatch.setattr(logfire, "configure", boom)
+    logfire.configure 를 패치하는 방식은 이 계약을 못 지킨다: 테스트가 먼저 logfire 를
+    import 해버리면 sys.modules 에 남아, 구현이 모듈 수준 import 로 바뀌어도 통과한다
+    (CodeRabbit 지적). import 자체를 막아 "시도조차 없음"을 검증한다.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def guard(name, *args, **kwargs):
+        if name == "logfire":
+            raise AssertionError("계측이 꺼진 상황에서 logfire 를 import 했다")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guard)
     assert observability.setup() is False
 
 

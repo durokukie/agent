@@ -25,7 +25,14 @@ INSTRUCTIONS = """너는 아직 승인되지 않은 Kubernetes Action Plan의 �
 # 판단 가이드 모델도 환경변수로 — 메인 에이전트(KUKIE_MODEL)와 다른 제공사에 묶여 있으면
 # 키를 두 벌 요구하게 된다. 실패해도 훅이 "guidance unavailable"로 삼키므로 터지지 않고
 # 조용히 빈칸이 되는 자리라, 설정 가능해야 한다 (예: openrouter:openai/gpt-5-mini).
-GUIDANCE_MODEL = os.environ.get("KUKIE_GUIDANCE_MODEL", "openai:gpt-5.6-luna")
+# `or` 인 이유: .env 의 `KUKIE_GUIDANCE_MODEL=` 처럼 빈 값도 환경변수로 등록되는데,
+# get(키, 기본값)은 그때 빈 문자열을 돌려줘 Agent("") 가 import 시점에 UserError 로
+# 터진다 (CodeRabbit 지적). 빈 값을 미설정과 같게 취급한다 — observability 와 같은 패턴.
+def _guidance_model() -> str:
+    return os.environ.get("KUKIE_GUIDANCE_MODEL") or "openai:gpt-5.6-luna"
+
+
+GUIDANCE_MODEL = _guidance_model()
 
 guidance_agent = Agent(
     GUIDANCE_MODEL,
