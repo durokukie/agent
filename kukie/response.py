@@ -6,7 +6,7 @@ run 동안 실제로 실행된 툴 호출 기록(ctx.messages 의 ToolReturnPart
 LLM의 성실함이 아니라 코드로 보장된다.
 
 구현 방식: pydantic-ai 의 함수 output_type.
-  - LLM에게 보이는 스키마 = 함수의 매개변수뿐 (narration, suggested_transition, 스킬 특화 필드)
+  - LLM에게 보이는 스키마 = 함수의 매개변수뿐 (narration, suggested_next_action, 스킬 특화 필드)
   - steps 는 매개변수에 없으므로 LLM은 그 칸의 존재조차 모른다
   - 함수 본문이 steps 를 채워 완성된 응답 객체를 돌려준다
 스킬별 특화 응답(DiagnosisResponse 등)은 build_response_for(응답클래스)로 같은 방식의

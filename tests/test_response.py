@@ -65,15 +65,29 @@ def test_툴을_안_부르면_steps는_비어있다(fake_kubectl):
     assert fake_kubectl == []
 
 
-# ── 2. LLM 스키마에는 steps 가 없다 ─────────────────────────────
+# ── 2. LLM 스키마와 다음 행동 안내 ─────────────────────────────
 
-def test_LLM에게_보이는_출력_스키마에_steps가_없다(fake_kubectl):
-    m = TestModel(call_tools=[], custom_output_args={"narration": "x"})
-    _run(m)
+@pytest.mark.parametrize("skill,extra_fields", [
+    ("학습", set()),
+    ("진단", {"finding"}),
+    ("실습", set()),
+])
+@pytest.mark.parametrize("values", [
+    {},
+    {"suggested_next_action": None},
+    {"suggested_next_action": "컨테이너 로그를 분석하려면 진단 모드로 전환해 주세요."},
+])
+def test_모든_모드의_다음_행동_스키마와_값(skill, extra_fields, values):
+    m = TestModel(call_tools=[], custom_output_args={"narration": "설명", **values})
+    result = _run(m, deps=_deps(skill), output_type=SKILLS[skill].output_fn)
     schema = m.last_model_request_parameters.output_tools[0].parameters_json_schema
-    keys = set(schema["properties"])
-    assert "steps" not in keys
-    assert keys == {"narration", "suggested_transition"}
+    assert set(schema["properties"]) == {"narration", "suggested_next_action"} | extra_fields
+    field = schema["properties"]["suggested_next_action"]
+    assert {item["type"] for item in field["anyOf"]} == {"string", "null"}
+    assert field["default"] is None
+    assert "suggested_next_action" not in schema.get("required", [])
+    assert result.output.suggested_next_action == values.get("suggested_next_action")
+    assert result.output.steps == []
 
 
 # ── 3. explanations 는 사전에서 ─────────────────────────────────

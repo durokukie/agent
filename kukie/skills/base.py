@@ -36,7 +36,7 @@ class KukieResponse(BaseModel):
     """공통 응답 뼈대. 스킬별 특화 블록은 이걸 상속해 추가한다."""
     narration: str
     steps: list[ToolStep] = []
-    suggested_transition: str | None = None   # "실습 모드로 전환할까요?" 등
+    suggested_next_action: str | None = None   # 답변·실행 결과에 근거한 다음 행동 안내
 
 
 # ── 스킬 정의 ────────────────────────────────────────────────

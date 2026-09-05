@@ -90,6 +90,26 @@ def test_채팅은_answer와_조립된_KukieResponse를_돌려준다(client):
     assert body["response"]["steps"][0]["command"] == FAKE_COMMAND   # 사실 칸 = 실행 기록 (DURO-44)
 
 
+def test_다음_행동은_HTTP로_전달되고_모드를_바꾸지_않는다(client):
+    client.post("/session")
+    suggestion = "컨테이너 로그를 분석하려면 진단 모드로 전환해 주세요."
+    model = TestModel(call_tools=[], custom_output_args={
+        "narration": "추가 로그 확인이 필요합니다.",
+        "suggested_next_action": suggestion,
+    })
+    with agent.override(model=model):
+        result = client.post("/chat", json={"text": "다음에 무엇을 할까요?"})
+    assert result.status_code == 200
+    body = result.json()
+    assert body["kind"] == "answer"
+    assert body["response"]["suggested_next_action"] == suggestion
+    assert "suggested_transition" not in body["response"]
+    assert body["response"]["steps"] == []
+    session = client.get("/session").json()
+    assert session["skill"] == "학습"
+    assert session["pending"] == []
+
+
 def test_대화_기록은_턴_사이에_이어진다(client):
     client.post("/session")
     with agent.override(model=_model()):
