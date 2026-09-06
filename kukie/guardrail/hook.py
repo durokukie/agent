@@ -13,6 +13,7 @@ LLM은 발동 여부에 관여할 수 없다. wrap 훅 하나가 전 단계를 �
 from __future__ import annotations
 
 import logging
+import shlex
 
 import yaml
 from pydantic_ai import ApprovalRequired, ModelRetry, ToolFailed
@@ -21,11 +22,30 @@ from pydantic_ai.capabilities.hooks import Hooks
 from kukie.guardrail.action_plan import ActionPlan, PlanTarget
 from kukie.guardrail.decision_guidance import generate_decision_guidance
 from kukie.guardrail.mutation_request import canonicalize_mutation_args
-from kukie.kubectl import assemble, run_kubectl
+from kukie.kubectl import KubectlResult, assemble, run_kubectl
 from kukie.tools.mutate import MUTATING_TOOLS, RISK_STICKERS
 
 logger = logging.getLogger(__name__)
 hooks = Hooks()
+
+
+def _recorded_result(plan: ActionPlan) -> KubectlResult:
+    """이미 실행된 Plan 의 저장 결과를 툴 반환값 모양으로 되돌린다 (DURO-66 재시도).
+
+    승인 재개(run)가 kubectl 실행 뒤에 실패하면 서버는 같은 승인으로 run 을 다시 부른다.
+    그때 kubectl 을 또 돌리면 안 되므로 Plan 파일에 기록된 결과를 그대로 돌려준다 —
+    LLM 은 첫 실행과 똑같은 결과를 보고, 화면 블록(collect_steps)도 KubectlResult 로 그려진다.
+    command 는 run_kubectl 이 만드는 것과 같은 모양(kubectl --context … + 조립 args)으로 복원한다.
+    """
+    recorded = plan.execution_result
+    assert recorded is not None
+    return KubectlResult(
+        command=shlex.join(["kubectl", "--context", str(plan.target["context"]), *plan.command]),
+        stdout=str(recorded.get("stdout", "")),
+        stderr=str(recorded.get("stderr", "")),
+        success=bool(recorded.get("success")),
+        exit_code=recorded.get("exit_code"),  # type: ignore[arg-type]
+    )
 
 
 def _dry_run_unsupported(stderr: str) -> bool:
@@ -124,6 +144,19 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
     if ctx.tool_call_approved:
         try:
             plan = ActionPlan.find_by_call_id(call.tool_call_id)
+        except (FileNotFoundError, ValueError) as exc:
+            raise ToolFailed(str(exc)) from None
+        # 재시도 분기 (DURO-66): 같은 승인으로 run 이 다시 왔을 때 kubectl 이 돌았는지는
+        # 서버가 아니라 Plan 파일이 안다. 실행 기록이 있으면 그걸 돌려주고, 승인 기록만 있고
+        # 실행 기록이 없으면(기록 도중 죽음·기록 실패) 실행 여부를 모르므로 다시 돌리지 않는다.
+        if plan.execution_result is not None:
+            return _recorded_result(plan)
+        if plan.approval is not None:
+            raise ToolFailed(
+                "실행 여부를 확인할 수 없다 — 승인은 기록됐지만 실행 결과가 없다. "
+                f"클러스터 상태를 직접 확인하라 (plan_id={plan.id})"
+            )
+        try:
             plan.approve_for_execution(
                 tool=tool_name,
                 args=plan_args,
@@ -131,7 +164,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
                 risk=risk,
                 target=target,
             )
-        except (FileNotFoundError, ValueError) as exc:
+        except ValueError as exc:
             raise ToolFailed(str(exc)) from None
         try:
             result = await handler(args)

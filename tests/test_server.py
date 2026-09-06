@@ -527,13 +527,17 @@ def test_여러_승인을_모은뒤_승인과_거절을_한번만_재개한다(
     ).status_code == 409
 
 
+# ── 재개 실패 정책 (DURO-66): 세션·티켓 유지 + /resume ──────────
+
 @pytest.mark.parametrize("approved", [True, False])
-def test_재개실패는_pending을_복원하지않고_세션을_무효화한다(
+def test_재개실패는_세션과_티켓을_유지하고_resume으로_다시_시도한다(
     client, monkeypatch, caplog, approved
 ):
     client.post("/session")
     plan, ticket = _pending_ticket_for_server("c1")
     server._to_payload(server._session, _fake_result(ticket))
+    session = server._session
+    original_history = list(session.history)
 
     async def boom(session, **kwargs):
         raise RuntimeError("resume failed")
@@ -546,23 +550,138 @@ def test_재개실패는_pending을_복원하지않고_세션을_무효화한다
         )
 
     assert response.status_code == 503
-    assert server._session is None
+    detail = response.json()["detail"]
+    assert detail["code"] == "RESUME_RETRYABLE"
+    assert detail["plan_ids"] == [plan.id]
+    assert "/resume" in detail["message"]
+    # 세션은 그대로 — 기록·티켓·결정 전부 실패 전과 같다
+    assert server._session is session
+    assert session.history == original_history
+    assert session.pending is ticket
+    assert "c1" in session.decisions
+    assert session.processing is False
+    assert ActionPlan.load(plan.path).status == ("draft" if approved else "rejected")
+    # 새 결정을 받는 문은 닫혀 있고 (/chat: 승인 대기, /approve: 이미 결정), 재시도 문만 열려 있다
     assert client.post("/chat", json={"text": "다음 질문"}).status_code == 409
-    assert client.post(
-        "/approve",
-        json={"call_id": "c1", "approved": approved},
-    ).status_code == 409
-    assert ActionPlan.load(plan.path).status == (
-        "draft" if approved else "rejected"
-    )
+    assert client.post("/approve", json={"call_id": "c1", "approved": approved}).status_code == 409
     [record] = [
         record for record in caplog.records
         if record.name == "kukie.server" and record.levelno == logging.ERROR
     ]
-    assert "call_id=c1" in record.getMessage()
-    assert f"plan_id={plan.id}" in record.getMessage()
-    assert f"approved={approved}" in record.getMessage()
+    assert "call_ids=['c1']" in record.getMessage()
+    assert plan.id in record.getMessage()
     assert isinstance(record.exc_info[1], RuntimeError)
+
+    # 재시도 — 같은 결정이 그대로 재조립돼 run 에 실린다
+    seen = {}
+
+    async def fake_run(session, **kwargs):
+        assert session.processing is True
+        seen["results"] = kwargs["deferred_tool_results"]
+        return _ok_result()
+
+    monkeypatch.setattr(server, "_run_agent", fake_run)
+    resumed = client.post("/resume")
+
+    assert resumed.status_code == 200
+    assert resumed.json()["kind"] == "answer"
+    assert isinstance(seen["results"], DeferredToolResults)
+    assert isinstance(seen["results"].approvals["c1"], ToolApproved if approved else ToolDenied)
+    assert session.pending is None and session.decisions == {}
+    assert client.post("/resume").status_code == 409         # 티켓이 소비됐으니 더 재개할 게 없다
+
+
+def test_resume은_티켓이_없으면_409(client):
+    client.post("/session")
+    assert client.post("/resume").status_code == 409
+
+
+def test_resume은_미결정_카드가_남아_있으면_409(client, monkeypatch):
+    """/resume 은 재시도 문이지 결정을 대신 내리는 문이 아니다."""
+    client.post("/session")
+    _, first = _pending_ticket_for_server("c1")
+    _, second = _pending_ticket_for_server("c2")
+    server._session.pending = DeferredToolRequests(
+        approvals=[first.approvals[0], second.approvals[0]],
+        metadata={**first.metadata, **second.metadata},
+    )
+    server._session.decisions = {"c1": ToolApproved()}
+
+    async def unexpected_run(session, **kwargs):
+        pytest.fail("미결정 카드가 있는데 run 을 재개하면 안 된다")
+
+    monkeypatch.setattr(server, "_run_agent", unexpected_run)
+    response = client.post("/resume")
+
+    assert response.status_code == 409
+    assert "c2" in response.json()["detail"]
+
+
+def test_resume_실행_중에는_다른_진입이_409(client, monkeypatch):
+    from fastapi import HTTPException
+
+    client.post("/session")
+    _, ticket = _pending_ticket_for_server("c1")
+    server._session.pending = ticket
+    server._session.decisions = {"c1": ToolApproved()}
+    seen = {}
+
+    async def fake_run(session, **kwargs):
+        assert session.processing is True
+        with pytest.raises(HTTPException) as exc:
+            await server.resume()
+        seen["resume_blocked"] = exc.value.status_code
+        with pytest.raises(HTTPException) as exc:
+            await server.chat(server.ChatIn(text="딴 얘기"))
+        seen["chat_blocked"] = exc.value.status_code
+        return _ok_result()
+
+    monkeypatch.setattr(server, "_run_agent", fake_run)
+    assert client.post("/resume").status_code == 200
+    assert seen == {"resume_blocked": 409, "chat_blocked": 409}
+    assert server._session.processing is False
+
+
+def test_거절_기록_실패는_결정을_남기지_않고_티켓을_유지한다(client, monkeypatch, caplog):
+    """거절은 로컬 파일 쓰기뿐 — 실패해도 LLM·클러스터는 건드리지 않았으니 같은 카드를 다시 누르면 된다
+    (DURO-66 결정 불필요 1: try 범위를 run 으로 좁힘)."""
+    client.post("/session")
+    plan, ticket = _pending_ticket_for_server("c1")
+    server._to_payload(server._session, _fake_result(ticket))
+    session = server._session
+
+    async def unexpected_run(session, **kwargs):
+        pytest.fail("거절 기록에 실패했는데 run 을 재개하면 안 된다")
+
+    monkeypatch.setattr(server, "_run_agent", unexpected_run)
+    original_reject = ActionPlan.reject
+
+    def disk_full(self):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ActionPlan, "reject", disk_full)
+    with caplog.at_level(logging.ERROR, logger="kukie.server"):
+        response = client.post("/approve", json={"call_id": "c1", "approved": False})
+
+    assert response.status_code == 503
+    assert "disk full" in response.json()["detail"]
+    assert server._session is session
+    assert session.pending is ticket
+    assert session.decisions == {}                            # 결정을 남기지 않았다
+    assert session.processing is False
+    assert ActionPlan.load(plan.path).status == "draft"
+    assert client.get("/session").json()["pending"] == ["c1"]   # 카드가 그대로 떠 있다
+    assert "disk full" in caplog.text
+
+    # 디스크가 돌아오면 같은 카드로 다시 결정할 수 있다
+    monkeypatch.setattr(ActionPlan, "reject", original_reject)
+    monkeypatch.setattr(server, "_run_agent", lambda session, **kwargs: _async_ok())
+    assert client.post("/approve", json={"call_id": "c1", "approved": False}).status_code == 200
+    assert ActionPlan.load(plan.path).status == "rejected"
+
+
+async def _async_ok():
+    return _ok_result()
 
 
 # ── 6. 실행 잠금 — run 이 도는 동안 새 요청은 409 ─────────────

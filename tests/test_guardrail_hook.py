@@ -908,17 +908,27 @@ async def test_terminal_Plan은_handler를_실행하지_않는다(
 
 
 @pytest.mark.asyncio
-async def test_같은_Deferred_결과를_재전달해도_handler를_다시_실행하지_않는다(
-    monkeypatch, tmp_path, successful_dry_run, successful_guidance
+@pytest.mark.parametrize(
+    ("success", "stdout", "stderr", "exit_code"),
+    [
+        (True, "scaled\n", "", 0),
+        (False, "", "deployment not found\n", 1),
+    ],
+)
+async def test_같은_Deferred_결과를_재전달하면_handler_대신_저장된_결과를_돌려준다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance,
+    success, stdout, stderr, exit_code,
 ):
+    """재개 실패 뒤 /resume 이 같은 승인으로 다시 오는 경로 (DURO-66).
+    kubectl 은 다시 돌지 않고, LLM 은 첫 실행과 같은 결과를 본다 — 성공이든 실패든."""
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     await _create_pending_plan()
     result = KubectlResult(
-        command="kubectl scale deployment nginx --replicas=3 -n study",
-        stdout="scaled\n",
-        stderr="",
-        success=True,
-        exit_code=0,
+        command="kubectl --context kind-dev scale deployment nginx --replicas=3 -n study",
+        stdout=stdout,
+        stderr=stderr,
+        success=success,
+        exit_code=exit_code,
     )
     await hook.guardrail(
         _ctx(approved=True),
@@ -929,16 +939,45 @@ async def test_같은_Deferred_결과를_재전달해도_handler를_다시_실�
     )
     duplicate_handler = AsyncMock()
 
-    with pytest.raises(ToolFailed, match="not ready for execution"):
+    replayed = await hook.guardrail(
+        _ctx(approved=True),
+        call=_call(),
+        tool_def=None,
+        args=BASE_ARGS,
+        handler=duplicate_handler,
+    )
+
+    duplicate_handler.assert_not_awaited()
+    assert isinstance(replayed, KubectlResult)          # collect_steps 의 isinstance 검사를 통과해야 함
+    assert replayed == result                            # command 까지 run_kubectl 과 같은 모양으로 복원
+    assert len(successful_dry_run) == 1                  # dry-run 도 다시 돌지 않음
+    metadata = _read_plan(next(tmp_path.glob("*.md")))
+    assert metadata["status"] == ("executed" if success else "failed")
+
+
+@pytest.mark.asyncio
+async def test_승인_기록만_있고_실행_기록이_없으면_실행_여부_불명으로_실패한다(
+    monkeypatch, tmp_path, successful_dry_run, successful_guidance
+):
+    """승인 기록 뒤·실행 기록 전에 프로세스가 죽은 경우 — kubectl 이 돌았는지 모르므로
+    다시 돌리지도, 성공했다고 하지도 않는다."""
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    await _create_pending_plan()
+    plan = action_plan.ActionPlan.load(next(tmp_path.glob("*.md")))
+    plan.record_approval("single")
+    handler = AsyncMock()
+
+    with pytest.raises(ToolFailed, match="실행 여부를 확인할 수 없다") as exc:
         await hook.guardrail(
             _ctx(approved=True),
             call=_call(),
             tool_def=None,
             args=BASE_ARGS,
-            handler=duplicate_handler,
+            handler=handler,
         )
 
-    duplicate_handler.assert_not_awaited()
+    handler.assert_not_awaited()
+    assert plan.id in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -1062,8 +1101,9 @@ async def test_기록_실패는_원래_결과에_경고하고_재실행을_차�
     assert "disk full" not in returned.stderr
     assert "disk full" in caplog.text
 
+    # 승인은 기록됐는데 실행 결과 기록이 실패한 상태 → 재전달 시 "실행 여부 불명" 으로 차단
     duplicate_handler = AsyncMock()
-    with pytest.raises(ToolFailed, match="not ready for execution"):
+    with pytest.raises(ToolFailed, match="실행 여부를 확인할 수 없다"):
         await hook.guardrail(
             _ctx(approved=True),
             call=_call(),

@@ -4,17 +4,25 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 
+import httpx
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.models import Model, infer_model
+from pydantic_ai.providers import Provider, infer_provider, infer_provider_class
+from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
 from pydantic_ai.tools import DeferredToolRequests, ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
+from tenacity import retry_if_exception, stop_after_attempt
 
 from kukie.deps import Deps
 from kukie.guardrail.hook import hooks as guardrail_hooks
 from kukie.response import build_response
 from kukie.tools.mutate import MUTATE_TOOLS
 from kukie.tools.read import READ_TOOLS
+
+logger = logging.getLogger(__name__)
 
 BASE_PROMPT = """너는 쿠버네티스를 처음 배우는 연수생을 돕는 조수 Kukie다.
 1. 실행한 명령·결과·플래그 설명은 시스템이 자동으로 화면에 붙인다 — 너는 narration에서
@@ -44,12 +52,52 @@ toolset = _toolset.filtered(_only_skill_tools)
 # TODO: Model Adapter로 Upstage 등 교체 경계 정리 (Architecture.md 6.5)
 MODEL = os.environ.get("KUKIE_MODEL", "test")
 
+
+# ── 모델 HTTP 재시도 (DURO-66 ④) ──────────────────────────────
+# 네트워크 끊김·타임아웃·429·5xx 는 서버(/approve)까지 올라오기 전에 모델 클라이언트 안에서
+# 재시도한다. 여기서 풀리면 사용자는 "다시 시도" 를 누를 일이 없다. 4xx(잘못된 키·요청)는
+# 다시 보내도 같은 답이므로 재시도하지 않는다.
+def _retryable(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        return code == 429 or code >= 500
+    return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
+
+
+def _provider_with_retry(name: str) -> Provider:
+    """infer_model 의 provider_factory — 기본 공급자에 재시도 전송층만 끼운 것."""
+    transport = AsyncTenacityTransport(
+        config=RetryConfig(
+            retry=retry_if_exception(_retryable),
+            wait=wait_retry_after(),          # 429 의 Retry-After 를 지키고, 없으면 지수 대기
+            stop=stop_after_attempt(3),
+            reraise=True,                     # 다 실패하면 tenacity RetryError 가 아니라 원래 예외
+        ),
+        validate_response=lambda response: response.raise_for_status(),
+    )
+    # 기본 클라이언트와 같은 시간 제한 — httpx 기본 5초는 LLM 응답에 너무 짧다.
+    client = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(600, connect=5))
+    try:
+        return infer_provider_class(name)(http_client=client)
+    except TypeError:                         # http_client 를 안 받는 공급자 — 재시도 없이 기본값
+        logger.warning("공급자 %s 는 http_client 를 받지 않아 HTTP 재시도 없이 진행한다", name)
+        return infer_provider(name)
+
+
+def _build_model(spec: str) -> str | Model:
+    """KUKIE_MODEL 문자열 → 모델. 'test' 나 공급자 접두어가 없으면 문자열 그대로 (pydantic-ai 가 해석)."""
+    if spec == "test" or ":" not in spec:
+        return spec
+    return infer_model(spec, provider_factory=_provider_with_retry)
+
+
 agent = Agent(
-    MODEL,
+    _build_model(MODEL),
     name="kukie",
     deps_type=Deps,
     output_type=[build_response, DeferredToolRequests],  # 일반 응답 또는 승인 대기 요청
                                       # 스킬 특화 응답은 run마다 output_type=skill.output_fn 으로 오버라이드
+    retries={"output": 2},            # 응답 형식 실패는 run 안에서 두 번까지 흡수 (DURO-66 ③). 툴은 기본 1
     instructions=BASE_PROMPT,
     toolsets=[toolset],               # 스킬 필터를 거친 툴 목록
     capabilities=[guardrail_hooks],   # 가드레일 훅 장착

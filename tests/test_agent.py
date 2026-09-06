@@ -264,3 +264,56 @@ def test_응답은_KukieResponse_형식으로_강제된다():
 
 def test_Agent는_일반응답과_Deferred요청을_output으로_허용한다():
     assert agent.output_type == [build_response, DeferredToolRequests]
+
+
+# ── 재시도 (DURO-66 ③·④) ────────────────────────────────────
+
+def test_응답_형식_실패는_run_안에서_두번까지_흡수한다():
+    """출력 검증 실패(B 유형)가 서버 503 까지 올라오기 전에 run 안에서 먼저 재시도한다."""
+    assert agent._max_output_retries == 2
+    assert agent._max_tool_retries == 1          # 툴 재시도 예산은 건드리지 않는다
+
+
+def test_build_model은_test와_접두어_없는_이름을_그대로_둔다():
+    from kukie.agent import _build_model
+
+    assert _build_model("test") == "test"
+    assert _build_model("gpt-4o") == "gpt-4o"    # 공급자 미지정 → pydantic-ai 가 해석
+
+
+def test_build_model은_실제_공급자에_HTTP_재시도_전송층을_끼운다(monkeypatch):
+    import httpx
+    from pydantic_ai.retries import AsyncTenacityTransport
+
+    from kukie.agent import _build_model
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+    model = _build_model("anthropic:claude-sonnet-4-6")
+
+    http_client = model.client._client                       # anthropic SDK 가 감싼 httpx 클라이언트
+    assert isinstance(http_client._transport, AsyncTenacityTransport)
+    assert http_client.timeout == httpx.Timeout(600, connect=5)   # httpx 기본 5초는 LLM 에 너무 짧다
+
+
+@pytest.mark.parametrize(("status", "expected"), [
+    (429, True), (500, True), (503, True),          # 레이트리밋·서버 오류 → 다시 보내면 풀린다
+    (400, False), (401, False), (404, False),       # 잘못된 요청·키 → 다시 보내도 같은 답
+])
+def test_HTTP_재시도는_429와_5xx만(status, expected):
+    import httpx
+
+    from kukie.agent import _retryable
+
+    request = httpx.Request("POST", "https://api.example")
+    error = httpx.HTTPStatusError("x", request=request, response=httpx.Response(status, request=request))
+    assert _retryable(error) is expected
+
+
+def test_HTTP_재시도는_네트워크와_타임아웃도_포함한다():
+    import httpx
+
+    from kukie.agent import _retryable
+
+    assert _retryable(httpx.ReadTimeout("t")) is True
+    assert _retryable(httpx.ConnectError("c")) is True
+    assert _retryable(ValueError("x")) is False
