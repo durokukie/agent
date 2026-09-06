@@ -44,6 +44,8 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           track_progress: true
+          # 공식 문서 예시 그대로 — 마켓플레이스를 먼저 등록해야 플러그인 이름이 풀린다
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
           plugins: "code-review@claude-code-plugins"
           prompt: |
             REPO: ${{ github.repository }}
