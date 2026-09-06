@@ -281,39 +281,50 @@ def test_build_model은_test와_접두어_없는_이름을_그대로_둔다():
     assert _build_model("gpt-4o") == "gpt-4o"    # 공급자 미지정 → pydantic-ai 가 해석
 
 
-def test_build_model은_실제_공급자에_HTTP_재시도_전송층을_끼운다(monkeypatch):
-    import httpx
-    from pydantic_ai.retries import AsyncTenacityTransport
+def _http_libs():
+    """공급자 SDK 가 예외를 던질 수 있는 HTTP 라이브러리 — pydantic-ai 2.3x 는 httpx, 2.4x 는 httpx2 도.
+    (httpx2 가 깔려 있어도 2.3x 의 SDK 는 httpx 로 통신하므로 agent 가 고른 목록을 그대로 쓴다.)"""
+    from kukie import agent as agent_module
+
+    return list(agent_module._HTTP_LIBS)
+
+
+def test_build_model은_실제_공급자에_HTTP_재시도_전송층을_끼운다(monkeypatch, caplog):
+    import pydantic_ai.retries as retries
 
     from kukie.agent import _build_model
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
     model = _build_model("anthropic:claude-sonnet-4-6")
 
-    http_client = model.client._client                       # anthropic SDK 가 감싼 httpx 클라이언트
-    assert isinstance(http_client._transport, AsyncTenacityTransport)
-    assert http_client.timeout == httpx.Timeout(600, connect=5)   # httpx 기본 5초는 LLM 에 너무 짧다
+    http_client = model.client._client                       # anthropic SDK 가 감싼 HTTP 클라이언트
+    transports = tuple(
+        cls for name in ("AsyncHTTPX2TenacityTransport", "AsyncTenacityTransport")
+        if (cls := getattr(retries, name, None)) is not None
+    )
+    assert isinstance(http_client._transport, transports)   # 설치된 스택(httpx2 / httpx)에 맞는 재시도 전송층
+    assert http_client.timeout.read == 600                   # 기본 5초는 LLM 에 너무 짧다
+    assert http_client.timeout.connect == 5
+    assert "HTTP 재시도 없이" not in caplog.text             # 폴백(재시도 없음)으로 빠지지 않았다
 
 
+@pytest.mark.parametrize("lib", _http_libs(), ids=lambda lib: lib.__name__)
 @pytest.mark.parametrize(("status", "expected"), [
     (429, True), (500, True), (503, True),          # 레이트리밋·서버 오류 → 다시 보내면 풀린다
     (400, False), (401, False), (404, False),       # 잘못된 요청·키 → 다시 보내도 같은 답
 ])
-def test_HTTP_재시도는_429와_5xx만(status, expected):
-    import httpx
-
+def test_HTTP_재시도는_429와_5xx만(lib, status, expected):
     from kukie.agent import _retryable
 
-    request = httpx.Request("POST", "https://api.example")
-    error = httpx.HTTPStatusError("x", request=request, response=httpx.Response(status, request=request))
+    request = lib.Request("POST", "https://api.example")
+    error = lib.HTTPStatusError("x", request=request, response=lib.Response(status, request=request))
     assert _retryable(error) is expected
 
 
-def test_HTTP_재시도는_네트워크와_타임아웃도_포함한다():
-    import httpx
-
+@pytest.mark.parametrize("lib", _http_libs(), ids=lambda lib: lib.__name__)
+def test_HTTP_재시도는_네트워크와_타임아웃도_포함한다(lib):
     from kukie.agent import _retryable
 
-    assert _retryable(httpx.ReadTimeout("t")) is True
-    assert _retryable(httpx.ConnectError("c")) is True
+    assert _retryable(lib.ReadTimeout("t")) is True
+    assert _retryable(lib.ConnectError("c")) is True
     assert _retryable(ValueError("x")) is False

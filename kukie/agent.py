@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
+from collections.abc import Iterator
+from typing import Any
 
 import httpx
 from pydantic_ai import Agent, RunContext
@@ -15,6 +18,15 @@ from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_
 from pydantic_ai.tools import DeferredToolRequests, ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 from tenacity import retry_if_exception, stop_after_attempt
+
+# pydantic-ai 2.4x 부터 공급자 SDK(anthropic 1.x 등)가 httpx 대신 httpx2 클라이언트를 받는다.
+# 2.3x 는 httpx 만 받는다. 어느 쪽인지는 설치된 버전이 정하므로 둘 다 준비해 두고 맞는 쪽을 쓴다.
+try:
+    import httpx2
+    from pydantic_ai.retries import AsyncHTTPX2TenacityTransport
+except ImportError:                          # pydantic-ai 2.3x — httpx2 전송층 없음
+    httpx2 = None                            # type: ignore[assignment]
+    AsyncHTTPX2TenacityTransport = None      # type: ignore[assignment,misc]
 
 from kukie.deps import Deps
 from kukie.guardrail.hook import hooks as guardrail_hooks
@@ -57,31 +69,60 @@ MODEL = os.environ.get("KUKIE_MODEL", "test")
 # 네트워크 끊김·타임아웃·429·5xx 는 서버(/approve)까지 올라오기 전에 모델 클라이언트 안에서
 # 재시도한다. 여기서 풀리면 사용자는 "다시 시도" 를 누를 일이 없다. 4xx(잘못된 키·요청)는
 # 다시 보내도 같은 답이므로 재시도하지 않는다.
+_HTTP_LIBS = tuple(lib for lib in (httpx2, httpx) if lib is not None)
+_STATUS_ERRORS = tuple(lib.HTTPStatusError for lib in _HTTP_LIBS)
+_TRANSIENT_ERRORS = tuple(err for lib in _HTTP_LIBS for err in (lib.TimeoutException, lib.NetworkError))
+
+
 def _retryable(exc: BaseException) -> bool:
-    if isinstance(exc, httpx.HTTPStatusError):
+    if isinstance(exc, _STATUS_ERRORS):
         code = exc.response.status_code
         return code == 429 or code >= 500
-    return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
+    return isinstance(exc, _TRANSIENT_ERRORS)
+
+
+def _retry_config() -> RetryConfig:
+    return RetryConfig(
+        retry=retry_if_exception(_retryable),
+        wait=wait_retry_after(),              # 429 의 Retry-After 를 지키고, 없으면 지수 대기
+        stop=stop_after_attempt(3),
+        reraise=True,                         # 다 실패하면 tenacity RetryError 가 아니라 원래 예외
+    )
+
+
+def _retry_clients() -> Iterator[Any]:
+    """공급자에 넘겨볼 클라이언트 후보 — httpx2(새 SDK) 먼저, 그다음 httpx(옛 SDK).
+
+    둘 다 시간 제한을 600초/접속 5초로 — httpx 기본 5초는 LLM 응답에 너무 짧다.
+    맞지 않는 쪽은 공급자가 TypeError 로 거절하므로 순서대로 시도하면 된다.
+    """
+    if httpx2 is not None and AsyncHTTPX2TenacityTransport is not None:
+        yield httpx2.AsyncClient(
+            transport=AsyncHTTPX2TenacityTransport(
+                config=_retry_config(),
+                validate_response=lambda response: response.raise_for_status(),
+            ),
+            timeout=httpx2.Timeout(600, connect=5),
+        )
+    with warnings.catch_warnings():           # 2.4x 에선 deprecated — 옛 SDK 일 때만 여기까지 온다
+        warnings.simplefilter("ignore", DeprecationWarning)
+        transport = AsyncTenacityTransport(
+            config=_retry_config(),
+            validate_response=lambda response: response.raise_for_status(),
+        )
+    yield httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(600, connect=5))
 
 
 def _provider_with_retry(name: str) -> Provider:
     """infer_model 의 provider_factory — 기본 공급자에 재시도 전송층만 끼운 것."""
-    transport = AsyncTenacityTransport(
-        config=RetryConfig(
-            retry=retry_if_exception(_retryable),
-            wait=wait_retry_after(),          # 429 의 Retry-After 를 지키고, 없으면 지수 대기
-            stop=stop_after_attempt(3),
-            reraise=True,                     # 다 실패하면 tenacity RetryError 가 아니라 원래 예외
-        ),
-        validate_response=lambda response: response.raise_for_status(),
-    )
-    # 기본 클라이언트와 같은 시간 제한 — httpx 기본 5초는 LLM 응답에 너무 짧다.
-    client = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(600, connect=5))
-    try:
-        return infer_provider_class(name)(http_client=client)
-    except TypeError:                         # http_client 를 안 받는 공급자 — 재시도 없이 기본값
-        logger.warning("공급자 %s 는 http_client 를 받지 않아 HTTP 재시도 없이 진행한다", name)
-        return infer_provider(name)
+    provider_cls = infer_provider_class(name)
+    for client in _retry_clients():
+        try:
+            return provider_cls(http_client=client)
+        except TypeError:                     # 이 클라이언트 종류는 안 받음 — 다음 후보
+            continue
+    logger.warning("공급자 %s 는 http_client 를 받지 않아 HTTP 재시도 없이 진행한다", name)
+    return infer_provider(name)
 
 
 def _build_model(spec: str) -> str | Model:
