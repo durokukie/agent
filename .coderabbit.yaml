@@ -1,6 +1,8 @@
 # CodeRabbit 설정 — https://docs.coderabbit.ai/reference/configuration
-# 기본값은 기본 브랜치(main) 대상 PR만 자동 리뷰한다.
-# 이 저장소는 develop 대상 PR이 기본 흐름이므로 develop을 명시한다.
+#
+# 자동 리뷰 꺼짐: Free 플랜은 요약(walkthrough)만 하고 줄 단위 지적을 안 하며, 시간당 1회 제한에
+# 걸리면 커밋을 건너뛴다. 줄 단위 리뷰는 .github/workflows/claude-review.yml 이 맡는다.
+# 다시 켜려면 enabled: true. App 자체를 떼려면 org 설정 → GitHub Apps → CodeRabbit.
 
 language: ko-KR
 
@@ -8,7 +10,7 @@ reviews:
   profile: chill
   review_status: false      # "Review skipped / Run configuration" 상태 메시지 비활성화
   auto_review:
-    enabled: true
+    enabled: false
     base_branches:
       - develop
       - main
