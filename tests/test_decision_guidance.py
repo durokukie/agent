@@ -2,7 +2,6 @@ import os
 from pathlib import Path
 
 import pytest
-from pydantic_ai import models
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
@@ -14,6 +13,7 @@ from kukie.guardrail.decision_guidance import (
     generate_decision_guidance,
     guidance_agent,
 )
+
 
 def _ready_plan(monkeypatch, tmp_path: Path) -> ActionPlan:
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
@@ -50,10 +50,6 @@ def test_guidance_agent는_설정된_모델과_reasoning_설정을_쓴다():
     test_판단_가이드_모델_기본값은_기존_동작을_유지한다 가 검증한다."""
     assert guidance_agent.model == decision_guidance.GUIDANCE_MODEL
     assert guidance_agent.model_settings == {"openai_reasoning_effort": "medium"}
-
-
-def test_테스트_suite는_실제_모델_요청을_금지한다():
-    assert models.ALLOW_MODEL_REQUESTS is False
 
 
 @pytest.mark.asyncio

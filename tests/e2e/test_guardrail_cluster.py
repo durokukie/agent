@@ -238,9 +238,10 @@ def test_apply_manifest_결정과_cluster상태가_일치한다(
         "guardrail-config",
         "-n",
         e2e_namespace,
-        check=False,
+        "--ignore-not-found=true",
+        "-o", "name",
     )
-    assert (found.returncode == 0) is approved
+    assert found.stdout.strip() == ("configmap/guardrail-config" if approved else "")
     assert plan.status == ("executed" if approved else "rejected")
     expected_command = ["apply", "-f", "-", "-n", e2e_namespace]
     assert calls[0] == (expected_command, e2e_context, True, CONFIG_MAP)
@@ -340,7 +341,8 @@ def test_delete_resource_결정과_cluster상태가_일치한다(
         "guardrail-nginx",
         "-n",
         e2e_namespace,
-        check=False,
+        "--ignore-not-found=true",
+        "-o", "name",
     )
-    assert (found.returncode != 0) is approved
+    assert found.stdout.strip() == ("" if approved else "deployment.apps/guardrail-nginx")
     assert plan.status == ("executed" if approved else "rejected")

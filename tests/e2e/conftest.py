@@ -18,6 +18,7 @@ def _run(
         input=stdin,
         capture_output=True,
         text=True,
+        timeout=60,
     )
     if check and result.returncode != 0:
         pytest.fail(
