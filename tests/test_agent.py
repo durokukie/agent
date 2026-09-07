@@ -264,3 +264,67 @@ def test_응답은_KukieResponse_형식으로_강제된다():
 
 def test_Agent는_일반응답과_Deferred요청을_output으로_허용한다():
     assert agent.output_type == [build_response, DeferredToolRequests]
+
+
+# ── 재시도 (DURO-66 ③·④) ────────────────────────────────────
+
+def test_응답_형식_실패는_run_안에서_두번까지_흡수한다():
+    """출력 검증 실패(B 유형)가 서버 503 까지 올라오기 전에 run 안에서 먼저 재시도한다."""
+    assert agent._max_output_retries == 2
+    assert agent._max_tool_retries == 1          # 툴 재시도 예산은 건드리지 않는다
+
+
+def test_build_model은_test와_접두어_없는_이름을_그대로_둔다():
+    from kukie.agent import _build_model
+
+    assert _build_model("test") == "test"
+    assert _build_model("gpt-4o") == "gpt-4o"    # 공급자 미지정 → pydantic-ai 가 해석
+
+
+def _http_libs():
+    """공급자 SDK 가 예외를 던질 수 있는 HTTP 라이브러리 — pydantic-ai 2.3x 는 httpx, 2.4x 는 httpx2 도.
+    (httpx2 가 깔려 있어도 2.3x 의 SDK 는 httpx 로 통신하므로 agent 가 고른 목록을 그대로 쓴다.)"""
+    from kukie import agent as agent_module
+
+    return list(agent_module._HTTP_LIBS)
+
+
+def test_build_model은_실제_공급자에_HTTP_재시도_전송층을_끼운다(monkeypatch, caplog):
+    import pydantic_ai.retries as retries
+
+    from kukie.agent import _build_model
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+    model = _build_model("anthropic:claude-sonnet-4-6")
+
+    http_client = model.client._client                       # anthropic SDK 가 감싼 HTTP 클라이언트
+    transports = tuple(
+        cls for name in ("AsyncHTTPX2TenacityTransport", "AsyncTenacityTransport")
+        if (cls := getattr(retries, name, None)) is not None
+    )
+    assert isinstance(http_client._transport, transports)   # 설치된 스택(httpx2 / httpx)에 맞는 재시도 전송층
+    assert http_client.timeout.read == 600                   # 기본 5초는 LLM 에 너무 짧다
+    assert http_client.timeout.connect == 5
+    assert "HTTP 재시도 없이" not in caplog.text             # 폴백(재시도 없음)으로 빠지지 않았다
+
+
+@pytest.mark.parametrize("lib", _http_libs(), ids=lambda lib: lib.__name__)
+@pytest.mark.parametrize(("status", "expected"), [
+    (429, True), (500, True), (503, True),          # 레이트리밋·서버 오류 → 다시 보내면 풀린다
+    (400, False), (401, False), (404, False),       # 잘못된 요청·키 → 다시 보내도 같은 답
+])
+def test_HTTP_재시도는_429와_5xx만(lib, status, expected):
+    from kukie.agent import _retryable
+
+    request = lib.Request("POST", "https://api.example")
+    error = lib.HTTPStatusError("x", request=request, response=lib.Response(status, request=request))
+    assert _retryable(error) is expected
+
+
+@pytest.mark.parametrize("lib", _http_libs(), ids=lambda lib: lib.__name__)
+def test_HTTP_재시도는_네트워크와_타임아웃도_포함한다(lib):
+    from kukie.agent import _retryable
+
+    assert _retryable(lib.ReadTimeout("t")) is True
+    assert _retryable(lib.ConnectError("c")) is True
+    assert _retryable(ValueError("x")) is False

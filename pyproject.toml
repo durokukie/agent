@@ -5,6 +5,7 @@ description = "쿠버네티스를 배우면서 안전하게 쓰는 에이전트"
 requires-python = ">=3.10"
 dependencies = [
     "pydantic-ai>=2.16",
+    "tenacity>=8.0",        # pydantic_ai.retries — 모델 HTTP 재시도 (DURO-66)
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "fastapi>=0.110",

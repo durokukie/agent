@@ -3,16 +3,24 @@
 사용자 컴에서 앱과 함께 돈다 (DURO-46 구조 1). 원격 아님, 인증 없음, 단일 사용자.
 앱(Node)은 파이썬을 직접 못 부르므로 이 서버가 "에이전트의 입" 역할을 한다.
 
-엔드포인트 3개:
+엔드포인트 4개:
   POST /session  kubeconfig 에서 대상(context/namespace)을 읽어 세션 시작
   POST /chat     한 턴 실행. 결과가 답변이면 answer, 승인 대기면 approval
   POST /approve  승인 버튼 결과로 run 재개 (2차). 결과 분기는 /chat 과 동일
+  POST /resume   재개가 실패했을 때 같은 결정으로 다시 시도 (DURO-66)
 
 run 이 끝나는 방식은 둘뿐이다 — 답변(KukieResponse) 또는 승인 대기 티켓(DeferredToolRequests).
 어느 쪽이 왔는지는 _to_payload 가 한 번만 판단하고, 앱은 kind 로 갈라 그린다.
 잠금은 두 겹이다: 승인 대기 중 /chat 409 (pending), run 실행 중 모든 진입 409 (processing).
 단일 프로세스 MVP 라 플래그면 충분하다 — asyncio 는 await 지점에서만 끼어들 수 있으므로
 "검사 → True 설정" 사이에 다른 요청이 낄 수 없다.
+
+재개 실패 정책 (DURO-66): 어떤 실패에도 세션을 버리지 않는다. 실패 시점에 history·pending·
+decisions 는 온전하므로(전부 run 성공 후에만 갱신) 503 RESUME_RETRYABLE 을 돌려주고 /resume 으로
+같은 결정을 다시 보낸다. kubectl 이 이미 돌았는지는 서버가 아니라 Plan 파일이 알고, 훅이 그걸 보고
+저장된 결과를 돌려주므로(guardrail/hook.py) 재시도해도 변경이 두 번 적용되지 않는다.
+계속 실패하면 사용자가 POST /session 으로 새로 여는 것이 탈출구다 — 버리는 결정은 코드가 아니라
+사용자가 한다.
 
 세션 상태(대화 기록·대기 티켓)는 메모리에만 있다. 서버가 꺼지면 대기 중인 승인은 만료된다 (MVP 결정).
 """
@@ -209,7 +217,6 @@ async def chat(body: ChatIn) -> dict[str, Any]:
 
 @app.post("/approve")
 async def approve(body: ApproveIn) -> dict[str, Any]:
-    global _session
     session = _require_session()
     if session.processing:
         raise HTTPException(409, "이전 요청 처리 중 — 끝난 뒤 다시 보내라")
@@ -239,43 +246,86 @@ async def approve(body: ApproveIn) -> dict[str, Any]:
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(409, str(exc)) from None
 
+    # 거절 기록은 run 밖에서 — 로컬 파일 쓰기일 뿐이라 실패해도 LLM 도 클러스터도 건드리지 않았다.
+    # 결정을 남기지 않고 티켓을 그대로 두면 사용자가 같은 카드를 다시 누를 수 있다 (DURO-66 결정 불필요 1).
+    if not body.approved:
+        try:
+            ActionPlan.find_by_call_id(approval_request.tool_call_id).reject()
+        except (OSError, ValueError) as exc:
+            logger.exception("거절 기록 실패 — 티켓 유지 (call_id=%s, plan_id=%s)",
+                             body.call_id, approval_request.plan_id)
+            raise HTTPException(503, f"거절을 기록하지 못했다. 같은 카드를 다시 결정하라: {exc}") from exc
+    session.decisions[body.call_id] = (
+        ToolApproved()
+        if body.approved
+        else ToolDenied("사용자가 변경 요청을 거절했습니다.")
+    )
+
+    remaining = [
+        call
+        for call in requests.approvals
+        if call.tool_call_id not in session.decisions
+    ]
+    if remaining:
+        return _approval_payload(session, requests, remaining)
+    return await _resume(session)
+
+
+@app.post("/resume")
+async def resume() -> dict[str, Any]:
+    """재개 실패(503 RESUME_RETRYABLE) 뒤 같은 결정으로 다시 시도한다.
+
+    결정이 전부 내려진 티켓이 있어야 한다 — 새 결정을 받는 자리가 아니다. 그건 /approve.
+    """
+    session = _require_session()
+    if session.processing:
+        raise HTTPException(409, "이전 요청 처리 중 — 끝난 뒤 다시 보내라")
+    if session.pending is None:
+        raise HTTPException(409, "재개할 승인 건이 없다")
+    if session.pending_ids:
+        raise HTTPException(409, f"아직 결정하지 않은 승인 건이 있다: {session.pending_ids}")
+    return await _resume(session)
+
+
+def _pending_plan_ids(session: Session) -> list[str]:
+    """티켓의 카드들이 가리키는 Plan id — 실패 응답에 실어 앱이 Action Plan 화면으로 안내하게."""
+    assert session.pending is not None
+    return [
+        str(plan_id)
+        for call in session.pending.approvals
+        if (plan_id := session.pending.metadata.get(call.tool_call_id, {}).get("plan_id"))
+    ]
+
+
+async def _resume(session: Session) -> dict[str, Any]:
+    """저장된 결정으로 run 을 재개한다. /approve(마지막 결정)와 /resume(재시도)이 함께 쓴다.
+
+    실패해도 session.pending / decisions 를 건드리지 않는다 — 그대로 남아 있어야 /resume 이
+    같은 결정을 재조립할 수 있다. 세션을 버리지 않는 이유는 모듈 docstring 참고.
+    """
+    assert session.pending is not None
+    plan_ids = _pending_plan_ids(session)
     session.processing = True
     try:
-        decision = (
-            ToolApproved()
-            if body.approved
-            else ToolDenied("사용자가 변경 요청을 거절했습니다.")
-        )
-        if not body.approved:
-            ActionPlan.find_by_call_id(approval_request.tool_call_id).reject()
-        session.decisions[body.call_id] = decision
-
-        remaining = [
-            call
-            for call in requests.approvals
-            if call.tool_call_id not in session.decisions
-        ]
-        if remaining:
-            return _approval_payload(session, requests, remaining)
-
-        results = requests.build_results(approvals=session.decisions)
-        result = await _run_agent(
-            session,
-            deferred_tool_results=results,
-        )
+        results = session.pending.build_results(approvals=session.decisions)
+        result = await _run_agent(session, deferred_tool_results=results)
         return _to_payload(session, result)
     except Exception as exc:
         logger.exception(
-            "승인 재개 실패로 세션 무효화 "
-            "(call_id=%s, plan_id=%s, approved=%s)",
-            body.call_id,
-            approval_request.plan_id,
-            body.approved,
+            "승인 재개 실패 — 세션·티켓 유지, /resume 으로 재시도 가능 (call_ids=%s, plan_ids=%s)",
+            list(session.decisions),
+            plan_ids,
         )
-        _session = None
         raise HTTPException(
             503,
-            "승인 결과 처리에 실패했다. POST /session으로 새 세션을 시작해야 한다",
+            {
+                "code": "RESUME_RETRYABLE",
+                "message": (
+                    "승인 결과 처리에 실패했다. 변경은 이미 적용됐을 수 있다 — "
+                    "POST /resume 으로 다시 시도하거나 Action Plan 을 확인하라"
+                ),
+                "plan_ids": plan_ids,
+            },
         ) from exc
     finally:
         session.processing = False

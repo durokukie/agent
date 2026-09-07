@@ -65,15 +65,21 @@ flowchart TD
         P --> E["Electron 승인 화면<br/>apply_manifest: 민감값을 가린 구조적 preview + SHA-256"]
         E --> A["POST /approve<br/>{call_id, approved}"]
         A --> D["DeferredToolResults<br/>ToolApproved | ToolDenied"]
-        D -->|"ToolApproved"| H5A["⑥ call_id로 기존 Plan 조회<br/>tool/args/command/risk/target 검증<br/>single approval 기록"]
+        D -->|"ToolApproved"| H5P["⑥ call_id로 기존 Plan 조회"]
+        H5P -->|"execution_result 있음<br/>(재개 실패 뒤 /resume 재시도)"| H5X["저장된 결과를 KubectlResult로 반환<br/>kubectl 다시 안 돌림 (DURO-66)"]
+        H5P -->|"approval만 있고 실행 기록 없음"| H5U["ToolFailed: 실행 여부 불명<br/>클러스터 직접 확인"]
+        H5P -->|"첫 승인"| H5A["tool/args/command/risk/target 검증<br/>single approval 기록"]
         D -->|"ToolDenied"| H5R["Plan mark rejected (1회)<br/>handler 실행 안 함"]
         H5A --> H6["⑦ 기존 handler(args) 정확히 1회"]
         H6 --> H7["⑧ execution_result와<br/>executed | failed 상태를 함께 기록"]
     end
 
     H7 --> L2["④ LLM 2차<br/>결과 보고 설명"]
+    H5X --> L2
+    H5U --> L2
     H4F --> L2
     H5R --> L2
+    L2 -.->|"run 실패 시 세션·티켓 유지<br/>503 RESUME_RETRYABLE → POST /resume"| A
 
     style H fill:#fff0f0,stroke:#c66
     style H5 fill:#ffe0e0,stroke:#c00,stroke-width:2px
