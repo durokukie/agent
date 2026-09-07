@@ -1,0 +1,40 @@
+# @claude 호출 — PR·이슈 코멘트에서 "@claude 이거 왜 이래?" 처럼 부르면 답한다.
+# 자동 리뷰(claude-review.yml)와 별개. 인증·App 설치 요건은 그 파일 주석 참고.
+name: Claude
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened, assigned]
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # 요청받으면 브랜치에 커밋할 수 있게
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read          # CI 결과를 읽어 "왜 실패했나" 에 답하게
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --system-prompt "답변은 한국어로. 이 레포는 pydantic-ai + subprocess kubectl 기반 쿠버네티스 학습 에이전트다. 가드레일(승인 훅·Action Plan)을 우회하는 변경은 제안하지 마라."
