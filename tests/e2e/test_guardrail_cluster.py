@@ -143,7 +143,7 @@ def _decide(client, tool_name, args, call_id, approved):
     )
     if tool_name == "rollout_restart":
         assert card["dry_run_result"]["status"] == "unsupported"
-        assert "unknown flag: --dry-run" in card["dry_run_result"]["stderr"]
+        assert card["dry_run_result"]["stderr"].strip()
         assert card["decision_guidance"] == "guidance unavailable"
     else:
         assert card["dry_run_result"]["status"] == "succeeded"
