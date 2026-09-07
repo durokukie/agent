@@ -37,7 +37,7 @@ flowchart TD
     end
 
     KR -.-> T
-    V -->|"통과"| OUT["result.output (KukieResponse)<br/>narration + steps[command, output, explanations]"]
+    V -->|"통과"| OUT["result.output (KukieResponse)<br/>narration + suggested_next_action<br/>+ steps[command, output, explanations]"]
     OUT --> CLI2["server._to_payload → {kind: answer}<br/>앱이 [학습 모드] + 명령 블록 + 설명 표 렌더링"]
     CLI2 --> U
 
@@ -122,11 +122,19 @@ flowchart LR
 
 | 결정 | 주체 | 시점 |
 |---|---|---|
-| 어떤 스킬 | 코드 (`router`) / 사용자 (`/mode`, 전환 y) | run 전 |
+| 어떤 스킬 | 코드 (`router`) / 사용자 (`/mode`) | run 전 |
 | 어떤 툴, 어떤 값, intent | LLM | ② (1차 호출) |
 | kubectl 명령 문장 | 코드 (`assemble` / 툴 내부) | ③ |
 | 위험도 | 코드 (`RISK_STICKERS`) | 훅 ② |
 | 실행 여부 | 사람 (승인 화면) | 훅 ⑤ |
 | 명령·결과 (steps 사실 칸) | 코드 (`collect_steps` — 실행 기록 그대로) | ⑤ |
 | 설명 (explanations) | 코드 (`FLAG_GLOSSARY` 사전) | ⑤ |
-| 해석 (narration, 전환 제안) | LLM | ④ (2차 호출) |
+| 해석 (narration, 다음 행동 안내) | LLM | ④ (2차 호출) |
+
+`suggested_next_action: str | None = None`은 현재 답변과 실행 결과에 근거한 짧은 다음 행동 안내다.
+현재 모드에서 가능한 행동이면 전환을 제안하지 않고, 다른 모드가 필요하면 모드 이름과 이유를 안내한다.
+추가 행동이 필요하지 않으면 `null`이다. 제안 자체는 모드를 바꾸거나 작업을 실행하거나 사용자 승인을 대신하지 않는다.
+모드는 `/mode`로 선택하고, 변경 작업의 승인·거절은 기존 `/approve` 절차를 따른다.
+
+API 변경(#48): 기존 `suggested_transition`을 참조하는 소비자는 `suggested_next_action`으로 변경해야 한다.
+구 필드는 응답에 함께 제공하지 않는다.
