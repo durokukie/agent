@@ -15,11 +15,12 @@ PR #41 / Issue #28은 최신 `develop`의 승인 구현을 유지하고 검증�
 | dry-run 미지원·guidance 실패 → 원인 표시 후 승인, 보호 namespace의 risk 유지 | `tests/test_guardrail_integration.py` |
 | mutation 성공·실패 후 모델 응답 실패 → HTTP 재개 → 저장 결과 반환, 실행 1회 | `tests/test_guardrail_integration.py` |
 | 실제 클러스터의 apply·scale·restart·delete 승인/거절, Plan과 상태 일치 | `tests/e2e/test_guardrail_cluster.py` |
-| apply의 dry-run/실행 stdin 및 namespace 일치 | `tests/e2e/test_guardrail_cluster.py` |
+| apply의 명시 namespace 우선 적용·기본 namespace 미변경, dry-run/실행 stdin 일치 | `tests/e2e/test_guardrail_cluster.py` |
 
 pytest 공통 `tests/conftest.py`에서 실제 LLM 요청을 차단한다. 테스트 파일을 하나만 실행해도 적용된다.
 서버·Hook·Plan은 실제 구현을 쓰고, 통합 테스트는 모델과 kubectl 경계만 대체한다.
-클러스터 E2E에서는 모델만 대체한다. Electron renderer 자체의 E2E는 이 저장소 범위 밖이다.
+클러스터 E2E에서는 모델만 대체한다. 세션 기본 namespace와 요청 namespace는 서로 다른 격리 공간이다.
+apply·scale·delete는 dry-run 성공과 guidance를, rollout restart는 dry-run 미지원 원인과 guidance unavailable 표시를 검증한다. Electron renderer 자체의 E2E는 이 저장소 범위 밖이다.
 
 ## 실행
 

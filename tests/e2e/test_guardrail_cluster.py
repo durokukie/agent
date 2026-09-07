@@ -92,12 +92,12 @@ def test_kind_context는_관리_cluster와_API_identity가_같아야한다(
 
 
 @pytest.fixture
-def client(monkeypatch, tmp_path, e2e_context, e2e_namespace):
+def client(monkeypatch, tmp_path, e2e_context, e2e_session_namespace):
     server._session = None
     monkeypatch.setattr(
         server,
         "read_kubeconfig",
-        lambda: (e2e_context, e2e_namespace),
+        lambda: (e2e_context, e2e_session_namespace),
     )
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     test_client = TestClient(server.app)
@@ -141,7 +141,13 @@ def _decide(client, tool_name, args, call_id, approved):
     assert card["risk"] == (
         "destructive" if tool_name == "delete_resource" else "caution"
     )
-    assert card["dry_run_result"]["status"] in {"succeeded", "unsupported"}
+    if tool_name == "rollout_restart":
+        assert card["dry_run_result"]["status"] == "unsupported"
+        assert "unknown flag: --dry-run" in card["dry_run_result"]["stderr"]
+        assert card["decision_guidance"] == "guidance unavailable"
+    else:
+        assert card["dry_run_result"]["status"] == "succeeded"
+        assert card["decision_guidance"] == "대상과 복구 기준을 확인한다."
 
     with agent.override(model=_answer_model()):
         decided = client.post(
@@ -207,8 +213,10 @@ def test_apply_manifest_결정과_cluster상태가_일치한다(
     kubectl_cli,
     e2e_context,
     e2e_namespace,
+    e2e_session_namespace,
     approved,
 ):
+    assert e2e_namespace != e2e_session_namespace
     calls = []
 
     def traced_run(command, *, context, dry_run=False, stdin=None, timeout=30):
@@ -242,6 +250,11 @@ def test_apply_manifest_결정과_cluster상태가_일치한다(
         "-o", "name",
     )
     assert found.stdout.strip() == ("configmap/guardrail-config" if approved else "")
+    assert kubectl_cli(
+        e2e_context, "get", "configmap", "guardrail-config",
+        "-n", e2e_session_namespace, "--ignore-not-found=true", "-o", "name",
+    ).stdout.strip() == ""
+    assert plan.target["namespace"] == e2e_namespace
     assert plan.status == ("executed" if approved else "rejected")
     expected_command = ["apply", "-f", "-", "-n", e2e_namespace]
     assert calls[0] == (expected_command, e2e_context, True, CONFIG_MAP)

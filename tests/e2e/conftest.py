@@ -91,8 +91,7 @@ def e2e_context() -> str:
     return context
 
 
-@pytest.fixture
-def e2e_namespace(e2e_context: str):
+def _namespace(e2e_context: str):
     namespace = f"kukie-e2e-{uuid.uuid4().hex[:8]}"
     kubectl(e2e_context, "create", "namespace", namespace)
     try:
@@ -111,3 +110,13 @@ def e2e_namespace(e2e_context: str):
                 f"namespace cleanup failed: {namespace}: {deleted.stderr.strip()}",
                 pytest.PytestWarning,
             )
+
+
+@pytest.fixture
+def e2e_namespace(e2e_context: str):
+    yield from _namespace(e2e_context)
+
+
+@pytest.fixture
+def e2e_session_namespace(e2e_context: str):
+    yield from _namespace(e2e_context)
