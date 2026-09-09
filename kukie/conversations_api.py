@@ -366,11 +366,13 @@ async def chat(
         except HTTPException as exc:
             wrapped = _wrap(exc)
             store.update_run(run.id, status="failed", response_payload=_error_record(wrapped))
+            store.expire_open_plans(run.id)   # failed 는 종료 상태다 — 여기서 안 닫으면 계획이 영원히 열린 채 남는다
             raise wrapped
         except Exception as exc:                 # 모델·툴 예외 — run 은 실패로 남기고 세션은 유지
             logger.exception("run 실패 (conversation=%s, run=%s)", conversation_id, run.id)
             failed = _error(500, "RUN_FAILED", f"요청 처리에 실패했다 ({type(exc).__name__}) — 서버 로그 참고")
             store.update_run(run.id, status="failed", response_payload=_error_record(failed))
+            store.expire_open_plans(run.id)
             raise failed from exc
 
         # 승인 카드면 run 은 열린 채(awaiting_approval) 남는다 — approve/resume 이 이어서 끝낸다 (문서 7절)

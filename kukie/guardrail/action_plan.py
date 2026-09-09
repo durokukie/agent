@@ -559,6 +559,14 @@ class ActionPlan:
         )
 
     def reject(self, user_id: str | None = None) -> None:
+        """거절을 기록한다. **다시 불러도 성공한다** — 안내가 "같은 카드를 다시 결정하라" 이기 때문이다.
+
+        DB commit 은 성공했는데 응답이 끊겨 실패로 올라오는 경우가 있다. 그때 사용자가 시킨 대로
+        다시 거절하면 예전에는 상태 검사에 걸려 또 503 이 나고 그 카드는 영영 결정할 수 없었다.
+        이미 거절로 끝난 계획이면 조용히 성공으로 돌려준다 (자동 리뷰 지적).
+        """
+        if self.status == "REJECTED" and self.decision is not None and not self.decision.get("approved"):
+            return
         if (
             self.status not in {"DRAFT", "WAITING_APPROVAL"}
             or self.decision is not None

@@ -304,12 +304,26 @@ def test_mark_rejects_unknown_status(monkeypatch, tmp_path):
         plan.mark("승인됨")
 
 
-def test_reject는_draft를_한번만_rejected로_바꾼다(monkeypatch, tmp_path):
+def test_reject는_다시_불러도_성공한다(monkeypatch, tmp_path):
+    """안내가 "같은 카드를 다시 결정하라" 이므로 재시도가 멱등이어야 한다 (자동 리뷰 지적).
+
+    DB commit 은 성공했는데 응답이 끊겨 실패로 올라오는 경우, 시킨 대로 다시 거절했을 때
+    상태 검사에 걸려 또 503 이 나면 그 카드는 영영 결정할 수 없다.
+    """
     plan = _create_plan(monkeypatch, tmp_path)
 
     plan.reject()
+    decision = plan.decision
+    plan.reject()                       # 두 번째도 조용히 성공
 
     assert ActionPlan.load(plan.path).status == "REJECTED"
+    assert plan.decision == decision    # 기록은 처음 것 그대로
+
+
+def test_이미_승인한_계획은_거절할_수_없다(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+    plan.record_decision(approved=True)
+
     with pytest.raises(ValueError, match="not ready for rejection"):
         plan.reject()
 
