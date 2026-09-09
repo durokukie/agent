@@ -8,8 +8,10 @@
 
 **자격증명은 어떤 응답에도 실리지 않는다** (기획 04 §4). 목록·상세는 접속 주소와 상태만 준다.
 
-권한은 지금 "등록한 사람" 기준이다. 기획 04 §3 은 팀 Admin 을 요구하는데 팀 판단은 Spring 이 하고
-agent 는 아직 팀 API 를 부르지 않는다 — 대화 승인 권한과 같은 임시 규칙이다 (#55).
+권한은 두 갈래다 (기획 02 §3, 04 §3).
+  - 팀에 속한 클러스터: 읽기는 팀 구성원, 쓰기(등록·수정·삭제)는 팀 Admin. 판단은 Spring 에 묻는다
+    (kukie/membership.py — 사용자 토큰으로 GET /teams)
+  - 팀이 없는(개인) 클러스터: 등록한 사람만. 회원 서버가 없는 개발 모드도 이쪽이다
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ from kukie.clusters import crypto
 from kukie.clusters.access import ClusterGone, kubeconfig_for
 from kukie.clusters.kubeconfig import KubeconfigRejected, parse_kubeconfig
 from kukie.clusters.settings import allow_local_clusters
+from kukie import membership
 from kukie.kubectl import run_kubectl
 from kukie.store import ChatStore, get_store
 from kukie.store.chat_store import ClusterInUse, ClusterRow
@@ -89,11 +92,25 @@ def _require_key() -> None:
         )
 
 
-def _owned(store: ChatStore, cluster_id: str, user: User) -> ClusterRow:
-    """남의 클러스터는 없는 것처럼 404 — 있다는 사실 자체를 알려 주지 않는다."""
+async def _readable(store: ChatStore, cluster_id: str, user: User) -> ClusterRow:
+    """볼 수 있는 클러스터인가. 못 보는 것은 없는 것처럼 404 — 있다는 사실 자체를 알려 주지 않는다."""
     row = store.get_cluster(cluster_id)
-    if row is None or row.registered_by != user.id:
+    if row is None:
         raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}")
+    if row.registered_by == user.id:
+        return row
+    if row.team_id and membership.available() and await membership.is_member(user, row.team_id):
+        return row
+    raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}")
+
+
+async def _writable(store: ChatStore, cluster_id: str, user: User) -> ClusterRow:
+    """바꾸거나 지울 수 있는가. 팀 클러스터는 Admin 만 (기획 02 §3)."""
+    row = await _readable(store, cluster_id, user)
+    if row.team_id and membership.available():
+        await membership.require_admin(user, row.team_id)
+    elif row.registered_by != user.id:
+        raise _error(403, "FORBIDDEN", "등록한 사람만 바꿀 수 있다")
     return row
 
 
@@ -113,6 +130,8 @@ async def register_cluster(
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
     _require_key()
+    if body.team_id and membership.available():
+        await membership.require_admin(user, body.team_id)   # 팀 클러스터 등록은 Admin 만 (기획 02 §3)
     parsed = _parse(body.kubeconfig, body.context)
     row = store.create_cluster(
         registered_by=user.id,
@@ -135,7 +154,10 @@ async def list_clusters(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> list[dict[str, Any]]:
-    return [_view(row) for row in store.list_clusters(user.id, team_id=team_id)]
+    if team_id and membership.available():
+        await membership.require_member(user, team_id)
+    mine = list(await membership.team_roles(user)) if membership.available() else None
+    return [_view(row) for row in store.list_clusters(user.id, team_ids=mine, team_id=team_id)]
 
 
 @router.get("/{cluster_id}")
@@ -144,7 +166,7 @@ async def get_cluster(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    return _view(_owned(store, cluster_id, user))
+    return _view(await _readable(store, cluster_id, user))
 
 
 @router.post("/{cluster_id}/test")
@@ -154,7 +176,7 @@ async def test_cluster(
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
     """연결 확인 (기획 04 §8). 서버 버전을 읽고 변경 권한이 있는지 물어본다."""
-    row = _owned(store, cluster_id, user)
+    row = await _readable(store, cluster_id, user)
     _require_key()
     from datetime import datetime, timezone
 
@@ -189,7 +211,7 @@ async def update_cluster(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    row = _owned(store, cluster_id, user)
+    row = await _writable(store, cluster_id, user)
     fields: dict[str, Any] = {}
     if body.name is not None:
         fields["name"] = body.name.strip()
@@ -224,7 +246,7 @@ async def delete_cluster(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    _owned(store, cluster_id, user)
+    await _writable(store, cluster_id, user)
     try:
         store.delete_cluster(cluster_id)
     except ClusterInUse:

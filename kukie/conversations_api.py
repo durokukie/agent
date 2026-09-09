@@ -37,6 +37,7 @@ import kukie.server as _server  # 순환 import: 이름은 호출 시점에만 �
 from kukie.auth import User, current_user
 from kukie.clusters import crypto
 from kukie.clusters.access import ClusterGone, kubeconfig_or_none
+from kukie import membership
 from kukie.conversations import Conversation, registry
 from kukie.skills import SKILLS
 from kukie.store import ChatStore, get_store
@@ -137,13 +138,23 @@ def _private_change_blocked(row: SessionRow) -> HTTPException:
                   "Private 대화에서는 클러스터를 변경할 수 없다 — 변경은 Shared 대화를 새로 만들어서 (기획 05)")
 
 
-def _require_approver(row: SessionRow, user: User) -> None:
-    """승인·재개 = 클러스터 변경. 기획 06 은 Admin 또는 대상의 Operator 인 팀원에게 여는데, 팀·권한 정보는 Spring 팀 API 가
-    생겨야 온다. 그 전까지는 로그인한 아무나 승인하지 않도록 **방을 만든 사람만** (팀원 리뷰 6) — 팀 API 가 붙으면 넓힌다."""
+async def _require_approver(row: SessionRow, user: User) -> None:
+    """승인·재개 = 클러스터 변경. 기획 06 §3 은 팀 Admin 에게 연다.
+
+    팀이 붙은 shared 방은 Spring 에 역할을 물어 Admin 이면 통과시킨다 (kukie/membership.py).
+    팀이 없는 방이나 회원 서버가 없는 개발 모드는 예전 규칙대로 **만든 사람만** — 로그인한 아무나
+    남의 클러스터를 바꾸지 못하게 (팀원 리뷰 6).
+
+    기획 06 은 "대상의 Operator 권한이 있는 Member" 도 승인할 수 있다고 하는데 Operator 는 아직 없다 (기획 03).
+    """
     if not row.shared:
         raise _private_change_blocked(row)
-    if row.user_id != user.id:
-        raise _error(403, "FORBIDDEN", "승인·재개는 지금은 대화를 만든 사람만 할 수 있다 (팀 권한 검사가 붙기 전까지)")
+    if row.user_id == user.id:
+        return
+    if row.team_id and membership.available():
+        await membership.require_admin(user, row.team_id)
+        return
+    raise _error(403, "FORBIDDEN", "승인·재개는 대화를 만든 사람이나 팀 Admin 만 할 수 있다")
 
 
 def _messages_json(result: Any) -> list[Any]:
@@ -441,7 +452,7 @@ async def approve(
 ) -> dict[str, Any]:
     row, conversation = _load(conversation_id, user, store)
     session = conversation.session
-    _require_approver(row, user)
+    await _require_approver(row, user)
     if conversation.lock.locked():
         raise _busy()
     run = _open_run(store, conversation_id)
@@ -468,7 +479,7 @@ async def resume(
 ) -> dict[str, Any]:
     row, conversation = _load(conversation_id, user, store)
     session = conversation.session
-    _require_approver(row, user)
+    await _require_approver(row, user)
     if conversation.lock.locked():
         raise _busy()
     if session.pending is None:

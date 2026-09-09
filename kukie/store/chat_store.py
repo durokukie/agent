@@ -531,16 +531,22 @@ class ChatStore:
             row = db.get(Cluster, cluster_id)
             return row.credential_encrypted if row is not None else None
 
-    def list_clusters(self, user_id: str, *, team_id: str | None = None) -> list[ClusterRow]:
-        """내가 등록한 것 + 내 팀 것. 팀 소속 검사는 부르는 쪽(Spring 팀 API)이 한다 — 지금은 team_id 로만 좁힌다."""
+    def list_clusters(
+        self, user_id: str, *, team_ids: list[str] | None = None, team_id: str | None = None
+    ) -> list[ClusterRow]:
+        """내가 등록한 것 + **내가 속한 팀** 것. team_ids 는 부르는 쪽이 회원 서버에서 받아 넘긴다.
+
+        team_ids 를 주지 않으면 팀 클러스터는 보이지 않는다 — 예전에는 팀이 붙은 클러스터를 전부
+        보여 줘서 남의 팀 것까지 새어 나갔다.
+        """
         with self._factory() as db:
-            stmt = select(Cluster)
+            mine = Cluster.registered_by == user_id
             if team_id is not None:
-                stmt = stmt.where(Cluster.team_id == team_id)
+                stmt = select(Cluster).where(Cluster.team_id == team_id)
+            elif team_ids:
+                stmt = select(Cluster).where(or_(mine, Cluster.team_id.in_(team_ids)))
             else:
-                stmt = stmt.where(
-                    or_(Cluster.registered_by == user_id, Cluster.team_id.is_not(None))
-                )
+                stmt = select(Cluster).where(mine)
             rows = db.scalars(stmt.order_by(Cluster.created_at)).all()
             return [ClusterRow.of(r) for r in rows]
 
