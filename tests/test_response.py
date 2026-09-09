@@ -26,7 +26,7 @@ def fake_kubectl(monkeypatch):
     """읽기 툴의 kubectl 실행을 가짜 결과로 교체. 호출된 args 를 기록한다."""
     calls: list[list[str]] = []
 
-    def fake(args, *, context, dry_run=False, stdin=None, timeout=30):
+    def fake(args, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None):
         calls.append(args)
         return KubectlResult(command=FAKE_COMMAND, stdout="nginx-abc  1/1  Running",
                              stderr="", success=True)
@@ -102,7 +102,7 @@ def test_explanations는_사전에서_채워진다(fake_kubectl):
 
 
 def test_사전_미등록_플래그는_로그만_남기고_응답은_그대로_나간다(monkeypatch, caplog):
-    def fake(args, *, context, dry_run=False, stdin=None, timeout=30):
+    def fake(args, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None):
         return KubectlResult(command="kubectl --context kind-dev get pods --weird-flag -n study",
                              stdout="ok", stderr="", success=True)
     monkeypatch.setattr(read_tools, "run_kubectl", fake)

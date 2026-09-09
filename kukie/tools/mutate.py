@@ -47,7 +47,8 @@ def apply_manifest(ctx: RunContext[Deps], manifest_yaml: str,
     """
     args = assemble("apply_manifest",
                     {"namespace": namespace or ctx.deps.namespace})
-    return run_kubectl(args, context=ctx.deps.context, stdin=manifest_yaml)
+    return run_kubectl(args, context=ctx.deps.context, stdin=manifest_yaml,
+                       kubeconfig=ctx.deps.kubeconfig)
 
 
 def scale_resource(ctx: RunContext[Deps], kind: str, name: str, replicas: int,
@@ -56,7 +57,7 @@ def scale_resource(ctx: RunContext[Deps], kind: str, name: str, replicas: int,
     """리소스의 레플리카 수를 조정한다 (kubectl scale). Deployment/StatefulSet/ReplicaSet 대상."""
     args = assemble("scale_resource",
                     {"kind": kind, "name": name, "replicas": replicas, "namespace": namespace})
-    return run_kubectl(args, context=ctx.deps.context)
+    return run_kubectl(args, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig)
 
 
 def rollout_restart(ctx: RunContext[Deps], kind: str, name: str, namespace: str,
@@ -65,7 +66,7 @@ def rollout_restart(ctx: RunContext[Deps], kind: str, name: str, namespace: str,
     """Deployment 등을 재시작한다 (kubectl rollout restart). 파드를 순차 교체한다."""
     args = assemble("rollout_restart",
                     {"kind": kind, "name": name, "namespace": namespace})
-    return run_kubectl(args, context=ctx.deps.context)
+    return run_kubectl(args, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig)
 
 
 def delete_resource(ctx: RunContext[Deps], kind: str, name: str, namespace: str,
@@ -74,7 +75,7 @@ def delete_resource(ctx: RunContext[Deps], kind: str, name: str, namespace: str,
     """리소스를 삭제한다 (kubectl delete). destructive 위험도로 단일 승인한다."""
     args = assemble("delete_resource",
                     {"kind": kind, "name": name, "namespace": namespace})
-    return run_kubectl(args, context=ctx.deps.context)
+    return run_kubectl(args, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig)
 
 
 MUTATE_TOOLS = [apply_manifest, scale_resource, rollout_restart, delete_resource]

@@ -43,6 +43,7 @@ def _ctx(*, namespace="study", approved=False, run_id=None, user_id=None):
             skill=SimpleNamespace(name="실습"),
             run_id=run_id,      # None 이면 계획이 DB 표에 들어가지 않는다 (flat 경로와 같다, #58)
             user_id=user_id,
+            kubeconfig=None,    # 서버 컴퓨터의 기본 kubeconfig (기획 04 §8 등록 경로가 아님)
         ),
         tool_call_approved=approved,
     )
@@ -74,7 +75,7 @@ async def _create_pending_plan(*, ctx=None, call=None, args=None) -> None:
 def successful_dry_run(monkeypatch):
     calls = []
 
-    def fake_run(args, *, context, dry_run=False, stdin=None, timeout=30):
+    def fake_run(args, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None):
         calls.append(
             {
                 "args": args,

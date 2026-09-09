@@ -113,6 +113,7 @@ flowchart LR
 | 실행 | `run_kubectl()` | `kubectl/runner.py` | ✅ |
 | 훅 파이프라인 | `guardrail()` | `guardrail/hook.py` | ✅ 2-pass 승인·실행·기록 |
 | Action Plan | `create_draft()`, `offer_for_approval()`, `approve_for_execution()`, `record_execution()` | `guardrail/action_plan.py` + `tbl_action_plan` | ✅ |
+| 클러스터 | `parse_kubeconfig()` → 암호화 저장 → 실행 직전 임시 kubeconfig | `clusters/` + `tbl_cluster` | ✅ |
 | 승인 | `DeferredToolRequests → Electron → /approve → DeferredToolResults` | `server.py`, `guardrail/approval.py` | ✅ #27 |
 | 응답 조립 (steps·설명) | `build_response_for()`, `collect_steps()` + `FLAG_GLOSSARY` | `response.py`, `glossary.py` | ✅ DURO-44 |
 | 사전 미등록 플래그 로그 | `log_unregistered_flags()` | `validators.py` | ✅ DURO-44 |

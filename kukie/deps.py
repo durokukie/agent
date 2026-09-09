@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,3 +22,6 @@ class Deps:
     # Action Plan 을 tbl_action_plan 에 넣으려면 어느 run 의 계획인지 알아야 한다 (#58).
     run_id: str | None = None       # 지금 처리 중인 tbl_chat_run.id
     user_id: str | None = None      # 요청·승인한 회원 id (plan.decision 에 남는다)
+    # 등록된 클러스터로 실행할 때의 임시 kubeconfig 경로 (기획 04 §8). 요청이 끝나면 파일이 지워진다.
+    # None 이면 서버 컴퓨터의 기본 kubeconfig 를 쓴다 — 로컬 개발 경로다.
+    kubeconfig: Path | None = None

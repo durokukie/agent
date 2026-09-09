@@ -1,0 +1,247 @@
+"""클러스터 등록 엔드포인트 (기획 04 §8, issue #61).
+
+  POST   /clusters              kubeconfig 본문으로 등록
+  GET    /clusters?team_id=     목록
+  POST   /clusters/{id}/test    연결 확인 (kubectl version + auth can-i)
+  PATCH  /clusters/{id}         이름·namespace·자격증명 교체
+  DELETE /clusters/{id}         삭제 — 자격증명도 함께 사라진다
+
+**자격증명은 어떤 응답에도 실리지 않는다** (기획 04 §4). 목록·상세는 접속 주소와 상태만 준다.
+
+권한은 지금 "등록한 사람" 기준이다. 기획 04 §3 은 팀 Admin 을 요구하는데 팀 판단은 Spring 이 하고
+agent 는 아직 팀 API 를 부르지 않는다 — 대화 승인 권한과 같은 임시 규칙이다 (#55).
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
+
+import kukie.server as _server   # 순환 import: 이름은 호출 시점에만 쓴다
+from kukie.auth import User, current_user
+from kukie.clusters import crypto
+from kukie.clusters.access import ClusterGone, kubeconfig_for
+from kukie.clusters.kubeconfig import KubeconfigRejected, parse_kubeconfig
+from kukie.clusters.settings import allow_local_clusters
+from kukie.kubectl import run_kubectl
+from kukie.store import ChatStore, get_store
+from kukie.store.chat_store import ClusterInUse, ClusterRow
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/clusters", tags=["clusters"])
+
+
+# ── 요청 본문 ──────────────────────────────────────────────
+
+class ClusterIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kubeconfig: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=100)
+    context: str | None = None            # 여러 context 중 하나를 고를 때
+    namespace: str | None = None
+    team_id: str | None = None
+
+
+class ClusterPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    namespace: str | None = None
+    kubeconfig: str | None = None         # 자격증명 교체
+    context: str | None = None
+
+
+# ── 응답 ───────────────────────────────────────────────────
+
+def _view(row: ClusterRow) -> dict[str, Any]:
+    """자격증명은 절대 넣지 않는다. 앱이 보여줄 값만."""
+    return {
+        "id": row.id,
+        "team_id": row.team_id,
+        "registered_by": row.registered_by,
+        "name": row.name,
+        "provider": row.provider,
+        "api_server": row.api_server,
+        "context": row.context_name,
+        "namespace": row.default_namespace,
+        "fingerprint": row.fingerprint,
+        "status": row.status,
+        "insecure": row.insecure,
+        "last_checked_at": row.last_checked_at.isoformat() if row.last_checked_at else None,
+        "created_at": row.created_at.isoformat(),
+        "updated_at": row.updated_at.isoformat(),
+    }
+
+
+def _error(status: int, code: str, message: str) -> HTTPException:
+    return HTTPException(status, {"code": code, "message": message})
+
+
+def _require_key() -> None:
+    if not crypto.available():
+        raise _error(
+            503, "SECRET_KEY_MISSING",
+            f"서버에 암호화 키({crypto.KEY_ENV})가 없어 클러스터를 등록할 수 없습니다",
+        )
+
+
+def _owned(store: ChatStore, cluster_id: str, user: User) -> ClusterRow:
+    """남의 클러스터는 없는 것처럼 404 — 있다는 사실 자체를 알려 주지 않는다."""
+    row = store.get_cluster(cluster_id)
+    if row is None or row.registered_by != user.id:
+        raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}")
+    return row
+
+
+def _parse(body_text: str, context: str | None):
+    try:
+        return parse_kubeconfig(body_text, context_name=context, allow_local=allow_local_clusters())
+    except KubeconfigRejected as exc:
+        raise _error(400, "KUBECONFIG_REJECTED", str(exc)) from None
+
+
+# ── 엔드포인트 ─────────────────────────────────────────────
+
+@router.post("")
+async def register_cluster(
+    body: ClusterIn,
+    user: User = Depends(current_user),
+    store: ChatStore = Depends(get_store),
+) -> dict[str, Any]:
+    _require_key()
+    parsed = _parse(body.kubeconfig, body.context)
+    row = store.create_cluster(
+        registered_by=user.id,
+        team_id=body.team_id,
+        name=body.name.strip(),
+        api_server=parsed.api_server,
+        ca_data=parsed.ca_data,
+        insecure=parsed.insecure,
+        credential_encrypted=crypto.encrypt(parsed.credential),
+        context_name=parsed.context_name,
+        default_namespace=(body.namespace or parsed.namespace).strip() or "default",
+        fingerprint=parsed.fingerprint,
+    )
+    return _view(row)
+
+
+@router.get("")
+async def list_clusters(
+    team_id: str | None = None,
+    user: User = Depends(current_user),
+    store: ChatStore = Depends(get_store),
+) -> list[dict[str, Any]]:
+    return [_view(row) for row in store.list_clusters(user.id, team_id=team_id)]
+
+
+@router.get("/{cluster_id}")
+async def get_cluster(
+    cluster_id: str,
+    user: User = Depends(current_user),
+    store: ChatStore = Depends(get_store),
+) -> dict[str, Any]:
+    return _view(_owned(store, cluster_id, user))
+
+
+@router.post("/{cluster_id}/test")
+async def test_cluster(
+    cluster_id: str,
+    user: User = Depends(current_user),
+    store: ChatStore = Depends(get_store),
+) -> dict[str, Any]:
+    """연결 확인 (기획 04 §8). 서버 버전을 읽고 변경 권한이 있는지 물어본다."""
+    row = _owned(store, cluster_id, user)
+    _require_key()
+    from datetime import datetime, timezone
+
+    try:
+        with kubeconfig_for(store, cluster_id) as path:
+            version = run_kubectl(
+                ["version", "-o", "json"], context=row.context_name, kubeconfig=path
+            )
+            can_edit = run_kubectl(
+                ["auth", "can-i", "update", "deployments", "-n", row.default_namespace],
+                context=row.context_name, kubeconfig=path,
+            )
+    except ClusterGone:
+        raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}") from None
+    except crypto.CredentialUnreadable as exc:
+        raise _error(503, "CREDENTIAL_UNREADABLE", str(exc)) from None
+    status = "connected" if version.success else _failure_status(version.stderr)
+    store.update_cluster(cluster_id, status=status, last_checked_at=datetime.now(timezone.utc))
+    return {
+        "status": status,
+        "reachable": version.success,
+        # 실패 사유는 그대로 보여줘야 고칠 수 있다. 자격증명은 원래 stderr 에 실리지 않는다
+        "detail": (version.stderr or version.stdout).strip()[:500],
+        "can_change": can_edit.success and can_edit.stdout.strip() == "yes",
+    }
+
+
+@router.patch("/{cluster_id}")
+async def update_cluster(
+    cluster_id: str,
+    body: ClusterPatch,
+    user: User = Depends(current_user),
+    store: ChatStore = Depends(get_store),
+) -> dict[str, Any]:
+    row = _owned(store, cluster_id, user)
+    fields: dict[str, Any] = {}
+    if body.name is not None:
+        fields["name"] = body.name.strip()
+    if body.namespace is not None:
+        fields["default_namespace"] = body.namespace.strip() or "default"
+    if body.kubeconfig is not None:
+        _require_key()
+        parsed = _parse(body.kubeconfig, body.context)
+        if parsed.fingerprint != row.fingerprint:
+            raise _error(
+                409, "CLUSTER_MISMATCH",
+                "다른 클러스터의 kubeconfig 입니다 — 자격증명 교체는 같은 클러스터만 됩니다",
+            )
+        fields.update(
+            credential_encrypted=crypto.encrypt(parsed.credential),
+            context_name=parsed.context_name,
+            ca_data=parsed.ca_data,
+            insecure=parsed.insecure,
+            status="disconnected",       # 바꿨으니 다시 확인해야 한다
+        )
+    if not fields:
+        raise _error(400, "NOTHING_TO_UPDATE", "바꿀 내용이 없습니다")
+    store.update_cluster(cluster_id, **fields)
+    updated = store.get_cluster(cluster_id)
+    assert updated is not None
+    return _view(updated)
+
+
+@router.delete("/{cluster_id}")
+async def delete_cluster(
+    cluster_id: str,
+    user: User = Depends(current_user),
+    store: ChatStore = Depends(get_store),
+) -> dict[str, Any]:
+    _owned(store, cluster_id, user)
+    try:
+        store.delete_cluster(cluster_id)
+    except ClusterInUse:
+        raise _error(
+            409, "CLUSTER_IN_USE",
+            "이 클러스터를 쓰는 대화가 남아 있습니다 — 대화를 먼저 정리하세요",
+        ) from None
+    return {"deleted": cluster_id}
+
+
+def _failure_status(stderr: str) -> str:
+    lowered = stderr.lower()
+    if "unauthorized" in lowered or "forbidden" in lowered or "credential" in lowered:
+        return "auth_expired"
+    return "disconnected"
+
+
+_server.app.include_router(router)
+
+__all__ = ["router"]

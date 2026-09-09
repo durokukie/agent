@@ -50,6 +50,11 @@ RUN_KINDS = ("chat", "mode_change")
 
 MODES = ("학습", "진단", "실습")
 
+# 클러스터 (기획 04 §8). MVP 는 Generic Kubernetes 만 — EKS/GKE/AKS 의 Cloud Identity 는 후속(§6).
+CLUSTER_PROVIDERS = ("GENERIC",)
+# 마지막 Connection Test 결과. auth_expired 는 붙었지만 권한이 없거나 만료된 상태.
+CLUSTER_STATUSES = ("connected", "disconnected", "auth_expired")
+
 # plan 상태 — DURO-83 결정 (기획 10 이름 + REJECTED). DB 문서 5절의 소문자 목록을 대체한다 (issue #58 댓글에 대응표).
 # 정상 흐름: DRAFT → WAITING_APPROVAL → APPROVED → EXECUTING → APPLIED → EFFECT_VERIFIED
 PLAN_OPEN = ("DRAFT", "WAITING_APPROVAL", "APPROVED", "EXECUTING")   # 아직 끝나지 않은 계획
@@ -169,3 +174,38 @@ class ActionPlan(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
     run: Mapped[ChatRun] = relationship(back_populates="plans")
+
+
+class Cluster(Base):
+    """등록된 클러스터 하나 (기획 04 §8).
+
+    지금까지 agent 는 자기가 도는 컴퓨터의 kubeconfig 를 읽었다. 서버가 사용자 노트북 밖으로 나가면
+    그 파일이 없으므로 접속 정보를 여기 보관한다. 자격증명은 평문으로 두지 않는다 —
+    credential_encrypted 에 서버 키로 암호화해 넣고, 실행 직전에만 풀어 임시 파일로 쓴다.
+
+    팀·권한은 Spring 이 원본이라 team_id 는 문자열로만 들고 FK 를 걸지 않는다 (tbl_user 와 같은 이유).
+    """
+
+    __tablename__ = "tbl_cluster"
+    __table_args__ = (
+        # 이름은 팀 안에서 유일. 팀이 없는(개인) 클러스터는 등록한 사람 안에서 유일하다.
+        UniqueConstraint("team_id", "registered_by", "name", name="uq_cluster_name"),
+        CheckConstraint("api_server LIKE 'https://%'", name="ck_cluster_https"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    team_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)   # Spring tbl_team.id. 팀 API 붙기 전 null
+    registered_by: Mapped[str] = mapped_column(String(64), index=True)                    # 등록한 회원 id
+    name: Mapped[str] = mapped_column(String(100))
+    provider: Mapped[str] = mapped_column(String(20), default="GENERIC")                  # CLUSTER_PROVIDERS
+    api_server: Mapped[str] = mapped_column(String(300))
+    ca_data: Mapped[str | None] = mapped_column(Text, nullable=True)                      # base64. insecure 면 없다
+    insecure: Mapped[bool] = mapped_column(Boolean, default=False)                        # TLS 검증 건너뜀 (문서에 없는 칸 — issue #61)
+    credential_encrypted: Mapped[str] = mapped_column(Text)                               # 토큰 또는 client cert/key
+    context_name: Mapped[str] = mapped_column(String(200))
+    default_namespace: Mapped[str] = mapped_column(String(63), default="default")
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True)                      # api_server + CA 해시
+    status: Mapped[str] = mapped_column(String(20), default="disconnected")               # CLUSTER_STATUSES
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)

@@ -232,6 +232,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
         context=ctx.deps.context,
         dry_run=True,
         stdin=stdin,
+        kubeconfig=ctx.deps.kubeconfig,
     )
 
     if rehearsal.success:

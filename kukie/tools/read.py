@@ -33,7 +33,7 @@ def list_resources(ctx: RunContext[Deps], kind: str,
     else:
         args += _ns(ctx, namespace)
     args += ["-o", "wide"]
-    return run_kubectl(args, context=ctx.deps.context)
+    return run_kubectl(args, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig)
 
 
 def describe_resource(ctx: RunContext[Deps], kind: str, name: str,
@@ -45,7 +45,7 @@ def describe_resource(ctx: RunContext[Deps], kind: str, name: str,
     앱이 찍은 로그가 필요하면 get_logs를 쓴다.
     """
     args = ["describe", kind, name, *_ns(ctx, namespace)]
-    return run_kubectl(args, context=ctx.deps.context)
+    return run_kubectl(args, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig)
 
 
 def get_events(ctx: RunContext[Deps], namespace: str | None = None,
@@ -60,7 +60,7 @@ def get_events(ctx: RunContext[Deps], namespace: str | None = None,
         args.append("--all-namespaces")
     else:
         args += _ns(ctx, namespace)
-    return run_kubectl(args, context=ctx.deps.context)
+    return run_kubectl(args, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig)
 
 
 def get_logs(ctx: RunContext[Deps], pod: str, namespace: str | None = None,
@@ -77,7 +77,7 @@ def get_logs(ctx: RunContext[Deps], pod: str, namespace: str | None = None,
         args += ["-c", container]
     if previous:
         args.append("--previous")
-    return run_kubectl(args, context=ctx.deps.context)
+    return run_kubectl(args, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig)
 
 
 def explain_command(ctx: RunContext[Deps], resource_or_field: str) -> KubectlResult:
@@ -88,7 +88,7 @@ def explain_command(ctx: RunContext[Deps], resource_or_field: str) -> KubectlRes
     이 결과를 연수생 눈높이로 다시 풀어서 설명해라.
     """
     args = ["explain", resource_or_field]
-    return run_kubectl(args, context=ctx.deps.context)
+    return run_kubectl(args, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig)
 
 
 READ_TOOLS = [list_resources, describe_resource, get_events, get_logs,

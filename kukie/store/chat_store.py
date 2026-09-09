@@ -16,7 +16,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from kukie.store.models import PLAN_OPEN, RUN_ACTIVE, ActionPlan, ChatRun, ChatSession
+from kukie.store.models import PLAN_OPEN, RUN_ACTIVE, ActionPlan, ChatRun, ChatSession, Cluster
 
 _UNSET: Any = object()
 
@@ -27,6 +27,10 @@ class RequestMismatch(ValueError):
 
 class ActiveRunExists(RuntimeError):
     """이 채팅방에 아직 끝나지 않은 run 이 있다."""
+
+
+class ClusterInUse(RuntimeError):
+    """이 클러스터를 쓰는 채팅방이 남아 있어 지울 수 없다."""
 
 
 @dataclass(frozen=True)
@@ -143,6 +147,39 @@ class PlanSummaryRow:
     requested_by: str
     updated_at: datetime
     approvals: int          # 같은 run 에서 함께 나온 카드 수 (batch)
+
+
+
+@dataclass(frozen=True)
+class ClusterRow:
+    """등록된 클러스터 한 행 (기획 04 §8). **자격증명은 여기 담지 않는다** — 실행 계층만 따로 읽는다."""
+
+    id: str
+    team_id: str | None
+    registered_by: str
+    name: str
+    provider: str
+    api_server: str
+    ca_data: str | None
+    insecure: bool
+    context_name: str
+    default_namespace: str
+    fingerprint: str
+    status: str
+    last_checked_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def of(cls, row: Cluster) -> "ClusterRow":
+        return cls(
+            id=row.id, team_id=row.team_id, registered_by=row.registered_by, name=row.name,
+            provider=row.provider, api_server=row.api_server, ca_data=row.ca_data,
+            insecure=row.insecure, context_name=row.context_name,
+            default_namespace=row.default_namespace, fingerprint=row.fingerprint,
+            status=row.status, last_checked_at=row.last_checked_at,
+            created_at=row.created_at, updated_at=row.updated_at,
+        )
 
 
 
@@ -463,6 +500,71 @@ class ChatStore:
                 .where(ActionPlan.id == plan_id)
             ).first()
             return (row[0], bool(row[1])) if row is not None else None
+
+    # ── 클러스터 (기획 04 §8) ─────────────────────────────
+
+    def create_cluster(
+        self, *, registered_by: str, name: str, api_server: str, ca_data: str | None,
+        insecure: bool, credential_encrypted: str, context_name: str, default_namespace: str,
+        fingerprint: str, team_id: str | None = None, provider: str = "GENERIC",
+    ) -> ClusterRow:
+        with self._factory() as db:
+            row = Cluster(
+                team_id=team_id, registered_by=registered_by, name=name, provider=provider,
+                api_server=api_server, ca_data=ca_data, insecure=insecure,
+                credential_encrypted=credential_encrypted, context_name=context_name,
+                default_namespace=default_namespace, fingerprint=fingerprint,
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return ClusterRow.of(row)
+
+    def get_cluster(self, cluster_id: str) -> ClusterRow | None:
+        with self._factory() as db:
+            row = db.get(Cluster, cluster_id)
+            return ClusterRow.of(row) if row is not None else None
+
+    def cluster_credential(self, cluster_id: str) -> str | None:
+        """암호문 그대로. 실행 계층만 부르고, 어떤 응답에도 실리지 않는다 (기획 04 §4)."""
+        with self._factory() as db:
+            row = db.get(Cluster, cluster_id)
+            return row.credential_encrypted if row is not None else None
+
+    def list_clusters(self, user_id: str, *, team_id: str | None = None) -> list[ClusterRow]:
+        """내가 등록한 것 + 내 팀 것. 팀 소속 검사는 부르는 쪽(Spring 팀 API)이 한다 — 지금은 team_id 로만 좁힌다."""
+        with self._factory() as db:
+            stmt = select(Cluster)
+            if team_id is not None:
+                stmt = stmt.where(Cluster.team_id == team_id)
+            else:
+                stmt = stmt.where(
+                    or_(Cluster.registered_by == user_id, Cluster.team_id.is_not(None))
+                )
+            rows = db.scalars(stmt.order_by(Cluster.created_at)).all()
+            return [ClusterRow.of(r) for r in rows]
+
+    def update_cluster(self, cluster_id: str, **fields: Any) -> None:
+        with self._factory() as db:
+            row = db.get(Cluster, cluster_id)
+            if row is None:
+                return
+            for key, value in fields.items():
+                setattr(row, key, value)
+            db.commit()
+
+    def delete_cluster(self, cluster_id: str) -> bool:
+        """자격증명까지 함께 사라진다 (기획 04 §4). 이 클러스터를 쓰는 방이 있으면 거절한다."""
+        with self._factory() as db:
+            row = db.get(Cluster, cluster_id)
+            if row is None:
+                return False
+            using = db.scalar(select(ChatSession.id).where(ChatSession.cluster_id == cluster_id))
+            if using is not None:
+                raise ClusterInUse(cluster_id)
+            db.delete(row)
+            db.commit()
+            return True
 
     # ── 내부 ─────────────────────────────────────────────────
 

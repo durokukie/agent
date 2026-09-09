@@ -12,6 +12,7 @@ dependencies = [
     "uvicorn>=0.30",
     "sqlalchemy>=2.0",      # 채팅방·run 저장 (kukie/store)
     "httpx>=0.27",          # Spring 회원 서버 /users/me 호출 (kukie/auth)
+    "cryptography>=42",     # 클러스터 자격증명 대칭 암호화 (kukie/clusters, 기획 04 §8)
 ]
 
 [project.optional-dependencies]

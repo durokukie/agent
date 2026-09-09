@@ -35,6 +35,8 @@ from pydantic_ai.messages import ModelMessagesTypeAdapter
 
 import kukie.server as _server  # 순환 import: 이름은 호출 시점에만 쓴다
 from kukie.auth import User, current_user
+from kukie.clusters import crypto
+from kukie.clusters.access import ClusterGone, kubeconfig_or_none
 from kukie.conversations import Conversation, registry
 from kukie.skills import SKILLS
 from kukie.store import ChatStore, get_store
@@ -165,6 +167,40 @@ def _usage_json(result: Any) -> dict[str, Any] | None:
     }
 
 
+#: 등록된 클러스터로 실행할 수 없는 사정들. 셋 다 서버·설정 문제라 대화는 살려 두고 안내만 한다.
+CLUSTER_FAILURES = (ClusterGone, crypto.CredentialUnreadable, crypto.SecretKeyMissing)
+
+
+def _cluster_error(exc: Exception, cluster_id: str | None) -> HTTPException:
+    if isinstance(exc, ClusterGone):
+        return _error(404, "CLUSTER_GONE",
+                      f"이 대화가 쓰던 클러스터가 삭제되었습니다: {cluster_id}")
+    if isinstance(exc, crypto.SecretKeyMissing):
+        return _error(503, "SECRET_KEY_MISSING", str(exc))
+    return _error(503, "CREDENTIAL_UNREADABLE", str(exc))
+
+
+def _with_cluster(store: ChatStore, session: Any, cluster_id: str | None):
+    """실행 동안만 임시 kubeconfig 를 연다 (기획 04 §8). 블록을 벗어나면 파일이 지워진다.
+
+    등록된 클러스터가 없는 방(옛 방·로컬 개발)은 아무것도 하지 않고 서버 컴퓨터의 기본 kubeconfig 를 쓴다.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def opened():
+        with kubeconfig_or_none(store, cluster_id) as path:
+            before = session.deps
+            session.deps = dataclasses.replace(before, kubeconfig=path)
+            try:
+                yield
+            finally:
+                # 파일은 곧 사라진다 — 경로를 세션에 남기면 다음 요청이 없는 파일을 가리킨다
+                session.deps = dataclasses.replace(session.deps, kubeconfig=None)
+
+    return opened()
+
+
 def _bind_run(session: Any, run: RunRow, user: User) -> None:
     """이번 요청이 어느 run 의 것이고 누가 보냈는지 세션에 싣는다 — 가드레일 훅이 Action Plan 을
     tbl_action_plan 에 넣고 decision 에 결정자를 적을 때 쓴다 (#58). 매 요청 새로 덮어쓴다."""
@@ -185,6 +221,15 @@ async def create_conversation(
 ) -> dict[str, Any]:
     context = (body.context or "").strip()
     namespace = (body.namespace or "").strip()
+    fingerprint = body.cluster_fingerprint
+    if body.cluster_id:
+        # 등록된 클러스터를 골랐다 (기획 04 §8). 접속 대상은 그 행이 정한다 — 화면이 보낸 값보다 우선한다.
+        cluster = store.get_cluster(body.cluster_id)
+        if cluster is None:
+            raise _error(404, "NOT_FOUND", f"클러스터가 없다: {body.cluster_id}")
+        context = cluster.context_name
+        namespace = namespace or cluster.default_namespace
+        fingerprint = cluster.fingerprint      # 방이 지문을 복사해 "승인한 대상 = 실행 대상" 을 확인한다
     if not context:
         # 빈 context 로 방을 만들면 `kubectl --context ''` 가 kubeconfig 의 현재 context 를 따라가서, 나중에 current-context 가
         # 바뀌면 같은 방의 실행 대상이 바뀐다 (팀원 리뷰 1). 만들 때 실제 이름으로 확정한다.
@@ -196,7 +241,7 @@ async def create_conversation(
     row = store.create_session(
         user_id=user.id, context_name=context, namespace=namespace or "default",
         mode=_server.DEFAULT_SKILL.name, title=body.title,
-        installation_id=body.installation_id, cluster_fingerprint=body.cluster_fingerprint,
+        installation_id=body.installation_id, cluster_fingerprint=fingerprint,
         team_id=body.team_id, cluster_id=body.cluster_id, shared=body.shared,
     )
     conversation = registry.register(row)
@@ -290,7 +335,12 @@ async def chat(
 
         _bind_run(session, run, user)
         try:
-            payload, result = await _server._chat_turn(session, body.text)
+            with _with_cluster(store, session, row.cluster_id):
+                payload, result = await _server._chat_turn(session, body.text)
+        except CLUSTER_FAILURES as exc:
+            wrapped = _cluster_error(exc, row.cluster_id)
+            store.update_run(run.id, status="failed", response_payload=_error_record(wrapped))
+            raise wrapped from None
         except HTTPException as exc:
             wrapped = _wrap(exc)
             store.update_run(run.id, status="failed", response_payload=_error_record(wrapped))
@@ -401,7 +451,10 @@ async def approve(
         plan_ids = _approved_plan_ids(session, body.call_id if body.approved else None)
         # 결정 검사·기록은 server._approve 가 한다 (문자열 detail). 여기서는 코드 객체로 감싼다.
         try:
-            outcome, result = await _server._approve(session, body.call_id, body.approved)
+            with _with_cluster(store, session, row.cluster_id):
+                outcome, result = await _server._approve(session, body.call_id, body.approved)
+        except CLUSTER_FAILURES as exc:
+            raise _record_failure(store, run, _cluster_error(exc, row.cluster_id)) from None
         except HTTPException as exc:
             raise _record_failure(store, run, _wrap(exc))
         return _continue_run(store, conversation, run, outcome, result, plan_ids)
@@ -427,7 +480,10 @@ async def resume(
         _bind_run(session, run, user)
         plan_ids = _approved_plan_ids(session)
         try:
-            outcome, result = await _server._resume(session)
+            with _with_cluster(store, session, row.cluster_id):
+                outcome, result = await _server._resume(session)
+        except CLUSTER_FAILURES as exc:
+            raise _record_failure(store, run, _cluster_error(exc, row.cluster_id)) from None
         except HTTPException as exc:
             raise _record_failure(store, run, _wrap(exc))
         return _continue_run(store, conversation, run, outcome, result, plan_ids)
