@@ -230,3 +230,59 @@ def test_팀이_없는_방은_예전대로_만든_사람만(client, spring):
     r = client.post(f"/conversations/{room}/approve", json={"call_id": "c1", "approved": True},
                     headers=BEARER)
     assert r.status_code == 403 and r.json()["detail"]["code"] == "FORBIDDEN"
+
+
+# ── 자동 리뷰 반영 ─────────────────────────────────────────
+
+def test_팀에서_나가면_등록자여도_안_보인다(client, spring):
+    """P1: 등록자라는 이유로 통과시키면 팀에서 쫓겨난 뒤에도 계속 만질 수 있다."""
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    cluster = _cluster("t-1", owner="u-1")          # 내가 등록한 팀 클러스터
+    assert client.get(f"/clusters/{cluster}", headers=BEARER).status_code == 200
+
+    membership.clear_cache()
+    spring["teams"] = []                            # 팀에서 나갔다
+    assert client.get(f"/clusters/{cluster}", headers=BEARER).status_code == 404
+    assert client.get("/clusters", headers=BEARER).json() == []
+
+
+def test_회원_서버가_죽으면_팀_클러스터에_닿지_못한다(client, spring):
+    """등록자 우회가 있으면 서버가 죽었을 때도 통과했다 — fail-closed 가 깨진다."""
+    import httpx
+
+    _cluster("t-1", owner="u-1")
+    spring["boom"] = httpx.ConnectError("연결 실패")
+    assert client.get("/clusters", headers=BEARER).status_code == 503
+
+
+def test_개인_클러스터는_회원_서버와_무관하게_보인다(client, spring):
+    """팀이 없는 클러스터까지 막으면 혼자 쓰는 사람이 못 쓴다."""
+    import httpx
+
+    personal = _cluster(None, owner="u-1")
+    spring["teams"] = []
+    assert client.get(f"/clusters/{personal}", headers=BEARER).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_만료된_기억은_스스로_사라진다(spring, monkeypatch):
+    """다시 오지 않는 토큰이 남아 있으면 "요청 처리 동안만" 보다 실제 수명이 길어진다."""
+    spring["teams"] = [{"id": "t-1", "role": "MEMBER"}]
+    monkeypatch.setattr(membership, "CACHE_TTL", 0.0)
+    await membership.team_roles(_user("tok-옛날"))
+    await membership.team_roles(_user("tok-새것"))
+    assert "tok-옛날" not in membership._cache
+
+
+@pytest.mark.asyncio
+async def test_200_인데_JSON_이_아니면_503(spring, monkeypatch):
+    """500 으로 나가면 앱이 회원 서버 문제와 agent 버그를 구분하지 못한다."""
+    import httpx
+
+    def bad_json(self):
+        raise ValueError("JSON 아님")
+
+    monkeypatch.setattr(httpx.Response, "json", bad_json)
+    with pytest.raises(HTTPException) as raised:
+        await membership.team_roles(_user())
+    assert raised.value.status_code == 503

@@ -47,9 +47,14 @@ def _cached(key: str) -> dict[str, str] | None:
 
 
 def _remember(key: str, roles: dict[str, str]) -> None:
+    # 쓸 때마다 만료된 것을 치운다. 다시 오지 않는 토큰(로그아웃·재발급)이 15초가 지나도 그대로
+    # 남아 있으면 "토큰은 요청 처리 동안만" 이라는 약속보다 실제 수명이 길어진다 (자동 리뷰 지적).
+    now = time.monotonic()
+    for stale in [k for k, (expires, _) in _cache.items() if expires < now]:
+        _cache.pop(stale, None)
     if len(_cache) >= CACHE_MAX:
-        _cache.clear()          # 로컬 단일 사용자 MVP — 오래된 것만 골라내는 대신 통째로 비운다
-    _cache[key] = (time.monotonic() + CACHE_TTL, roles)
+        _cache.clear()
+    _cache[key] = (now + CACHE_TTL, roles)
 
 
 def _unavailable(detail: str) -> HTTPException:
@@ -57,7 +62,13 @@ def _unavailable(detail: str) -> HTTPException:
 
 
 async def team_roles(user: User) -> dict[str, str]:
-    """{팀 id: 역할}. 역할은 Spring 그대로 대문자 (ADMIN / MEMBER)."""
+    """{팀 id: 역할}. 역할은 Spring 그대로 대문자 (ADMIN / MEMBER).
+
+    응답 형식은 kukie-server 의 `TeamController.getMyTeams` → `List<TeamResponse>` 이고
+    `TeamResponse(id: UUID, name: String, role: TeamRole)` 다. `TeamRole` 은 `@JsonValue` 가 없어
+    enum 이름 그대로(`ADMIN`/`MEMBER`) 직렬화된다. 형식이 바뀌면 여기가 조용히 틀리므로,
+    바뀌면 이 함수의 테스트(tests/test_membership.py)도 같이 고쳐야 한다.
+    """
     member_url = _member_url()
     if member_url is None:
         return {}
@@ -81,7 +92,10 @@ async def team_roles(user: User) -> dict[str, str]:
     if response.status_code != 200:
         raise _unavailable(f"회원 서버 응답 {response.status_code}")
 
-    body: Any = response.json()
+    try:
+        body: Any = response.json()
+    except ValueError as exc:      # 200 인데 JSON 이 아니다 — 앱이 agent 버그와 구분할 수 있게 503 으로
+        raise _unavailable("회원 서버 응답을 읽을 수 없다") from exc
     if not isinstance(body, list):
         raise _unavailable("회원 서버의 팀 목록 형식이 올바르지 않다")
     roles = {

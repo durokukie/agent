@@ -12,12 +12,16 @@
   - 팀에 속한 클러스터: 읽기는 팀 구성원, 쓰기(등록·수정·삭제)는 팀 Admin. 판단은 Spring 에 묻는다
     (kukie/membership.py — 사용자 토큰으로 GET /teams)
   - 팀이 없는(개인) 클러스터: 등록한 사람만. 회원 서버가 없는 개발 모드도 이쪽이다
+
+예외 하나: `POST /{id}/test` 는 구성원도 부를 수 있는데 안에서 status·last_checked_at 을 쓴다.
+연결 확인의 부산물이라 "쓰기는 Admin" 경계에서 일부러 빼 뒀다 (자동 리뷰 지적).
 """
 from __future__ import annotations
 
 import logging
 from typing import Any
 
+from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -97,10 +101,14 @@ async def _readable(store: ChatStore, cluster_id: str, user: User) -> ClusterRow
     row = store.get_cluster(cluster_id)
     if row is None:
         raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}")
+    if row.team_id and membership.available():
+        # 팀 클러스터는 **등록한 사람이어도** 지금 소속을 확인한다. 등록자라는 이유로 통과시키면
+        # 팀에서 쫓겨난 뒤에도 계속 보고 만질 수 있고, 회원 서버가 죽었을 때도 통과한다 (자동 리뷰 P1).
+        if not await membership.is_member(user, row.team_id):
+            raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}")
+        return row
     if row.registered_by == user.id:
-        return row
-    if row.team_id and membership.available() and await membership.is_member(user, row.team_id):
-        return row
+        return row          # 팀이 없는(개인) 클러스터 — 등록한 사람만
     raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}")
 
 
@@ -112,6 +120,7 @@ async def _writable(store: ChatStore, cluster_id: str, user: User) -> ClusterRow
     elif row.registered_by != user.id:
         raise _error(403, "FORBIDDEN", "등록한 사람만 바꿀 수 있다")
     return row
+
 
 
 def _parse(body_text: str, context: str | None):
@@ -180,15 +189,20 @@ async def test_cluster(
     _require_key()
     from datetime import datetime, timezone
 
-    try:
+    def probe() -> tuple[Any, Any]:
         with kubeconfig_for(store, cluster_id) as path:
-            version = run_kubectl(
-                ["version", "-o", "json"], context=row.context_name, kubeconfig=path
+            return (
+                run_kubectl(["version", "-o", "json"], context=row.context_name, kubeconfig=path),
+                run_kubectl(
+                    ["auth", "can-i", "update", "deployments", "-n", row.default_namespace],
+                    context=row.context_name, kubeconfig=path,
+                ),
             )
-            can_edit = run_kubectl(
-                ["auth", "can-i", "update", "deployments", "-n", row.default_namespace],
-                context=row.context_name, kubeconfig=path,
-            )
+
+    try:
+        # run_kubectl 은 subprocess.run 을 그대로 부른다. 여기서 직접 부르면 닿지 않는 주소일 때
+        # 최대 60초(version + can-i) 동안 서버 전체가 멈춘다 (자동 리뷰 지적). 스레드로 넘긴다.
+        version, can_edit = await to_thread.run_sync(probe)
     except ClusterGone:
         raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}") from None
     except crypto.CredentialUnreadable as exc:
@@ -225,9 +239,11 @@ async def update_cluster(
                 409, "CLUSTER_MISMATCH",
                 "다른 클러스터의 kubeconfig 입니다 — 자격증명 교체는 같은 클러스터만 됩니다",
             )
+        # context 이름은 바꾸지 않는다. 지문은 주소·CA 만 덮으므로 새 kubeconfig 의 context 이름이
+        # 달라도 통과하는데, 그 이름을 방마다 복사해 뒀기 때문에 바꾸면 기존 방이 전부 엉뚱한
+        # context 를 가리킨다 (자동 리뷰 지적). 이름을 바꿔야 하면 다시 등록한다.
         fields.update(
             credential_encrypted=crypto.encrypt(parsed.credential),
-            context_name=parsed.context_name,
             ca_data=parsed.ca_data,
             insecure=parsed.insecure,
             status="disconnected",       # 바꿨으니 다시 확인해야 한다

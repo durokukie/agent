@@ -15,6 +15,7 @@ import binascii
 import hashlib
 from dataclasses import dataclass
 from ipaddress import ip_address
+from socket import getaddrinfo
 from urllib.parse import urlparse
 
 import yaml
@@ -68,6 +69,22 @@ def _base64(value: object, field: str) -> str:
     return str(value)
 
 
+def _blocked(address: str) -> bool:
+    try:
+        parsed = ip_address(address)
+    except ValueError:
+        return False
+    return parsed.is_loopback or parsed.is_private or parsed.is_link_local or parsed.is_reserved
+
+
+def _resolved(host: str) -> list[str]:
+    """호스트명이 실제로 가리키는 주소들. 못 풀면 빈 목록."""
+    try:
+        return [info[4][0] for info in getaddrinfo(host, None)]
+    except OSError:
+        return []
+
+
 def _check_api_server(url: str, *, allow_local: bool) -> None:
     parsed = urlparse(url)
     _require(parsed.scheme == "https", f"클러스터 주소는 https 여야 합니다: {url}")
@@ -75,16 +92,15 @@ def _check_api_server(url: str, *, allow_local: bool) -> None:
     if allow_local:
         return
     host = str(parsed.hostname)
-    try:
-        address = ip_address(host)
-    except ValueError:
-        _require(host not in {"localhost", "localhost.localdomain"},
-                 "로컬 주소는 등록할 수 없습니다 (서버에서 닿지 않습니다)")
-        return
-    _require(
-        not (address.is_loopback or address.is_private or address.is_link_local),
-        f"사설·로컬 주소는 등록할 수 없습니다 (서버에서 닿지 않습니다): {host}",
-    )
+    _require(not _blocked(host), f"사설·로컬 주소는 등록할 수 없습니다: {host}")
+    # 호스트명도 **실제로 풀리는 주소**까지 본다. 이름만 보면 사내망이나 127.0.0.1 로 풀리는
+    # 이름을 등록해 서버가 대신 접속하게 만들 수 있다 (자동 리뷰 P1).
+    # 이름이 나중에 다른 주소로 다시 풀리는 것(DNS rebinding)까지는 못 막는다 — issue #61 에 적었다.
+    for address in _resolved(host):
+        _require(
+            not _blocked(address),
+            f"사설·로컬 주소로 풀리는 이름은 등록할 수 없습니다: {host} → {address}",
+        )
 
 
 def _credential(user: dict) -> dict[str, str]:
@@ -163,6 +179,13 @@ def parse_kubeconfig(
 
     insecure = bool(cluster.get("insecure-skip-tls-verify"))
     ca = cluster.get("certificate-authority-data")
+    # kubectl 은 CA 와 insecure 를 함께 쓴 cluster 항목을 거부한다
+    # ("specifying a root certificates file with the insecure flag is not allowed").
+    # 둘 다 받아 두면 등록은 되고 실행만 실패하므로 여기서 막는다 (자동 리뷰 지적).
+    _require(
+        not (insecure and ca is not None),
+        "CA 인증서와 insecure-skip-tls-verify 를 함께 쓸 수 없습니다 — 하나만 남기세요",
+    )
     if ca is None:
         _require(insecure, "CA 인증서(certificate-authority-data)가 없습니다")
         ca_data = None
