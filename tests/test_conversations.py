@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 from pydantic_ai.models.test import TestModel
 
 from kukie import conversations, server
@@ -28,6 +29,7 @@ OTHER = {"X-User": "u-2"}
 def client(monkeypatch, tmp_path):
     monkeypatch.delenv("KUKIE_MEMBER_URL", raising=False)
     monkeypatch.delenv("KUKIE_DEV_USER", raising=False)
+    monkeypatch.setenv("KUKIE_DEV_AUTH", "1")            # Spring 없이 X-User 헤더로 사용자 구분
     reset_store_for_tests(f"sqlite:///{tmp_path / 'test.db'}")
     conversations.registry.clear()
     monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
@@ -86,6 +88,29 @@ def test_남의_채팅방은_404_공유면_보인다(client):
 def test_인증_없으면_401(client):
     r = client.post("/conversations", json={})
     assert r.status_code == 401 and r.json()["detail"]["code"] == "UNAUTHORIZED"
+
+
+def test_공유_방은_남이_읽을_수만_있고_chat_approve는_403(client):
+    shared = client.post("/conversations", json={"shared": True}, headers=OTHER).json()["conversation"]["id"]
+    assert client.get(f"/conversations/{shared}", headers=USER).status_code == 200
+    r = client.post(f"/conversations/{shared}/chat", json={"text": "x"}, headers=USER)
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "FORBIDDEN"
+    r = client.post(f"/conversations/{shared}/approve", json={"call_id": "c", "approved": True}, headers=USER)
+    assert r.status_code == 403
+    assert client.post(f"/conversations/{shared}/resume", headers=USER).status_code == 403
+
+
+def test_회원_서버가_설정되면_개발용_헤더와_변수는_무시된다(client, monkeypatch):
+    monkeypatch.setenv("KUKIE_MEMBER_URL", "http://member.invalid")
+    monkeypatch.setenv("KUKIE_DEV_USER", "dev")
+    r = client.post("/conversations", json={}, headers=USER)       # X-User 만 있고 Bearer 없음
+    assert r.status_code == 401 and r.json()["detail"]["code"] == "UNAUTHORIZED"
+
+
+def test_회원_서버도_개발_모드도_없으면_503_AUTH_NOT_CONFIGURED(client, monkeypatch):
+    monkeypatch.delenv("KUKIE_DEV_AUTH")
+    r = client.post("/conversations", json={}, headers=USER)
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "AUTH_NOT_CONFIGURED"
 
 
 # ── 채팅 · run 기록 ────────────────────────────────────────
@@ -194,10 +219,100 @@ def test_서버가_다시_떠도_기록과_history가_복원된다(client):
     assert restored.session.skill.name == "학습" and restored.session.pending is None
 
 
+def test_실패한_요청을_같은_request_id로_다시_보내면_저장된_실패를_준다(client):
+    cid = _new(client)
+    calls = 0
+
+    async def boom(session, **kw):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("모델 죽음")
+
+    import kukie.server as srv
+    original = srv._run_agent
+    srv._run_agent = boom
+    try:
+        body = {"text": "파드", "request_id": "req-fail"}
+        first = client.post(f"/conversations/{cid}/chat", json=body, headers=USER)
+        second = client.post(f"/conversations/{cid}/chat", json=body, headers=USER)
+    finally:
+        srv._run_agent = original
+    assert first.status_code == 500 and second.status_code == 500       # BUSY 가 아니라 같은 실패
+    assert second.json()["detail"]["code"] == "RUN_FAILED" and calls == 1
+    assert "모델 죽음" not in first.json()["detail"]["message"]         # 예외 문자열은 응답에 안 싣는다
+    # 새 request_id 면 다시 실행한다
+    with agent.override(model=_model("살아남")):
+        assert client.post(f"/conversations/{cid}/chat", json={"text": "파드"}, headers=USER).status_code == 200
+
+
 # ── 승인 · 재개 ────────────────────────────────────────────
 
-def _fake(output):
-    return SimpleNamespace(output=output, all_messages=lambda: [], new_messages=lambda: [])
+def _fake(output, new_messages=()):
+    msgs = list(new_messages)
+    return SimpleNamespace(output=output, all_messages=lambda: msgs, new_messages=lambda: msgs)
+
+
+def _swap_run_agent(outputs):
+    """_run_agent 를 outputs 순서대로 돌려주는 가짜로. 반환은 원복 함수."""
+    import kukie.server as srv
+    original = srv._run_agent
+    queue = list(outputs)
+
+    async def fake(session, **kw):
+        value = queue.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    srv._run_agent = fake
+    return lambda: setattr(srv, "_run_agent", original)
+
+
+def test_chat이_승인_카드를_주면_approve_뒤_다음_chat이_된다(client):
+    """리뷰 🔴: 승인 카드 run 이 활성으로 남아 approve 가 500, 방이 영구 BUSY 였다."""
+    cid = _new(client)
+    _, ticket = _pending_ticket_for_server("call-f")
+    restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="적용됨")),
+                               _fake(KukieResponse(narration="다음 턴"))])
+    try:
+        r = client.post(f"/conversations/{cid}/chat", json={"text": "nginx 3개로"}, headers=USER)
+        assert r.status_code == 200 and r.json()["kind"] == "approval"
+        turns = client.get(f"/conversations/{cid}", headers=USER).json()["turns"]
+        assert turns[0]["status"] == "awaiting_approval" and turns[0]["finished_at"] is None
+        assert client.get(f"/conversations/{cid}", headers=USER).json()["conversation"]["running"] is False
+
+        r = client.post(f"/conversations/{cid}/approve", json={"call_id": "call-f", "approved": True}, headers=USER)
+        assert r.status_code == 200 and r.json()["response"]["narration"] == "적용됨"
+        turns = client.get(f"/conversations/{cid}", headers=USER).json()["turns"]
+        assert [(t["kind"], t["status"]) for t in turns] == [("chat", "completed"), ("approve", "completed")]
+        assert turns[0]["payload"]["kind"] == "approval"                 # 카드 응답은 그대로 남는다
+        assert turns[0]["finished_at"] is not None
+
+        r = client.post(f"/conversations/{cid}/chat", json={"text": "다음"}, headers=USER)
+        assert r.status_code == 200 and r.json()["response"]["narration"] == "다음 턴"
+    finally:
+        restore()
+
+
+def test_승인_대기_중_재시작하면_카드는_만료되고_그_턴의_기록은_history에서_뺀다(client):
+    """리뷰 P1/🟡: 재시작 뒤 활성 run 이 남아 영구 BUSY, 결과 없는 tool call 이 history 에 남는 문제."""
+    cid = _new(client)
+    _, ticket = _pending_ticket_for_server("call-x")
+    dangling = [ModelRequest(parts=[UserPromptPart(content="nginx 3개로")])]
+    restore = _swap_run_agent([_fake(ticket, dangling), _fake(KukieResponse(narration="재시작 뒤"))])
+    try:
+        assert client.post(f"/conversations/{cid}/chat", json={"text": "nginx 3개로"}, headers=USER).json()["kind"] == "approval"
+        conversations.registry.clear()                                   # 프로세스 재시작 흉내
+
+        detail = client.get(f"/conversations/{cid}", headers=USER).json()
+        assert detail["turns"][0]["status"] == "interrupted" and detail["turns"][0]["error"]["code"] == "INTERRUPTED"
+        assert detail["session"]["pending"] == [] and detail["conversation"]["running"] is False
+        assert conversations.registry.get(cid).session.history == []   # 만료된 턴의 메시지는 버린다
+
+        r = client.post(f"/conversations/{cid}/chat", json={"text": "다시"}, headers=USER)
+        assert r.status_code == 200 and r.json()["response"]["narration"] == "재시작 뒤"
+    finally:
+        restore()
 
 
 def test_승인은_채팅방_단위로_run을_남기고_잠금은_방마다다(client):
@@ -246,13 +361,16 @@ def test_재개_실패는_503_RESUME_RETRYABLE이고_resume으로_이어간다(c
         r = client.post(f"/conversations/{cid}/approve", json={"call_id": "call-r", "approved": True}, headers=USER)
         assert r.status_code == 503 and r.json()["detail"]["code"] == "RESUME_RETRYABLE"
         assert conversations.registry.get(cid).session.pending is ticket      # 티켓 유지
+        failed = client.get(f"/conversations/{cid}", headers=USER).json()["turns"]
+        assert [(t["kind"], t["status"]) for t in failed] == [("approve", "failed")]   # 실패도 기록
+        assert failed[0]["error"]["code"] == "RESUME_RETRYABLE"
         srv._run_agent = lambda session, **kw: _async(_fake(KukieResponse(narration="이번엔 됨")))
         r = client.post(f"/conversations/{cid}/resume", headers=USER)
     finally:
         srv._run_agent = original
     assert r.status_code == 200 and r.json()["response"]["narration"] == "이번엔 됨"
     kinds = [t["kind"] for t in client.get(f"/conversations/{cid}", headers=USER).json()["turns"]]
-    assert kinds == ["resume"]
+    assert kinds == ["approve", "resume"]
 
 
 def test_재개할_티켓이_없으면_409_NOT_PENDING(client):

@@ -1,7 +1,9 @@
 """채팅방·run 읽기/쓰기. 라우터와 세션 레지스트리는 이 함수들만 쓴다.
 
 멱등성 (DB 문서 4절): 같은 (session_id, request_id) 로 다시 오면 기존 run 을 돌려주고,
-같은 id 에 다른 입력이면 거절한다. 채팅방 하나에 활성 run 은 최대 하나.
+같은 id 에 다른 입력이면 거절한다. 채팅방 하나에 실행 중(running) run 은 최대 하나.
+
+전제: 단일 프로세스. 검사 → INSERT 사이의 경합은 유니크 제약이 잡고 IntegrityError 를 재조회로 바꾼다.
 """
 from __future__ import annotations
 
@@ -10,9 +12,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from kukie.store.models import RUN_ACTIVE, ChatRun, ChatSession
+from kukie.store.models import RUN_ACTIVE, RUN_BLOCKING, ChatRun, ChatSession
 
 
 class RequestMismatch(ValueError):
@@ -107,7 +110,7 @@ class ChatStore:
             row = db.get(ChatSession, session_id)
             if row is None:
                 return None
-            return SessionRow.of(row, running=self._has_active_run(db, session_id))
+            return SessionRow.of(row, running=self._has_running(db, session_id))
 
     def list_sessions(self, user_id: str, *, cluster_id: str | None = None) -> list[SessionRow]:
         with self._factory() as db:
@@ -116,7 +119,7 @@ class ChatStore:
                 stmt = stmt.where(ChatSession.cluster_id == cluster_id)
             stmt = stmt.order_by(ChatSession.updated_at.desc())
             rows = db.scalars(stmt).all()
-            return [SessionRow.of(r, running=self._has_active_run(db, r.id)) for r in rows]
+            return [SessionRow.of(r, running=self._has_running(db, r.id)) for r in rows]
 
     def update_session(self, session_id: str, **fields: Any) -> None:
         with self._factory() as db:
@@ -141,14 +144,10 @@ class ChatStore:
     ) -> tuple[RunRow, bool]:
         """run 을 만든다. 반환 (run, created). 같은 request_id 면 기존 run 과 created=False."""
         with self._factory() as db:
-            existing = db.scalar(
-                select(ChatRun).where(ChatRun.session_id == session_id, ChatRun.request_id == request_id)
-            )
+            existing = self._find_request(db, session_id, request_id)
             if existing is not None:
-                if existing.input_text != input_text or existing.kind != kind:
-                    raise RequestMismatch(request_id)
-                return RunRow.of(existing), False
-            if self._has_active_run(db, session_id):
+                return self._replay(existing, kind, input_text), False
+            if self._has_running(db, session_id):
                 raise ActiveRunExists(session_id)
             last = db.scalar(
                 select(ChatRun.turn_no).where(ChatRun.session_id == session_id).order_by(ChatRun.turn_no.desc())
@@ -161,9 +160,29 @@ class ChatStore:
             session = db.get(ChatSession, session_id)
             if session is not None:
                 session.updated_at = datetime.now(timezone.utc)
-            db.commit()
+            try:
+                db.commit()
+            except IntegrityError:
+                # 검사와 INSERT 사이에 다른 요청이 먼저 넣었다 — 유니크 제약이 잡았다. 재조회로 판정한다.
+                db.rollback()
+                existing = self._find_request(db, session_id, request_id)
+                if existing is not None:
+                    return self._replay(existing, kind, input_text), False
+                raise ActiveRunExists(session_id) from None
             db.refresh(row)
             return RunRow.of(row), True
+
+    @staticmethod
+    def _find_request(db: Session, session_id: str, request_id: str) -> ChatRun | None:
+        return db.scalar(
+            select(ChatRun).where(ChatRun.session_id == session_id, ChatRun.request_id == request_id)
+        )
+
+    @staticmethod
+    def _replay(existing: ChatRun, kind: str, input_text: str | None) -> RunRow:
+        if existing.input_text != input_text or existing.kind != kind:
+            raise RequestMismatch(existing.request_id)
+        return RunRow.of(existing)
 
     def finish_run(
         self,
@@ -186,6 +205,35 @@ class ChatStore:
                 row.finished_at = datetime.now(timezone.utc)
             db.commit()
 
+    def settle_run(self, run_id: str, *, status: str) -> None:
+        """응답·기록은 그대로 두고 상태만 종료로 바꾼다 (승인 카드를 준 run 이 결정 뒤 닫힐 때)."""
+        with self._factory() as db:
+            row = db.get(ChatRun, run_id)
+            if row is None:
+                return
+            row.status = status
+            if status not in RUN_ACTIVE:
+                row.finished_at = datetime.now(timezone.utc)
+            db.commit()
+
+    def settle_active_runs(self, session_id: str, *, status: str, error: dict[str, Any] | None = None) -> list[RunRow]:
+        """이 채팅방의 활성 run 을 전부 닫는다. 반환은 닫은 run 들.
+
+        승인 카드 뒤에 결정이 오면 completed 로, 재시작 뒤 복원할 때는 interrupted 로 (카드 만료·실행 중단).
+        """
+        with self._factory() as db:
+            rows = db.scalars(
+                select(ChatRun).where(ChatRun.session_id == session_id, ChatRun.status.in_(RUN_ACTIVE))
+            ).all()
+            now = datetime.now(timezone.utc)
+            for row in rows:
+                row.status = status
+                row.finished_at = now
+                if error is not None:
+                    row.error = error
+            db.commit()
+            return [RunRow.of(r) for r in rows]
+
     def list_runs(self, session_id: str) -> list[RunRow]:
         with self._factory() as db:
             rows = db.scalars(
@@ -201,10 +249,11 @@ class ChatStore:
             return RunRow.of(row) if row is not None else None
 
     @staticmethod
-    def _has_active_run(db: Session, session_id: str) -> bool:
+    def _has_running(db: Session, session_id: str) -> bool:
+        """지금 실행 중인 run 이 있나. 승인 대기(awaiting_approval)는 막지 않는다 — RUN_BLOCKING 주석."""
         return (
             db.scalar(
-                select(ChatRun.id).where(ChatRun.session_id == session_id, ChatRun.status.in_(RUN_ACTIVE))
+                select(ChatRun.id).where(ChatRun.session_id == session_id, ChatRun.status.in_(RUN_BLOCKING))
             )
             is not None
         )

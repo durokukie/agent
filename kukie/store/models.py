@@ -31,6 +31,10 @@ RUN_ACTIVE = ("running", "awaiting_approval", "recovery_required")
 RUN_FINAL = ("completed", "failed", "interrupted")
 RUN_STATUSES = RUN_ACTIVE + RUN_FINAL
 
+# 새 run 을 막는 상태는 "지금 실행 중" 뿐이다. awaiting_approval 은 메모리의 session.pending 이 chat 을 막고,
+# approve/resume 은 그 run 뒤에 이어지는 새 run 이어야 하므로 여기서 막으면 방이 영구히 잠긴다 (PR #54 리뷰).
+RUN_BLOCKING = ("running",)
+
 RUN_KINDS = ("chat", "mode_change", "approve", "resume")
 
 
