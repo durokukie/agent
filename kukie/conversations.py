@@ -2,8 +2,10 @@
 
 메모리에 있는 것: 대화 기록(history), 승인 대기 티켓(pending), 결정(decisions), 잠금(lock).
 DB 에 있는 것: 채팅방 행, run 행(입력·응답·이 run 의 ModelMessage 들).
-서버가 다시 뜨면 run 들의 agent_messages 를 이어 붙여 history 를 복원한다. pending 은 복원하지 않는다
-(승인 카드는 만료 — MVP 결정, api-spec 1절).
+서버가 다시 뜨면 완료된 run 들의 agent_messages 를 이어 붙여 history 를 복원한다. pending 은 복원하지
+않는다 (승인 카드는 만료 — MVP 결정, api-spec 1절). 그래서 복원 시점에 아직 활성인 run(실행 중이었거나
+승인 카드를 기다리던 것)은 interrupted 로 닫고 그 메시지는 버린다 — 승인 카드 run 의 마지막 메시지는
+결과 없는 tool call 이라, 그대로 이어 붙이면 다음 chat 에서 모델이 대화를 거부한다.
 
 잠금은 채팅방마다 하나다: 같은 방에 run 은 하나, 다른 방은 동시에 돈다 (product-spec "동시 작업").
 """
@@ -56,12 +58,17 @@ class ConversationRegistry:
         live = self._live.get(conversation_id)
         if live is not None:
             return live
-        row = store.get_session(conversation_id)
-        if row is None:
+        if store.get_session(conversation_id) is None:
             return None
+        store.settle_active_runs(
+            conversation_id, status="interrupted",
+            error={"code": "INTERRUPTED", "message": "서버가 다시 떠서 이 요청은 중단됐다. 승인 카드는 만료됐다"},
+        )
+        row = store.get_session(conversation_id)
+        assert row is not None
         history: list[Any] = []
         for run in store.list_runs(conversation_id):
-            if run.agent_messages:
+            if run.status == "completed" and run.agent_messages:
                 history.extend(ModelMessagesTypeAdapter.validate_python(run.agent_messages))
         return self.register(row, history)
 
