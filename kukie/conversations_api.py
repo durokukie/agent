@@ -307,20 +307,41 @@ async def chat(
 
 def _save_or_fail(
     store: ChatStore, conversation_id: str, run: RunRow, *, on_failure: HTTPException, failure_status: str,
-    **fields: Any,
+    keep_payload: bool = False, **fields: Any,
 ) -> None:
     """실행 결과 저장. 실패하면 run 을 failure_status 로라도 남기고 on_failure 를 던진다 — 그것도 안 되면 다음 chat 이
     잠금을 쥔 채 활성 run 을 닫는다. 호출자가 상태·문구를 고른다: 모델 답변만 잃은 chat 은 failed, kubectl 이 이미 돈
-    승인·재개는 recovery_required ("변경은 적용됐을 수 있다", 문서 4절)."""
+    승인·재개는 recovery_required ("변경은 적용됐을 수 있다", 문서 4절). keep_payload 면 대체 쓰기가 payload 를
+    건드리지 않는다 — "여기서 계속하라" 는 경로는 계속할 재료(남은 카드)를 기록에 남겨야 한다."""
     try:
         store.update_run(run.id, **fields)
     except Exception as exc:
         logger.exception("실행 결과 저장 실패 (conversation=%s, run=%s)", conversation_id, run.id)
         try:
-            store.update_run(run.id, status=failure_status, response_payload=_error_record(on_failure))
+            if keep_payload:
+                store.update_run(run.id, status=failure_status)
+            else:
+                store.update_run(run.id, status=failure_status, response_payload=_error_record(on_failure))
         except Exception:
             logger.exception("실패 표시도 저장하지 못했다 (run=%s)", run.id)
         raise on_failure from exc
+
+
+def _approved_plan_ids(session: Any, also_approved: str | None = None) -> list[str]:
+    """티켓 중 **승인한** 카드의 Plan id 만 — "적용됐을 수 있는 변경" 목록에 거절한 카드가 섞이면 안 된다.
+    also_approved 는 지금 처리 중인 결정(아직 session.decisions 에 없다)."""
+    if session.pending is None:
+        return []
+    from pydantic_ai.tools import ToolApproved
+    approved = {cid for cid, d in session.decisions.items() if isinstance(d, ToolApproved)}
+    if also_approved:
+        approved.add(also_approved)
+    return [
+        str(plan_id)
+        for call in session.pending.approvals
+        if call.tool_call_id in approved
+        and (plan_id := session.pending.metadata.get(call.tool_call_id, {}).get("plan_id"))
+    ]
 
 
 def _chat_store_failure() -> HTTPException:
@@ -367,8 +388,8 @@ async def approve(
         raise _busy()
     run = _open_run(store, conversation_id)
     async with conversation.lock:
-        # 재개가 돌면 _to_payload 가 티켓을 지우므로, 저장 실패 안내에 실을 Plan id 는 여기서 미리 뽑는다
-        plan_ids = _server._pending_plan_ids(session) if session.pending is not None else []
+        # 재개가 돌면 _to_payload 가 티켓을 지우므로, 저장 실패 안내에 실을 Plan id(승인한 카드만)는 여기서 미리 뽑는다
+        plan_ids = _approved_plan_ids(session, body.call_id if body.approved else None)
         # 결정 검사·기록은 server._approve 가 한다 (문자열 detail). 여기서는 코드 객체로 감싼다.
         try:
             outcome, result = await _server._approve(session, body.call_id, body.approved)
@@ -394,7 +415,7 @@ async def resume(
         raise _error(409, "PENDING_APPROVAL", f"아직 결정하지 않은 승인 건이 있다: {session.pending_ids}")
     run = _open_run(store, conversation_id)
     async with conversation.lock:
-        plan_ids = _server._pending_plan_ids(session)
+        plan_ids = _approved_plan_ids(session)
         try:
             outcome, result = await _server._resume(session)
         except HTTPException as exc:
@@ -424,7 +445,7 @@ def _continue_run(
     usage = _usage_json(result) if result is not None else run.usage_summary
     # 저장 실패의 뜻은 "실제로 재개가 돌았나"(result 유무)로 정한다: 안 돌았으면 카드 대기 그대로, 돌았으면 확인 필요 (문서 4절)
     failure = (
-        dict(on_failure=_decision_store_failure(), failure_status="awaiting_approval")
+        dict(on_failure=_decision_store_failure(), failure_status="awaiting_approval", keep_payload=True)
         if result is None
         else dict(on_failure=_resume_store_failure(plan_ids), failure_status="recovery_required")
     )

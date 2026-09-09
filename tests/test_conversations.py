@@ -260,6 +260,8 @@ def test_남은_카드_재전송에서_저장이_죽어도_확인_필요가_아�
         assert "남은 카드를 계속 결정" in r.json()["detail"]["message"]          # "변경 적용됐을 수 있다" 가 아니다
         assert "plan_ids" not in r.json()["detail"]
         assert store.active_run(cid).status == "awaiting_approval"            # 확인 필요가 아니라 카드 대기 그대로
+        turn = client.get(f"/conversations/{cid}", headers=USER).json()["turns"][0]
+        assert turn["payload"]["kind"] == "approval"                           # 계속할 재료(카드)가 기록에 남는다 (8차)
         # 티켓은 살아 있다 — 남은 카드를 결정하면 재개된다. 마지막 재개의 저장이 죽으면 plan_ids 에 A·B 둘 다
         dead["on"] = True
         r = client.post(f"/conversations/{cid}/approve", json={"call_id": "d2", "approved": True}, headers=USER)
@@ -267,6 +269,37 @@ def test_남은_카드_재전송에서_저장이_죽어도_확인_필요가_아�
     finally:
         restore()
     assert store.active_run(cid).status == "recovery_required"
+
+
+def test_거절한_카드의_Plan은_확인_목록에_들어가지_않는다(client, monkeypatch):
+    """자동 리뷰 8차: 티켓 전체에서 뽑으면 거절해서 실행된 적 없는 Plan 까지 "적용됐을 수 있다" 목록에 섞인다."""
+    from kukie.store import get_store
+    from pydantic_ai.tools import DeferredToolRequests
+    store = get_store()
+    original = store.update_run
+    dead = {"on": False}
+
+    def flaky(run_id, **fields):
+        if dead["on"]:
+            dead["on"] = False
+            raise RuntimeError("db down")
+        return original(run_id, **fields)
+
+    monkeypatch.setattr(store, "update_run", flaky)
+    cid = _new(client, shared=True)
+    pa, first = _pending_ticket_for_server("k1")
+    pb, second = _pending_ticket_for_server("k2")
+    batch = DeferredToolRequests(approvals=[first.approvals[0], second.approvals[0]],
+                                 metadata={**first.metadata, **second.metadata})
+    restore = _swap_run_agent([_fake(batch), _fake(KukieResponse(narration="하나만 적용"))])
+    try:
+        client.post(f"/conversations/{cid}/chat", json={"text": "둘"}, headers=USER)
+        client.post(f"/conversations/{cid}/approve", json={"call_id": "k2", "approved": False}, headers=USER)   # B 거절
+        dead["on"] = True
+        r = client.post(f"/conversations/{cid}/approve", json={"call_id": "k1", "approved": True}, headers=USER)  # A 승인 → 재개
+    finally:
+        restore()
+    assert r.status_code == 503 and r.json()["detail"]["plan_ids"] == [pa.id]     # 거절한 B 는 없다
 
 
 def test_재개_재시도_경로에서도_저장_실패_안내에_plan_ids가_실린다(client, monkeypatch):
