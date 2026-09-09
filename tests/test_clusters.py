@@ -309,3 +309,74 @@ def test_임시_kubeconfig는_주인만_읽고_블록을_벗어나면_사라진�
         assert path.exists() and oct(path.stat().st_mode & 0o777) == "0o600"
         assert yaml.safe_load(path.read_text(encoding="utf-8"))["current-context"] == "c"
     assert not path.exists()
+
+
+# ── 자동 리뷰 반영 ─────────────────────────────────────────
+
+def test_남의_클러스터를_방에_붙일_수_없다(client):
+    """P1: 이 검사가 없으면 남의 클러스터 id 로 방을 만들어 그 클러스터를 바꿀 수 있다."""
+    남의것 = get_store().create_cluster(
+        registered_by="다른사람", name="피해자", api_server="https://victim.example",
+        ca_data=CA, insecure=False, credential_encrypted=crypto.encrypt({"token": "비밀"}),
+        context_name="victim", default_namespace="default", fingerprint="fp-victim",
+    ).id
+    r = client.post("/conversations", json={"cluster_id": 남의것, "shared": True}, headers=USER)
+    assert r.status_code == 404 and r.json()["detail"]["code"] == "NOT_FOUND"
+
+
+def test_방의_팀은_클러스터가_정한다(client):
+    """🔴 화면이 보낸 team_id 를 그대로 믿으면 "승인 권한은 A팀, 실제 대상은 B팀 클러스터" 인 방이 생긴다."""
+    cluster = get_store().create_cluster(
+        registered_by="u-1", team_id="t-진짜", name="c", api_server="https://k.example",
+        ca_data=CA, insecure=False, credential_encrypted=crypto.encrypt({"token": "t"}),
+        context_name="ctx", default_namespace="default", fingerprint="fp",
+    ).id
+    created = client.post(
+        "/conversations", json={"cluster_id": cluster, "team_id": "t-거짓"}, headers=USER
+    ).json()
+    assert created["conversation"]["team_id"] == "t-진짜"
+
+
+def test_CA_와_insecure_를_함께_쓰면_거부한다():
+    """kubectl 이 그런 kubeconfig 를 거부한다 — 등록만 되고 실행이 실패하면 원인을 알기 어렵다."""
+    body = yaml.safe_load(kubeconfig())
+    body["clusters"][0]["cluster"]["insecure-skip-tls-verify"] = True
+    with pytest.raises(KubeconfigRejected, match="함께 쓸 수 없습니다"):
+        parse_kubeconfig(yaml.safe_dump(body))
+
+
+def test_사설_주소로_풀리는_이름도_거부한다(monkeypatch):
+    """P1: 이름만 보면 127.0.0.1 로 풀리는 이름을 등록해 서버가 대신 접속하게 만들 수 있다."""
+    from kukie.clusters import kubeconfig as module
+
+    monkeypatch.setattr(module, "_resolved", lambda host: ["127.0.0.1"])
+    with pytest.raises(KubeconfigRejected, match="풀리는 이름"):
+        parse_kubeconfig(kubeconfig(server_url="https://sneaky.example"))
+
+
+def test_같은_이름을_두_번_등록할_수_없다(client):
+    """team_id 가 NULL 이면 예전 UNIQUE 는 아무것도 막지 못했다."""
+    from sqlalchemy.exc import IntegrityError
+
+    _register(client, name="운영")
+    with pytest.raises(IntegrityError):
+        _register(client, name="운영")
+
+
+def test_자격증명을_바꿔도_context_이름은_그대로다(client):
+    """방마다 복사해 둔 context 이름이 바뀌면 기존 방이 전부 끊긴다."""
+    registered = _register(client)
+    다른이름 = kubeconfig(context="renamed", user={"token": "새-토큰"})
+    r = client.patch(f"/clusters/{registered['id']}", json={"kubeconfig": 다른이름}, headers=USER)
+    assert r.status_code == 200 and r.json()["context"] == "prod"
+
+
+def test_클러스터의_접속_대상이_바뀌면_기존_방은_거절한다(client):
+    """지문을 방에 복사해 두는 이유 — 승인한 대상과 실행 대상이 같은지 실행 직전에 확인한다."""
+    registered = _register(client)
+    room = client.post("/conversations", json={"cluster_id": registered["id"]},
+                       headers=USER).json()["conversation"]["id"]
+    get_store().update_cluster(registered["id"], fingerprint="다른-지문")
+
+    r = client.post(f"/conversations/{room}/chat", json={"text": "안녕"}, headers=USER)
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "CLUSTER_CHANGED"

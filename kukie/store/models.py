@@ -19,10 +19,12 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -188,8 +190,16 @@ class Cluster(Base):
 
     __tablename__ = "tbl_cluster"
     __table_args__ = (
-        # 이름은 팀 안에서 유일. 팀이 없는(개인) 클러스터는 등록한 사람 안에서 유일하다.
-        UniqueConstraint("team_id", "registered_by", "name", name="uq_cluster_name"),
+        # 이름 유일성은 조건에 따라 기준이 다르다. 하나의 UNIQUE 로는 못 한다 — SQL 은 NULL 을 서로
+        # 다른 값으로 보므로 (team_id, registered_by, name) 은 team_id 가 NULL 인 개인 클러스터를
+        # 전혀 막지 못하고, 팀 클러스터에서는 registered_by 가 섞여 같은 팀에 같은 이름이 둘 생긴다
+        # (자동 리뷰 지적). 조건부 인덱스 둘로 나눈다.
+        Index("uq_cluster_team_name", "team_id", "name",
+              unique=True, sqlite_where=text("team_id IS NOT NULL"),
+              postgresql_where=text("team_id IS NOT NULL")),
+        Index("uq_cluster_personal_name", "registered_by", "name",
+              unique=True, sqlite_where=text("team_id IS NULL"),
+              postgresql_where=text("team_id IS NULL")),
         CheckConstraint("api_server LIKE 'https://%'", name="ck_cluster_https"),
     )
 
