@@ -33,11 +33,14 @@ from typing import Any
 
 import yaml
 
+from sqlalchemy.exc import IntegrityError
+
 from kukie.store.models import PLAN_CLOSED, PLAN_FAILURE_REASONS, PLAN_STATUSES
 
 logger = logging.getLogger(__name__)
 
 PLAN_DIR = Path.home() / ".kukie" / "plans"
+ID_ATTEMPTS = 20        # 이름 충돌을 물러나며 재시도할 횟수
 FINAL_STATUSES = frozenset(PLAN_CLOSED)
 DRY_RUN_STATUSES = frozenset({"succeeded", "failed", "unsupported"})
 PlanTarget = dict[str, str | list[dict[str, str]]]
@@ -122,8 +125,9 @@ class ActionPlan:
         # 파일명 원자적 예약: "있나 확인 → 쓰기"로 나누면 확인과 쓰기 사이에 다른 프로세스가
         # 같은 이름을 잡을 수 있다. 확인 없이 exclusive 쓰기를 시도하고, 이미 있으면(FileExistsError)
         # 다음 번호로 재시도한다 — 판단이 "쓰는 순간" OS에서 이뤄져 틈이 없다.
-        suffix = 1
-        while True:
+        # 같은 이름이 있으면 -2, -3 … 으로 물러난다. 이름과 무관한 충돌(같은 run 에 같은 tool_call_id)이면
+        # 번호만 늘리며 영원히 돌게 되므로 몇 번만 시도하고 던진다.
+        for suffix in range(1, ID_ATTEMPTS + 1):
             plan_id = base_id if suffix == 1 else f"{base_id}-{suffix}"
             plan = cls(
                 id=plan_id,
@@ -144,11 +148,17 @@ class ActionPlan:
             )
             try:
                 plan._write(exclusive=True)
-            except FileExistsError:   # 누군가 먼저 이 이름을 썼음 → -2, -3 …
-                suffix += 1
-            else:
+            except FileExistsError:   # 누군가 먼저 이 이름을 썼음 → 다음 번호로
+                continue
+            try:
                 plan._insert()
-                return plan
+            except IntegrityError:
+                # 이름 예약은 파일이 하지만 원본은 표다 — 표에서 부딪히면 파일도 물리고 다음 번호로
+                # (자동 리뷰 지적: _insert 가 루프 밖이라 재시도되지 않았다)
+                plan.path.unlink(missing_ok=True)
+                continue
+            return plan
+        raise RuntimeError(f"Action Plan id 를 확보하지 못했다: {base_id}")
 
     @classmethod
     def load(cls, path: Path) -> "ActionPlan":

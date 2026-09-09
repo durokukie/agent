@@ -29,6 +29,10 @@ class ActiveRunExists(RuntimeError):
     """이 채팅방에 아직 끝나지 않은 run 이 있다."""
 
 
+class PlanMissing(LookupError):
+    """바꾸려는 계획 행이 표에 없다. 계획은 표가 원본이라 조용히 넘어가면 안 된다."""
+
+
 class ClusterInUse(RuntimeError):
     """이 클러스터를 쓰는 채팅방이 남아 있어 지울 수 없다."""
 
@@ -358,11 +362,17 @@ class ChatStore:
                     row.response_payload = error_payload("INTERRUPTED", message, 409)
                 row.status = "interrupted"
                 row.finished_at = now
+                # 계획도 **같은 트랜잭션에서** 닫는다. 따로 커밋하면 그 사이에 죽었을 때 run 은
+                # interrupted 인데 계획은 열린 채 남고, 다시 지나가는 경로가 없다 (자동 리뷰 지적).
+                for plan in db.scalars(
+                    select(ActionPlan).where(
+                        ActionPlan.run_id == row.id, ActionPlan.status.in_(PLAN_OPEN)
+                    )
+                ).all():
+                    approved = bool(plan.decision and plan.decision.get("approved"))
+                    plan.status = "UNKNOWN" if approved and plan.execution_result is None else "STALE"
             db.commit()
-            closed = [RunRow.of(r) for r in rows]
-        for run in closed:      # 중단된 run 의 승인 카드도 함께 닫는다 (STALE / UNKNOWN)
-            self.expire_open_plans(run.id)
-        return closed
+            return [RunRow.of(r) for r in rows]
 
     def list_runs(self, session_id: str) -> list[RunRow]:
         with self._factory() as db:
@@ -419,10 +429,12 @@ class ChatStore:
             return PlanRow.of(row) if row is not None else None
 
     def update_plan(self, plan_id: str, **fields: Any) -> None:
+        """행이 없으면 던진다. 계획은 표가 원본이라 "없으면 그만" 이 아니다 (자동 리뷰 지적) —
+        조용히 넘어가면 상태 변화가 .md 에만 남고 표와 어긋난다. 방·run 의 no-op 과 뜻이 다르다."""
         with self._factory() as db:
             row = db.get(ActionPlan, plan_id)
             if row is None:
-                return
+                raise PlanMissing(plan_id)
             for key, value in fields.items():
                 setattr(row, key, value)
             _check_applied(row.status, row.execution_result)

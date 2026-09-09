@@ -273,7 +273,9 @@ async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict
             ActionPlan.find_by_call_id(
                 approval_request.tool_call_id, run_id=session.deps.run_id,
             ).reject(session.deps.user_id)
-        except (OSError, ValueError) as exc:
+        except Exception as exc:
+            # DB 가 원본이 된 뒤로는 SQLAlchemyError 도 온다 (OSError·ValueError 만 잡으면
+            # DB 장애일 때만 안내가 사라지고 코드 없는 500 이 나간다 — 자동 리뷰 지적)
             logger.exception("거절 기록 실패 — 티켓 유지 (call_id=%s, plan_id=%s)",
                              call_id, approval_request.plan_id)
             raise HTTPException(503, f"거절을 기록하지 못했다. 같은 카드를 다시 결정하라: {exc}") from exc
