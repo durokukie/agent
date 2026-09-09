@@ -268,28 +268,38 @@ def _swap_run_agent(outputs):
     return lambda: setattr(srv, "_run_agent", original)
 
 
-def test_chat이_승인_카드를_주면_approve_뒤_다음_chat이_된다(client):
-    """리뷰 🔴: 승인 카드 run 이 활성으로 남아 approve 가 500, 방이 영구 BUSY 였다."""
+def test_chat이_승인_카드를_주면_approve가_같은_run을_이어서_끝내고_다음_chat이_된다(client):
+    """DB 문서 7절: 승인만으로 새 run 을 만들지 않는다 — 카드 run(awaiting_approval)을 이어서 completed 로."""
     cid = _new(client)
     _, ticket = _pending_ticket_for_server("call-f")
-    restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="적용됨")),
+    card_msgs = [ModelRequest(parts=[UserPromptPart(content="nginx 3개로")])]
+    resume_msgs = [ModelRequest(parts=[UserPromptPart(content="(tool 결과)")])]
+    restore = _swap_run_agent([_fake(ticket, card_msgs), _fake(KukieResponse(narration="적용됨"), resume_msgs),
                                _fake(KukieResponse(narration="다음 턴"))])
     try:
         r = client.post(f"/conversations/{cid}/chat", json={"text": "nginx 3개로"}, headers=USER)
         assert r.status_code == 200 and r.json()["kind"] == "approval"
-        turns = client.get(f"/conversations/{cid}", headers=USER).json()["turns"]
-        assert turns[0]["status"] == "awaiting_approval" and turns[0]["finished_at"] is None
-        assert client.get(f"/conversations/{cid}", headers=USER).json()["conversation"]["running"] is False
+        detail = client.get(f"/conversations/{cid}", headers=USER).json()
+        assert detail["turns"][0]["status"] == "awaiting_approval" and detail["turns"][0]["finished_at"] is None
+        assert detail["conversation"]["running"] is False                # 대기는 "실행 중" 이 아니다
+        r = client.post(f"/conversations/{cid}/chat", json={"text": "x"}, headers=USER)
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "PENDING_APPROVAL"   # 활성 run 하나
 
         r = client.post(f"/conversations/{cid}/approve", json={"call_id": "call-f", "approved": True}, headers=USER)
         assert r.status_code == 200 and r.json()["response"]["narration"] == "적용됨"
         turns = client.get(f"/conversations/{cid}", headers=USER).json()["turns"]
-        assert [(t["kind"], t["status"]) for t in turns] == [("chat", "completed"), ("approve", "completed")]
-        assert turns[0]["payload"]["kind"] == "approval"                 # 카드 응답은 그대로 남는다
-        assert turns[0]["finished_at"] is not None
+        assert [(t["kind"], t["status"]) for t in turns] == [("chat", "completed")]   # run 은 여전히 하나
+        assert turns[0]["payload"]["kind"] == "answer" and turns[0]["finished_at"] is not None
+        assert conversations.registry.get(cid).session.pending is None
+
+        # 재시작해도 카드 메시지 + 재개 메시지가 한 run 에 이어져 있어 history 가 온전하다
+        conversations.registry.clear()
+        client.get(f"/conversations/{cid}", headers=USER)
+        assert len(conversations.registry.get(cid).session.history) == 2
 
         r = client.post(f"/conversations/{cid}/chat", json={"text": "다음"}, headers=USER)
         assert r.status_code == 200 and r.json()["response"]["narration"] == "다음 턴"
+        assert len(client.get(f"/conversations/{cid}", headers=USER).json()["turns"]) == 2
     finally:
         restore()
 
@@ -316,32 +326,30 @@ def test_승인_대기_중_재시작하면_카드는_만료되고_그_턴의_기
         restore()
 
 
-def test_승인은_채팅방_단위로_run을_남기고_잠금은_방마다다(client):
+def test_승인_대기는_그_방만_막고_다른_방은_자유다(client):
     a, b = _new(client), _new(client)
-    plan, ticket = _pending_ticket_for_server("call-a")
-    conversations.registry.get(a).session.pending = ticket
-
-    # a 는 승인 대기 → chat 막힘, b 는 자유
-    r = client.post(f"/conversations/{a}/chat", json={"text": "x"}, headers=USER)
-    assert r.status_code == 409 and r.json()["detail"]["code"] == "PENDING_APPROVAL"
-    with agent.override(model=_model()):
-        assert client.post(f"/conversations/{b}/chat", json={"text": "x"}, headers=USER).status_code == 200
-
-    import kukie.server as srv
-    original = srv._run_agent
-    srv._run_agent = lambda session, **kw: _async(_fake(KukieResponse(narration="적용됨")))
+    _, ticket = _pending_ticket_for_server("call-a")
+    restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="b 답")),
+                               _fake(KukieResponse(narration="적용됨"))])
     try:
+        assert client.post(f"/conversations/{a}/chat", json={"text": "늘려"}, headers=USER).json()["kind"] == "approval"
+        # a 는 승인 대기 → chat 막힘, b 는 자유
+        r = client.post(f"/conversations/{a}/chat", json={"text": "x"}, headers=USER)
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "PENDING_APPROVAL"
+        r = client.post(f"/conversations/{b}/chat", json={"text": "x"}, headers=USER)
+        assert r.status_code == 200 and r.json()["response"]["narration"] == "b 답"
+
         r = client.post(f"/conversations/{a}/approve", json={"call_id": "call-a", "approved": True}, headers=USER)
+        assert r.status_code == 200 and r.json()["kind"] == "answer"
     finally:
-        srv._run_agent = original
-    assert r.status_code == 200 and r.json()["kind"] == "answer"
+        restore()
     turns = client.get(f"/conversations/{a}", headers=USER).json()["turns"]
-    assert [t["kind"] for t in turns] == ["approve"] and turns[0]["status"] == "completed"
+    assert [(t["kind"], t["status"]) for t in turns] == [("chat", "completed")]
     assert conversations.registry.get(a).session.pending is None
 
 
-def test_카드가_여러_장이면_마지막_결정까지_카드_run은_열려_있다(client):
-    """리뷰 🟡: 남은 카드가 있는데 카드 run 을 completed 로 닫으면 재시작 시 결과 없는 tool call 이 복원된다."""
+def test_카드가_여러_장이면_마지막_결정까지_run은_열려_있고_payload는_남은_카드다(client):
+    """문서 7절: 계획이 여러 개면 결정이 모일 때까지 기다린다."""
     from pydantic_ai.tools import DeferredToolRequests
     cid = _new(client)
     _, first = _pending_ticket_for_server("c1")
@@ -353,12 +361,13 @@ def test_카드가_여러_장이면_마지막_결정까지_카드_run은_열려_
         assert client.post(f"/conversations/{cid}/chat", json={"text": "두 개"}, headers=USER).json()["kind"] == "approval"
         r = client.post(f"/conversations/{cid}/approve", json={"call_id": "c1", "approved": True}, headers=USER)
         assert r.json()["kind"] == "approval"                            # 카드 한 장 남음
-        statuses = [t["status"] for t in client.get(f"/conversations/{cid}", headers=USER).json()["turns"]]
-        assert statuses == ["awaiting_approval", "awaiting_approval"]   # 아직 아무것도 닫지 않는다
+        turns = client.get(f"/conversations/{cid}", headers=USER).json()["turns"]
+        assert [t["status"] for t in turns] == ["awaiting_approval"]
+        assert [c["tool_call_id"] for c in turns[0]["payload"]["approvals"]] == ["c2"]
         r = client.post(f"/conversations/{cid}/approve", json={"call_id": "c2", "approved": True}, headers=USER)
         assert r.json()["response"]["narration"] == "둘 다 적용"
-        statuses = [t["status"] for t in client.get(f"/conversations/{cid}", headers=USER).json()["turns"]]
-        assert statuses == ["completed", "completed", "completed"]
+        turns = client.get(f"/conversations/{cid}", headers=USER).json()["turns"]
+        assert [t["status"] for t in turns] == ["completed"]
     finally:
         restore()
 
@@ -383,32 +392,60 @@ def test_모르는_call_id는_409_NOT_PENDING(client):
     assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
 
 
-def test_재개_실패는_503_RESUME_RETRYABLE이고_resume으로_이어간다(client):
+def test_재개_실패는_run을_recovery_required로_남기고_resume이_같은_run을_끝낸다(client):
+    """문서 4절: recovery_required = 실제 변경 결과가 불명확해 확인 필요. DURO-66 의 RESUME_RETRYABLE 과 같다."""
     cid = _new(client)
     _, ticket = _pending_ticket_for_server("call-r")
-    conversations.registry.get(cid).session.pending = ticket
-
-    import kukie.server as srv
-    original = srv._run_agent
-
-    async def fail(session, **kw):
-        raise RuntimeError("네트워크")
-
-    srv._run_agent = fail
+    restore = _swap_run_agent([_fake(ticket), RuntimeError("네트워크"), _fake(KukieResponse(narration="이번엔 됨"))])
     try:
+        assert client.post(f"/conversations/{cid}/chat", json={"text": "늘려"}, headers=USER).json()["kind"] == "approval"
         r = client.post(f"/conversations/{cid}/approve", json={"call_id": "call-r", "approved": True}, headers=USER)
         assert r.status_code == 503 and r.json()["detail"]["code"] == "RESUME_RETRYABLE"
-        assert conversations.registry.get(cid).session.pending is ticket      # 티켓 유지
-        failed = client.get(f"/conversations/{cid}", headers=USER).json()["turns"]
-        assert [(t["kind"], t["status"]) for t in failed] == [("approve", "failed")]   # 실패도 기록
-        assert failed[0]["error"]["code"] == "RESUME_RETRYABLE"
-        srv._run_agent = lambda session, **kw: _async(_fake(KukieResponse(narration="이번엔 됨")))
+        assert conversations.registry.get(cid).session.pending is not None       # 티켓 유지
+        turns = client.get(f"/conversations/{cid}", headers=USER).json()["turns"]
+        assert [(t["kind"], t["status"]) for t in turns] == [("chat", "recovery_required")]
+        assert turns[0]["error"]["code"] == "RESUME_RETRYABLE" and turns[0]["finished_at"] is None
+        r = client.post(f"/conversations/{cid}/chat", json={"text": "x"}, headers=USER)
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "RECOVERY_REQUIRED"
+
         r = client.post(f"/conversations/{cid}/resume", headers=USER)
+        assert r.status_code == 200 and r.json()["response"]["narration"] == "이번엔 됨"
     finally:
-        srv._run_agent = original
-    assert r.status_code == 200 and r.json()["response"]["narration"] == "이번엔 됨"
-    kinds = [t["kind"] for t in client.get(f"/conversations/{cid}", headers=USER).json()["turns"]]
-    assert kinds == ["approve", "resume"]
+        restore()
+    turns = client.get(f"/conversations/{cid}", headers=USER).json()["turns"]
+    assert [(t["kind"], t["status"]) for t in turns] == [("chat", "completed")]
+    assert turns[0]["error"] is None and turns[0]["payload"]["kind"] == "answer"
+
+
+def test_recovery_required_중_재시작하면_interrupted지만_확인_필요_코드는_남는다(client):
+    cid = _new(client)
+    _, ticket = _pending_ticket_for_server("call-k")
+    restore = _swap_run_agent([_fake(ticket), RuntimeError("네트워크")])
+    try:
+        client.post(f"/conversations/{cid}/chat", json={"text": "늘려"}, headers=USER)
+        client.post(f"/conversations/{cid}/approve", json={"call_id": "call-k", "approved": True}, headers=USER)
+    finally:
+        restore()
+    conversations.registry.clear()
+    turn = client.get(f"/conversations/{cid}", headers=USER).json()["turns"][0]
+    assert turn["status"] == "interrupted" and turn["error"]["code"] == "RESUME_RETRYABLE"
+    assert turn["finished_at"] is not None
+
+
+def test_응답이_유실된_뒤_같은_request_id로_재전송하면_승인_대기_중이라도_카드를_다시_준다(client):
+    cid = _new(client)
+    _, ticket = _pending_ticket_for_server("call-l")
+    restore = _swap_run_agent([_fake(ticket)])
+    try:
+        body = {"text": "늘려", "request_id": "lost"}
+        first = client.post(f"/conversations/{cid}/chat", json=body, headers=USER).json()
+        again = client.post(f"/conversations/{cid}/chat", json=body, headers=USER)
+    finally:
+        restore()
+    assert again.status_code == 200 and again.json() == first                   # PENDING_APPROVAL 이 아니라 재생
+    conversations.registry.clear()                                               # 재시작 뒤엔 만료된 카드 대신 오류
+    again = client.post(f"/conversations/{cid}/chat", json=body, headers=USER)
+    assert again.status_code == 409 and again.json()["detail"]["code"] == "INTERRUPTED"
 
 
 def test_재개할_티켓이_없으면_409_NOT_PENDING(client):
