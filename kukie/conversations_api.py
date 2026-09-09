@@ -323,15 +323,19 @@ def _save_or_fail(
         raise on_failure from exc
 
 
-def _chat_store_failure(exc_name: str = "") -> HTTPException:
+def _chat_store_failure() -> HTTPException:
     return _error(503, "STORE_FAILED",
                   "실행은 끝났지만 결과를 저장하지 못했다 — 같은 내용을 새 요청(request_id)으로 보내라")
 
 
-def _resume_store_failure(run: RunRow) -> HTTPException:
-    """승인·재개 뒤 저장 실패: kubectl 은 이미 돌았다. 같은 지시를 다시 넣게 하면 안 된다 — Plan 을 확인하게 한다."""
-    cards = (run.response_payload or {}).get("approvals", []) if run.response_payload else []
-    plan_ids = [c.get("plan_id") for c in cards if isinstance(c, dict) and c.get("plan_id")]
+def _decision_store_failure() -> HTTPException:
+    """남은 카드 재전송(아무것도 실행하지 않음)에서 저장 실패: 결정은 메모리에 남았고 티켓은 살아 있다."""
+    return _error(503, "STORE_FAILED", "결정은 받았지만 기록을 저장하지 못했다 — 남은 카드를 계속 결정하라")
+
+
+def _resume_store_failure(plan_ids: list[str]) -> HTTPException:
+    """승인·재개 뒤 저장 실패: kubectl 은 이미 돌았다. 같은 지시를 다시 넣게 하면 안 된다 — Plan 을 확인하게 한다.
+    plan_ids 는 재개 직전 티켓 전체에서 뽑은 것 (카드 여러 장·재시도 경로 모두 빠짐없이)."""
     return HTTPException(503, {
         "code": "STORE_FAILED",
         "message": "승인 결과는 처리됐지만 기록을 저장하지 못했다. 변경은 이미 적용됐을 수 있다 — 같은 지시를 다시 보내지 말고 Action Plan 을 확인하라",
@@ -363,12 +367,14 @@ async def approve(
         raise _busy()
     run = _open_run(store, conversation_id)
     async with conversation.lock:
+        # 재개가 돌면 _to_payload 가 티켓을 지우므로, 저장 실패 안내에 실을 Plan id 는 여기서 미리 뽑는다
+        plan_ids = _server._pending_plan_ids(session) if session.pending is not None else []
         # 결정 검사·기록은 server._approve 가 한다 (문자열 detail). 여기서는 코드 객체로 감싼다.
         try:
             outcome, result = await _server._approve(session, body.call_id, body.approved)
         except HTTPException as exc:
             raise _record_failure(store, run, _wrap(exc))
-        return _continue_run(store, conversation, run, outcome, result)
+        return _continue_run(store, conversation, run, outcome, result, plan_ids)
 
 
 @router.post("/{conversation_id}/resume")
@@ -388,11 +394,12 @@ async def resume(
         raise _error(409, "PENDING_APPROVAL", f"아직 결정하지 않은 승인 건이 있다: {session.pending_ids}")
     run = _open_run(store, conversation_id)
     async with conversation.lock:
+        plan_ids = _server._pending_plan_ids(session)
         try:
             outcome, result = await _server._resume(session)
         except HTTPException as exc:
             raise _record_failure(store, run, _wrap(exc))
-        return _continue_run(store, conversation, run, outcome, result)
+        return _continue_run(store, conversation, run, outcome, result, plan_ids)
 
 
 def _open_run(store: ChatStore, conversation_id: str) -> RunRow:
@@ -405,6 +412,7 @@ def _open_run(store: ChatStore, conversation_id: str) -> RunRow:
 
 def _continue_run(
     store: ChatStore, conversation: Conversation, run: RunRow, outcome: dict[str, Any], result: Any,
+    plan_ids: list[str],
 ) -> dict[str, Any]:
     """승인/재개 결과를 같은 run 에 남긴다 (문서 7절 "승인만으로 새 run 을 만들지 않는다").
 
@@ -414,7 +422,12 @@ def _continue_run(
     """
     messages = (run.agent_messages or []) + (_messages_json(result) if result is not None else [])
     usage = _usage_json(result) if result is not None else run.usage_summary
-    failure = dict(on_failure=_resume_store_failure(run), failure_status="recovery_required")
+    # 저장 실패의 뜻은 "실제로 재개가 돌았나"(result 유무)로 정한다: 안 돌았으면 카드 대기 그대로, 돌았으면 확인 필요 (문서 4절)
+    failure = (
+        dict(on_failure=_decision_store_failure(), failure_status="awaiting_approval")
+        if result is None
+        else dict(on_failure=_resume_store_failure(plan_ids), failure_status="recovery_required")
+    )
     if outcome.get("kind") == "approval":
         _save_or_fail(store, conversation.id, run, **failure, status="awaiting_approval", response_payload=outcome,
                       agent_messages=messages or None, usage_summary=usage)

@@ -231,6 +231,73 @@ def test_승인_뒤_저장이_죽으면_recovery_required와_plan_ids로_남고_
     assert statuses == ["interrupted", "completed"]
 
 
+def test_남은_카드_재전송에서_저장이_죽어도_확인_필요가_아니라_카드_대기_그대로다(client, monkeypatch):
+    """자동 리뷰 7차: 아무것도 실행하지 않은 경로(result 없음)에 recovery_required + "변경 적용됐을 수 있다" 를 적으면 사실 칸 오염."""
+    from kukie.store import get_store
+    from pydantic_ai.tools import DeferredToolRequests
+    store = get_store()
+    original = store.update_run
+    dead = {"on": False}
+
+    def flaky(run_id, **fields):
+        if dead["on"]:
+            dead["on"] = False                                                   # 한 번만 실패 — 대체 쓰기는 성공
+            raise RuntimeError("db down")
+        return original(run_id, **fields)
+
+    monkeypatch.setattr(store, "update_run", flaky)
+    cid = _new(client, shared=True)
+    pa, first = _pending_ticket_for_server("d1")
+    pb, second = _pending_ticket_for_server("d2")
+    batch = DeferredToolRequests(approvals=[first.approvals[0], second.approvals[0]],
+                                 metadata={**first.metadata, **second.metadata})
+    restore = _swap_run_agent([_fake(batch), _fake(KukieResponse(narration="둘 다 적용"))])
+    try:
+        client.post(f"/conversations/{cid}/chat", json={"text": "둘"}, headers=USER)
+        dead["on"] = True                                                        # 본 쓰기만 죽고 대체 쓰기는 산다
+        r = client.post(f"/conversations/{cid}/approve", json={"call_id": "d1", "approved": True}, headers=USER)
+        assert r.status_code == 503 and r.json()["detail"]["code"] == "STORE_FAILED"
+        assert "남은 카드를 계속 결정" in r.json()["detail"]["message"]          # "변경 적용됐을 수 있다" 가 아니다
+        assert "plan_ids" not in r.json()["detail"]
+        assert store.active_run(cid).status == "awaiting_approval"            # 확인 필요가 아니라 카드 대기 그대로
+        # 티켓은 살아 있다 — 남은 카드를 결정하면 재개된다. 마지막 재개의 저장이 죽으면 plan_ids 에 A·B 둘 다
+        dead["on"] = True
+        r = client.post(f"/conversations/{cid}/approve", json={"call_id": "d2", "approved": True}, headers=USER)
+        assert r.status_code == 503 and sorted(r.json()["detail"]["plan_ids"]) == sorted([pa.id, pb.id])
+    finally:
+        restore()
+    assert store.active_run(cid).status == "recovery_required"
+
+
+def test_재개_재시도_경로에서도_저장_실패_안내에_plan_ids가_실린다(client, monkeypatch):
+    """자동 리뷰 7차: 앞선 RESUME_RETRYABLE 이 카드 payload 를 error 로 덮은 뒤라 payload 에서 뽑으면 빈 배열이었다."""
+    from kukie.store import get_store
+    store = get_store()
+    original = store.update_run
+    dead = {"on": False}
+
+    def flaky(run_id, **fields):
+        if dead["on"]:
+            raise RuntimeError("db down")
+        return original(run_id, **fields)
+
+    monkeypatch.setattr(store, "update_run", flaky)
+    cid = _new(client, shared=True)
+    plan, ticket = _pending_ticket_for_server("rr")
+    restore = _swap_run_agent([_fake(ticket), RuntimeError("네트워크"), _fake(KukieResponse(narration="이번엔 됨"))])
+    try:
+        client.post(f"/conversations/{cid}/chat", json={"text": "늘려"}, headers=USER)
+        r = client.post(f"/conversations/{cid}/approve", json={"call_id": "rr", "approved": True}, headers=USER)
+        assert r.json()["detail"]["code"] == "RESUME_RETRYABLE"                 # 카드 payload 가 error 로 덮인다
+        dead["on"] = True
+        r = client.post(f"/conversations/{cid}/resume", headers=USER)           # 재개는 되는데 저장이 죽는다
+        assert r.status_code == 503 and r.json()["detail"]["code"] == "STORE_FAILED"
+        assert r.json()["detail"]["plan_ids"] == [plan.id]
+        dead["on"] = False
+    finally:
+        restore()
+
+
 def test_실패_표시도_저장_못_한_running_run은_다음_chat이_닫고_진행한다(client):
     """저장이 완전히 죽었다 살아난 경우: 잠금을 쥔 chat 이 DB 의 running 을 중단으로 닫는다."""
     from kukie.store import get_store
