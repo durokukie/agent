@@ -196,6 +196,27 @@ def add_target(ctx: RunContext[Deps]) -> str:
 
 
 @agent.instructions
+def add_current_mode(ctx: RunContext[Deps]) -> str:
+    """지금 무슨 모드인지 못 박는다 (#60).
+
+    모드를 바꿔도 AI 가 "학습 모드라 못 한다" 며 거절하는 일이 있었다 (첫 로컬 E2E, DURO-85).
+    시스템 프롬프트는 매 run 현재 스킬로 다시 만들어지지만, 대화 기록에 남은 **이전 모드의 거절
+    답변**이 모델을 그쪽으로 끈다. 모드 전환(`/mode`)은 LLM 을 부르지 않아 기록에 흔적도 없다.
+
+    그래서 모델이 문맥에서 추론하게 두지 않고, 현재 모드와 "과거 답변을 근거로 거절하지 마라" 를
+    매 턴 직접 말한다.
+    """
+    skill = ctx.deps.skill
+    tools = ", ".join(sorted(skill.allowed_tools)) or "없음"
+    return (
+        f"[현재 모드: {skill.name}] 지금 호출할 수 있는 툴은 {tools} 뿐이다.\n"
+        "대화 기록에 다른 모드에서 한 답변(예: \"학습 모드에서는 실행할 수 없습니다\")이 남아 있어도 "
+        "그것은 지나간 상태다. 지금 무엇이 가능한지는 위에 적힌 현재 모드와 지금 노출된 툴이 정한다. "
+        "과거 답변을 근거로 거절하지 마라."
+    )
+
+
+@agent.instructions
 def add_skill_prompt(ctx: RunContext[Deps]) -> str:
     """현재 스킬의 전용 프롬프트 주입 (스킬 = 프롬프트+툴+응답형식).
 

@@ -371,6 +371,9 @@ async def chat(
             usage_summary=_usage_json(result) if result is not None else None,
         )
         store.update_session(conversation_id, current_mode=session.skill.name)
+        if kind == "chat":
+            # 첫 마디로 방 제목을 짓는다 (#59). 이미 제목이 있으면 저장소가 건드리지 않는다.
+            store.name_from_first_message(conversation_id, body.text)
         return payload
 
 

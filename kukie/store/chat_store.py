@@ -16,7 +16,9 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from kukie.store.models import PLAN_OPEN, RUN_ACTIVE, ActionPlan, ChatRun, ChatSession, Cluster
+from kukie.store.models import (
+    DEFAULT_TITLE, PLAN_OPEN, RUN_ACTIVE, ActionPlan, ChatRun, ChatSession, Cluster,
+)
 
 _UNSET: Any = object()
 
@@ -226,7 +228,7 @@ class ChatStore:
         context_name: str,
         namespace: str,
         mode: str,
-        title: str = "새 대화",
+        title: str = DEFAULT_TITLE,
         installation_id: str | None = None,
         cluster_fingerprint: str | None = None,
         team_id: str | None = None,
@@ -272,6 +274,23 @@ class ChatStore:
                 setattr(row, key, value)
             row.version += 1
             db.commit()
+
+    def name_from_first_message(self, session_id: str, text: str, *, limit: int = 30) -> str | None:
+        """첫 마디로 제목을 짓는다 (#59, 기획 05 §6). 이미 사용자가·AI 가 지은 제목이면 건드리지 않는다.
+
+        반환은 새 제목, 안 바꿨으면 None. 앱 픽스처와 같은 규칙(앞 30자)이라 화면 동작이 일치한다.
+        AI 가 요약해 짓는 방식은 후속이다.
+        """
+        title = " ".join(text.split())[:limit].strip()
+        if not title:
+            return None
+        with self._factory() as db:
+            row = db.get(ChatSession, session_id)
+            if row is None or row.title != DEFAULT_TITLE:
+                return None
+            row.title = title
+            db.commit()
+            return title
 
     # ── run ──────────────────────────────────────────────────
 

@@ -50,6 +50,9 @@ RUN_KINDS = ("chat", "mode_change")
 
 MODES = ("학습", "진단", "실습")
 
+#: 방을 만들 때의 기본 제목. 첫 마디가 오면 이 값일 때만 바꾼다 (#59).
+DEFAULT_TITLE = "새 대화"
+
 # 클러스터 (기획 04 §8). MVP 는 Generic Kubernetes 만 — EKS/GKE/AKS 의 Cloud Identity 는 후속(§6).
 CLUSTER_PROVIDERS = ("GENERIC",)
 # 마지막 Connection Test 결과. auth_expired 는 붙었지만 권한이 없거나 만료된 상태.
@@ -83,7 +86,7 @@ class ChatSession(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(String(64), index=True)                 # tbl_user.id (Spring)
-    title: Mapped[str] = mapped_column(String(200), default="새 대화")
+    title: Mapped[str] = mapped_column(String(200), default=DEFAULT_TITLE)
     current_mode: Mapped[str] = mapped_column(String(20))                        # MODES — 다음 요청에 적용
     installation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)   # kubectl 을 실행하는 agent 설치 환경
     context_name: Mapped[str] = mapped_column(String(200))                       # kubeconfig context
