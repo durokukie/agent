@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -158,15 +159,20 @@ async def test_cluster(
     _require_key()
     from datetime import datetime, timezone
 
-    try:
+    def probe() -> tuple[Any, Any]:
         with kubeconfig_for(store, cluster_id) as path:
-            version = run_kubectl(
-                ["version", "-o", "json"], context=row.context_name, kubeconfig=path
+            return (
+                run_kubectl(["version", "-o", "json"], context=row.context_name, kubeconfig=path),
+                run_kubectl(
+                    ["auth", "can-i", "update", "deployments", "-n", row.default_namespace],
+                    context=row.context_name, kubeconfig=path,
+                ),
             )
-            can_edit = run_kubectl(
-                ["auth", "can-i", "update", "deployments", "-n", row.default_namespace],
-                context=row.context_name, kubeconfig=path,
-            )
+
+    try:
+        # run_kubectl 은 subprocess.run 을 그대로 부른다. 여기서 직접 부르면 닿지 않는 주소일 때
+        # 최대 60초(version + can-i) 동안 서버 전체가 멈춘다 (자동 리뷰 지적). 스레드로 넘긴다.
+        version, can_edit = await to_thread.run_sync(probe)
     except ClusterGone:
         raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}") from None
     except crypto.CredentialUnreadable as exc:
@@ -203,9 +209,11 @@ async def update_cluster(
                 409, "CLUSTER_MISMATCH",
                 "다른 클러스터의 kubeconfig 입니다 — 자격증명 교체는 같은 클러스터만 됩니다",
             )
+        # context 이름은 바꾸지 않는다. 지문은 주소·CA 만 덮으므로 새 kubeconfig 의 context 이름이
+        # 달라도 통과하는데, 그 이름을 방마다 복사해 뒀기 때문에 바꾸면 기존 방이 전부 엉뚱한
+        # context 를 가리킨다 (자동 리뷰 지적). 이름을 바꿔야 하면 다시 등록한다.
         fields.update(
             credential_encrypted=crypto.encrypt(parsed.credential),
-            context_name=parsed.context_name,
             ca_data=parsed.ca_data,
             insecure=parsed.insecure,
             status="disconnected",       # 바꿨으니 다시 확인해야 한다
