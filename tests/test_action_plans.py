@@ -297,3 +297,18 @@ def test_결정_전_카드도_다른_이유로_run이_닫히면_STALE이_된다(
     get_store().interrupt_active_runs(room, "중단")
 
     assert _plans(room)[0].status == "STALE"
+
+
+def test_실패한_실행_결과로는_APPLIED가_될_수_없다(client):
+    """DB 문서 5절 — APPLIED 는 success=true, exit_code=0 인 결과를 요구한다."""
+    room = _room(client)
+    _card(client, room)
+    store = get_store()
+    plan = _plans(room)[0]
+    store.update_plan(plan.id, decision={"approved": True, "user_id": "u-1", "at": "2026-09-10T00:00:00+00:00"},
+                      status="APPROVED")
+
+    with pytest.raises(ValueError, match="성공한 실행 결과"):
+        store.update_plan(plan.id, status="APPLIED",
+                          execution_result={"success": False, "exit_code": 1, "stdout": "", "stderr": "x"})
+    assert _plans(room)[0].status == "APPROVED"

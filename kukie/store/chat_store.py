@@ -151,6 +151,22 @@ def error_payload(code: str, message: str, http_status: int, **extra: Any) -> di
     return {"kind": "error", "code": code, "message": message, "http_status": http_status, **extra}
 
 
+_APPLIED = ("APPLIED", "EFFECT_VERIFIED")
+
+
+def _check_applied(status: str | None, result: dict[str, Any] | None) -> None:
+    """DB 문서 5절: "executed(=APPLIED)라면 결과의 success=true, exit_code=0 을 요구한다".
+
+    문서는 DB 가 검사한다고 적었지만 JSON 안을 들여다보는 CHECK 는 SQLite 와 Postgres 문법이 달라
+    여기서 검사한다. 나머지 셋(결정 유무·결과 유무·실패 사유)은 표의 CHECK 가 본다.
+    저장된 값의 앞뒤가 맞는지 보는 검사이고, 클러스터의 현재 상태를 증명하지는 않는다.
+    """
+    if status not in _APPLIED:
+        return
+    if not isinstance(result, dict) or result.get("success") is not True or result.get("exit_code") != 0:
+        raise ValueError(f"{status} 는 성공한 실행 결과(success=true, exit_code=0)를 요구한다")
+
+
 def _plan_title(plan: ActionPlan) -> str:
     """목록에 보일 한 줄. 변경 툴의 intent(왜 하는지)가 사람이 읽기 가장 좋다."""
     payload = plan.plan_payload or {}
@@ -340,6 +356,7 @@ class ChatStore:
         status: str = "DRAFT",
     ) -> PlanRow:
         with self._factory() as db:
+            _check_applied(status, None)
             row = ActionPlan(
                 id=plan_id, run_id=run_id, tool_call_id=tool_call_id, tool_name=tool_name,
                 status=status, risk=risk, plan_payload=plan_payload, request_hash=request_hash,
@@ -371,6 +388,7 @@ class ChatStore:
                 return
             for key, value in fields.items():
                 setattr(row, key, value)
+            _check_applied(row.status, row.execution_result)
             db.commit()
 
     def list_plans_for_run(self, run_id: str) -> list[PlanRow]:
