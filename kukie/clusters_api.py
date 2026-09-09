@@ -18,6 +18,7 @@ from typing import Any
 
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, ConfigDict, Field
 
 import kukie.server as _server   # 순환 import: 이름은 호출 시점에만 쓴다
@@ -98,9 +99,14 @@ def _owned(store: ChatStore, cluster_id: str, user: User) -> ClusterRow:
     return row
 
 
-def _parse(body_text: str, context: str | None):
-    try:
+async def _parse(body_text: str, context: str | None):
+    """kubeconfig 검사. 이름 해석(getaddrinfo)이 블로킹이라 스레드로 넘긴다 — 응답하지 않는
+    네임서버를 가진 도메인을 등록하면 그동안 서버 전체가 멈춘다 (자동 리뷰 지적)."""
+    def run():
         return parse_kubeconfig(body_text, context_name=context, allow_local=allow_local_clusters())
+
+    try:
+        return await to_thread.run_sync(run)
     except KubeconfigRejected as exc:
         raise _error(400, "KUBECONFIG_REJECTED", str(exc)) from None
 
@@ -114,19 +120,22 @@ async def register_cluster(
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
     _require_key()
-    parsed = _parse(body.kubeconfig, body.context)
-    row = store.create_cluster(
-        registered_by=user.id,
-        team_id=body.team_id,
-        name=body.name.strip(),
-        api_server=parsed.api_server,
-        ca_data=parsed.ca_data,
-        insecure=parsed.insecure,
-        credential_encrypted=crypto.encrypt(parsed.credential),
-        context_name=parsed.context_name,
-        default_namespace=(body.namespace or parsed.namespace).strip() or "default",
-        fingerprint=parsed.fingerprint,
-    )
+    parsed = await _parse(body.kubeconfig, body.context)
+    try:
+        row = store.create_cluster(
+            registered_by=user.id,
+            team_id=body.team_id,
+            name=body.name.strip(),
+            api_server=parsed.api_server,
+            ca_data=parsed.ca_data,
+            insecure=parsed.insecure,
+            credential_encrypted=crypto.encrypt(parsed.credential),
+            context_name=parsed.context_name,
+            default_namespace=(body.namespace or parsed.namespace).strip() or "default",
+            fingerprint=parsed.fingerprint,
+        )
+    except IntegrityError:
+        raise _error(409, "CLUSTER_NAME_TAKEN", f"같은 이름의 클러스터가 이미 있습니다: {body.name.strip()}") from None
     return _view(row)
 
 
@@ -203,7 +212,7 @@ async def update_cluster(
         fields["default_namespace"] = body.namespace.strip() or "default"
     if body.kubeconfig is not None:
         _require_key()
-        parsed = _parse(body.kubeconfig, body.context)
+        parsed = await _parse(body.kubeconfig, body.context)
         if parsed.fingerprint != row.fingerprint:
             raise _error(
                 409, "CLUSTER_MISMATCH",
@@ -220,7 +229,10 @@ async def update_cluster(
         )
     if not fields:
         raise _error(400, "NOTHING_TO_UPDATE", "바꿀 내용이 없습니다")
-    store.update_cluster(cluster_id, **fields)
+    try:
+        store.update_cluster(cluster_id, **fields)
+    except IntegrityError:
+        raise _error(409, "CLUSTER_NAME_TAKEN", f"같은 이름의 클러스터가 이미 있습니다: {fields.get('name')}") from None
     updated = store.get_cluster(cluster_id)
     assert updated is not None
     return _view(updated)

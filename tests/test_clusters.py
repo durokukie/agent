@@ -55,8 +55,8 @@ def client(monkeypatch, tmp_path):
     return TestClient(server.app)
 
 
-def _register(client, **body) -> dict:
-    body.setdefault("kubeconfig", kubeconfig())
+def _register(client, *, server_kubeconfig: str | None = None, **body) -> dict:
+    body.setdefault("kubeconfig", server_kubeconfig or kubeconfig())
     body.setdefault("name", "운영")
     r = client.post("/clusters", json=body, headers=USER)
     assert r.status_code == 200, r.text
@@ -354,13 +354,21 @@ def test_사설_주소로_풀리는_이름도_거부한다(monkeypatch):
         parse_kubeconfig(kubeconfig(server_url="https://sneaky.example"))
 
 
-def test_같은_이름을_두_번_등록할_수_없다(client):
-    """team_id 가 NULL 이면 예전 UNIQUE 는 아무것도 막지 못했다."""
-    from sqlalchemy.exc import IntegrityError
+def test_같은_이름을_두_번_등록하면_409(client):
+    """team_id 가 NULL 이면 예전 UNIQUE 는 아무것도 막지 못했다.
 
+    제약을 실제로 걸고 나니 이번엔 500 이 나갔다 — 사용자 실수는 500 이 아니라 안내여야 한다.
+    """
     _register(client, name="운영")
-    with pytest.raises(IntegrityError):
-        _register(client, name="운영")
+    r = client.post("/clusters", json={"kubeconfig": kubeconfig(), "name": "운영"}, headers=USER)
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "CLUSTER_NAME_TAKEN"
+
+
+def test_이름_변경도_충돌하면_409(client):
+    first = _register(client, name="운영")
+    _register(client, name="스테이징", server_kubeconfig=kubeconfig(server_url="https://b.example"))
+    r = client.patch(f"/clusters/{first['id']}", json={"name": "스테이징"}, headers=USER)
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "CLUSTER_NAME_TAKEN"
 
 
 def test_자격증명을_바꿔도_context_이름은_그대로다(client):
