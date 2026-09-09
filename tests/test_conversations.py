@@ -176,10 +176,59 @@ def test_결과_저장이_실패해도_방이_영구_BUSY로_남지_않는다(cl
     with agent.override(model=_model("첫 답")):
         r = client.post(f"/conversations/{cid}/chat", json={"text": "파드"}, headers=USER)
     assert r.status_code == 503 and r.json()["detail"]["code"] == "STORE_FAILED"
+    assert "새 요청" in r.json()["detail"]["message"]                             # 같은 request_id 로는 같은 실패가 재생된다
     assert client.get(f"/conversations/{cid}", headers=USER).json()["turns"][0]["status"] == "failed"
     with agent.override(model=_model("둘째 답")):
         r = client.post(f"/conversations/{cid}/chat", json={"text": "파드"}, headers=USER)
     assert r.status_code == 200 and r.json()["response"]["narration"] == "둘째 답"
+
+
+def test_저장_실패한_run을_같은_request_id로_재전송해도_영원히_BUSY가_아니다(client):
+    """자동 리뷰 6차: 재전송 판정이 밀린 run 정리보다 앞이라, 같은 request_id 재시도가 저장된 실패·BUSY 를 영원히 재생했다."""
+    from kukie.store import get_store
+    cid = _new(client)
+    # 대체 쓰기까지 실패해 running 으로 남은 run 을 흉내낸다
+    get_store().start_run(cid, request_id="r-stuck", kind="chat", mode="학습", input_text="파드")
+    r = client.post(f"/conversations/{cid}/chat", json={"text": "파드", "request_id": "r-stuck"}, headers=USER)
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "INTERRUPTED"      # BUSY 가 아니라 "새 요청으로"
+    assert "새 요청" in r.json()["detail"]["message"]
+    with agent.override(model=_model("살아남")):
+        assert client.post(f"/conversations/{cid}/chat", json={"text": "파드"}, headers=USER).status_code == 200
+
+
+def test_승인_뒤_저장이_죽으면_recovery_required와_plan_ids로_남고_다음_chat이_방을_풀어준다(client, monkeypatch):
+    """자동 리뷰 6차: kubectl 이 이미 돈 run 을 failed 로 적고 "다시 보내라" 하면 같은 변경을 또 시킬 수 있다.
+    저장이 두 번 다 죽어 awaiting_approval 이 남아도 다음 chat 이 닫아야 한다."""
+    from kukie.store import get_store
+    store = get_store()
+    original = store.update_run
+    dead = {"on": False}
+
+    def flaky(run_id, **fields):
+        if dead["on"]:
+            raise RuntimeError("db down")
+        return original(run_id, **fields)
+
+    monkeypatch.setattr(store, "update_run", flaky)
+    cid = _new(client, shared=True)
+    plan, ticket = _pending_ticket_for_server("call-st")
+    restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="적용됨"))])
+    try:
+        assert client.post(f"/conversations/{cid}/chat", json={"text": "늘려"}, headers=USER).json()["kind"] == "approval"
+        dead["on"] = True                                                         # 승인 결과 저장부터 DB 가 죽는다
+        r = client.post(f"/conversations/{cid}/approve", json={"call_id": "call-st", "approved": True}, headers=USER)
+        assert r.status_code == 503 and r.json()["detail"]["code"] == "STORE_FAILED"
+        assert r.json()["detail"]["plan_ids"] == [plan.id]                       # 확인할 Plan 을 알려 준다
+        assert "다시 보내지 말고" in r.json()["detail"]["message"]
+        dead["on"] = False                                                        # DB 복구. run 은 awaiting_approval 그대로, 메모리 티켓은 없음
+        assert store.active_run(cid).status == "awaiting_approval"
+    finally:
+        restore()
+    with agent.override(model=_model("풀렸다")):
+        r = client.post(f"/conversations/{cid}/chat", json={"text": "다음"}, headers=USER)
+    assert r.status_code == 200 and r.json()["response"]["narration"] == "풀렸다"
+    statuses = [t["status"] for t in client.get(f"/conversations/{cid}", headers=USER).json()["turns"]]
+    assert statuses == ["interrupted", "completed"]
 
 
 def test_실패_표시도_저장_못_한_running_run은_다음_chat이_닫고_진행한다(client):

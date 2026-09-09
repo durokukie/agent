@@ -247,6 +247,10 @@ async def chat(
     if stored is not None:
         if stored.input_text != body.text or stored.kind != kind:
             raise _error(409, "REQUEST_MISMATCH", f"같은 request_id 로 다른 입력을 보냈다: {body.request_id}")
+        if stored.status == "running" and not conversation.lock.locked():
+            # 실행 중이라는데 이 방의 잠금이 비어 있다 = 결과 저장에 실패한 run 이다. 영원히 BUSY 를 재생하지 않도록 닫는다
+            store.interrupt_active_runs(conversation_id, "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라")
+            stored = store.find_run(conversation_id, body.request_id) or stored
         return _replay(stored)
 
     if conversation.lock.locked():
@@ -257,12 +261,14 @@ async def chat(
         raise _error(409, "RECOVERY_REQUIRED", "재개가 실패한 요청이 있다 — /resume 으로 다시 시도")
 
     async with conversation.lock:
-        # 잠금을 쥔 지금 이 방에 실행 중인 run 은 없다. DB 에 running 이 남아 있다면 결과 저장에 실패한 run 이다 (팀원 리뷰 3) —
-        # 그대로 두면 이 방은 영원히 BUSY 라, 중단으로 닫고 진행한다.
+        # 잠금을 쥔 지금 이 방에 실행 중인 run 은 없고, 여기까지 왔으면 메모리에 이어갈 티켓(session.pending)도 없다.
+        # 그런데 DB 에 활성 run(running / awaiting_approval / recovery_required)이 남아 있다면 결과 저장에 실패한 run 이다
+        # (팀원 리뷰 3, 자동 리뷰 6차) — 그대로 두면 이 방은 영원히 BUSY 라, 중단으로 닫고 진행한다. 저장 실패 사정(error)은 남는다.
         stale = store.active_run(conversation_id)
-        if stale is not None and stale.status == "running":
-            logger.warning("결과가 저장되지 않은 run 을 닫는다 (conversation=%s, run=%s)", conversation_id, stale.id)
-            store.interrupt_active_runs(conversation_id, "결과를 저장하지 못해 중단된 요청이다")
+        if stale is not None:
+            logger.warning("결과가 저장되지 않은 run 을 닫는다 (conversation=%s, run=%s, status=%s)",
+                           conversation_id, stale.id, stale.status)
+            store.interrupt_active_runs(conversation_id, "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라")
         try:
             run, created = store.start_run(
                 conversation_id, request_id=body.request_id, kind=kind,
@@ -290,7 +296,7 @@ async def chat(
         # 승인 카드면 run 은 열린 채(awaiting_approval) 남는다 — approve/resume 이 이어서 끝낸다 (문서 7절)
         status = "awaiting_approval" if payload.get("kind") == "approval" else "completed"
         _save_or_fail(
-            store, conversation_id, run,
+            store, conversation_id, run, on_failure=_chat_store_failure(), failure_status="failed",
             status=status, response_payload=payload,
             agent_messages=_messages_json(result) if result is not None else None,
             usage_summary=_usage_json(result) if result is not None else None,
@@ -299,18 +305,38 @@ async def chat(
         return payload
 
 
-def _save_or_fail(store: ChatStore, conversation_id: str, run: RunRow, **fields: Any) -> None:
-    """실행 결과 저장. 실패하면 run 을 failed 로라도 남기고 503 STORE_FAILED — 그것도 안 되면 다음 chat 이 running 을 닫는다."""
+def _save_or_fail(
+    store: ChatStore, conversation_id: str, run: RunRow, *, on_failure: HTTPException, failure_status: str,
+    **fields: Any,
+) -> None:
+    """실행 결과 저장. 실패하면 run 을 failure_status 로라도 남기고 on_failure 를 던진다 — 그것도 안 되면 다음 chat 이
+    잠금을 쥔 채 활성 run 을 닫는다. 호출자가 상태·문구를 고른다: 모델 답변만 잃은 chat 은 failed, kubectl 이 이미 돈
+    승인·재개는 recovery_required ("변경은 적용됐을 수 있다", 문서 4절)."""
     try:
         store.update_run(run.id, **fields)
     except Exception as exc:
         logger.exception("실행 결과 저장 실패 (conversation=%s, run=%s)", conversation_id, run.id)
-        failed = _error(503, "STORE_FAILED", f"실행은 끝났지만 결과를 저장하지 못했다 ({type(exc).__name__}) — 다시 보내라")
         try:
-            store.update_run(run.id, status="failed", response_payload=_error_record(failed))
+            store.update_run(run.id, status=failure_status, response_payload=_error_record(on_failure))
         except Exception:
             logger.exception("실패 표시도 저장하지 못했다 (run=%s)", run.id)
-        raise failed from exc
+        raise on_failure from exc
+
+
+def _chat_store_failure(exc_name: str = "") -> HTTPException:
+    return _error(503, "STORE_FAILED",
+                  "실행은 끝났지만 결과를 저장하지 못했다 — 같은 내용을 새 요청(request_id)으로 보내라")
+
+
+def _resume_store_failure(run: RunRow) -> HTTPException:
+    """승인·재개 뒤 저장 실패: kubectl 은 이미 돌았다. 같은 지시를 다시 넣게 하면 안 된다 — Plan 을 확인하게 한다."""
+    cards = (run.response_payload or {}).get("approvals", []) if run.response_payload else []
+    plan_ids = [c.get("plan_id") for c in cards if isinstance(c, dict) and c.get("plan_id")]
+    return HTTPException(503, {
+        "code": "STORE_FAILED",
+        "message": "승인 결과는 처리됐지만 기록을 저장하지 못했다. 변경은 이미 적용됐을 수 있다 — 같은 지시를 다시 보내지 말고 Action Plan 을 확인하라",
+        "plan_ids": plan_ids,
+    })
 
 
 def _replay(run: RunRow) -> dict[str, Any]:
@@ -388,11 +414,12 @@ def _continue_run(
     """
     messages = (run.agent_messages or []) + (_messages_json(result) if result is not None else [])
     usage = _usage_json(result) if result is not None else run.usage_summary
+    failure = dict(on_failure=_resume_store_failure(run), failure_status="recovery_required")
     if outcome.get("kind") == "approval":
-        _save_or_fail(store, conversation.id, run, status="awaiting_approval", response_payload=outcome,
+        _save_or_fail(store, conversation.id, run, **failure, status="awaiting_approval", response_payload=outcome,
                       agent_messages=messages or None, usage_summary=usage)
         return outcome
-    _save_or_fail(store, conversation.id, run, status="completed", response_payload=outcome,
+    _save_or_fail(store, conversation.id, run, **failure, status="completed", response_payload=outcome,
                   agent_messages=messages or None, usage_summary=usage)
     store.update_session(conversation.id, current_mode=conversation.session.skill.name)
     return outcome
