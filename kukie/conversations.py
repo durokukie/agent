@@ -7,8 +7,11 @@ DB 에 있는 것: 채팅방 행, run 행(입력·응답·이 run 의 ModelMessa
 최근 HISTORY_MAX_RUNS 개, 직렬화 크기 HISTORY_MAX_BYTES 까지 (오래된 것부터 버린다).
 승인 카드(pending)도 복원한다 (#58). 카드가 DB 표 tbl_action_plan 에 남으므로, 아직 WAITING_APPROVAL 인
 계획이 있는 run 은 그 tool call 을 되살려 사용자가 이어서 결정할 수 있다. 자동 재개는 아니다 — 결정은
-사람이 다시 누른다 (문서 5절 "재시작 후 자동 재개하는 구조는 아니다"). 결정 기록은 메모리에만 있으므로
-여러 장 중 일부만 결정한 상태였다면 전부 다시 묻는다 (아직 아무것도 실행되지 않았으므로 안전하다).
+사람이 다시 누른다 (문서 5절 "재시작 후 자동 재개하는 구조는 아니다").
+
+승인 결정은 메모리에만 있어 여러 장 중 일부만 승인한 상태였다면 전부 다시 묻는다 (아직 아무것도
+실행되지 않았으므로 안전하다). **거절은 다르다** — 표에 남으므로 다시 묻지 않고, 거절이 섞인 run 은
+아예 되살리지 않고 중단으로 닫는다 (아래 _restore_pending).
 
 되살릴 수 없는 활성 run 은 예전대로 interrupted 로 닫고 그 메시지는 버린다 — 승인 카드 run 의 마지막
 메시지는 결과 없는 tool call 이라, 그대로 이어 붙이면 다음 chat 에서 모델이 대화를 거부한다.
@@ -126,9 +129,13 @@ def _unanswered_calls(messages: list[Any]) -> dict[str, ToolCallPart]:
 def _restore_pending(store: ChatStore, run: RunRow) -> DeferredToolRequests | None:
     """아직 결정되지 않은 승인 카드를 DB 에서 되살린다 (#58). 되살릴 수 없으면 None — 부르는 쪽이 run 을 닫는다.
 
-    조건은 셋이다: run 이 승인 대기 중이고, 그 run 의 모델 메시지가 남아 있고, 그 run 의 열린 계획이
-    전부 WAITING_APPROVAL 이어야 한다. 승인까지 갔던 계획(APPROVED/EXECUTING)이 섞여 있으면 kubectl 이
-    돌았는지 모르므로 카드를 다시 내밀지 않는다 — interrupt 경로가 그것들을 UNKNOWN 으로 닫는다.
+    되살리는 조건은 하나다: **답 없는 tool call 집합이 대기 카드(WAITING_APPROVAL) 집합과 정확히 같아야 한다.**
+
+    그래서 다음이 전부 걸러진다.
+      - 승인까지 갔던 계획(APPROVED/EXECUTING) — kubectl 이 돌았는지 모른다
+      - **이미 거절한 계획(REJECTED)** — 표에서는 닫혔지만 그 tool call 은 기록에 답 없이 남아,
+        남은 카드만 되살려 재개하면 그 call 이 답 없이 모델에 가서 재개가 영원히 실패한다
+    걸러지면 예전대로 run 을 중단으로 닫고 계획은 STALE / UNKNOWN 이 된다.
     """
     if run.status != "awaiting_approval" or not run.agent_messages:
         return None
