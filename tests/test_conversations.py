@@ -306,6 +306,7 @@ def test_승인_대기_중_재시작하면_카드는_만료되고_그_턴의_기
 
         detail = client.get(f"/conversations/{cid}", headers=USER).json()
         assert detail["turns"][0]["status"] == "interrupted" and detail["turns"][0]["error"]["code"] == "INTERRUPTED"
+        assert detail["turns"][0]["payload"] is None                     # 만료된 카드는 다시 그리지 않는다
         assert detail["session"]["pending"] == [] and detail["conversation"]["running"] is False
         assert conversations.registry.get(cid).session.history == []   # 만료된 턴의 메시지는 버린다
 
@@ -337,6 +338,43 @@ def test_승인은_채팅방_단위로_run을_남기고_잠금은_방마다다(c
     turns = client.get(f"/conversations/{a}", headers=USER).json()["turns"]
     assert [t["kind"] for t in turns] == ["approve"] and turns[0]["status"] == "completed"
     assert conversations.registry.get(a).session.pending is None
+
+
+def test_카드가_여러_장이면_마지막_결정까지_카드_run은_열려_있다(client):
+    """리뷰 🟡: 남은 카드가 있는데 카드 run 을 completed 로 닫으면 재시작 시 결과 없는 tool call 이 복원된다."""
+    from pydantic_ai.tools import DeferredToolRequests
+    cid = _new(client)
+    _, first = _pending_ticket_for_server("c1")
+    _, second = _pending_ticket_for_server("c2")
+    batch = DeferredToolRequests(approvals=[first.approvals[0], second.approvals[0]],
+                                 metadata={**first.metadata, **second.metadata})
+    restore = _swap_run_agent([_fake(batch), _fake(KukieResponse(narration="둘 다 적용"))])
+    try:
+        assert client.post(f"/conversations/{cid}/chat", json={"text": "두 개"}, headers=USER).json()["kind"] == "approval"
+        r = client.post(f"/conversations/{cid}/approve", json={"call_id": "c1", "approved": True}, headers=USER)
+        assert r.json()["kind"] == "approval"                            # 카드 한 장 남음
+        statuses = [t["status"] for t in client.get(f"/conversations/{cid}", headers=USER).json()["turns"]]
+        assert statuses == ["awaiting_approval", "awaiting_approval"]   # 아직 아무것도 닫지 않는다
+        r = client.post(f"/conversations/{cid}/approve", json={"call_id": "c2", "approved": True}, headers=USER)
+        assert r.json()["response"]["narration"] == "둘 다 적용"
+        statuses = [t["status"] for t in client.get(f"/conversations/{cid}", headers=USER).json()["turns"]]
+        assert statuses == ["completed", "completed", "completed"]
+    finally:
+        restore()
+
+
+def test_실행_중_죽은_run은_처음_열_때_interrupted가_되고_running도_같이_꺼진다(client):
+    """리뷰 🟡: 복원 전에 읽은 row 의 running 이 낡은 값으로 나가던 문제."""
+    from kukie.store import get_store
+    cid = _new(client)
+    get_store().start_run(cid, request_id="crash", kind="chat", mode="학습", input_text="죽기 직전")  # 끝내지 않음
+    conversations.registry.clear()
+    detail = client.get(f"/conversations/{cid}", headers=USER).json()
+    assert detail["conversation"]["running"] is False
+    assert detail["turns"][0]["status"] == "interrupted"
+    assert client.get("/conversations", headers=USER).json()[0]["running"] is False
+    with agent.override(model=_model("살아남")):
+        assert client.post(f"/conversations/{cid}/chat", json={"text": "다시"}, headers=USER).status_code == 200
 
 
 def test_모르는_call_id는_409_NOT_PENDING(client):
