@@ -552,7 +552,9 @@ class ChatStore:
         보여 줘서 남의 팀 것까지 새어 나갔다.
         """
         with self._factory() as db:
-            mine = Cluster.registered_by == user_id
+            # 개인 클러스터(team_id 가 NULL)만 "내가 등록했으니 내 것" 이다. 팀이 붙은 행은
+            # 등록자여도 지금 소속으로 판단한다 — 팀에서 나간 뒤에도 보이면 안 된다 (자동 리뷰 P1).
+            mine = (Cluster.registered_by == user_id) & Cluster.team_id.is_(None)
             if team_id is not None:
                 stmt = select(Cluster).where(Cluster.team_id == team_id)
             elif team_ids:

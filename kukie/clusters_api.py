@@ -12,6 +12,9 @@
   - 팀에 속한 클러스터: 읽기는 팀 구성원, 쓰기(등록·수정·삭제)는 팀 Admin. 판단은 Spring 에 묻는다
     (kukie/membership.py — 사용자 토큰으로 GET /teams)
   - 팀이 없는(개인) 클러스터: 등록한 사람만. 회원 서버가 없는 개발 모드도 이쪽이다
+
+예외 하나: `POST /{id}/test` 는 구성원도 부를 수 있는데 안에서 status·last_checked_at 을 쓴다.
+연결 확인의 부산물이라 "쓰기는 Admin" 경계에서 일부러 빼 뒀다 (자동 리뷰 지적).
 """
 from __future__ import annotations
 
@@ -98,10 +101,14 @@ async def _readable(store: ChatStore, cluster_id: str, user: User) -> ClusterRow
     row = store.get_cluster(cluster_id)
     if row is None:
         raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}")
+    if row.team_id and membership.available():
+        # 팀 클러스터는 **등록한 사람이어도** 지금 소속을 확인한다. 등록자라는 이유로 통과시키면
+        # 팀에서 쫓겨난 뒤에도 계속 보고 만질 수 있고, 회원 서버가 죽었을 때도 통과한다 (자동 리뷰 P1).
+        if not await membership.is_member(user, row.team_id):
+            raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}")
+        return row
     if row.registered_by == user.id:
-        return row
-    if row.team_id and membership.available() and await membership.is_member(user, row.team_id):
-        return row
+        return row          # 팀이 없는(개인) 클러스터 — 등록한 사람만
     raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}")
 
 
@@ -113,6 +120,7 @@ async def _writable(store: ChatStore, cluster_id: str, user: User) -> ClusterRow
     elif row.registered_by != user.id:
         raise _error(403, "FORBIDDEN", "등록한 사람만 바꿀 수 있다")
     return row
+
 
 
 def _parse(body_text: str, context: str | None):
