@@ -76,14 +76,17 @@ def test_초안은_모든_필드를_frontmatter에만_저장한다(monkeypatch, 
         },
         "command": ["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
         "risk_level": "caution",
-        "status": "draft",
+        "status": "DRAFT",
         "intent": "nginx 실습 환경의 레플리카를 늘린다.",
         "expected_effects": ["nginx Deployment의 레플리카가 3개로 변경된다."],
         "side_effects": ["추가 Pod가 노드 자원을 사용한다."],
         "dry_run_result": None,
         "decision_guidance": None,
-        "approval": None,
+        "decision": None,
         "execution_result": None,
+        "failure_reason": None,
+        "applied_at": None,
+        "run_id": None,
     }
     assert datetime.fromisoformat(metadata["created_at"]).tzinfo is not None
     assert body == ""
@@ -104,13 +107,13 @@ def test_create_draft_keeps_structured_fields_in_memory(monkeypatch, tmp_path):
     assert plan.target["name"] == "nginx"
     assert plan.command[-1] == "study"
     assert plan.risk_level == "caution"
-    assert plan.status == "draft"
+    assert plan.status == "DRAFT"
     assert plan.intent == "nginx 실습 환경의 레플리카를 늘린다."
     assert plan.expected_effects == ["nginx Deployment의 레플리카가 3개로 변경된다."]
     assert plan.side_effects == ["추가 Pod가 노드 자원을 사용한다."]
     assert plan.dry_run_result is None
     assert plan.decision_guidance is None
-    assert plan.approval is None
+    assert plan.decision is None
     assert plan.execution_result is None
 
 
@@ -208,7 +211,7 @@ def test_record_메서드는_frontmatter를_갱신하고_본문을_비워둔다(
     plan = _create_plan(monkeypatch, tmp_path)
 
     plan.record_dry_run("succeeded", "dry-run ok", "")
-    plan.record_approval("single")
+    plan.record_decision(approved=True)
     plan.record_execution(
         success=True,
         stdout="scaled",
@@ -221,17 +224,17 @@ def test_record_메서드는_frontmatter를_갱신하고_본문을_비워둔다(
     assert metadata["dry_run_result"]["stdout"] == "dry-run ok"
     assert metadata["dry_run_result"]["stderr"] == ""
     assert datetime.fromisoformat(metadata["dry_run_result"]["at"]).tzinfo is not None
-    assert metadata["approval"]["mode"] == "single"
-    assert datetime.fromisoformat(metadata["approval"]["at"]).tzinfo is not None
+    assert metadata["decision"]["approved"] is True
+    assert datetime.fromisoformat(metadata["decision"]["at"]).tzinfo is not None
     assert metadata["execution_result"]["success"] is True
     assert metadata["execution_result"]["stdout"] == "scaled"
     assert metadata["execution_result"]["stderr"] == ""
     assert metadata["execution_result"]["exit_code"] == 0
-    assert metadata["status"] == "executed"
+    assert metadata["status"] == "APPLIED"
     assert datetime.fromisoformat(metadata["execution_result"]["at"]).tzinfo is not None
     assert body == ""
     assert plan.dry_run_result == metadata["dry_run_result"]
-    assert plan.approval == metadata["approval"]
+    assert plan.decision == metadata["decision"]
     assert plan.execution_result == metadata["execution_result"]
 
 
@@ -268,21 +271,22 @@ def test_dry_run_failure_is_recorded_and_plan_is_kept(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
 
     plan.record_dry_run("failed", "", "deployment nginx not found")
-    plan.mark("failed")
+    plan.mark_failed("DRY_RUN_FAILED")
 
     metadata, _ = _read_plan(plan.path)
-    assert metadata["status"] == "failed"
+    assert metadata["status"] == "FAILED"
+    assert metadata["failure_reason"] == "DRY_RUN_FAILED"
     assert metadata["dry_run_result"]["status"] == "failed"
     assert metadata["dry_run_result"]["stdout"] == ""
     assert metadata["dry_run_result"]["stderr"] == "deployment nginx not found"
     assert datetime.fromisoformat(metadata["dry_run_result"]["at"]).tzinfo is not None
     assert metadata["execution_result"] is None
     assert plan.path.exists()
-    assert plan.status == "failed"
+    assert plan.status == "FAILED"
     assert plan.dry_run_result == metadata["dry_run_result"]
 
 
-@pytest.mark.parametrize("status", ["executed", "failed", "rejected"])
+@pytest.mark.parametrize("status", ["APPLIED", "REJECTED", "STALE", "UNKNOWN"])
 def test_mark_accepts_final_statuses(monkeypatch, tmp_path, status):
     plan = _create_plan(monkeypatch, tmp_path)
 
@@ -297,7 +301,7 @@ def test_mark_rejects_unknown_status(monkeypatch, tmp_path):
     plan = _create_plan(monkeypatch, tmp_path)
 
     with pytest.raises(ValueError, match="invalid Action Plan status"):
-        plan.mark("approved")
+        plan.mark("승인됨")
 
 
 def test_reject는_draft를_한번만_rejected로_바꾼다(monkeypatch, tmp_path):
@@ -305,7 +309,7 @@ def test_reject는_draft를_한번만_rejected로_바꾼다(monkeypatch, tmp_pat
 
     plan.reject()
 
-    assert ActionPlan.load(plan.path).status == "rejected"
+    assert ActionPlan.load(plan.path).status == "REJECTED"
     with pytest.raises(ValueError, match="not ready for rejection"):
         plan.reject()
 
@@ -354,9 +358,9 @@ def test_update_rolls_back_object_when_write_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(plan, "_write", fail_write)
 
     with pytest.raises(OSError, match="simulated write failure"):
-        plan.mark("failed")
+        plan.mark_failed("DRY_RUN_FAILED")
 
-    assert plan.status == "draft"
+    assert plan.status == "DRAFT"
 
 
 def test_validate_for_decision_guidance_requires_successful_dry_run(
@@ -455,9 +459,10 @@ def test_validate_for_decision_guidance_rejects_wrong_lifecycle_state(
 ):
     plan = _create_plan(monkeypatch, tmp_path)
     plan.record_dry_run("succeeded", "dry-run ok", "")
-    plan.record_approval("single")
+    # 상태는 DRAFT 인데 결정만 들어 있는 어긋난 상태 (방어 분기)
+    plan._update_fields(decision={"approved": True, "user_id": None, "at": "2026-09-10T00:00:00+00:00"})
 
-    with pytest.raises(ValueError, match="approval must be empty"):
+    with pytest.raises(ValueError, match="decision must be empty"):
         plan.validate_for_decision_guidance()
 
 
@@ -499,9 +504,9 @@ def test_실행_승인은_준비된_Plan을_검증하고_single로_기록한다(
     )
 
     metadata, _ = _read_plan(plan.path)
-    assert metadata["approval"]["mode"] == "single"
-    assert datetime.fromisoformat(metadata["approval"]["at"]).tzinfo is not None
-    assert plan.approval == metadata["approval"]
+    assert metadata["decision"]["approved"] is True
+    assert datetime.fromisoformat(metadata["decision"]["at"]).tzinfo is not None
+    assert plan.decision == metadata["decision"]
 
 
 def test_실행_승인은_dry_run과_guidance가_없는_Plan을_거부한다(
@@ -518,7 +523,7 @@ def test_실행_승인은_dry_run과_guidance가_없는_Plan을_거부한다(
             target=plan.target,
         )
 
-    assert plan.approval is None
+    assert plan.decision is None
 
 
 @pytest.mark.parametrize(
@@ -549,7 +554,7 @@ def test_실행_승인은_승인_당시_요청과_다르면_거부한다(
     with pytest.raises(ValueError, match=f"approved request mismatch: {field}"):
         plan.approve_for_execution(**request)
 
-    assert plan.approval is None
+    assert plan.decision is None
 
 
 def test_실행_승인은_한번만_기록한다(monkeypatch, tmp_path):
@@ -571,13 +576,13 @@ def test_실행_승인은_한번만_기록한다(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     ("success", "expected_status", "exit_code"),
-    [(True, "executed", 0), (False, "failed", 7)],
+    [(True, "APPLIED", 0), (False, "FAILED", 7)],
 )
 def test_실행_결과와_최종_상태를_함께_기록한다(
     monkeypatch, tmp_path, success, expected_status, exit_code
 ):
     plan = _create_plan(monkeypatch, tmp_path)
-    plan.record_approval("single")
+    plan.record_decision(approved=True)
 
     plan.record_execution(
         success=success,
@@ -630,7 +635,7 @@ def test_Plan_파일에서_구조화된_객체를_복원한다(monkeypatch, tmp_
     assert loaded.target == plan.target
     assert loaded.command == plan.command
     assert loaded.risk_level == plan.risk_level
-    assert loaded.status == "draft"
+    assert loaded.status == "DRAFT"
     assert loaded.intent == plan.intent
     assert loaded.expected_effects == plan.expected_effects
     assert loaded.side_effects == plan.side_effects

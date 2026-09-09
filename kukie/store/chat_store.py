@@ -12,11 +12,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from kukie.store.models import RUN_ACTIVE, ChatRun, ChatSession
+from kukie.store.models import PLAN_OPEN, RUN_ACTIVE, ActionPlan, ChatRun, ChatSession
 
 _UNSET: Any = object()
 
@@ -93,9 +93,71 @@ class RunRow:
         return self.status in RUN_ACTIVE
 
 
+@dataclass(frozen=True)
+class PlanRow:
+    """tbl_action_plan 한 행 (DB 문서 5절). 상태 이름은 DURO-83 결정(대문자)."""
+
+    id: str
+    run_id: str
+    tool_call_id: str
+    tool_name: str
+    status: str
+    risk: str
+    plan_payload: dict[str, Any]
+    request_hash: str
+    decision: dict[str, Any] | None
+    execution_result: dict[str, Any] | None
+    failure_reason: str | None
+    applied_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def of(cls, row: ActionPlan) -> "PlanRow":
+        return cls(
+            id=row.id, run_id=row.run_id, tool_call_id=row.tool_call_id, tool_name=row.tool_name,
+            status=row.status, risk=row.risk, plan_payload=row.plan_payload, request_hash=row.request_hash,
+            decision=row.decision, execution_result=row.execution_result, failure_reason=row.failure_reason,
+            applied_at=row.applied_at, created_at=row.created_at, updated_at=row.updated_at,
+        )
+
+    @property
+    def open(self) -> bool:
+        return self.status in PLAN_OPEN
+
+    @property
+    def approved(self) -> bool:
+        return bool(self.decision and self.decision.get("approved"))
+
+
+@dataclass(frozen=True)
+class PlanSummaryRow:
+    """GET /action-plans 한 줄 — 앱 api/types.ts 의 ActionPlanSummary (대시보드용)."""
+
+    id: str
+    cluster_id: str | None
+    title: str
+    status: str
+    running: bool
+    risk: str
+    requested_by: str
+    updated_at: datetime
+    approvals: int          # 같은 run 에서 함께 나온 카드 수 (batch)
+
+
+
 def error_payload(code: str, message: str, http_status: int, **extra: Any) -> dict[str, Any]:
     """response_payload 에 남기는 실패 형태. http_status 는 같은 request_id 재전송에 같은 응답을 주기 위해."""
     return {"kind": "error", "code": code, "message": message, "http_status": http_status, **extra}
+
+
+def _plan_title(plan: ActionPlan) -> str:
+    """목록에 보일 한 줄. 변경 툴의 intent(왜 하는지)가 사람이 읽기 가장 좋다."""
+    payload = plan.plan_payload or {}
+    intent = payload.get("intent")
+    if isinstance(intent, str) and intent.strip():
+        return intent.strip()
+    return plan.tool_name
 
 
 class ChatStore:
@@ -244,7 +306,10 @@ class ChatStore:
                 row.status = "interrupted"
                 row.finished_at = now
             db.commit()
-            return [RunRow.of(r) for r in rows]
+            closed = [RunRow.of(r) for r in rows]
+        for run in closed:      # 중단된 run 의 승인 카드도 함께 닫는다 (STALE / UNKNOWN)
+            self.expire_open_plans(run.id)
+        return closed
 
     def list_runs(self, session_id: str) -> list[RunRow]:
         with self._factory() as db:
@@ -259,6 +324,127 @@ class ChatStore:
                 select(ChatRun).where(ChatRun.session_id == session_id, ChatRun.status.in_(RUN_ACTIVE))
             )
             return RunRow.of(row) if row is not None else None
+
+    # ── Action Plan (문서 5절) ───────────────────────────────
+
+    def create_plan(
+        self,
+        *,
+        plan_id: str,
+        run_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        risk: str,
+        plan_payload: dict[str, Any],
+        request_hash: str,
+        status: str = "DRAFT",
+    ) -> PlanRow:
+        with self._factory() as db:
+            row = ActionPlan(
+                id=plan_id, run_id=run_id, tool_call_id=tool_call_id, tool_name=tool_name,
+                status=status, risk=risk, plan_payload=plan_payload, request_hash=request_hash,
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return PlanRow.of(row)
+
+    def get_plan(self, plan_id: str) -> PlanRow | None:
+        with self._factory() as db:
+            row = db.get(ActionPlan, plan_id)
+            return PlanRow.of(row) if row is not None else None
+
+    def find_plan_by_call_id(self, tool_call_id: str, *, run_id: str | None = None) -> PlanRow | None:
+        """카드 하나를 tool_call_id 로 찾는다. run 을 알면 같이 좁힌다 (run 안에서 유일 — 문서 5절)."""
+        with self._factory() as db:
+            stmt = select(ActionPlan).where(ActionPlan.tool_call_id == tool_call_id)
+            if run_id is not None:
+                stmt = stmt.where(ActionPlan.run_id == run_id)
+            stmt = stmt.order_by(ActionPlan.created_at.desc())
+            row = db.scalars(stmt).first()
+            return PlanRow.of(row) if row is not None else None
+
+    def update_plan(self, plan_id: str, **fields: Any) -> None:
+        with self._factory() as db:
+            row = db.get(ActionPlan, plan_id)
+            if row is None:
+                return
+            for key, value in fields.items():
+                setattr(row, key, value)
+            db.commit()
+
+    def list_plans_for_run(self, run_id: str) -> list[PlanRow]:
+        with self._factory() as db:
+            rows = db.scalars(
+                select(ActionPlan).where(ActionPlan.run_id == run_id).order_by(ActionPlan.created_at)
+            ).all()
+            return [PlanRow.of(r) for r in rows]
+
+    def expire_open_plans(self, run_id: str) -> list[PlanRow]:
+        """run 이 중단될 때 남은 계획을 닫는다 (DURO-83).
+
+        승인까지 갔는데 실행 결과가 없으면 UNKNOWN — kubectl 이 돌았는지 모른다 (문서 5절, run 의 recovery_required 와 같은 뜻).
+        아직 승인 전이면 STALE — 그 승인 카드는 더 이상 쓸 수 없다.
+        """
+        with self._factory() as db:
+            rows = db.scalars(
+                select(ActionPlan).where(ActionPlan.run_id == run_id, ActionPlan.status.in_(PLAN_OPEN))
+            ).all()
+            for row in rows:
+                approved = bool(row.decision and row.decision.get("approved"))
+                row.status = "UNKNOWN" if approved and row.execution_result is None else "STALE"
+            db.commit()
+            return [PlanRow.of(r) for r in rows]
+
+    def list_plan_summaries(
+        self, user_id: str, *, cluster_id: str | None = None, status: str | None = None,
+    ) -> list[PlanSummaryRow]:
+        """대시보드 목록. 내 방 + shared 방의 계획만 (list_sessions 와 같은 범위).
+
+        requested_by 는 방 주인이다 — run 에 요청자 칸이 없다 (문서 6절 "회원 id 를 중복 저장하지 않는다").
+        shared 방에서 팀원이 보낸 요청도 방 주인으로 표시된다. 팀 API 가 붙을 때 다시 본다.
+        """
+        with self._factory() as db:
+            stmt = (
+                select(ActionPlan, ChatSession.cluster_id, ChatSession.user_id)
+                .join(ChatRun, ActionPlan.run_id == ChatRun.id)
+                .join(ChatSession, ChatRun.session_id == ChatSession.id)
+                .where(or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True)))
+            )
+            if cluster_id is not None:
+                stmt = stmt.where(ChatSession.cluster_id == cluster_id)
+            if status is not None:
+                stmt = stmt.where(ActionPlan.status == status)
+            stmt = stmt.order_by(ActionPlan.updated_at.desc())
+            found = db.execute(stmt).all()
+            # 카드 수(batch)는 필터에 걸린 것만 세면 안 된다 — status 필터로 잘린 형제 카드도 같은 run 의 한 묶음이다
+            run_ids = {plan.run_id for plan, _, _ in found}
+            batch = dict(
+                db.execute(
+                    select(ActionPlan.run_id, func.count(ActionPlan.id))
+                    .where(ActionPlan.run_id.in_(run_ids))
+                    .group_by(ActionPlan.run_id)
+                ).all()
+            ) if run_ids else {}
+            return [
+                PlanSummaryRow(
+                    id=plan.id, cluster_id=cluster, title=_plan_title(plan), status=plan.status,
+                    running=plan.status == "EXECUTING", risk=plan.risk, requested_by=owner,
+                    updated_at=plan.updated_at, approvals=batch.get(plan.run_id, 1),
+                )
+                for plan, cluster, owner in found
+            ]
+
+    def plan_scope(self, plan_id: str) -> tuple[str, bool] | None:
+        """이 계획이 속한 방의 (주인, shared) — 접근 권한 검사용. plan 에 회원 id 를 두지 않으므로 거슬러 올라간다 (문서 6절)."""
+        with self._factory() as db:
+            row = db.execute(
+                select(ChatSession.user_id, ChatSession.shared)
+                .join(ChatRun, ChatRun.session_id == ChatSession.id)
+                .join(ActionPlan, ActionPlan.run_id == ChatRun.id)
+                .where(ActionPlan.id == plan_id)
+            ).first()
+            return (row[0], bool(row[1])) if row is not None else None
 
     # ── 내부 ─────────────────────────────────────────────────
 

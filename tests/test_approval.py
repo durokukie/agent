@@ -51,6 +51,7 @@ def _ready_plan(
     stderr = "server does not support dry run\n" if dry_run_status == "unsupported" else ""
     plan.record_dry_run(dry_run_status, stdout, stderr)
     plan.record_decision_guidance("현재 replica와 가용 자원을 확인한다.")
+    plan.offer_for_approval()
     return plan
 
 
@@ -77,6 +78,7 @@ def _ready_manifest_plan(monkeypatch, plan_dir, call_id: str, manifest: str) -> 
     )
     plan.record_dry_run("unsupported", "", "server does not support dry run")
     plan.record_decision_guidance("대상과 권한을 확인한다.")
+    plan.offer_for_approval()
     return plan
 
 

@@ -143,7 +143,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
 
     if ctx.tool_call_approved:
         try:
-            plan = ActionPlan.find_by_call_id(call.tool_call_id)
+            plan = ActionPlan.find_by_call_id(call.tool_call_id, run_id=ctx.deps.run_id)
         except (FileNotFoundError, ValueError) as exc:
             raise ToolFailed(str(exc)) from None
         # 재시도 분기 (DURO-66): 같은 승인으로 run 이 다시 왔을 때 kubectl 이 돌았는지는
@@ -151,7 +151,12 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
         # 실행 기록이 없으면(기록 도중 죽음·기록 실패) 실행 여부를 모르므로 다시 돌리지 않는다.
         if plan.execution_result is not None:
             return _recorded_result(plan)
-        if plan.approval is not None:
+        if plan.decision is not None:
+            # 승인은 남았는데 결과가 없다 = kubectl 이 돌았는지 모른다. 다시 돌리지 않고 UNKNOWN 으로 남긴다 (DURO-83)
+            try:
+                plan.mark_unknown()
+            except Exception:
+                logger.exception("UNKNOWN 표시 실패: plan_id=%s", plan.id)
             raise ToolFailed(
                 "실행 여부를 확인할 수 없다 — 승인은 기록됐지만 실행 결과가 없다. "
                 f"클러스터 상태를 직접 확인하라 (plan_id={plan.id})"
@@ -163,7 +168,9 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
                 command=command,
                 risk=risk,
                 target=target,
+                user_id=ctx.deps.user_id,
             )
+            plan.mark_executing()
         except ValueError as exc:
             raise ToolFailed(str(exc)) from None
         try:
@@ -202,6 +209,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
         return result
 
     plan = ActionPlan.create_draft(
+        run_id=ctx.deps.run_id,
         call_id=call.tool_call_id,
         tool=tool_name,
         args=plan_args,
@@ -239,7 +247,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
         rehearsal.stderr,
     )
     if dry_run_status == "failed":
-        plan.mark("failed")
+        plan.mark_failed("DRY_RUN_FAILED")
         raise ToolFailed(f"dry-run failed: {rehearsal.stderr.strip()}")
 
     guidance = "guidance unavailable"
@@ -250,4 +258,5 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
             logger.exception("decision guidance unavailable: plan_id=%s", plan.id)
 
     plan.record_decision_guidance(guidance)
+    plan.offer_for_approval()          # DRAFT → WAITING_APPROVAL: 이제 카드가 사용자에게 나간다
     raise ApprovalRequired({"plan_id": plan.id})

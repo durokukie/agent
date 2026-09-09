@@ -35,12 +35,14 @@ DELETE_ARGS = {
 }
 
 
-def _ctx(*, namespace="study", approved=False):
+def _ctx(*, namespace="study", approved=False, run_id=None, user_id=None):
     return SimpleNamespace(
         deps=SimpleNamespace(
             context="kind-dev",
             namespace=namespace,
             skill=SimpleNamespace(name="실습"),
+            run_id=run_id,      # None 이면 계획이 DB 표에 들어가지 않는다 (flat 경로와 같다, #58)
+            user_id=user_id,
         ),
         tool_call_approved=approved,
     )
@@ -447,8 +449,8 @@ async def test_dry_run_성공은_판단_가이드를_저장하고_Plan으로_승
         )
 
     metadata = _read_plan(next(tmp_path.glob("*.md")))
-    assert metadata["status"] == "draft"
-    assert metadata["approval"] is None
+    assert metadata["status"] == "WAITING_APPROVAL"
+    assert metadata["decision"] is None
     assert metadata["dry_run_result"]["status"] == "succeeded"
     assert metadata["dry_run_result"]["stdout"] == "ok\n"
     assert metadata["dry_run_result"]["stderr"] == ""
@@ -503,8 +505,8 @@ async def test_판단_가이드_예외와_빈_출력은_대체문구를_저장�
     metadata = _read_plan(next(tmp_path.glob("*.md")))
     assert metadata["decision_guidance"] == "guidance unavailable"
     assert metadata["risk_level"] == "caution"
-    assert metadata["status"] == "draft"
-    assert metadata["approval"] is None
+    assert metadata["status"] == "WAITING_APPROVAL"
+    assert metadata["decision"] is None
     assert metadata["execution_result"] is None
     assert str(error) in caplog.text
 
@@ -564,11 +566,12 @@ async def test_dry_run_실패는_Plan을_failed로_남기고_중단한다(monkey
         )
 
     metadata = _read_plan(next(tmp_path.glob("*.md")))
-    assert metadata["status"] == "failed"
+    assert metadata["status"] == "FAILED"
+    assert metadata["failure_reason"] == "DRY_RUN_FAILED"
     assert metadata["dry_run_result"]["status"] == "failed"
     assert metadata["dry_run_result"]["stdout"] == ""
     assert metadata["dry_run_result"]["stderr"] == "deployment nginx not found\n"
-    assert metadata["approval"] is None
+    assert metadata["decision"] is None
     assert metadata["execution_result"] is None
     handler.assert_not_awaited()
 
@@ -601,11 +604,12 @@ async def test_dry_run_실행_예외도_Plan을_failed로_남긴다(
         )
 
     metadata = _read_plan(next(tmp_path.glob("*.md")))
-    assert metadata["status"] == "failed"
+    assert metadata["status"] == "FAILED"
+    assert metadata["failure_reason"] == "DRY_RUN_FAILED"
     assert metadata["dry_run_result"]["status"] == "failed"
     assert metadata["dry_run_result"]["stdout"] == ""
     assert expected_stderr in metadata["dry_run_result"]["stderr"]
-    assert metadata["approval"] is None
+    assert metadata["decision"] is None
     assert metadata["execution_result"] is None
     handler.assert_not_awaited()
 
@@ -649,11 +653,11 @@ async def test_dry_run_미지원은_판단_가이드_없이_원인을_남기고_
         )
 
     metadata = _read_plan(next(tmp_path.glob("*.md")))
-    assert metadata["status"] == "draft"
+    assert metadata["status"] == "WAITING_APPROVAL"
     assert metadata["dry_run_result"]["status"] == "unsupported"
     assert metadata["dry_run_result"]["stderr"] == stderr
     assert metadata["decision_guidance"] == "guidance unavailable"
-    assert metadata["approval"] is None
+    assert metadata["decision"] is None
     assert approval_required.value.metadata == {"plan_id": metadata["id"]}
     handler.assert_not_awaited()
 
@@ -684,7 +688,8 @@ async def test_일반_dry_run_오류를_미지원으로_오인하지_않는다(
         )
 
     metadata = _read_plan(next(tmp_path.glob("*.md")))
-    assert metadata["status"] == "failed"
+    assert metadata["status"] == "FAILED"
+    assert metadata["failure_reason"] == "DRY_RUN_FAILED"
     assert metadata["dry_run_result"]["status"] == "failed"
 
 
@@ -717,8 +722,8 @@ async def test_ToolApproved_재개는_기존_Plan의_handler를_한번_실행한
     assert len(successful_dry_run) == 1
     successful_guidance.assert_awaited_once()
     metadata = _read_plan(next(tmp_path.glob("*.md")))
-    assert metadata["approval"]["mode"] == "single"
-    assert metadata["status"] == "executed"
+    assert metadata["decision"]["approved"] is True
+    assert metadata["status"] == "APPLIED"
     assert metadata["args"] == {
         "kind": "deployment",
         "name": "nginx",
@@ -759,8 +764,8 @@ async def test_DESTRUCTIVE도_단일_승인_후_handler를_한번_실행한다(
     handler.assert_awaited_once_with(DELETE_ARGS)
     metadata = _read_plan(next(tmp_path.glob("*.md")))
     assert metadata["risk_level"] == "destructive"
-    assert metadata["approval"]["mode"] == "single"
-    assert datetime.fromisoformat(metadata["approval"]["at"]).tzinfo is not None
+    assert metadata["decision"]["approved"] is True
+    assert datetime.fromisoformat(metadata["decision"]["at"]).tzinfo is not None
 
 
 @pytest.mark.asyncio
@@ -801,7 +806,8 @@ async def test_handler_예외는_failed로_기록하고_원래_예외를_유지�
 
     handler.assert_awaited_once_with(BASE_ARGS)
     metadata = _read_plan(next(tmp_path.glob("*.md")))
-    assert metadata["status"] == "failed"
+    assert metadata["status"] == "FAILED"
+    assert metadata["failure_reason"] == "EXECUTION_FAILED"
     assert metadata["execution_result"]["success"] is False
     assert metadata["execution_result"]["stdout"] == ""
     assert metadata["execution_result"]["stderr"] == "cluster disconnected"
@@ -885,7 +891,7 @@ async def test_apply_manifest_원문이_달라지면_해시_불일치로_실행�
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["executed", "failed", "rejected"])
+@pytest.mark.parametrize("status", ["APPLIED", "REJECTED", "STALE"])
 async def test_terminal_Plan은_handler를_실행하지_않는다(
     monkeypatch, tmp_path, successful_dry_run, successful_guidance, status
 ):
@@ -952,7 +958,7 @@ async def test_같은_Deferred_결과를_재전달하면_handler_대신_저장�
     assert replayed == result                            # command 까지 run_kubectl 과 같은 모양으로 복원
     assert len(successful_dry_run) == 1                  # dry-run 도 다시 돌지 않음
     metadata = _read_plan(next(tmp_path.glob("*.md")))
-    assert metadata["status"] == ("executed" if success else "failed")
+    assert metadata["status"] == ("APPLIED" if success else "FAILED")
 
 
 @pytest.mark.asyncio
@@ -964,7 +970,7 @@ async def test_승인_기록만_있고_실행_기록이_없으면_실행_여부_
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     await _create_pending_plan()
     plan = action_plan.ActionPlan.load(next(tmp_path.glob("*.md")))
-    plan.record_approval("single")
+    plan.record_decision(approved=True)
     handler = AsyncMock()
 
     with pytest.raises(ToolFailed, match="실행 여부를 확인할 수 없다") as exc:
@@ -1004,7 +1010,8 @@ async def test_handler_non_zero_결과는_failed로_기록한다(
 
     assert returned is result
     metadata = _read_plan(next(tmp_path.glob("*.md")))
-    assert metadata["status"] == "failed"
+    assert metadata["status"] == "FAILED"
+    assert metadata["failure_reason"] == "EXECUTION_FAILED"
     assert metadata["execution_result"]["success"] is False
     assert metadata["execution_result"]["stderr"] == "deployment not found\n"
     assert metadata["execution_result"]["exit_code"] == 1

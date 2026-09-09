@@ -124,6 +124,7 @@ def _approval_payload(
             call,
             requests.metadata.get(call.tool_call_id, {}),
             default_namespace=session.deps.namespace,
+            run_id=session.deps.run_id,
         )
         for call in calls
     ]
@@ -260,6 +261,7 @@ async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict
             call,
             requests.metadata.get(call_id, {}),
             default_namespace=session.deps.namespace,
+            run_id=session.deps.run_id,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(409, str(exc)) from None
@@ -268,7 +270,9 @@ async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict
     # 결정을 남기지 않고 티켓을 그대로 두면 사용자가 같은 카드를 다시 누를 수 있다 (DURO-66 결정 불필요 1).
     if not approved:
         try:
-            ActionPlan.find_by_call_id(approval_request.tool_call_id).reject()
+            ActionPlan.find_by_call_id(
+                approval_request.tool_call_id, run_id=session.deps.run_id,
+            ).reject(session.deps.user_id)
         except (OSError, ValueError) as exc:
             logger.exception("거절 기록 실패 — 티켓 유지 (call_id=%s, plan_id=%s)",
                              call_id, approval_request.plan_id)
@@ -350,8 +354,9 @@ async def _resume(session: Session) -> tuple[dict[str, Any], Any]:
         session.processing = False
 
 
-# ── 대화(채팅방) 단위 엔드포인트 — kukie/conversations_api.py ──
+# ── 대화(채팅방) 단위 엔드포인트 — kukie/conversations_api.py, Action Plan 조회 — kukie/plans_api.py ──
 # flat 엔드포인트와 같은 _chat_turn / _approve / _resume 을 쓴다. 그 모듈이 이 모듈을 참조하므로
 # 맨 아래에서 plain import 만 한다 (from-import 는 순환 시 이름이 아직 없어 깨진다).
 # 라우터 등록은 conversations_api 가 자기 맨 아래에서 app.include_router 로 한다.
 import kukie.conversations_api  # noqa: E402, F401
+import kukie.plans_api  # noqa: E402, F401

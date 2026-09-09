@@ -24,6 +24,7 @@ row.team_id 로 붙인다 — 지금은 로그인한 사용자면 된다. Privat
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import uuid
 from typing import Any
@@ -164,6 +165,12 @@ def _usage_json(result: Any) -> dict[str, Any] | None:
     }
 
 
+def _bind_run(session: Any, run: RunRow, user: User) -> None:
+    """이번 요청이 어느 run 의 것이고 누가 보냈는지 세션에 싣는다 — 가드레일 훅이 Action Plan 을
+    tbl_action_plan 에 넣고 decision 에 결정자를 적을 때 쓴다 (#58). 매 요청 새로 덮어쓴다."""
+    session.deps = dataclasses.replace(session.deps, run_id=run.id, user_id=user.id)
+
+
 def _busy() -> HTTPException:
     return _error(409, "BUSY", "이전 요청 처리 중 — 끝난 뒤 다시 보내라")
 
@@ -281,6 +288,7 @@ async def chat(
         if not created:
             return _replay(run)
 
+        _bind_run(session, run, user)
         try:
             payload, result = await _server._chat_turn(session, body.text)
         except HTTPException as exc:
@@ -388,6 +396,7 @@ async def approve(
         raise _busy()
     run = _open_run(store, conversation_id)
     async with conversation.lock:
+        _bind_run(session, run, user)
         # 재개가 돌면 _to_payload 가 티켓을 지우므로, 저장 실패 안내에 실을 Plan id(승인한 카드만)는 여기서 미리 뽑는다
         plan_ids = _approved_plan_ids(session, body.call_id if body.approved else None)
         # 결정 검사·기록은 server._approve 가 한다 (문자열 detail). 여기서는 코드 객체로 감싼다.
@@ -415,6 +424,7 @@ async def resume(
         raise _error(409, "PENDING_APPROVAL", f"아직 결정하지 않은 승인 건이 있다: {session.pending_ids}")
     run = _open_run(store, conversation_id)
     async with conversation.lock:
+        _bind_run(session, run, user)
         plan_ids = _approved_plan_ids(session)
         try:
             outcome, result = await _server._resume(session)
