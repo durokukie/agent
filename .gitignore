@@ -4,6 +4,3 @@ __pycache__/
 .env
 *.egg-info/
 dist/
-
-# 로컬 SQLite (kukie/store, 기본 ~/.kukie/kukie.db — 레포 안에 두면 무시)
-*.db
