@@ -82,6 +82,9 @@ def _conversation_view(row: SessionRow, running: bool) -> dict[str, Any]:
 
 
 def _turn_view(run: RunRow) -> dict[str, Any]:
+    payload = run.response_payload
+    if run.status == "interrupted" and payload is not None and payload.get("kind") == "approval":
+        payload = None        # 만료된 승인 카드 — 앱이 버튼을 다시 그리지 않게. 사정은 error 에 있다
     return {
         "id": run.id,
         "seq": run.turn_no,
@@ -89,7 +92,7 @@ def _turn_view(run: RunRow) -> dict[str, Any]:
         "mode": run.mode,
         "status": run.status,
         "input_text": run.input_text,
-        "payload": run.response_payload,
+        "payload": payload,
         "error": run.error,
         "started_at": run.started_at.isoformat(),
         "finished_at": run.finished_at.isoformat() if run.finished_at else None,
@@ -108,7 +111,10 @@ def _load(
         raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
     if write and row.user_id != user.id:
         raise _error(403, "FORBIDDEN", "공유 대화는 읽기만 할 수 있다 — 메시지·승인은 만든 사람만")
-    conversation = registry.get_or_load(conversation_id, store)
+    if registry.get(conversation_id) is None:
+        registry.get_or_load(conversation_id, store)   # 복원하면서 밀린 run 을 닫으므로 row 를 다시 읽는다
+        row = store.get_session(conversation_id) or row
+    conversation = registry.get(conversation_id)
     assert conversation is not None
     return row, conversation
 
@@ -275,15 +281,17 @@ def _record_outcome(
 ) -> dict[str, Any]:
     """승인/재개 결과를 run 으로 남긴다. 남은 카드 재전송(approval)도 한 run 이다.
 
-    직전에 승인 카드를 준 run(awaiting_approval)은 결정이 왔으니 completed 로 닫는다 — 카드는 전달됐고
-    결정과 실행은 이 새 run 에 남는다.
+    실제로 재개돼 답이 나왔을 때만 앞의 승인 카드 run 들(awaiting_approval)을 completed 로 닫는다. 그 run 의
+    마지막 메시지는 결과 없는 tool call 인데, 재개 run 의 메시지에 그 결과가 이어지므로 둘을 합쳐야 온전하다.
+    카드가 아직 남아 있으면(outcome 이 approval) 열어 둔다 — 재시작 시 통째로 만료시키기 위해.
     """
-    store.settle_active_runs(conversation.id, status="completed")
+    status = "awaiting_approval" if outcome.get("kind") == "approval" else "completed"
+    if status == "completed":
+        store.settle_active_runs(conversation.id, status="completed")
     run, _ = store.start_run(
         conversation.id, request_id=str(uuid.uuid4()), kind=kind,
         mode=conversation.session.skill.name, input_text=input_text,
     )
-    status = "awaiting_approval" if outcome.get("kind") == "approval" else "completed"
     store.finish_run(
         run.id, status=status, response_payload=outcome,
         agent_messages=_messages_json(result) if result is not None else None,
