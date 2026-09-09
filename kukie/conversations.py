@@ -23,7 +23,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic_ai.messages import ModelMessagesTypeAdapter, ToolCallPart
+from pydantic_ai.messages import (
+    ModelMessagesTypeAdapter,
+    RetryPromptPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.tools import DeferredToolRequests
 
 from kukie.deps import Deps
@@ -102,6 +107,22 @@ class ConversationRegistry:
         self._live.clear()
 
 
+def _unanswered_calls(messages: list[Any]) -> dict[str, ToolCallPart]:
+    """결과가 아직 안 붙은 tool call 들. 승인 카드가 그대로 남아 있다는 뜻이다.
+
+    ToolReturnPart(정상 결과)와 RetryPromptPart(모델에게 다시 시키는 응답) 둘 다 "답" 으로 센다.
+    """
+    calls: dict[str, ToolCallPart] = {}
+    answered: set[str] = set()
+    for message in messages:
+        for part in getattr(message, "parts", []):
+            if isinstance(part, ToolCallPart) and part.tool_call_id:
+                calls[part.tool_call_id] = part
+            elif isinstance(part, (ToolReturnPart, RetryPromptPart)) and part.tool_call_id:
+                answered.add(part.tool_call_id)
+    return {cid: call for cid, call in calls.items() if cid not in answered}
+
+
 def _restore_pending(store: ChatStore, run: RunRow) -> DeferredToolRequests | None:
     """아직 결정되지 않은 승인 카드를 DB 에서 되살린다 (#58). 되살릴 수 없으면 None — 부르는 쪽이 run 을 닫는다.
 
@@ -114,20 +135,20 @@ def _restore_pending(store: ChatStore, run: RunRow) -> DeferredToolRequests | No
     try:
         plans = store.list_plans_for_run(run.id)
         waiting = {p.tool_call_id: p for p in plans if p.status == "WAITING_APPROVAL"}
-        if not waiting or any(p.open and p.status != "WAITING_APPROVAL" for p in plans):
+        if not waiting:
             return None
         messages = ModelMessagesTypeAdapter.validate_python(run.agent_messages)
-        calls = [
-            part
-            for message in messages
-            for part in getattr(message, "parts", [])
-            if isinstance(part, ToolCallPart) and part.tool_call_id in waiting
-        ]
-        if len(calls) != len(waiting):
-            return None            # 메시지와 표가 어긋난다 — 되살리지 않는다
+        unanswered = _unanswered_calls(messages)
+
+        # 되살릴 수 있는 건 **답 없는 tool call 집합이 대기 카드와 정확히 같을 때뿐**이다.
+        # 한 장을 이미 거절했다면 그 계획은 표에서 닫히지만(REJECTED) 그 tool call 은 기록에 답 없이
+        # 남는다. 남은 한 장만 되살려 재개하면 답 없는 call 이 모델에 그대로 가서 재개가 영원히
+        # 실패하고, 그 방은 새 대화 말고는 빠져나갈 길이 없다 (자동 리뷰 지적).
+        if set(unanswered) != set(waiting):
+            return None            # 예전대로 interrupt → 계획은 STALE / UNKNOWN 으로 닫힌다
         return DeferredToolRequests(
-            approvals=calls,
-            metadata={call.tool_call_id: {"plan_id": waiting[call.tool_call_id].id} for call in calls},
+            approvals=list(unanswered.values()),
+            metadata={cid: {"plan_id": waiting[cid].id} for cid in unanswered},
         )
     except Exception:
         logger.exception("승인 카드 복원 실패 — 중단으로 닫는다 (run=%s)", run.id)

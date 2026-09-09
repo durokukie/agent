@@ -312,3 +312,63 @@ def test_실패한_실행_결과로는_APPLIED가_될_수_없다(client):
         store.update_plan(plan.id, status="APPLIED",
                           execution_result={"success": False, "exit_code": 1, "stdout": "", "stderr": "x"})
     assert _plans(room)[0].status == "APPROVED"
+
+
+# ── 자동 리뷰 반영 ─────────────────────────────────────────
+
+def test_한_장을_거절한_뒤_재시작하면_되살리지_않는다(client):
+    """🔴 자동 리뷰: 답 없는 tool call 이 대기 카드보다 많으면 재개가 영원히 실패한다.
+
+    카드 두 장 중 하나를 거절하면 그 계획은 표에서 닫히지만(REJECTED) tool call 은 기록에 답 없이
+    남는다. 남은 한 장만 되살려 재개하면 그 call 이 답 없이 모델에 가서 그 방은 갇힌다.
+    """
+    room = _room(client)
+    client.post(f"/conversations/{room}/chat", json={"text": "/mode 실습"}, headers=USER)
+
+    from pydantic_ai import ModelResponse
+    from pydantic_ai.messages import ToolCallPart
+
+    def two_cards(messages, info):
+        return ModelResponse(parts=[
+            ToolCallPart(tool_name="scale_resource", args=dict(SCALE_ARGS), tool_call_id="call-1"),
+            ToolCallPart(tool_name="scale_resource",
+                         args={**SCALE_ARGS, "name": "api"}, tool_call_id="call-2"),
+        ])
+
+    with agent.override(model=FunctionModel(two_cards)):
+        r = client.post(f"/conversations/{room}/chat", json={"text": "둘 다 늘려줘"}, headers=USER)
+    assert r.status_code == 200 and len(r.json()["approvals"]) == 2
+
+    # 한 장만 거절 — 남은 카드가 있으니 run 은 계속 열려 있다
+    with agent.override(model=_answer_model()):
+        r = client.post(f"/conversations/{room}/approve",
+                        json={"call_id": "call-1", "approved": False}, headers=USER)
+    assert r.json()["kind"] == "approval"
+    assert {p.tool_call_id: p.status for p in _plans(room)}["call-1"] == "REJECTED"
+
+    conversations.registry.clear()          # 재시작
+    body = client.get(f"/conversations/{room}", headers=USER).json()
+
+    assert body["session"]["pending"] == []          # 되살리지 않는다
+    assert body["turns"][-1]["status"] == "interrupted"
+    assert {p.tool_call_id: p.status for p in _plans(room)}["call-2"] == "STALE"
+
+
+def test_없는_계획을_고치려_하면_조용히_넘어가지_않는다(client):
+    """계획은 표가 원본이라 "없으면 그만" 이 아니다 — 조용히 성공하면 .md 와 표가 갈린다."""
+    from kukie.store.chat_store import PlanMissing
+
+    with pytest.raises(PlanMissing):
+        get_store().update_plan("없는-계획", status="STALE")
+
+
+def test_run_을_닫으면_계획도_같은_트랜잭션에서_닫힌다(client):
+    """따로 커밋하면 그 사이에 죽었을 때 계획이 열린 채 영원히 남는다."""
+    room = _room(client)
+    _card(client, room)
+    runs = get_store().list_runs(room)
+
+    get_store().interrupt_active_runs(room, "중단")
+
+    assert all(r.status == "interrupted" for r in get_store().list_runs(room) if r.id == runs[-1].id)
+    assert _plans(room)[0].status == "STALE"
