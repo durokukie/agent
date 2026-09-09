@@ -18,7 +18,9 @@ recovery_required 로 남아 /resume 으로 다시 시도한다. 채팅방 하�
 오류는 전부 FastAPI 의 detail 자리에 {code, message} 객체로 간다 — 응답은 {"detail": {code, message}}.
 앱의 http.ts 가 detail 이 객체면 code 를 꺼낸다 (api-spec 공통 절).
 
-권한: 남의 방은 404. shared 방은 남도 읽을 수 있지만 chat/approve/resume 은 주인만 (승인 = 클러스터 변경).
+Private / Shared (기획 05): private 방은 만든 사람만 보고, 조회·진단만 — 변경 도구가 있는 모드(실습)로 못 들어간다.
+shared 방은 팀원이 같이 보고 같이 입력하고 승인한다. 팀 소속·Operator 권한 검사는 Spring 팀 API 가 생기면
+row.team_id 로 붙인다 — 지금은 로그인한 사용자면 된다. Private → Shared 전환은 없다 (문서 05 §3).
 """
 from __future__ import annotations
 
@@ -36,6 +38,7 @@ from kukie.conversations import Conversation, registry
 from kukie.skills import SKILLS
 from kukie.store import ChatStore, get_store
 from kukie.store.chat_store import ActiveRunExists, RequestMismatch, RunRow, SessionRow, error_payload
+from kukie.tools.mutate import MUTATING_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +82,7 @@ def _conversation_view(row: SessionRow, running: bool) -> dict[str, Any]:
         "id": row.id,
         "cluster_id": row.cluster_id,
         "team_id": row.team_id,
+        "user_id": row.user_id,                  # 작성자 — 목록에 표시 (문서 05 §6)
         "title": row.title,
         "shared": row.shared,
         "version": row.version,
@@ -107,20 +111,27 @@ def _error(status: int, code: str, message: str) -> HTTPException:
     return HTTPException(status, {"code": code, "message": message})
 
 
-def _load(
-    conversation_id: str, user: User, store: ChatStore, *, write: bool = False,
-) -> tuple[SessionRow, Conversation]:
+def _load(conversation_id: str, user: User, store: ChatStore) -> tuple[SessionRow, Conversation]:
+    """private 방은 주인만 (남에게는 없는 방, 404). shared 방은 팀원 누구나 읽고 쓴다 (문서 05 §4)."""
     row = store.get_session(conversation_id)
     if row is None or (row.user_id != user.id and not row.shared):
         raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
-    if write and row.user_id != user.id:
-        raise _error(403, "FORBIDDEN", "공유 대화는 읽기만 할 수 있다 — 메시지·승인은 만든 사람만")
     if registry.get(conversation_id) is None:
         registry.get_or_load(conversation_id, store)   # 복원하면서 밀린 run 을 닫으므로 row 를 다시 읽는다
         row = store.get_session(conversation_id) or row
     conversation = registry.get(conversation_id)
     assert conversation is not None
     return row, conversation
+
+
+def _mutating_mode(name: str) -> bool:
+    skill = SKILLS.get(name)
+    return skill is not None and bool(skill.allowed_tools & MUTATING_TOOLS)
+
+
+def _private_change_blocked(row: SessionRow) -> HTTPException:
+    return _error(403, "PRIVATE_SESSION",
+                  "Private 대화에서는 클러스터를 변경할 수 없다 — 변경은 Shared 대화를 새로 만들어서 (기획 05)")
 
 
 def _messages_json(result: Any) -> list[Any]:
@@ -212,10 +223,12 @@ async def chat(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    _, conversation = _load(conversation_id, user, store, write=True)
+    row, conversation = _load(conversation_id, user, store)
     session = conversation.session
     is_mode = body.text.startswith("/mode ")
     kind = "mode_change" if is_mode else "chat"
+    if is_mode and not row.shared and _mutating_mode(body.text.removeprefix("/mode ").strip()):
+        raise _private_change_blocked(row)       # 변경 도구가 있는 모드는 shared 방에서만 (문서 05 §3)
 
     # 재전송이면 실행하지 않고 저장된 결과를 그대로 — 승인 대기 검사보다 먼저 (응답 유실 뒤 재시도 규약)
     stored = store.find_run(conversation_id, body.request_id)
@@ -284,8 +297,10 @@ async def approve(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    _, conversation = _load(conversation_id, user, store, write=True)
+    row, conversation = _load(conversation_id, user, store)
     session = conversation.session
+    if not row.shared:
+        raise _private_change_blocked(row)       # 모드 게이트가 막지만, 승인은 곧 변경이라 한 번 더
     if conversation.lock.locked():
         raise _busy()
     run = _open_run(store, conversation_id)
@@ -304,8 +319,10 @@ async def resume(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    _, conversation = _load(conversation_id, user, store, write=True)
+    row, conversation = _load(conversation_id, user, store)
     session = conversation.session
+    if not row.shared:
+        raise _private_change_blocked(row)
     if conversation.lock.locked():
         raise _busy()
     if session.pending is None:

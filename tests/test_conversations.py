@@ -90,14 +90,34 @@ def test_인증_없으면_401(client):
     assert r.status_code == 401 and r.json()["detail"]["code"] == "UNAUTHORIZED"
 
 
-def test_공유_방은_남이_읽을_수만_있고_chat_approve는_403(client):
+def test_shared_방은_남도_같이_입력하고_승인한다(client):
+    """기획 05 §4: 여러 팀원이 하나의 Shared Session 에 참여하고 메시지를 보낼 수 있다."""
     shared = client.post("/conversations", json={"shared": True}, headers=OTHER).json()["conversation"]["id"]
-    assert client.get(f"/conversations/{shared}", headers=USER).status_code == 200
-    r = client.post(f"/conversations/{shared}/chat", json={"text": "x"}, headers=USER)
-    assert r.status_code == 403 and r.json()["detail"]["code"] == "FORBIDDEN"
-    r = client.post(f"/conversations/{shared}/approve", json={"call_id": "c", "approved": True}, headers=USER)
-    assert r.status_code == 403
-    assert client.post(f"/conversations/{shared}/resume", headers=USER).status_code == 403
+    assert client.get(f"/conversations/{shared}", headers=USER).json()["conversation"]["user_id"] == "u-2"
+    _, ticket = _pending_ticket_for_server("call-s")
+    restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="남이 승인해서 적용"))])
+    try:
+        r = client.post(f"/conversations/{shared}/chat", json={"text": "늘려"}, headers=USER)     # 주인 아님
+        assert r.status_code == 200 and r.json()["kind"] == "approval"
+        r = client.post(f"/conversations/{shared}/approve", json={"call_id": "call-s", "approved": True}, headers=USER)
+        assert r.status_code == 200 and r.json()["response"]["narration"] == "남이 승인해서 적용"
+    finally:
+        restore()
+
+
+def test_private_방은_실습_모드와_승인이_막힌다(client):
+    """기획 05 §3: Private 는 조회·진단만, 실제 변경은 불가. 변경이 필요하면 Shared 를 새로 만든다."""
+    cid = _new(client)                                                   # shared=False
+    r = client.post(f"/conversations/{cid}/chat", json={"text": "/mode 실습"}, headers=USER)
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "PRIVATE_SESSION"
+    assert client.get(f"/conversations/{cid}", headers=USER).json()["session"]["skill"] == "학습"   # 안 바뀜
+    assert client.get(f"/conversations/{cid}", headers=USER).json()["turns"] == []             # run 도 안 남음
+    assert client.post(f"/conversations/{cid}/chat", json={"text": "/mode 진단"}, headers=USER).status_code == 200
+    r = client.post(f"/conversations/{cid}/approve", json={"call_id": "c", "approved": True}, headers=USER)
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "PRIVATE_SESSION"
+    assert client.post(f"/conversations/{cid}/resume", headers=USER).status_code == 403
+    assert client.post(f"/conversations/{_new(client, shared=True)}/chat", json={"text": "/mode 실습"},
+                       headers=USER).json() == {"kind": "mode", "skill": "실습", "known": True}
 
 
 def test_회원_서버가_설정되면_개발용_헤더와_변수는_무시된다(client, monkeypatch):
@@ -270,7 +290,7 @@ def _swap_run_agent(outputs):
 
 def test_chat이_승인_카드를_주면_approve가_같은_run을_이어서_끝내고_다음_chat이_된다(client):
     """DB 문서 7절: 승인만으로 새 run 을 만들지 않는다 — 카드 run(awaiting_approval)을 이어서 completed 로."""
-    cid = _new(client)
+    cid = _new(client, shared=True)
     _, ticket = _pending_ticket_for_server("call-f")
     card_msgs = [ModelRequest(parts=[UserPromptPart(content="nginx 3개로")])]
     resume_msgs = [ModelRequest(parts=[UserPromptPart(content="(tool 결과)")])]
@@ -306,7 +326,7 @@ def test_chat이_승인_카드를_주면_approve가_같은_run을_이어서_끝�
 
 def test_승인_대기_중_재시작하면_카드는_만료되고_그_턴의_기록은_history에서_뺀다(client):
     """리뷰 P1/🟡: 재시작 뒤 활성 run 이 남아 영구 BUSY, 결과 없는 tool call 이 history 에 남는 문제."""
-    cid = _new(client)
+    cid = _new(client, shared=True)
     _, ticket = _pending_ticket_for_server("call-x")
     dangling = [ModelRequest(parts=[UserPromptPart(content="nginx 3개로")])]
     restore = _swap_run_agent([_fake(ticket, dangling), _fake(KukieResponse(narration="재시작 뒤"))])
@@ -327,7 +347,7 @@ def test_승인_대기_중_재시작하면_카드는_만료되고_그_턴의_기
 
 
 def test_승인_대기는_그_방만_막고_다른_방은_자유다(client):
-    a, b = _new(client), _new(client)
+    a, b = _new(client, shared=True), _new(client)
     _, ticket = _pending_ticket_for_server("call-a")
     restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="b 답")),
                                _fake(KukieResponse(narration="적용됨"))])
@@ -351,7 +371,7 @@ def test_승인_대기는_그_방만_막고_다른_방은_자유다(client):
 def test_카드가_여러_장이면_마지막_결정까지_run은_열려_있고_payload는_남은_카드다(client):
     """문서 7절: 계획이 여러 개면 결정이 모일 때까지 기다린다."""
     from pydantic_ai.tools import DeferredToolRequests
-    cid = _new(client)
+    cid = _new(client, shared=True)
     _, first = _pending_ticket_for_server("c1")
     _, second = _pending_ticket_for_server("c2")
     batch = DeferredToolRequests(approvals=[first.approvals[0], second.approvals[0]],
@@ -387,14 +407,14 @@ def test_실행_중_죽은_run은_처음_열_때_interrupted가_되고_running�
 
 
 def test_모르는_call_id는_409_NOT_PENDING(client):
-    cid = _new(client)
+    cid = _new(client, shared=True)
     r = client.post(f"/conversations/{cid}/approve", json={"call_id": "없음", "approved": True}, headers=USER)
     assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
 
 
 def test_재개_실패는_run을_recovery_required로_남기고_resume이_같은_run을_끝낸다(client):
     """문서 4절: recovery_required = 실제 변경 결과가 불명확해 확인 필요. DURO-66 의 RESUME_RETRYABLE 과 같다."""
-    cid = _new(client)
+    cid = _new(client, shared=True)
     _, ticket = _pending_ticket_for_server("call-r")
     restore = _swap_run_agent([_fake(ticket), RuntimeError("네트워크"), _fake(KukieResponse(narration="이번엔 됨"))])
     try:
@@ -418,7 +438,7 @@ def test_재개_실패는_run을_recovery_required로_남기고_resume이_같은
 
 
 def test_recovery_required_중_재시작하면_interrupted지만_확인_필요_코드는_남는다(client):
-    cid = _new(client)
+    cid = _new(client, shared=True)
     _, ticket = _pending_ticket_for_server("call-k")
     restore = _swap_run_agent([_fake(ticket), RuntimeError("네트워크")])
     try:
@@ -433,7 +453,7 @@ def test_recovery_required_중_재시작하면_interrupted지만_확인_필요_�
 
 
 def test_응답이_유실된_뒤_같은_request_id로_재전송하면_승인_대기_중이라도_카드를_다시_준다(client):
-    cid = _new(client)
+    cid = _new(client, shared=True)
     _, ticket = _pending_ticket_for_server("call-l")
     restore = _swap_run_agent([_fake(ticket)])
     try:
@@ -449,7 +469,7 @@ def test_응답이_유실된_뒤_같은_request_id로_재전송하면_승인_대
 
 
 def test_재개할_티켓이_없으면_409_NOT_PENDING(client):
-    cid = _new(client)
+    cid = _new(client, shared=True)
     r = client.post(f"/conversations/{cid}/resume", headers=USER)
     assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
 
