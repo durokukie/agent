@@ -24,6 +24,7 @@ from kukie.deps import Deps
 from kukie.skills import DEFAULT_SKILL, SKILLS
 from kukie.store import ChatStore
 from kukie.store.chat_store import SessionRow
+from kukie.tools.mutate import MUTATING_TOOLS
 
 HISTORY_MAX_RUNS = 100
 HISTORY_MAX_BYTES = 4 * 1024 * 1024
@@ -50,6 +51,10 @@ class ConversationRegistry:
         from kukie.server import Session   # 순환 import (server → conversations_api → 여기) 회피
 
         skill = SKILLS.get(row.current_mode, DEFAULT_SKILL)
+        if not row.shared and skill.allowed_tools & MUTATING_TOOLS:
+            # private 방은 변경 불가 (기획 05 §3). 게이트가 생기기 전 DB 에 남은 current_mode=실습 행을 그대로 복원하면
+            # 카드는 뜨는데 승인은 403 이라 방이 막힌다 — 판정을 입력이 아니라 세션 상태에 건다.
+            skill = DEFAULT_SKILL
         session = Session(
             deps=Deps(context=row.context_name, namespace=row.namespace, skill=skill),
             history=list(history or []),
@@ -85,9 +90,9 @@ def _restore_history(store: ChatStore, conversation_id: str) -> list[Any]:
     chunks: list[list[Any]] = []
     total = 0
     for run in reversed(completed[-HISTORY_MAX_RUNS:]):          # 최신부터 채우고 한도를 넘기면 멈춘다
-        size = len(json.dumps(run.agent_messages, ensure_ascii=False))
-        if chunks and total + size > HISTORY_MAX_BYTES:
-            break
+        size = len(json.dumps(run.agent_messages, ensure_ascii=False).encode("utf-8"))   # 문자 수가 아니라 바이트
+        if total + size > HISTORY_MAX_BYTES:
+            break                                                 # 최신 run 하나가 한도를 넘어도 복원하지 않는다 — 부분 복원은 없다
         chunks.append(run.agent_messages)
         total += size
     history: list[Any] = []

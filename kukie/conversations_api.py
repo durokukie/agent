@@ -112,7 +112,7 @@ def _error(status: int, code: str, message: str) -> HTTPException:
 
 
 def _load(conversation_id: str, user: User, store: ChatStore) -> tuple[SessionRow, Conversation]:
-    """private 방은 주인만 (남에게는 없는 방, 404). shared 방은 팀원 누구나 읽고 쓴다 (문서 05 §4)."""
+    """private 방은 주인만 (남에게는 없는 방, 404). shared 방은 팀원 누구나 읽고 입력한다 (문서 05 §4)."""
     row = store.get_session(conversation_id)
     if row is None or (row.user_id != user.id and not row.shared):
         raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
@@ -132,6 +132,15 @@ def _mutating_mode(name: str) -> bool:
 def _private_change_blocked(row: SessionRow) -> HTTPException:
     return _error(403, "PRIVATE_SESSION",
                   "Private 대화에서는 클러스터를 변경할 수 없다 — 변경은 Shared 대화를 새로 만들어서 (기획 05)")
+
+
+def _require_approver(row: SessionRow, user: User) -> None:
+    """승인·재개 = 클러스터 변경. 기획 06 은 Admin 또는 대상의 Operator 인 팀원에게 여는데, 팀·권한 정보는 Spring 팀 API 가
+    생겨야 온다. 그 전까지는 로그인한 아무나 승인하지 않도록 **방을 만든 사람만** (팀원 리뷰 6) — 팀 API 가 붙으면 넓힌다."""
+    if not row.shared:
+        raise _private_change_blocked(row)
+    if row.user_id != user.id:
+        raise _error(403, "FORBIDDEN", "승인·재개는 지금은 대화를 만든 사람만 할 수 있다 (팀 권한 검사가 붙기 전까지)")
 
 
 def _messages_json(result: Any) -> list[Any]:
@@ -167,8 +176,11 @@ async def create_conversation(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    context, namespace = body.context, body.namespace
-    if context is None:
+    context = (body.context or "").strip()
+    namespace = (body.namespace or "").strip()
+    if not context:
+        # 빈 context 로 방을 만들면 `kubectl --context ''` 가 kubeconfig 의 현재 context 를 따라가서, 나중에 current-context 가
+        # 바뀌면 같은 방의 실행 대상이 바뀐다 (팀원 리뷰 1). 만들 때 실제 이름으로 확정한다.
         try:
             context, kube_ns = _server.read_kubeconfig()
         except _server.KubeconfigError as exc:
@@ -245,6 +257,12 @@ async def chat(
         raise _error(409, "RECOVERY_REQUIRED", "재개가 실패한 요청이 있다 — /resume 으로 다시 시도")
 
     async with conversation.lock:
+        # 잠금을 쥔 지금 이 방에 실행 중인 run 은 없다. DB 에 running 이 남아 있다면 결과 저장에 실패한 run 이다 (팀원 리뷰 3) —
+        # 그대로 두면 이 방은 영원히 BUSY 라, 중단으로 닫고 진행한다.
+        stale = store.active_run(conversation_id)
+        if stale is not None and stale.status == "running":
+            logger.warning("결과가 저장되지 않은 run 을 닫는다 (conversation=%s, run=%s)", conversation_id, stale.id)
+            store.interrupt_active_runs(conversation_id, "결과를 저장하지 못해 중단된 요청이다")
         try:
             run, created = store.start_run(
                 conversation_id, request_id=body.request_id, kind=kind,
@@ -271,13 +289,28 @@ async def chat(
 
         # 승인 카드면 run 은 열린 채(awaiting_approval) 남는다 — approve/resume 이 이어서 끝낸다 (문서 7절)
         status = "awaiting_approval" if payload.get("kind") == "approval" else "completed"
-        store.update_run(
-            run.id, status=status, response_payload=payload,
+        _save_or_fail(
+            store, conversation_id, run,
+            status=status, response_payload=payload,
             agent_messages=_messages_json(result) if result is not None else None,
             usage_summary=_usage_json(result) if result is not None else None,
         )
         store.update_session(conversation_id, current_mode=session.skill.name)
         return payload
+
+
+def _save_or_fail(store: ChatStore, conversation_id: str, run: RunRow, **fields: Any) -> None:
+    """실행 결과 저장. 실패하면 run 을 failed 로라도 남기고 503 STORE_FAILED — 그것도 안 되면 다음 chat 이 running 을 닫는다."""
+    try:
+        store.update_run(run.id, **fields)
+    except Exception as exc:
+        logger.exception("실행 결과 저장 실패 (conversation=%s, run=%s)", conversation_id, run.id)
+        failed = _error(503, "STORE_FAILED", f"실행은 끝났지만 결과를 저장하지 못했다 ({type(exc).__name__}) — 다시 보내라")
+        try:
+            store.update_run(run.id, status="failed", response_payload=_error_record(failed))
+        except Exception:
+            logger.exception("실패 표시도 저장하지 못했다 (run=%s)", run.id)
+        raise failed from exc
 
 
 def _replay(run: RunRow) -> dict[str, Any]:
@@ -299,8 +332,7 @@ async def approve(
 ) -> dict[str, Any]:
     row, conversation = _load(conversation_id, user, store)
     session = conversation.session
-    if not row.shared:
-        raise _private_change_blocked(row)       # 모드 게이트가 막지만, 승인은 곧 변경이라 한 번 더
+    _require_approver(row, user)
     if conversation.lock.locked():
         raise _busy()
     run = _open_run(store, conversation_id)
@@ -321,8 +353,7 @@ async def resume(
 ) -> dict[str, Any]:
     row, conversation = _load(conversation_id, user, store)
     session = conversation.session
-    if not row.shared:
-        raise _private_change_blocked(row)
+    _require_approver(row, user)
     if conversation.lock.locked():
         raise _busy()
     if session.pending is None:
@@ -351,17 +382,18 @@ def _continue_run(
 ) -> dict[str, Any]:
     """승인/재개 결과를 같은 run 에 남긴다 (문서 7절 "승인만으로 새 run 을 만들지 않는다").
 
-    카드가 남았으면(outcome 이 approval) 남은 카드로 payload 만 바꾸고 awaiting_approval 그대로.
-    재개돼 답이 나왔으면 이 run 의 메시지에 재개 run 의 메시지(tool 결과 + 답)를 이어 붙이고 completed.
+    result 가 있으면 실제로 재개가 돌았다 — 그 메시지(tool 결과, 다음 tool call)를 이 run 에 이어 붙인다. 재개 뒤 새 카드가
+    나와도 마찬가지다 (팀원 리뷰 2: 여기서 안 붙이면 복원 history 에 첫 작업의 결과와 둘째 작업의 호출이 빠진다).
+    result 가 없으면 남은 카드 재전송이라 payload 만 바꾼다. 답이 나왔으면 completed, 카드가 나왔으면 awaiting_approval 그대로.
     """
-    if outcome.get("kind") == "approval":
-        store.update_run(run.id, status="awaiting_approval", response_payload=outcome)
-        return outcome
     messages = (run.agent_messages or []) + (_messages_json(result) if result is not None else [])
-    store.update_run(
-        run.id, status="completed", response_payload=outcome, agent_messages=messages or None,
-        usage_summary=_usage_json(result) if result is not None else run.usage_summary,
-    )
+    usage = _usage_json(result) if result is not None else run.usage_summary
+    if outcome.get("kind") == "approval":
+        _save_or_fail(store, conversation.id, run, status="awaiting_approval", response_payload=outcome,
+                      agent_messages=messages or None, usage_summary=usage)
+        return outcome
+    _save_or_fail(store, conversation.id, run, status="completed", response_payload=outcome,
+                  agent_messages=messages or None, usage_summary=usage)
     store.update_session(conversation.id, current_mode=conversation.session.skill.name)
     return outcome
 

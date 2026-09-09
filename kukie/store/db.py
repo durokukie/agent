@@ -6,6 +6,7 @@ run_kubectl 이 동기인 것과 같은 결정 — 다중 사용자가 되면 to
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 from sqlalchemy import create_engine
@@ -20,6 +21,7 @@ DEFAULT_DB_PATH = Path.home() / ".kukie" / "kukie.db"
 _engine: Engine | None = None
 _factory: sessionmaker[Session] | None = None
 _store: ChatStore | None = None
+_init_lock = threading.Lock()   # 동기 dependency 는 스레드풀에서 돈다 — 첫 요청 여럿이 create_all 에 동시에 들어오면 안 된다
 
 
 def database_url() -> str:
@@ -41,8 +43,10 @@ def get_store() -> ChatStore:
     """프로세스당 하나. 처음 부를 때 연결한다 (import 시점에 홈 디렉터리를 만들지 않기 위해)."""
     global _engine, _factory, _store
     if _store is None:
-        _engine, _factory = _connect(database_url())
-        _store = ChatStore(_factory)
+        with _init_lock:
+            if _store is None:
+                _engine, _factory = _connect(database_url())
+                _store = ChatStore(_factory)
     return _store
 
 

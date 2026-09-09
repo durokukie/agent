@@ -90,19 +90,159 @@ def test_인증_없으면_401(client):
     assert r.status_code == 401 and r.json()["detail"]["code"] == "UNAUTHORIZED"
 
 
-def test_shared_방은_남도_같이_입력하고_승인한다(client):
-    """기획 05 §4: 여러 팀원이 하나의 Shared Session 에 참여하고 메시지를 보낼 수 있다."""
+def test_shared_방은_남도_읽고_입력하지만_승인은_아직_주인만이다(client):
+    """기획 05 §4 는 팀원 공동 승인인데, 팀·Operator 정보가 오기 전까지는 만든 사람만 승인한다 (팀원 리뷰 6)."""
     shared = client.post("/conversations", json={"shared": True}, headers=OTHER).json()["conversation"]["id"]
     assert client.get(f"/conversations/{shared}", headers=USER).json()["conversation"]["user_id"] == "u-2"
     _, ticket = _pending_ticket_for_server("call-s")
-    restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="남이 승인해서 적용"))])
+    restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="주인이 승인해서 적용"))])
     try:
-        r = client.post(f"/conversations/{shared}/chat", json={"text": "늘려"}, headers=USER)     # 주인 아님
+        r = client.post(f"/conversations/{shared}/chat", json={"text": "늘려"}, headers=USER)     # 주인 아님 — 입력은 된다
         assert r.status_code == 200 and r.json()["kind"] == "approval"
         r = client.post(f"/conversations/{shared}/approve", json={"call_id": "call-s", "approved": True}, headers=USER)
-        assert r.status_code == 200 and r.json()["response"]["narration"] == "남이 승인해서 적용"
+        assert r.status_code == 403 and r.json()["detail"]["code"] == "FORBIDDEN"
+        assert client.post(f"/conversations/{shared}/resume", headers=USER).status_code == 403
+        r = client.post(f"/conversations/{shared}/approve", json={"call_id": "call-s", "approved": True}, headers=OTHER)
+        assert r.status_code == 200 and r.json()["response"]["narration"] == "주인이 승인해서 적용"
     finally:
         restore()
+
+
+def test_목록에_남이_만든_shared_방이_나온다(client):
+    """팀원 리뷰 7: 읽고 입력할 수 있는 방을 목록에서 찾을 수 있어야 참여할 수 있다."""
+    mine = _new(client)
+    shared = client.post("/conversations", json={"shared": True}, headers=OTHER).json()["conversation"]["id"]
+    private = client.post("/conversations", json={}, headers=OTHER).json()["conversation"]["id"]
+    ids = {c["id"] for c in client.get("/conversations", headers=USER).json()}
+    assert mine in ids and shared in ids and private not in ids
+
+
+def test_빈_context는_kubeconfig의_실제_이름으로_확정한다(client):
+    """팀원 리뷰 1: `kubectl --context ''` 는 현재 context 를 따라가서 나중에 방의 대상이 바뀔 수 있다."""
+    r = client.post("/conversations", json={"context": "", "namespace": "  "}, headers=USER)
+    assert r.status_code == 200
+    assert r.json()["session"] == {"context": "kind-dev", "namespace": "study", "skill": "학습", "pending": []}
+
+
+def test_private_방은_DB에_실습_모드가_남아_있어도_변경_모드로_복원하지_않는다(client):
+    """자동 리뷰 5차: 게이트 전 커밋으로 남은 current_mode=실습 private 행을 그대로 열면 카드는 뜨고 승인은 403 이라 방이 막힌다."""
+    from kukie.store import get_store
+    cid = _new(client)
+    get_store().update_session(cid, current_mode="실습")
+    conversations.registry.clear()
+    assert client.get(f"/conversations/{cid}", headers=USER).json()["session"]["skill"] == "학습"
+
+
+def test_재개_뒤_새_카드가_나와도_그_사이_메시지가_run에_쌓인다(client):
+    """팀원 리뷰 2: 첫 승인 → 실행 → 둘째 카드 → 승인 → 완료. 복원하면 첫 작업 결과와 둘째 호출이 빠지면 안 된다."""
+    cid = _new(client, shared=True)
+    _, first = _pending_ticket_for_server("c1")
+    _, second = _pending_ticket_for_server("c2")
+    m = lambda text: [ModelRequest(parts=[UserPromptPart(content=text)])]   # noqa: E731
+    restore = _swap_run_agent([_fake(first, m("카드1")), _fake(second, m("결과1+호출2")),
+                               _fake(KukieResponse(narration="끝"), m("결과2+답"))])
+    try:
+        assert client.post(f"/conversations/{cid}/chat", json={"text": "둘"}, headers=USER).json()["kind"] == "approval"
+        r = client.post(f"/conversations/{cid}/approve", json={"call_id": "c1", "approved": True}, headers=USER)
+        assert r.json()["kind"] == "approval"                                # 실제 재개가 돌아 새 카드가 나왔다
+        assert [c["tool_call_id"] for c in r.json()["approvals"]] == ["c2"]
+        r = client.post(f"/conversations/{cid}/approve", json={"call_id": "c2", "approved": True}, headers=USER)
+        assert r.json()["response"]["narration"] == "끝"
+    finally:
+        restore()
+    turns = client.get(f"/conversations/{cid}", headers=USER).json()["turns"]
+    assert [t["status"] for t in turns] == ["completed"]
+    conversations.registry.clear()
+    client.get(f"/conversations/{cid}", headers=USER)
+    history = conversations.registry.get(cid).session.history
+    assert [msg.parts[0].content for msg in history] == ["카드1", "결과1+호출2", "결과2+답"]
+
+
+def test_결과_저장이_실패해도_방이_영구_BUSY로_남지_않는다(client, monkeypatch):
+    """팀원 리뷰 3: 실행 뒤 저장이 실패하면 DB 의 run 이 running 으로 남아 다음 요청이 계속 409 였다."""
+    from kukie.store import get_store
+    store = get_store()
+    original = store.update_run
+    calls = {"failed": 0}
+
+    def flaky(run_id, **fields):
+        if fields.get("status") == "completed" and calls["failed"] == 0:
+            calls["failed"] += 1
+            raise RuntimeError("disk full")
+        return original(run_id, **fields)
+
+    monkeypatch.setattr(store, "update_run", flaky)
+    cid = _new(client)
+    with agent.override(model=_model("첫 답")):
+        r = client.post(f"/conversations/{cid}/chat", json={"text": "파드"}, headers=USER)
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "STORE_FAILED"
+    assert client.get(f"/conversations/{cid}", headers=USER).json()["turns"][0]["status"] == "failed"
+    with agent.override(model=_model("둘째 답")):
+        r = client.post(f"/conversations/{cid}/chat", json={"text": "파드"}, headers=USER)
+    assert r.status_code == 200 and r.json()["response"]["narration"] == "둘째 답"
+
+
+def test_실패_표시도_저장_못_한_running_run은_다음_chat이_닫고_진행한다(client):
+    """저장이 완전히 죽었다 살아난 경우: 잠금을 쥔 chat 이 DB 의 running 을 중단으로 닫는다."""
+    from kukie.store import get_store
+    cid = _new(client)
+    get_store().start_run(cid, request_id="orphan", kind="chat", mode="학습", input_text="저장 실패")   # running 으로 방치
+    with agent.override(model=_model("살아남")):
+        r = client.post(f"/conversations/{cid}/chat", json={"text": "다시"}, headers=USER)
+    assert r.status_code == 200
+    statuses = [t["status"] for t in client.get(f"/conversations/{cid}", headers=USER).json()["turns"]]
+    assert statuses == ["interrupted", "completed"]
+
+
+def test_복원_한도는_UTF8_바이트_기준이고_최신_run_하나가_넘어도_복원하지_않는다(client, monkeypatch):
+    """팀원 리뷰 5: 문자 수로 재면 한글이 작게 잡히고, 첫 run 은 검사를 건너뛰었다."""
+    import json
+    cid = _new(client)
+    text = "한글" * 50
+    restore = _swap_run_agent([_fake(KukieResponse(narration="ok"), [ModelRequest(parts=[UserPromptPart(content=text)])])])
+    try:
+        client.post(f"/conversations/{cid}/chat", json={"text": "질문"}, headers=USER)
+    finally:
+        restore()
+    stored = client.get(f"/conversations/{cid}", headers=USER)
+    conversations.registry.clear()
+    client.get(f"/conversations/{cid}", headers=USER)
+    messages = conversations.registry.get(cid).session.history
+    assert len(messages) == 1
+    from kukie.store import get_store
+    raw = get_store().list_runs(cid)[0].agent_messages
+    chars, size = len(json.dumps(raw, ensure_ascii=False)), len(json.dumps(raw, ensure_ascii=False).encode("utf-8"))
+    assert size > chars                                                   # 한글은 바이트가 더 크다
+    monkeypatch.setattr(conversations, "HISTORY_MAX_BYTES", size - 1)   # 문자 수로 재면 통과했을 값
+    conversations.registry.clear()
+    client.get(f"/conversations/{cid}", headers=USER)
+    assert conversations.registry.get(cid).session.history == []
+    assert stored.status_code == 200
+
+
+def test_첫_요청_여럿이_동시에_와도_DB_초기화가_충돌하지_않는다(tmp_path, monkeypatch):
+    """팀원 리뷰 4: 동기 dependency 는 스레드풀에서 돌아 create_all 이 동시에 들어올 수 있다."""
+    import threading
+    from kukie.store import db as store_db
+    monkeypatch.setenv("KUKIE_DATABASE_URL", f"sqlite:///{tmp_path / 'race.db'}")
+    monkeypatch.setattr(store_db, "_engine", None)
+    monkeypatch.setattr(store_db, "_factory", None)
+    monkeypatch.setattr(store_db, "_store", None)
+    stores, errors = [], []
+
+    def call():
+        try:
+            stores.append(store_db.get_store())
+        except Exception as exc:                                          # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=call) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == [] and len({id(s) for s in stores}) == 1
+    reset_store_for_tests(f"sqlite:///{tmp_path / 'after.db'}")           # 다른 테스트가 쓰는 전역을 되돌린다
 
 
 def test_private_방은_실습_모드와_승인이_막힌다(client):

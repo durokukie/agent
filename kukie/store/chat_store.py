@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -137,8 +137,11 @@ class ChatStore:
             return SessionRow.of(row, running=self._has_run_with(db, session_id, ("running",)))
 
     def list_sessions(self, user_id: str, *, cluster_id: str | None = None) -> list[SessionRow]:
+        """내 방 + shared 방 (기획 05 §4: 팀원이 같이 본다). 팀 소속으로 좁히는 건 Spring 팀 API 뒤 — 지금은 shared 전부."""
         with self._factory() as db:
-            stmt = select(ChatSession).where(ChatSession.user_id == user_id)
+            stmt = select(ChatSession).where(
+                or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True))
+            )
             if cluster_id is not None:
                 stmt = stmt.where(ChatSession.cluster_id == cluster_id)
             stmt = stmt.order_by(ChatSession.updated_at.desc())
