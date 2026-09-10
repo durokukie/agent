@@ -163,8 +163,14 @@ async def _require_approver(row: SessionRow, user: User) -> None:
         raise _private_change_blocked(row)
     if row.team_id and membership.available():
         # 소속을 먼저 본다. 주인을 먼저 통과시키면 나간 사람이 옛 방에서 계속 승인한다 (자동 리뷰 🔴).
-        # 소속만 확인되면 Admin 이거나 **자기가 만든 방**이면 승인할 수 있다 — 기획 06 §3 의
-        # "요청한 사용자 본인도 자신의 Plan 을 승인할 수 있다".
+        # 소속만 확인되면 Admin 이거나 **방을 만든 사람**이면 승인할 수 있다.
+        #
+        # 기획 06 §3 은 "요청한 사용자 본인도 자신의 Plan 을 승인할 수 있다" 인데, 여기 비교하는 값은
+        # 요청자가 아니라 방 생성자다 — run 에 요청자 칸이 없다 (DB 문서 6절이 회원 id 중복 저장을
+        # 금한다). shared 방은 팀원 누구나 입력하므로 둘이 갈릴 수 있다 (자동 리뷰 지적):
+        # 남이 요청한 카드를 방 주인이 누를 수 있고, 요청한 Member 는 자기 카드를 못 누른다.
+        # 팀 밖으로 새지는 않아 지금은 이대로 두고, 요청자를 run 에 남길지는 #62 의 requested_by
+        # 질문과 함께 정한다.
         if await membership.require_member(user, row.team_id) == "ADMIN" or row.user_id == user.id:
             return
         raise _error(403, "NOT_TEAM_ADMIN", "승인·재개는 팀 Admin 이나 대화를 만든 사람만 할 수 있다")
@@ -253,6 +259,12 @@ async def create_conversation(
     namespace = (body.namespace or "").strip()
     fingerprint = body.cluster_fingerprint
     team_id = body.team_id
+    if team_id and not body.cluster_id and membership.available():
+        # 클러스터를 고르지 않은 방은 team_id 를 클라이언트가 정한다. 이 값이 이제 방을 여닫는
+        # 열쇠라(_load) 검사 없이 두면 두 가지가 깨진다 (자동 리뷰 🔴):
+        #   ① 없는 팀을 적으면 만든 사람도 자기 방에 못 들어가고 지울 방법도 없다
+        #   ② 남의 팀을 적으면 그 팀 구성원이 들어오는 방을 외부인이 심을 수 있다
+        await membership.require_member(user, team_id)
     if body.cluster_id:
         # 등록된 클러스터를 골랐다 (기획 04 §8). 접속 대상은 그 행이 정한다 — 화면이 보낸 값보다 우선한다.
         #
