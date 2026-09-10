@@ -461,7 +461,7 @@ async def chat(
         status = "awaiting_approval" if payload.get("kind") == "approval" else "completed"
         _save_or_fail(
             store, conversation_id, run, on_failure=_chat_store_failure(), failure_status="failed",
-            status=status, response_payload=payload,
+            session=session, status=status, response_payload=payload,
             agent_messages=_messages_json(result) if result is not None else None,
             usage_summary=_usage_json(result) if result is not None else None,
         )
@@ -515,12 +515,19 @@ def _close_plans(store: ChatStore, run: RunRow) -> None:
 
 def _save_or_fail(
     store: ChatStore, conversation_id: str, run: RunRow, *, on_failure: HTTPException, failure_status: str,
-    keep_payload: bool = False, **fields: Any,
+    session: Any = None, keep_payload: bool = False, **fields: Any,
 ) -> None:
     """실행 결과 저장. 실패하면 run 을 failure_status 로라도 남기고 on_failure 를 던진다 — 그것도 안 되면 다음 chat 이
     잠금을 쥔 채 활성 run 을 닫는다. 호출자가 상태·문구를 고른다: 모델 답변만 잃은 chat 은 failed, kubectl 이 이미 돈
     승인·재개는 recovery_required ("변경은 적용됐을 수 있다", 문서 4절). keep_payload 면 대체 쓰기가 payload 를
-    건드리지 않는다 — "여기서 계속하라" 는 경로는 계속할 재료(남은 카드)를 기록에 남겨야 한다."""
+    건드리지 않는다 — "여기서 계속하라" 는 경로는 계속할 재료(남은 카드)를 기록에 남겨야 한다.
+
+    **종료 상태로 닫으면 메모리의 승인 티켓도 함께 버린다** (팀원 리뷰). DB 의 run 은 닫혔는데
+    session.pending 이 남으면 그 방은 이 프로세스가 사는 동안 아무것도 못 한다 — /chat 은
+    PENDING_APPROVAL, /approve 는 활성 run 이 없어 NOT_PENDING, /resume 은 다시 PENDING_APPROVAL
+    이고, 다음 chat 의 복구 로직은 pending 검사에 먼저 막혀 닿지 못한다. 활성 상태로 남기는
+    경로(awaiting_approval·recovery_required)는 티켓이 있어야 이어갈 수 있으므로 그대로 둔다.
+    """
     try:
         store.update_run(run.id, **fields)
     except Exception as exc:
@@ -532,10 +539,14 @@ def _save_or_fail(
                 store.update_run(run.id, status=failure_status, response_payload=_error_record(on_failure))
         except Exception:
             logger.exception("실패 표시도 저장하지 못했다 (run=%s)", run.id)
-        # failed 는 종료 상태다 — 이 문으로 닫힌 run 의 계획도 함께 닫아야 한다 (자동 리뷰 지적).
+        # failed 는 종료 상태다 — 이 문으로 닫힌 run 의 계획도 함께 닫고(자동 리뷰 지적),
+        # 메모리의 승인 티켓도 함께 버린다(팀원 리뷰). 둘 다 "DB 가 닫았으면 나머지도 닫는다" 다.
         # recovery_required·awaiting_approval 은 활성이라 나중에 interrupt 가 지나간다.
         if failure_status not in RUN_ACTIVE:
             _close_plans(store, run)
+            if session is not None:
+                session.pending = None
+                session.decisions.clear()
         raise on_failure from exc
 
 

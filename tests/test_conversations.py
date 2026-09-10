@@ -764,3 +764,77 @@ def test_재개할_티켓이_없으면_409_NOT_PENDING(client):
 
 async def _async(value):
     return value
+
+
+def test_최초_승인_요청_저장만_실패해도_방을_계속_쓸_수_있다(client, monkeypatch):
+    """팀원 리뷰: 카드를 만든 직후 awaiting_approval 저장만 실패하면 메모리와 DB 가 갈린다.
+
+    메모리에는 승인 티켓이 남고 DB 의 run 은 failed 다. 그러면 /chat 은 PENDING_APPROVAL,
+    /approve 는 활성 run 이 없어 NOT_PENDING, /resume 은 다시 PENDING_APPROVAL — 이 프로세스가
+    사는 동안 그 방은 아무것도 못 한다. 다음 chat 의 복구 로직도 pending 검사에 먼저 막힌다.
+
+    카드가 기록에 안 남았으므로 그 승인은 이어갈 수 없다. 티켓을 버려 DB 와 맞추고, 안내대로
+    새 요청을 받는다.
+    """
+    from kukie.store import get_store
+
+    store = get_store()
+    original = store.update_run
+    dead = {"on": False}
+
+    def flaky(run_id, **fields):
+        if dead["on"] and fields.get("status") == "awaiting_approval":
+            raise RuntimeError("db down")          # 첫 저장만 실패, 대체 저장(failed)은 성공
+        return original(run_id, **fields)
+
+    monkeypatch.setattr(store, "update_run", flaky)
+    cid = _new(client, shared=True)
+    _, ticket = _pending_ticket_for_server("first")
+    restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="다시 됨"))])
+    try:
+        dead["on"] = True
+        r = client.post(f"/conversations/{cid}/chat", json={"text": "늘려"}, headers=USER)
+        assert r.status_code == 503 and r.json()["detail"]["code"] == "STORE_FAILED"
+        dead["on"] = False
+        assert store.list_runs(cid)[-1].status == "failed"          # DB 는 닫혔고
+        assert conversations.registry.get(cid).session.pending is None   # 메모리도 같이 비었다
+
+        # 안내대로 새 요청을 보내면 방이 그대로 산다
+        r = client.post(f"/conversations/{cid}/chat", json={"text": "다시"}, headers=USER)
+        assert r.status_code == 200, r.json()
+        assert r.json()["response"]["narration"] == "다시 됨"
+    finally:
+        restore()
+    assert [t["status"] for t in client.get(f"/conversations/{cid}", headers=USER).json()["turns"]] \
+        == ["failed", "completed"]
+
+
+def test_저장_실패로_닫힌_카드는_approve_도_resume_도_받지_않는다(client, monkeypatch):
+    """티켓을 버렸으니 둘 다 "대기 중인 승인이 없다" 가 나와야 한다 — 서로 다른 409 로 엇갈리면 안 된다."""
+    from kukie.store import get_store
+
+    store = get_store()
+    original = store.update_run
+    dead = {"on": False}
+
+    def flaky(run_id, **fields):
+        if dead["on"] and fields.get("status") == "awaiting_approval":
+            raise RuntimeError("db down")
+        return original(run_id, **fields)
+
+    monkeypatch.setattr(store, "update_run", flaky)
+    cid = _new(client, shared=True)
+    _, ticket = _pending_ticket_for_server("gone")
+    restore = _swap_run_agent([_fake(ticket)])
+    try:
+        dead["on"] = True
+        client.post(f"/conversations/{cid}/chat", json={"text": "늘려"}, headers=USER)
+        dead["on"] = False
+    finally:
+        restore()
+
+    r = client.post(f"/conversations/{cid}/approve",
+                    json={"call_id": "gone", "approved": True}, headers=USER)
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
+    r = client.post(f"/conversations/{cid}/resume", headers=USER)
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
