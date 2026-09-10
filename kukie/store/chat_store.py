@@ -325,7 +325,7 @@ class ChatStore:
             return SessionRow.of(row, running=self._has_run_with(db, session_id, ("running",)))
 
     def list_sessions(
-        self, user_id: str, *, cluster_id: str | None = None, team_ids: list[str] | None = None
+        self, user_id: str, *, team_ids: list[str] | None, cluster_id: str | None = None
     ) -> list[SessionRow]:
         """내 방 + 내가 볼 수 있는 shared 방 (기획 05 §4: 팀원이 같이 본다).
 
@@ -562,8 +562,8 @@ class ChatStore:
             return [PlanRow.of(r) for r in rows]
 
     def list_plan_summaries(
-        self, user_id: str, *, cluster_id: str | None = None, status: str | None = None,
-        team_ids: list[str] | None = None,
+        self, user_id: str, *, team_ids: list[str] | None, cluster_id: str | None = None,
+        status: str | None = None,
     ) -> list[PlanSummaryRow]:
         """대시보드 목록. 내 방 + 내가 볼 수 있는 shared 방의 계획만 (list_sessions 와 **같은 범위**).
 
@@ -660,7 +660,10 @@ class ChatStore:
         with self._factory() as db:
             # 개인 클러스터(team_id 가 NULL)만 "내가 등록했으니 내 것" 이다. 팀이 붙은 행은
             # 등록자여도 지금 소속으로 판단한다 — 팀에서 나간 뒤에도 보이면 안 된다 (자동 리뷰 P1).
-            mine = (Cluster.registered_by == user_id) & Cluster.team_id.is_(None)
+            # `""` 도 "팀 없음" 으로 본다 — _readable 은 falsy 라 팀 검사를 건너뛰므로, 여기서
+            # IS NULL 에만 맡기면 목록엔 없는데 상세·/test·DELETE 는 되는 행이 남는다 (자동 리뷰).
+            no_team = or_(Cluster.team_id.is_(None), Cluster.team_id == "")
+            mine = (Cluster.registered_by == user_id) & no_team
             if team_id is not None:
                 stmt = select(Cluster).where(Cluster.team_id == team_id)
             elif team_ids:

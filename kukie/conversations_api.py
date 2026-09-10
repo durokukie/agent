@@ -39,7 +39,7 @@ from kukie.clusters import crypto
 from kukie import membership
 from kukie.clusters.access import ClusterChanged, ClusterGone, kubeconfig_or_none
 from kukie.conversations import Conversation, registry
-from kukie.fields import blank_is_none
+from kukie.fields import blank_is_none, none_if_blank
 from kukie.skills import SKILLS
 from kukie.store import ChatStore, get_store
 from kukie.store.chat_store import ActiveRunExists, RequestMismatch, RunRow, SessionRow, error_payload
@@ -347,7 +347,7 @@ async def list_conversations(
 ) -> list[dict[str, Any]]:
     # 목록과 상세의 답이 같아야 한다 — 열 수 없는 방이 목록에 뜨면 사용자가 막다른 길에 선다
     mine = list(await membership.team_roles(user)) if membership.available() else None
-    rows = store.list_sessions(user.id, cluster_id=cluster_id, team_ids=mine)
+    rows = store.list_sessions(user.id, cluster_id=none_if_blank(cluster_id), team_ids=mine)
     return [_conversation_view(r, running=_is_running(r)) for r in rows]
 
 

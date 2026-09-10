@@ -18,4 +18,12 @@ def blank_is_none(cls: object, value: object) -> object:
     return None if value == "" else value
 
 
-__all__ = ["blank_is_none", "stripped"]
+def none_if_blank(value: str | None) -> str | None:
+    """쿼리 파라미터용. 검증기가 안 도는 자리에서 본문과 같은 규칙을 손으로 적용한다 —
+    `?team_id=`·`?cluster_id=` 를 그대로 넘기면 `''` 로 좁혀져 늘 빈 목록이 나온다 (자동 리뷰 지적)."""
+    if value is None:
+        return None
+    return value.strip() or None
+
+
+__all__ = ["blank_is_none", "none_if_blank", "stripped"]

@@ -32,7 +32,7 @@ from kukie.clusters import crypto
 from kukie.clusters.access import ClusterGone, kubeconfig_for
 from kukie.clusters.kubeconfig import KubeconfigRejected, parse_kubeconfig
 from kukie.clusters.settings import allow_local_clusters
-from kukie.fields import blank_is_none, stripped
+from kukie.fields import blank_is_none, none_if_blank, stripped
 from kukie import membership
 from kukie.kubectl import run_kubectl
 from kukie.store import ChatStore, get_store
@@ -188,7 +188,9 @@ async def register_cluster(
             insecure=parsed.insecure,
             credential_encrypted=crypto.encrypt(parsed.credential),
             context_name=parsed.context_name,
-            default_namespace=(body.namespace or parsed.namespace or "").strip() or "default",
+            # 둘 다 검증기·parse_kubeconfig 를 거쳐 공백 아닌 값이거나 None 이다
+            # (parsed.namespace 는 kubeconfig.py 에서 이미 "default" 로 채워져 온다)
+            default_namespace=body.namespace or parsed.namespace,
             fingerprint=parsed.fingerprint,
         )
     except IntegrityError:
@@ -202,10 +204,7 @@ async def list_clusters(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> list[dict[str, Any]]:
-    # 본문과 같은 정규화 — `?team_id=` 를 그대로 넘기면 팀 `''` 로 좁혀져 항상 빈 목록이 나온다
-    # (자동 리뷰 지적). 값이 없으면 좁히지 않는다는 뜻으로 읽는다.
-    if team_id is not None and not team_id.strip():
-        team_id = None
+    team_id = none_if_blank(team_id)      # `?team_id=` 는 "좁히지 않는다" 로 읽는다
     if team_id and membership.available():
         await membership.require_member(user, team_id)
     mine = list(await membership.team_roles(user)) if membership.available() else None

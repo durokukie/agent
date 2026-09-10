@@ -577,3 +577,35 @@ def test_계획_목록은_팀을_안_넘기면_부를_수_없다():
 
     param = inspect.signature(action_plan.list_plans).parameters["team_ids"]
     assert param.default is inspect.Parameter.empty
+
+
+def test_빈_team_id_클러스터도_목록과_상세가_같다(client, spring):
+    """`""` 는 IS NULL 도 IN 도 아니라 목록에서만 사라진다 — 상세·/test·DELETE 는 열린다."""
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    cluster = _cluster("", owner="u-1")
+
+    ids = {c["id"] for c in client.get("/clusters", headers=BEARER).json()}
+    assert cluster in ids                                                     # 목록과
+    assert client.get(f"/clusters/{cluster}", headers=BEARER).status_code == 200   # 상세가 같다
+
+
+def test_빈_cluster_id_쿼리는_좁히지_않는다(client, spring):
+    """`?cluster_id=` 를 그대로 넘기면 클러스터 '' 로 좁혀져 조용히 빈 목록이 나온다."""
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    _plan_in_room(None, owner="u-1", shared=False)
+
+    for path in ("/conversations", "/action-plans"):
+        전체 = client.get(path, headers=BEARER).json()
+        assert 전체, path
+        assert client.get(f"{path}?cluster_id=", headers=BEARER).json() == 전체, path
+
+
+def test_목록_쿼리를_만드는_층도_팀을_안_넘기면_못_부른다():
+    """윗층에서만 막으면 아랫층을 직접 부르는 새 호출자가 조용히 샌다 (None = shared 전부)."""
+    import inspect
+
+    from kukie.store.chat_store import ChatStore
+
+    for name in ("list_sessions", "list_plan_summaries"):
+        param = inspect.signature(getattr(ChatStore, name)).parameters["team_ids"]
+        assert param.default is inspect.Parameter.empty, name
