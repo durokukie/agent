@@ -375,3 +375,32 @@ def test_팀원이면_자기가_만든_방은_승인할_수_있다(client, sprin
     r = client.post(f"/conversations/{room}/approve", json={"call_id": "c1", "approved": True},
                     headers=BEARER)
     assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
+
+
+def test_클러스터_없이_남의_팀에_방을_심을_수_없다(client, spring):
+    """🔴 team_id 가 방을 여는 열쇠가 됐는데 클러스터 없는 경로는 그 값을 검사하지 않았다.
+
+    외부인이 심은 방에 그 팀 구성원이 들어오고, 방의 context·namespace 는 외부인이 정한 값이다.
+    """
+    spring["teams"] = [{"id": "t-내팀", "role": "ADMIN"}]
+    r = client.post("/conversations", json={"team_id": "t-남의팀", "shared": True}, headers=BEARER)
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "NOT_TEAM_MEMBER"
+
+
+def test_없는_팀을_적으면_방이_만들어지지_않는다(client, spring):
+    """만들어지고 나면 만든 사람도 못 들어가는데 지울 방법이 없다."""
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    r = client.post("/conversations", json={"team_id": "t-없음", "shared": True}, headers=BEARER)
+    assert r.status_code == 403
+
+    ids = [c["id"] for c in client.get("/conversations", headers=BEARER).json()]
+    assert ids == []                      # 죽은 방이 목록에 남지 않는다
+
+
+def test_내_팀이면_클러스터_없이도_방을_만든다(client, spring):
+    spring["teams"] = [{"id": "t-1", "role": "MEMBER"}]
+    created = client.post("/conversations", json={"team_id": "t-1", "shared": True},
+                          headers=BEARER)
+    assert created.status_code == 200
+    room = created.json()["conversation"]["id"]
+    assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 200
