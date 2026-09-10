@@ -144,6 +144,14 @@ def _cluster(team_id: str | None, *, owner: str = "u-1") -> str:
 
 
 BEARER = {"Authorization": "Bearer tok-1"}
+DEV = {"X-User": "u-1"}          # 개발 모드(회원 서버 없음)에서 쓰는 헤더
+
+
+def _dev_mode(monkeypatch) -> None:
+    """회원 서버가 없는 개발 모드로 바꾼다 — 인증도 X-User 로 넘어간다."""
+    monkeypatch.delenv("KUKIE_MEMBER_URL", raising=False)
+    monkeypatch.setenv("KUKIE_DEV_AUTH", "1")
+    membership.clear_cache()
 
 
 def test_팀_클러스터는_구성원이_보고_Admin_만_지운다(client, spring):
@@ -609,3 +617,41 @@ def test_목록_쿼리를_만드는_층도_팀을_안_넘기면_못_부른다():
     for name in ("list_sessions", "list_plan_summaries"):
         param = inspect.signature(getattr(ChatStore, name)).parameters["team_ids"]
         assert param.default is inspect.Parameter.empty, name
+
+
+def test_team_id_필터는_좁히기만_한다(client, spring, monkeypatch):
+    """쿼리가 소유·소속 조건을 대신하면, 회원 서버가 없는 개발 모드에서 남의 팀 목록이 나간다."""
+    from kukie import clusters_api
+
+    남의것 = _cluster("t-9", owner="다른사람")
+    _dev_mode(monkeypatch)                                  # require_member 를 안 탄다
+    assert not clusters_api.membership.available()
+
+    assert client.get("/clusters?team_id=t-9", headers=DEV).json() == []
+    assert client.get(f"/clusters/{남의것}", headers=DEV).status_code == 404      # 상세도 같다
+
+
+def test_개발_모드에서도_목록과_상세가_같다(client, spring, monkeypatch):
+    """team_ids 가 None 일 때 _readable 은 등록자로 판정하는데 목록만 팀 것을 숨겼다."""
+    내가등록한팀것 = _cluster("t-1", owner="u-1")
+    _dev_mode(monkeypatch)
+
+    ids = {c["id"] for c in client.get("/clusters", headers=DEV).json()}
+    assert 내가등록한팀것 in ids
+    assert client.get(f"/clusters/{내가등록한팀것}", headers=DEV).status_code == 200
+
+
+def test_빈_team_id_는_개인_클러스터로_저장돼_이름이_겹치지_않는다(client, spring):
+    """`""` 로 저장되면 이름 유일성 인덱스(WHERE team_id IS NULL)에 안 걸린다."""
+    from sqlalchemy.exc import IntegrityError
+
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    첫번째 = get_store().create_cluster(
+        registered_by="u-1", team_id="", name="c", api_server="https://k.example",
+        ca_data="QQ==", insecure=False, credential_encrypted="x", context_name="ctx",
+        default_namespace="default", fingerprint="fp",
+    )
+    assert 첫번째.team_id is None
+
+    with pytest.raises(IntegrityError):
+        _cluster(None, owner="u-1")          # 같은 사람 + 같은 이름 = 막힌다

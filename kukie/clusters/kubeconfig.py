@@ -196,12 +196,14 @@ def parse_kubeconfig(
     else:
         ca_data = _base64(ca, "certificate-authority-data")
 
+    # 여기서 공백을 뗀다 — 쓰는 쪽마다 떼면 하나만 빠져도 `"web "` 이 그대로 저장된다 (자동 리뷰 지적)
     namespace = context.get("namespace")
+    namespace = namespace.strip() if isinstance(namespace, str) else ""
     return ParsedCluster(
         context_name=str(chosen),
         api_server=str(server).rstrip("/"),
         ca_data=ca_data,
-        namespace=str(namespace) if isinstance(namespace, str) and namespace else "default",
+        namespace=namespace or "default",
         credential=_credential(user),
         insecure=insecure,
     )

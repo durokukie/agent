@@ -627,6 +627,9 @@ class ChatStore:
         fingerprint: str, team_id: str | None = None, provider: str = "GENERIC",
     ) -> ClusterRow:
         with self._factory() as db:
+            # `""` 를 그대로 넣으면 이름 유일성 인덱스(WHERE team_id IS NULL)에 안 걸려 한 사람의
+            # 개인 목록에 같은 이름이 둘 뜬다. 읽는 쪽과 같은 규칙으로 여기서 접는다 (자동 리뷰 지적).
+            team_id = team_id or None
             row = Cluster(
                 team_id=team_id, registered_by=registered_by, name=name, provider=provider,
                 api_server=api_server, ca_data=ca_data, insecure=insecure,
@@ -650,26 +653,33 @@ class ChatStore:
             return row.credential_encrypted if row is not None else None
 
     def list_clusters(
-        self, user_id: str, *, team_ids: list[str] | None = None, team_id: str | None = None
+        self, user_id: str, *, team_ids: list[str] | None, team_id: str | None = None
     ) -> list[ClusterRow]:
-        """내가 등록한 것 + **내가 속한 팀** 것. team_ids 는 부르는 쪽이 회원 서버에서 받아 넘긴다.
+        """내가 볼 수 있는 클러스터. team_ids 는 부르는 쪽이 회원 서버에서 받아 넘긴다 (기본값 없음).
 
-        team_ids 를 주지 않으면 팀 클러스터는 보이지 않는다 — 예전에는 팀이 붙은 클러스터를 전부
-        보여 줘서 남의 팀 것까지 새어 나갔다.
+        규칙은 clusters_api._readable 과 **한 벌**이어야 한다 — 다르면 "목록엔 없는데 상세·/test·
+        DELETE 는 되는" 행이 남는다 (자동 리뷰 지적).
+          개인 클러스터(팀 없음) → 등록한 사람만
+          팀 클러스터           → 지금 그 팀 구성원만. 등록자여도 나갔으면 안 보인다 (자동 리뷰 P1)
+          team_ids 가 None      → 회원 서버 없는 개발 모드. _readable 이 등록자로 판정하므로 같게 둔다
+
+        team_id 는 그 위에 **좁히기만** 한다. 소유·소속 조건을 대신하면 개발 모드에서 윗층
+        require_member 도 건너뛰어 남의 팀 목록이 그대로 나간다 (자동 리뷰 지적).
         """
         with self._factory() as db:
-            # 개인 클러스터(team_id 가 NULL)만 "내가 등록했으니 내 것" 이다. 팀이 붙은 행은
-            # 등록자여도 지금 소속으로 판단한다 — 팀에서 나간 뒤에도 보이면 안 된다 (자동 리뷰 P1).
             # `""` 도 "팀 없음" 으로 본다 — _readable 은 falsy 라 팀 검사를 건너뛰므로, 여기서
-            # IS NULL 에만 맡기면 목록엔 없는데 상세·/test·DELETE 는 되는 행이 남는다 (자동 리뷰).
+            # IS NULL 에만 맡기면 목록엔 없는데 상세는 되는 행이 남는다.
             no_team = or_(Cluster.team_id.is_(None), Cluster.team_id == "")
-            mine = (Cluster.registered_by == user_id) & no_team
-            if team_id is not None:
-                stmt = select(Cluster).where(Cluster.team_id == team_id)
-            elif team_ids:
-                stmt = select(Cluster).where(or_(mine, Cluster.team_id.in_(team_ids)))
+            if team_ids is None:
+                visible = Cluster.registered_by == user_id          # 개발 모드
             else:
-                stmt = select(Cluster).where(mine)
+                visible = or_(
+                    (Cluster.registered_by == user_id) & no_team,
+                    ~no_team & Cluster.team_id.in_(team_ids),
+                )
+            stmt = select(Cluster).where(visible)
+            if team_id is not None:
+                stmt = stmt.where(Cluster.team_id == team_id)
             rows = db.scalars(stmt.order_by(Cluster.created_at)).all()
             return [ClusterRow.of(r) for r in rows]
 
