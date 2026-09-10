@@ -521,3 +521,8 @@ def test_주소의_공백은_떼고_안쪽_공백은_막는다(client):
         parse_kubeconfig(kubeconfig(server_url="https://127.0.0.1 "))
     with pytest.raises(KubeconfigRejected, match="공백"):          # 안쪽 공백은 뗄 수 없다
         parse_kubeconfig(kubeconfig(server_url="https:// 127.0.0.1"))
+    # urlparse 는 탭·줄바꿈을 조용히 지운다 — 검사는 깨끗한 이름을 보고 통과시키는데 저장되는
+    # 원문에는 남아 실행에서 죽는다. 원문에서 봐야 잡힌다.
+    for 공백 in ("\t", "\n", "\r"):
+        with pytest.raises(KubeconfigRejected, match="공백"):
+            parse_kubeconfig(kubeconfig(server_url=f"https://api.example{공백}.com"))
