@@ -66,6 +66,20 @@ def _stripped(cls: object, value: object) -> object:
     return value.strip() if isinstance(value, str) else value
 
 
+def _blank_is_none(cls: object, value: object) -> object:
+    """공백을 떼고, 남은 게 없으면 None.
+
+    **빈 문자열은 "값을 안 정했다" 는 뜻 하나**로 고정한다 (자동 리뷰 지적). 등록에서는 kubeconfig
+    가 정하고, 수정에서는 안 바꾼다. 같은 입력이 두 곳에서 다른 뜻이면 폼 전체를 보내는 화면이
+    사용자가 안 건드린 칸을 조용히 갈아엎는다.
+
+    `context` 처럼 정확히 일치해야 하는 값도 여기서 공백을 뗀다 — `"prod "` 가 알아보기 어려운
+    400 으로 나가지 않게.
+    """
+    value = value.strip() if isinstance(value, str) else value
+    return None if value == "" else value
+
+
 class ClusterIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -75,13 +89,8 @@ class ClusterIn(BaseModel):
     namespace: str | None = None
     team_id: str | None = Field(default=None, max_length=64)
 
-    @field_validator("team_id", "context", "namespace", mode="before")
-    @classmethod
-    def _blank_is_none(cls, value: object) -> object:
-        """빈 문자열은 None 으로. `team_id: ""` 가 falsy 검사를 지나 팀 `''` 의 클러스터로 저장되면
-        목록·이름 공간이 그 값으로 갈라진다 (자동 리뷰 지적)."""
-        return None if isinstance(value, str) and not value.strip() else value
-
+    # `team_id: ""` 가 falsy 검사를 지나 팀 `''` 의 클러스터로 저장되면 목록·이름 공간이 갈라진다
+    _blank = field_validator("team_id", "context", "namespace", mode="before")(_blank_is_none)
     _name = field_validator("name", mode="before")(_stripped)
 
 
@@ -93,11 +102,8 @@ class ClusterPatch(BaseModel):
     kubeconfig: str | None = None         # 자격증명 교체
     context: str | None = None
 
-    # namespace 는 여기 없다 — PATCH {"namespace": ""} 는 "기본값(default) 으로 되돌리기" 라서
-    # None(=안 바꿈) 으로 접으면 그 뜻이 사라진다 (자동 리뷰 지적).
-    _blank = field_validator("context", mode="before")(
-        lambda cls, value: None if isinstance(value, str) and not value.strip() else value
-    )
+    # 등록과 같은 규칙 — 빈 값은 "안 정했다" = 안 바꾼다. 기본값으로 되돌리려면 "default" 를 보낸다.
+    _blank = field_validator("namespace", "context", mode="before")(_blank_is_none)
     _name = field_validator("name", mode="before")(_stripped)
 
 
@@ -195,17 +201,17 @@ async def register_cluster(
         row = store.create_cluster(
             registered_by=user.id,
             team_id=body.team_id,
-            name=body.name.strip(),
+            name=body.name,      # 검증기가 이미 공백을 뗐다
             api_server=parsed.api_server,
             ca_data=parsed.ca_data,
             insecure=parsed.insecure,
             credential_encrypted=crypto.encrypt(parsed.credential),
             context_name=parsed.context_name,
-            default_namespace=(body.namespace or parsed.namespace).strip() or "default",
+            default_namespace=(body.namespace or parsed.namespace or "").strip() or "default",
             fingerprint=parsed.fingerprint,
         )
     except IntegrityError:
-        raise _error(409, "CLUSTER_NAME_TAKEN", f"같은 이름의 클러스터가 이미 있습니다: {body.name.strip()}") from None
+        raise _error(409, "CLUSTER_NAME_TAKEN", f"같은 이름의 클러스터가 이미 있습니다: {body.name}") from None
     return _view(row)
 
 
@@ -284,9 +290,9 @@ async def update_cluster(
     row = await _writable(store, cluster_id, user)
     fields: dict[str, Any] = {}
     if body.name is not None:
-        fields["name"] = body.name.strip()
+        fields["name"] = body.name
     if body.namespace is not None:
-        fields["default_namespace"] = body.namespace.strip() or "default"
+        fields["default_namespace"] = body.namespace       # 빈 값은 위에서 None 으로 접혔다
     if body.kubeconfig is not None:
         _require_key()
         parsed = await _parse(body.kubeconfig, body.context)
