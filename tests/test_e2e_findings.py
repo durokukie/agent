@@ -247,3 +247,9 @@ def test_빈_제목으로_만든_방도_첫_마디로_제목을_받는다(client
 
     _say(client, room, "파드 상태 알려줘")
     assert get_store().get_session(room).title == "파드 상태 알려줘"
+
+
+def test_제목이_문자열이_아니면_422(client):
+    """빈 제목을 접느라 바로 .strip() 을 부르면 숫자 제목이 500 으로 샌다."""
+    r = client.post("/conversations", json={"title": 123}, headers=USER)
+    assert r.status_code == 422

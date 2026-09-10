@@ -39,7 +39,7 @@ from kukie.clusters import crypto
 from kukie import membership
 from kukie.clusters.access import ClusterChanged, ClusterGone, kubeconfig_or_none
 from kukie.conversations import Conversation, registry
-from kukie.fields import blank_is_none, none_if_blank
+from kukie.fields import blank_is_none, none_if_blank, stripped
 from kukie.skills import SKILLS
 from kukie.store import ChatStore, get_store
 from kukie.store.chat_store import ActiveRunExists, RequestMismatch, RunRow, SessionRow, error_payload
@@ -74,7 +74,9 @@ class ConversationIn(BaseModel):
     # 빈 제목은 기본 제목으로. `title: ""` 로 만든 방은 `row.title != DEFAULT_TITLE` 이 늘 참이라
     # 첫 마디로 제목을 받을 자격을 영영 잃는다 (자동 리뷰 지적).
     _title = field_validator("title", mode="before")(
-        lambda cls, value: DEFAULT_TITLE if blank_is_none(cls, value) is None else value.strip()
+        # 문자열이 아닌 값은 stripped 가 그대로 흘려보내 str 검사에서 422 가 된다. 여기서 바로
+        # value.strip() 을 부르면 `{"title": 123}` 이 AttributeError → 500 으로 샌다 (자동 리뷰 지적).
+        lambda cls, value: DEFAULT_TITLE if blank_is_none(cls, value) is None else stripped(cls, value)
     )
 
 
