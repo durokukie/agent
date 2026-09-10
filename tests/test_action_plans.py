@@ -480,27 +480,34 @@ def test_저장에_실패해_남은_run_을_치울_때도_md_가_따라온다(cl
     assert _front(_plans(room)[0].id, tmp_path)["status"] == "STALE"
 
 
-def test_재시작_복원은_이미_끝난_계획의_md_를_덧쓰지_않는다(client, tmp_path):
-    """방금 닫힌 것만 다시 쓴다 — 그 run 의 닫힌 계획을 전부 쓰면 APPLIED 사본까지 덧쓴다."""
+def test_재시작_복원은_방금_닫힌_계획만_다시_쓴다(client, tmp_path, monkeypatch):
+    """넘어가는 행을 직접 센다.
+
+    파일 비교로는 안 잡힌다 — 이미 끝난 계획을 다시 써도 `_write()` 는 같은 바이트를 만들고,
+    옛 코드도 **그 run 의** 닫힌 계획만 봤다 (자동 리뷰 지적). 그러니 `sync_markdown` 이 받은
+    목록이 방금 닫힌 하나뿐인지 본다. 여기서 run 을 통째로 훑으면 REJECTED 형제까지 딸려 온다.
+    """
     room = _room(client)
     _card(client, room)
-    with agent.override(model=_answer_model()):
-        client.post(f"/conversations/{room}/approve",
-                    json={"call_id": "call-1", "approved": True}, headers=USER)
     store = get_store()
-    applied = _plans(room)[0]
-    assert applied.status == "APPLIED"
-    before = (tmp_path / f"{applied.id}.md").read_text(encoding="utf-8")
-
-    _card(client, room, call_id="call-2")           # 두 번째 카드
-    새계획 = [p for p in _plans(room) if p.id != applied.id][0]
+    새계획 = _plans(room)[0]
+    run_id = 새계획.run_id
+    # **같은 run** 에 이미 닫힌 형제를 하나 둔다 — run 을 통째로 훑으면 이 행까지 딸려 온다
+    거절된계획 = store.create_plan(
+        plan_id="ap-형제", run_id=run_id, tool_call_id="call-9", tool_name="scale_resource",
+        risk="caution", plan_payload=dict(SCALE_ARGS), request_hash="h", status="REJECTED",
+    )
     store.update_plan(새계획.id, status="APPROVED",              # 되살릴 수 없는 카드 → run 을 닫는다
                       decision={"approved": True, "user_id": "u-1", "at": "2026-09-10T00:00:00+00:00"})
+
+    받은행: list[list] = []
+    real = action_plan.sync_markdown
+    monkeypatch.setattr(action_plan, "sync_markdown",
+                        lambda rows: (받은행.append(list(rows)), real(rows))[1])
 
     conversations.registry.clear()
     client.get(f"/conversations/{room}", headers=USER)
 
-    assert get_store().get_plan(새계획.id).status == "UNKNOWN"
+    assert store.get_plan(새계획.id).status == "UNKNOWN"
     assert _front(새계획.id, tmp_path)["status"] == "UNKNOWN"
-    # 이미 끝난 계획의 사본은 손대지 않는다 — 같은 run 이 아니어도 전부 다시 쓰면 여기서 어긋난다
-    assert (tmp_path / f"{applied.id}.md").read_text(encoding="utf-8") == before
+    assert [p.id for rows in 받은행 for p in rows] == [새계획.id]     # 방금 닫힌 하나뿐
