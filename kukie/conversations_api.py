@@ -42,7 +42,7 @@ from kukie.conversations import Conversation, registry
 from kukie.skills import SKILLS
 from kukie.store import ChatStore, get_store
 from kukie.store.chat_store import ActiveRunExists, RequestMismatch, RunRow, SessionRow, error_payload
-from kukie.store.models import DEFAULT_TITLE
+from kukie.store.models import DEFAULT_TITLE, RUN_ACTIVE
 from kukie.tools.mutate import MUTATING_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -126,10 +126,12 @@ async def _load(conversation_id: str, user: User, store: ChatStore) -> tuple[Ses
     row = store.get_session(conversation_id)
     if row is None or (row.user_id != user.id and not row.shared):
         raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
-    # 팀이 붙은 방은 **만든 사람에게도** 지금 소속을 묻는다. 주인을 먼저 통과시키면 팀에서 나가기
-    # 전에 만들어 둔 방으로 그 팀 클러스터를 계속 쓸 수 있다 (자동 리뷰 🔴) — /clusters 의
-    # _readable 과 답이 같아야 한다. 회원 서버가 죽었을 때도 여기서 함께 막힌다.
-    if row.team_id and membership.available():
+    # 팀이 붙은 **shared** 방은 만든 사람에게도 지금 소속을 묻는다. 팀 공간이므로 나간 사람은 보면 안 된다.
+    #
+    # private 방은 읽기까지 막지 않는다. 자기 대화 기록인데 팀에서 나갔다는 이유로 열 수 없으면
+    # 되돌릴 방법이 없다 (대화 삭제 API 도 없다 — 자동 리뷰 지적). 대신 **클러스터를 쓰는 것**은
+    # 아래 _require_cluster_access 가 막는다. 읽기는 열고 실행은 닫는다.
+    if row.shared and row.team_id and membership.available():
         if not await membership.is_member(user, row.team_id):
             raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
     if registry.get(conversation_id) is None:
@@ -217,6 +219,22 @@ def _cluster_error(exc: Exception, cluster_id: str | None) -> HTTPException:
     return _error(503, "CREDENTIAL_UNREADABLE", str(exc))
 
 
+async def _require_cluster_access(store: ChatStore, row: SessionRow, user: User) -> None:
+    """이 방의 클러스터를 지금 쓸 수 있나. 읽기(_load)와 달리 **실행 직전**에 본다.
+
+    팀에서 나간 사람이 자기 private 방은 계속 읽되 그 팀 클러스터로 kubectl 을 돌리지는 못하게 한다.
+    판단 규칙은 /clusters 의 _readable 과 같다.
+    """
+    if not row.cluster_id or not membership.available():
+        return
+    cluster = store.get_cluster(row.cluster_id)
+    if cluster is None or not cluster.team_id:
+        return
+    if not await membership.is_member(user, cluster.team_id):
+        raise _error(403, "NOT_TEAM_MEMBER",
+                     "이 대화가 쓰는 클러스터의 팀 구성원이 아닙니다")
+
+
 def _with_cluster(store: ChatStore, session: Any, row: SessionRow):
     """실행 동안만 임시 kubeconfig 를 연다 (기획 04 §8). 블록을 벗어나면 파일이 지워진다.
 
@@ -283,6 +301,11 @@ async def create_conversation(
                 raise _error(404, "NOT_FOUND", f"클러스터가 없다: {body.cluster_id}")
         elif cluster.registered_by != user.id:
             raise _error(404, "NOT_FOUND", f"클러스터가 없다: {body.cluster_id}")
+        if body.team_id and body.team_id != cluster.team_id:
+            # 조용히 덮으면 요청보다 **더 열린** 방이 된다 — 개인 클러스터를 고르고 team_id 를 같이
+            # 보내면 team_id 가 None 으로 사라져 "팀으로 좁혀 달라" 가 "전원 공개" 가 됐다 (자동 리뷰).
+            raise _error(400, "CLUSTER_TEAM_MISMATCH",
+                         "고른 클러스터의 팀과 team_id 가 다릅니다 — 방의 팀은 클러스터가 정합니다")
         context = cluster.context_name
         namespace = namespace or cluster.default_namespace
         fingerprint = cluster.fingerprint      # 방이 지문을 복사해 "승인한 대상 = 실행 대상" 을 확인한다
@@ -316,7 +339,9 @@ async def list_conversations(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> list[dict[str, Any]]:
-    rows = store.list_sessions(user.id, cluster_id=cluster_id)
+    # 목록과 상세의 답이 같아야 한다 — 열 수 없는 방이 목록에 뜨면 사용자가 막다른 길에 선다
+    mine = list(await membership.team_roles(user)) if membership.available() else None
+    rows = store.list_sessions(user.id, cluster_id=cluster_id, team_ids=mine)
     return [_conversation_view(r, running=_is_running(r)) for r in rows]
 
 
@@ -366,6 +391,9 @@ async def chat(
 
     if conversation.lock.locked():
         raise _busy()
+    # 권한 검사는 run 을 만들기 **전에** 한다. 뒤에서 던지면 그 run 이 running 인 채 남고, 같은
+    # request_id 로 재시도하면 403 대신 409 INTERRUPTED 라는 엉뚱한 안내가 나간다 (자동 리뷰 지적).
+    await _require_cluster_access(store, row, user)
     if session.pending is not None:
         if session.pending_ids:
             raise _error(409, "PENDING_APPROVAL", "승인 대기 중 — /approve 로 먼저 결정")
@@ -403,13 +431,13 @@ async def chat(
         except HTTPException as exc:
             wrapped = _wrap(exc)
             store.update_run(run.id, status="failed", response_payload=_error_record(wrapped))
-            store.expire_open_plans(run.id)   # failed 는 종료 상태다 — 여기서 안 닫으면 계획이 영원히 열린 채 남는다
+            _close_plans(store, run)   # failed 는 종료 상태다 — 안 닫으면 계획이 영원히 열린 채 남는다
             raise wrapped
         except Exception as exc:                 # 모델·툴 예외 — run 은 실패로 남기고 세션은 유지
             logger.exception("run 실패 (conversation=%s, run=%s)", conversation_id, run.id)
             failed = _error(500, "RUN_FAILED", f"요청 처리에 실패했다 ({type(exc).__name__}) — 서버 로그 참고")
             store.update_run(run.id, status="failed", response_payload=_error_record(failed))
-            store.expire_open_plans(run.id)
+            _close_plans(store, run)
             raise failed from exc
 
         # 승인 카드면 run 은 열린 채(awaiting_approval) 남는다 — approve/resume 이 이어서 끝낸다 (문서 7절)
@@ -433,6 +461,19 @@ async def chat(
         return payload
 
 
+def _close_plans(store: ChatStore, run: RunRow) -> None:
+    """run 이 종료 상태로 닫힐 때 남은 계획도 닫는다. **여기서 터져도 원래 응답을 삼키면 안 된다.**
+
+    같은 트랜잭션으로 합칠 수 없어(run 은 이미 커밋됐다) 좁은 틈이 남는다 — 둘 사이에 죽으면 계획이
+    열린 채 남는다. 그 틈을 없애려면 update_run 과 한 트랜잭션이어야 하는데, 저장 실패 경로마다
+    상태·payload 가 달라 지금 구조로는 묶이지 않는다 (자동 리뷰 지적). 다음 정리 대상으로 남긴다.
+    """
+    try:
+        store.expire_open_plans(run.id)
+    except Exception:
+        logger.exception("계획 닫기 실패 — run 은 이미 종료로 닫혔다 (run=%s)", run.id)
+
+
 def _save_or_fail(
     store: ChatStore, conversation_id: str, run: RunRow, *, on_failure: HTTPException, failure_status: str,
     keep_payload: bool = False, **fields: Any,
@@ -452,6 +493,10 @@ def _save_or_fail(
                 store.update_run(run.id, status=failure_status, response_payload=_error_record(on_failure))
         except Exception:
             logger.exception("실패 표시도 저장하지 못했다 (run=%s)", run.id)
+        # failed 는 종료 상태다 — 이 문으로 닫힌 run 의 계획도 함께 닫아야 한다 (자동 리뷰 지적).
+        # recovery_required·awaiting_approval 은 활성이라 나중에 interrupt 가 지나간다.
+        if failure_status not in RUN_ACTIVE:
+            _close_plans(store, run)
         raise on_failure from exc
 
 
@@ -514,6 +559,7 @@ async def approve(
     await _require_approver(row, user)
     if conversation.lock.locked():
         raise _busy()
+    await _require_cluster_access(store, row, user)
     run = _open_run(store, conversation_id)
     async with conversation.lock:
         _bind_run(session, run, user)
@@ -545,6 +591,7 @@ async def resume(
         raise _error(409, "NOT_PENDING", "재개할 승인 건이 없다")
     if session.pending_ids:
         raise _error(409, "PENDING_APPROVAL", f"아직 결정하지 않은 승인 건이 있다: {session.pending_ids}")
+    await _require_cluster_access(store, row, user)
     run = _open_run(store, conversation_id)
     async with conversation.lock:
         _bind_run(session, run, user)

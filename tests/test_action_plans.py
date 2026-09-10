@@ -387,3 +387,49 @@ def test_run_을_닫으면_계획도_같은_트랜잭션에서_닫힌다(client)
 
     assert all(r.status == "interrupted" for r in get_store().list_runs(room) if r.id == runs[-1].id)
     assert _plans(room)[0].status == "STALE"
+
+
+def test_저장_실패로_run_이_failed_가_돼도_계획이_닫힌다(client, monkeypatch):
+    """세 번째 failed 문 — _save_or_fail 의 대체 쓰기 경로 (자동 리뷰 지적).
+
+    여기서 안 닫으면 run 은 종료 상태인데 계획은 열린 채 남고, active_run 이 그 run 을 더 이상
+    주지 않아 다시 지나가는 경로가 없다.
+    """
+    room = _room(client)
+    client.post(f"/conversations/{room}/chat", json={"text": "/mode 실습"}, headers=USER)
+
+    store = get_store()
+    real = store.update_run
+    calls = {"n": 0}
+
+    def flaky(run_id, **fields):
+        calls["n"] += 1
+        # 카드가 뜬 뒤의 첫 저장만 실패시킨다 (대체 쓰기는 통과)
+        if fields.get("status") == "awaiting_approval":
+            raise RuntimeError("저장 실패")
+        return real(run_id, **fields)
+
+    monkeypatch.setattr(store, "update_run", flaky)
+    with agent.override(model=_mutation_model()):
+        r = client.post(f"/conversations/{room}/chat", json={"text": "늘려줘"}, headers=USER)
+
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "STORE_FAILED"
+    monkeypatch.undo()
+    assert get_store().list_runs(room)[-1].status == "failed"
+    assert _plans(room)[0].status == "STALE"        # 열린 채 남지 않는다
+
+
+def test_계획_닫기가_실패해도_원래_오류를_돌려준다(client, monkeypatch):
+    """계획 닫기에서 터지면 코드 없는 500 이 나가고 계획도 못 닫았다."""
+    room = _room(client)
+    client.post(f"/conversations/{room}/chat", json={"text": "/mode 실습"}, headers=USER)
+    monkeypatch.setattr(get_store(), "expire_open_plans",
+                        lambda run_id: (_ for _ in ()).throw(RuntimeError("DB 넘어짐")))
+
+    def boom(messages, info):
+        raise RuntimeError("모델 실패")
+
+    with agent.override(model=FunctionModel(boom)):
+        r = client.post(f"/conversations/{room}/chat", json={"text": "늘려줘"}, headers=USER)
+
+    assert r.status_code == 500 and r.json()["detail"]["code"] == "RUN_FAILED"

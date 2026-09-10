@@ -566,6 +566,12 @@ class ActionPlan:
         이미 거절로 끝난 계획이면 조용히 성공으로 돌려준다 (자동 리뷰 지적).
         """
         if self.status == "REJECTED" and self.decision is not None and not self.decision.get("approved"):
+            # 이 경로가 생기는 상황은 "DB 는 됐는데 응답이 끊겼다" 이고, 그때 _write 는 한 번도 안 돌았다 —
+            # .md 가 결정 전 카드로 남아 있다. 사본을 따라오게 한다 (자동 리뷰 지적). 실패는 로그만.
+            try:
+                self._write()
+            except Exception:
+                logger.exception("거절 재시도에서 .md 갱신 실패 (plan_id=%s)", self.id)
             return
         if (
             self.status not in {"DRAFT", "WAITING_APPROVAL"}

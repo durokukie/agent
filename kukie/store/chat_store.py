@@ -210,6 +210,23 @@ def _check_applied(status: str | None, result: dict[str, Any] | None) -> None:
         raise ValueError(f"{status} 는 성공한 실행 결과(success=true, exit_code=0)를 요구한다")
 
 
+def _close_open_plans(db: Session, run_id: str) -> list[ActionPlan]:
+    """열린 계획을 닫는 **유일한** 전이 규칙 (DURO-83). 커밋은 부르는 쪽이 한다.
+
+    승인까지 갔는데 실행 결과가 없으면 UNKNOWN — kubectl 이 돌았는지 모른다 (DB 문서 5절, run 의
+    recovery_required 와 같은 뜻). 아직 승인 전이면 STALE — 그 카드는 더 이상 쓸 수 없다.
+
+    규칙을 두 벌로 두면 한쪽만 고쳐진다 (자동 리뷰 지적).
+    """
+    rows = db.scalars(
+        select(ActionPlan).where(ActionPlan.run_id == run_id, ActionPlan.status.in_(PLAN_OPEN))
+    ).all()
+    for row in rows:
+        approved = bool(row.decision and row.decision.get("approved"))
+        row.status = "UNKNOWN" if approved and row.execution_result is None else "STALE"
+    return list(rows)
+
+
 def titleable(text: str | None) -> bool:
     """제목이 될 수 있는 마디인가 (#59).
 
@@ -267,12 +284,29 @@ class ChatStore:
                 return None
             return SessionRow.of(row, running=self._has_run_with(db, session_id, ("running",)))
 
-    def list_sessions(self, user_id: str, *, cluster_id: str | None = None) -> list[SessionRow]:
-        """내 방 + shared 방 (기획 05 §4: 팀원이 같이 본다). 팀 소속으로 좁히는 건 Spring 팀 API 뒤 — 지금은 shared 전부."""
+    def list_sessions(
+        self, user_id: str, *, cluster_id: str | None = None, team_ids: list[str] | None = None
+    ) -> list[SessionRow]:
+        """내 방 + 내가 볼 수 있는 shared 방 (기획 05 §4: 팀원이 같이 본다).
+
+        team_ids 는 부르는 쪽이 회원 서버에서 받아 넘긴다. 주면 팀이 붙은 shared 방은 그 목록에
+        든 팀만 보인다 — 목록과 상세(_load)의 답이 달라 "목록에 있는데 열 수 없는 방" 이 생기던 것을
+        맞춘다 (자동 리뷰 지적). 주지 않으면(개발 모드) 예전처럼 shared 전부.
+        """
         with self._factory() as db:
-            stmt = select(ChatSession).where(
-                or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True))
-            )
+            if team_ids is None:
+                stmt = select(ChatSession).where(
+                    or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True))
+                )
+            else:
+                # _load 와 같은 규칙이어야 "목록에 있는데 열 수 없는 방" 이 안 생긴다 (자동 리뷰 지적).
+                #   private 방 → 내 것이면 보인다 (자기 기록이라 읽기는 열어 뒀다)
+                #   shared 방  → 팀이 없거나 내가 그 팀 구성원일 때만. **내가 만든 방도 마찬가지**다
+                my_private = (ChatSession.user_id == user_id) & ChatSession.shared.is_(False)
+                open_shared = ChatSession.shared.is_(True) & or_(
+                    ChatSession.team_id.is_(None), ChatSession.team_id.in_(team_ids)
+                )
+                stmt = select(ChatSession).where(or_(my_private, open_shared))
             if cluster_id is not None:
                 stmt = stmt.where(ChatSession.cluster_id == cluster_id)
             stmt = stmt.order_by(ChatSession.updated_at.desc())
@@ -411,13 +445,7 @@ class ChatStore:
                 row.finished_at = now
                 # 계획도 **같은 트랜잭션에서** 닫는다. 따로 커밋하면 그 사이에 죽었을 때 run 은
                 # interrupted 인데 계획은 열린 채 남고, 다시 지나가는 경로가 없다 (자동 리뷰 지적).
-                for plan in db.scalars(
-                    select(ActionPlan).where(
-                        ActionPlan.run_id == row.id, ActionPlan.status.in_(PLAN_OPEN)
-                    )
-                ).all():
-                    approved = bool(plan.decision and plan.decision.get("approved"))
-                    plan.status = "UNKNOWN" if approved and plan.execution_result is None else "STALE"
+                _close_open_plans(db, row.id)
             db.commit()
             return [RunRow.of(r) for r in rows]
 
@@ -495,18 +523,9 @@ class ChatStore:
             return [PlanRow.of(r) for r in rows]
 
     def expire_open_plans(self, run_id: str) -> list[PlanRow]:
-        """run 이 중단될 때 남은 계획을 닫는다 (DURO-83).
-
-        승인까지 갔는데 실행 결과가 없으면 UNKNOWN — kubectl 이 돌았는지 모른다 (문서 5절, run 의 recovery_required 와 같은 뜻).
-        아직 승인 전이면 STALE — 그 승인 카드는 더 이상 쓸 수 없다.
-        """
+        """run 이 종료 상태로 닫힐 때 남은 계획을 닫는다 (DURO-83). 전이 규칙은 _close_open_plans 한 벌."""
         with self._factory() as db:
-            rows = db.scalars(
-                select(ActionPlan).where(ActionPlan.run_id == run_id, ActionPlan.status.in_(PLAN_OPEN))
-            ).all()
-            for row in rows:
-                approved = bool(row.decision and row.decision.get("approved"))
-                row.status = "UNKNOWN" if approved and row.execution_result is None else "STALE"
+            rows = _close_open_plans(db, run_id)
             db.commit()
             return [PlanRow.of(r) for r in rows]
 

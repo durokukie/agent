@@ -78,7 +78,11 @@ def _blocked(address: str) -> bool:
 
 
 def _resolved(host: str) -> list[str]:
-    """호스트명이 실제로 가리키는 주소들. 못 풀면 빈 목록."""
+    """호스트명이 실제로 가리키는 주소들. 못 풀면 빈 목록.
+
+    getaddrinfo 는 파이썬에서 타임아웃을 줄 수 없다. 느린 이름을 여럿 등록하면 스레드가 묶이므로,
+    부르는 쪽(clusters_api)이 동시 실행 수를 따로 제한한다 (자동 리뷰 지적).
+    """
     try:
         return [info[4][0] for info in getaddrinfo(host, None)]
     except OSError:
