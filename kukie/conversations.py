@@ -149,7 +149,7 @@ def _restore_pending(store: ChatStore, run: RunRow) -> DeferredToolRequests | No
       - 승인까지 갔던 계획(APPROVED/EXECUTING) — kubectl 이 돌았는지 모른다
       - **이미 거절한 계획(REJECTED)** — 표에서는 닫혔지만 그 tool call 은 기록에 답 없이 남아,
         남은 카드만 되살려 재개하면 그 call 이 답 없이 모델에 가서 재개가 영원히 실패한다
-    걸러지면 예전대로 run 을 중단으로 닫고 계획은 STALE / UNKNOWN 이 된다.
+    걸러지면 예전대로 run 을 중단으로 닫고 계획은 EXPIRED / UNKNOWN 이 된다.
     """
     if run.status != "awaiting_approval" or not run.agent_messages:
         return None
@@ -166,7 +166,7 @@ def _restore_pending(store: ChatStore, run: RunRow) -> DeferredToolRequests | No
         # 남는다. 남은 한 장만 되살려 재개하면 답 없는 call 이 모델에 그대로 가서 재개가 영원히
         # 실패하고, 그 방은 새 대화 말고는 빠져나갈 길이 없다 (자동 리뷰 지적).
         if set(unanswered) != set(waiting):
-            return None            # 예전대로 interrupt → 계획은 STALE / UNKNOWN 으로 닫힌다
+            return None            # 예전대로 interrupt → 계획은 EXPIRED / UNKNOWN 으로 닫힌다
         return DeferredToolRequests(
             approvals=list(unanswered.values()),
             metadata={cid: {"plan_id": waiting[cid].id} for cid in unanswered},
