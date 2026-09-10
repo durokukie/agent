@@ -92,8 +92,7 @@ class ConversationRegistry:
         active = store.active_run(conversation_id)
         pending = _restore_pending(store, active) if active is not None else None
         if pending is None:
-            for closed in store.interrupt_active_runs(conversation_id, INTERRUPTED_MESSAGE):
-                _sync_plan_files(store, closed.id)
+            _sync_plan_files(store.interrupt_active_runs(conversation_id, INTERRUPTED_MESSAGE).plans)
         row = store.get_session(conversation_id)
         assert row is not None
         conversation = self.register(
@@ -127,14 +126,18 @@ def _unanswered_calls(messages: list[Any]) -> dict[str, ToolCallPart]:
     return {cid: call for cid, call in calls.items() if cid not in answered}
 
 
-def _sync_plan_files(store: ChatStore, run_id: str) -> None:
-    """중단으로 닫힌 계획의 .md 사본을 따라오게 한다. 표가 원본이고 사본은 사람이 읽는 용도다."""
+def _sync_plan_files(closed: list[Any]) -> None:
+    """방금 닫힌 계획의 .md 사본을 따라오게 한다. 표가 원본이고 사본은 사람이 읽는 용도다.
+
+    **방금 닫힌 행만** 받는다. 그 run 의 닫힌 계획을 전부 다시 쓰면 이미 끝난 계획(APPLIED)의
+    사본까지 덧써 applied_at 같은 값이 다시 만들어진다 (자동 리뷰 지적).
+    """
     from kukie.guardrail.action_plan import sync_markdown   # 순환 import 회피
 
     try:
-        sync_markdown([p for p in store.list_plans_for_run(run_id) if not p.open])
+        sync_markdown(closed)
     except Exception:
-        logger.exception("만료된 계획의 .md 갱신 실패 (run=%s)", run_id)
+        logger.exception("만료된 계획의 .md 갱신 실패")
 
 
 def _restore_pending(store: ChatStore, run: RunRow) -> DeferredToolRequests | None:
