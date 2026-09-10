@@ -194,12 +194,15 @@ class Cluster(Base):
         # 다른 값으로 보므로 (team_id, registered_by, name) 은 team_id 가 NULL 인 개인 클러스터를
         # 전혀 막지 못하고, 팀 클러스터에서는 registered_by 가 섞여 같은 팀에 같은 이름이 둘 생긴다
         # (자동 리뷰 지적). 조건부 인덱스 둘로 나눈다.
+        # 조건은 읽는 쪽(_visible_sessions·list_clusters)과 같아야 한다 — `''` 를 "팀 없음" 으로
+        # 보면서 인덱스만 IS NULL 로 두면, 정규화 전에 들어간 `''` 행이 개인 이름 유일성 밖에
+        # 남아 한 사람의 목록에 같은 이름이 둘 뜬다 (자동 리뷰 지적).
         Index("uq_cluster_team_name", "team_id", "name",
-              unique=True, sqlite_where=text("team_id IS NOT NULL"),
-              postgresql_where=text("team_id IS NOT NULL")),
+              unique=True, sqlite_where=text("team_id IS NOT NULL AND team_id <> ''"),
+              postgresql_where=text("team_id IS NOT NULL AND team_id <> ''")),
         Index("uq_cluster_personal_name", "registered_by", "name",
-              unique=True, sqlite_where=text("team_id IS NULL"),
-              postgresql_where=text("team_id IS NULL")),
+              unique=True, sqlite_where=text("team_id IS NULL OR team_id = ''"),
+              postgresql_where=text("team_id IS NULL OR team_id = ''")),
         CheckConstraint("api_server LIKE 'https://%'", name="ck_cluster_https"),
     )
 
