@@ -19,7 +19,7 @@ from typing import Any
 from anyio import CapacityLimiter, to_thread
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.exc import IntegrityError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 import kukie.server as _server   # 순환 import: 이름은 호출 시점에만 쓴다
 from kukie.auth import User, current_user
@@ -35,10 +35,21 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/clusters", tags=["clusters"])
 
-#: kubeconfig 검사(이름 해석)에 쓸 수 있는 스레드 수. AnyIO 의 공용 워커 풀은 기본 40개인데,
-#: getaddrinfo 는 타임아웃을 줄 수 없어 느린 이름 몇 개가 그 풀을 통째로 물면 같은 풀을 쓰는
-#: 다른 일까지 함께 멈춘다 (자동 리뷰 지적). 등록은 드문 동작이라 넉넉히 4면 된다.
-_RESOLVE_LIMIT = CapacityLimiter(4)
+#: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적).
+#: AnyIO 공용 풀은 기본 40개인데, getaddrinfo 는 타임아웃을 줄 수 없고 kubectl 은 30초씩 잡는다.
+#: 여기서 다 물면 채팅의 동기 툴(pydantic-ai 가 같은 풀로 돌린다)까지 함께 멈춘다.
+RESOLVE_WORKERS = 4          # kubeconfig 검사 (이름 해석)
+PROBE_WORKERS = 4            # 연결 확인 (kubectl × 2, 최대 60초)
+
+_limiters: dict[str, CapacityLimiter] = {}
+
+
+def _limiter(name: str, workers: int) -> CapacityLimiter:
+    """처음 쓸 때 만든다. anyio 3.x 는 이벤트 루프 밖에서 만들면 터지므로 import 시점에 두지 않는다."""
+    found = _limiters.get(name)
+    if found is None:
+        found = _limiters[name] = CapacityLimiter(workers)
+    return found
 
 
 # ── 요청 본문 ──────────────────────────────────────────────
@@ -50,7 +61,14 @@ class ClusterIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     context: str | None = None            # 여러 context 중 하나를 고를 때
     namespace: str | None = None
-    team_id: str | None = None
+    team_id: str | None = Field(default=None, max_length=64)
+
+    @field_validator("team_id", "context", "namespace", mode="before")
+    @classmethod
+    def _blank_is_none(cls, value: object) -> object:
+        """빈 문자열은 None 으로. `team_id: ""` 가 falsy 검사를 지나 팀 `''` 의 클러스터로 저장되면
+        목록·이름 공간이 그 값으로 갈라진다 (자동 리뷰 지적)."""
+        return None if isinstance(value, str) and not value.strip() else value
 
 
 class ClusterPatch(BaseModel):
@@ -60,6 +78,10 @@ class ClusterPatch(BaseModel):
     namespace: str | None = None
     kubeconfig: str | None = None         # 자격증명 교체
     context: str | None = None
+
+    _blank = field_validator("namespace", "context", mode="before")(
+        lambda cls, value: None if isinstance(value, str) and not value.strip() else value
+    )
 
 
 # ── 응답 ───────────────────────────────────────────────────
@@ -111,7 +133,7 @@ async def _parse(body_text: str, context: str | None):
         return parse_kubeconfig(body_text, context_name=context, allow_local=allow_local_clusters())
 
     try:
-        return await to_thread.run_sync(run, limiter=_RESOLVE_LIMIT)
+        return await to_thread.run_sync(run, limiter=_limiter("resolve", RESOLVE_WORKERS))
     except KubeconfigRejected as exc:
         raise _error(400, "KUBECONFIG_REJECTED", str(exc)) from None
 
@@ -193,7 +215,7 @@ async def test_cluster(
     try:
         # run_kubectl 은 subprocess.run 을 그대로 부른다. 여기서 직접 부르면 닿지 않는 주소일 때
         # 최대 60초(version + can-i) 동안 서버 전체가 멈춘다 (자동 리뷰 지적). 스레드로 넘긴다.
-        version, can_edit = await to_thread.run_sync(probe)
+        version, can_edit = await to_thread.run_sync(probe, limiter=_limiter("probe", PROBE_WORKERS))
     except ClusterGone:
         raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}") from None
     except crypto.CredentialUnreadable as exc:

@@ -399,3 +399,33 @@ def test_팀_클러스터_등록은_아직_막혀_있다(client):
     r = client.post("/clusters", json={"kubeconfig": kubeconfig(), "name": "운영", "team_id": "t-1"},
                     headers=USER)
     assert r.status_code == 501 and r.json()["detail"]["code"] == "TEAM_CLUSTER_UNSUPPORTED"
+
+
+def test_빈_team_id_는_개인_클러스터로_들어간다(client):
+    """`team_id: ""` 가 falsy 검사를 지나면 팀 `''` 의 클러스터가 되어 목록·이름 공간이 갈라진다."""
+    registered = _register(client, team_id="")
+    assert registered["team_id"] is None
+    assert get_store().get_cluster(registered["id"]).team_id is None
+
+
+def test_연결_확인도_공용_스레드풀을_다_물지_않는다(client, monkeypatch):
+    """probe 는 kubectl 두 번 × 30초라 DNS 보다 오래 잡는다 — 리미터가 붙어 있어야 한다."""
+    from kukie import clusters_api
+
+    registered = _register(client)
+    seen: list[object] = []
+    real = clusters_api.to_thread.run_sync
+
+    async def watched(fn, *args, **kwargs):
+        # FastAPI 가 동기 의존성을 돌릴 때도 이 함수를 쓴다 — 우리 호출만 골라 본다
+        seen.append((getattr(fn, "__name__", ""), kwargs.get("limiter")))
+        return await real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(clusters_api.to_thread, "run_sync", watched)
+    monkeypatch.setattr(clusters_api, "run_kubectl",
+                        lambda *a, **k: KubectlResult(command="k", stdout="{}", stderr="",
+                                                      success=True, exit_code=0))
+    client.post(f"/clusters/{registered['id']}/test", headers=USER)
+
+    ours = [limiter for name, limiter in seen if name == "probe"]
+    assert ours and all(limiter is not None for limiter in ours)
