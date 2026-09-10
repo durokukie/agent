@@ -601,6 +601,19 @@ class ActionPlan:
 _PLAN_ID = _compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
+def sync_markdown(rows: "list[Any]") -> None:
+    """DB 에서 직접 바꾼 계획들의 .md 사본을 따라오게 한다 (자동 리뷰 지적).
+
+    표를 원본으로 두고 DB 만 고치는 경로(계획 만료 — STALE/UNKNOWN)가 있어서, 그대로 두면 사본이
+    옛 상태로 굳고 다시 지나가는 경로가 없다. 사본이므로 실패는 로그만 남긴다.
+    """
+    for row in rows:
+        try:
+            ActionPlan.from_row(row)._write()
+        except Exception:
+            logger.exception("만료된 계획의 .md 갱신 실패 (plan_id=%s)", getattr(row, "id", "?"))
+
+
 def list_plans(
     user_id: str, *, cluster_id: str | None = None, status: str | None = None,
 ) -> list[Any]:

@@ -438,3 +438,35 @@ def test_연결_확인도_공용_스레드풀을_다_물지_않는다(client, mo
 
     ours = [limiter for name, limiter in seen if name == "probe"]
     assert ours and all(limiter is not None for limiter in ours)
+
+
+def test_공백만_있는_이름은_422(client):
+    """min_length=1 은 "  " 를 통과시키고, 뒤의 .strip() 이 빈 이름으로 저장한다 (자동 리뷰 지적)."""
+    r = client.post("/clusters", json={"kubeconfig": kubeconfig(), "name": "   "}, headers=USER)
+    assert r.status_code == 422
+
+    registered = _register(client)
+    r = client.patch(f"/clusters/{registered['id']}", json={"name": " \t "}, headers=USER)
+    assert r.status_code == 422
+    assert get_store().get_cluster(registered["id"]).name == "운영"
+
+
+def test_이름의_앞뒤_공백은_떼고_저장한다(client):
+    assert _register(client, name="  운영  ")["name"] == "운영"
+
+
+def test_빈_team_id_쿼리는_좁히지_않는다(client):
+    """`?team_id=` 를 그대로 넘기면 팀 '' 로 좁혀져 내 클러스터가 안 보인다 (자동 리뷰 지적)."""
+    _register(client)
+    assert len(client.get("/clusters", headers=USER).json()) == 1
+    assert len(client.get("/clusters?team_id=", headers=USER).json()) == 1
+
+
+def test_빈_namespace_는_기본값으로_되돌린다(client):
+    """PATCH {"namespace": ""} 는 "기본값 복귀" 다 — None 으로 접으면 바꿀 게 없다며 400 이 난다."""
+    registered = _register(client, namespace="prod")
+    assert registered["namespace"] == "prod"
+
+    r = client.patch(f"/clusters/{registered['id']}", json={"namespace": ""}, headers=USER)
+    assert r.status_code == 200, r.text
+    assert r.json()["namespace"] == "default"
