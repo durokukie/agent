@@ -391,6 +391,9 @@ async def chat(
 
     if conversation.lock.locked():
         raise _busy()
+    # 권한 검사는 run 을 만들기 **전에** 한다. 뒤에서 던지면 그 run 이 running 인 채 남고, 같은
+    # request_id 로 재시도하면 403 대신 409 INTERRUPTED 라는 엉뚱한 안내가 나간다 (자동 리뷰 지적).
+    await _require_cluster_access(store, row, user)
     if session.pending is not None:
         if session.pending_ids:
             raise _error(409, "PENDING_APPROVAL", "승인 대기 중 — /approve 로 먼저 결정")
@@ -418,7 +421,6 @@ async def chat(
             return _replay(run)
 
         _bind_run(session, run, user)
-        await _require_cluster_access(store, row, user)
         try:
             with _with_cluster(store, session, row):
                 payload, result = await _server._chat_turn(session, body.text)
@@ -548,10 +550,10 @@ async def approve(
     await _require_approver(row, user)
     if conversation.lock.locked():
         raise _busy()
+    await _require_cluster_access(store, row, user)
     run = _open_run(store, conversation_id)
     async with conversation.lock:
         _bind_run(session, run, user)
-        await _require_cluster_access(store, row, user)
         # 재개가 돌면 _to_payload 가 티켓을 지우므로, 저장 실패 안내에 실을 Plan id(승인한 카드만)는 여기서 미리 뽑는다
         plan_ids = _approved_plan_ids(session, body.call_id if body.approved else None)
         # 결정 검사·기록은 server._approve 가 한다 (문자열 detail). 여기서는 코드 객체로 감싼다.
@@ -580,10 +582,10 @@ async def resume(
         raise _error(409, "NOT_PENDING", "재개할 승인 건이 없다")
     if session.pending_ids:
         raise _error(409, "PENDING_APPROVAL", f"아직 결정하지 않은 승인 건이 있다: {session.pending_ids}")
+    await _require_cluster_access(store, row, user)
     run = _open_run(store, conversation_id)
     async with conversation.lock:
         _bind_run(session, run, user)
-        await _require_cluster_access(store, row, user)
         plan_ids = _approved_plan_ids(session)
         try:
             with _with_cluster(store, session, row):

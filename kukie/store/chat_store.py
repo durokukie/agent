@@ -282,12 +282,19 @@ class ChatStore:
         맞춘다 (자동 리뷰 지적). 주지 않으면(개발 모드) 예전처럼 shared 전부.
         """
         with self._factory() as db:
-            visible = ChatSession.shared.is_(True)
-            if team_ids is not None:
-                visible = visible & or_(
+            if team_ids is None:
+                stmt = select(ChatSession).where(
+                    or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True))
+                )
+            else:
+                # _load 와 같은 규칙이어야 "목록에 있는데 열 수 없는 방" 이 안 생긴다 (자동 리뷰 지적).
+                #   private 방 → 내 것이면 보인다 (자기 기록이라 읽기는 열어 뒀다)
+                #   shared 방  → 팀이 없거나 내가 그 팀 구성원일 때만. **내가 만든 방도 마찬가지**다
+                my_private = (ChatSession.user_id == user_id) & ChatSession.shared.is_(False)
+                open_shared = ChatSession.shared.is_(True) & or_(
                     ChatSession.team_id.is_(None), ChatSession.team_id.in_(team_ids)
                 )
-            stmt = select(ChatSession).where(or_(ChatSession.user_id == user_id, visible))
+                stmt = select(ChatSession).where(or_(my_private, open_shared))
             if cluster_id is not None:
                 stmt = stmt.where(ChatSession.cluster_id == cluster_id)
             stmt = stmt.order_by(ChatSession.updated_at.desc())

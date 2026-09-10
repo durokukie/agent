@@ -445,3 +445,35 @@ def test_목록과_상세의_답이_같다(client, spring):
     assert 보이는방 in ids and 숨는방 not in ids
     assert client.get(f"/conversations/{보이는방}", headers=BEARER).status_code == 200
     assert client.get(f"/conversations/{숨는방}", headers=BEARER).status_code == 404
+
+
+def test_내가_만든_팀_shared_방도_목록과_상세가_같다(client, spring):
+    """주인을 목록에서 예외로 두면 _load 와 갈려 "목록에 있는데 열 수 없는 방" 이 남는다."""
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    cluster = _cluster("t-1", owner="u-1")
+    room = client.post("/conversations", json={"cluster_id": cluster, "shared": True},
+                       headers=BEARER).json()["conversation"]["id"]
+
+    membership.clear_cache()
+    spring["teams"] = []
+    ids = {c["id"] for c in client.get("/conversations", headers=BEARER).json()}
+    assert room not in ids
+    assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 404
+
+
+def test_권한_거절이_run_을_남기지_않는다(client, spring):
+    """뒤에서 던지면 run 이 running 인 채 남고, 같은 request_id 재시도가 409 INTERRUPTED 로 샌다."""
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    cluster = _cluster("t-1", owner="u-1")
+    room = client.post("/conversations", json={"cluster_id": cluster}, headers=BEARER
+                       ).json()["conversation"]["id"]
+
+    membership.clear_cache()
+    spring["teams"] = []
+    body = {"text": "파드 보여줘", "request_id": "req-1"}
+    first = client.post(f"/conversations/{room}/chat", json=body, headers=BEARER)
+    assert first.status_code == 403
+
+    assert get_store().list_runs(room) == []          # run 이 안 남는다
+    again = client.post(f"/conversations/{room}/chat", json=body, headers=BEARER)
+    assert again.status_code == 403                   # 재시도도 같은 안내
