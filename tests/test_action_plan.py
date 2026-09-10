@@ -286,7 +286,7 @@ def test_dry_run_failure_is_recorded_and_plan_is_kept(monkeypatch, tmp_path):
     assert plan.dry_run_result == metadata["dry_run_result"]
 
 
-@pytest.mark.parametrize("status", ["APPLIED", "REJECTED", "STALE", "UNKNOWN"])
+@pytest.mark.parametrize("status", ["APPLIED", "REJECTED", "EXPIRED", "UNKNOWN"])
 def test_mark_accepts_final_statuses(monkeypatch, tmp_path, status):
     plan = _create_plan(monkeypatch, tmp_path)
 
