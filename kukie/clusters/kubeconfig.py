@@ -90,14 +90,17 @@ def _resolved(host: str) -> list[str]:
 
 
 def _check_api_server(url: str, *, allow_local: bool) -> None:
+    # 공백은 **원문에서** 본다. 검사한 주소와 저장·실행할 주소가 같아야 하는데 urlparse 가 둘을
+    # 갈라 놓는다 (자동 리뷰 지적).
+    #   `https://127.0.0.1 `   → 호스트에 공백이 남아 ip_address 가 못 읽고, _blocked 가 False 가
+    #                            되고 getaddrinfo 도 못 풀어 사설·로컬 검사가 통째로 지나간다
+    #   `https://api.exa\t.com` → urlparse 는 탭·줄바꿈을 조용히 지운다. 검사는 깨끗한 이름을 보고
+    #                            통과시키는데 저장되는 원문에는 탭이 남아 실행에서 죽는다
+    _require(not any(ch.isspace() for ch in url), f"클러스터 주소에 공백이 들어 있습니다: {url!r}")
     parsed = urlparse(url)
     _require(parsed.scheme == "https", f"클러스터 주소는 https 여야 합니다: {url}")
     _require(bool(parsed.hostname), f"클러스터 주소에 호스트가 없습니다: {url}")
     host = str(parsed.hostname)
-    # urlparse 는 호스트 안의 공백을 그대로 남긴다 — `https://127.0.0.1 ` 의 호스트는 `"127.0.0.1 "`
-    # 이고, ip_address 가 못 읽어 _blocked 가 False 가 되고 getaddrinfo 도 못 풀어 사설·로컬 검사가
-    # 통째로 조용히 지나간다 (자동 리뷰 지적). 검사 전에 막는다.
-    _require(not any(ch.isspace() for ch in host), f"클러스터 주소에 공백이 들어 있습니다: {url}")
     if allow_local:
         return
     _require(not _blocked(host), f"사설·로컬 주소는 등록할 수 없습니다: {host}")
