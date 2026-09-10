@@ -389,11 +389,14 @@ async def chat(
             stored = store.find_run(conversation_id, body.request_id) or stored
         return _replay(stored)
 
+    # 권한 검사는 **잠금 검사보다 먼저** 한다. 이유가 둘이다 (자동 리뷰).
+    #   - run 을 만들기 전이어야 한다. 뒤에서 던지면 그 run 이 running 인 채 남고, 같은 request_id 로
+    #     재시도하면 403 대신 409 INTERRUPTED 라는 엉뚱한 안내가 나간다
+    #   - `lock.locked()` 검사와 `async with lock` 사이에 await 가 있으면 안 된다. 그 창에서 루프를
+    #     놓으면 두 요청이 나란히 통과해 같은 방에 run 이 둘 생긴다 (체크리스트 "잠금 틈")
+    await _require_cluster_access(store, row, user)
     if conversation.lock.locked():
         raise _busy()
-    # 권한 검사는 run 을 만들기 **전에** 한다. 뒤에서 던지면 그 run 이 running 인 채 남고, 같은
-    # request_id 로 재시도하면 403 대신 409 INTERRUPTED 라는 엉뚱한 안내가 나간다 (자동 리뷰 지적).
-    await _require_cluster_access(store, row, user)
     if session.pending is not None:
         if session.pending_ids:
             raise _error(409, "PENDING_APPROVAL", "승인 대기 중 — /approve 로 먼저 결정")
@@ -448,6 +451,8 @@ async def chat(
             agent_messages=_messages_json(result) if result is not None else None,
             usage_summary=_usage_json(result) if result is not None else None,
         )
+        if status == "completed":
+            _close_plans(store, run)
         store.update_session(conversation_id, current_mode=session.skill.name)
         # 첫 마디로 방 제목을 짓는다 (#59). 제목이 될 수 있는 마디인지, 첫 턴인지는 저장소가 본다 —
         # 판정이 두 곳에 갈라지면 한쪽만 고쳐진다 (자동 리뷰 지적). 라우팅 조건(`/mode ` 공백 포함)은
@@ -463,6 +468,10 @@ async def chat(
 
 def _close_plans(store: ChatStore, run: RunRow) -> None:
     """run 이 종료 상태로 닫힐 때 남은 계획도 닫는다. **여기서 터져도 원래 응답을 삼키면 안 된다.**
+
+    성공(completed)에도 부른다. 정상 흐름이면 그 시점에 열린 계획이 없지만, kubectl 이 돈 뒤
+    record_execution 이 실패하면 훅이 경고만 붙이고 결과를 정상 반환해 run 은 completed 로 닫히고
+    계획은 EXECUTING 으로 남는다 (자동 리뷰 지적). 종료 상태면 종류를 가리지 않고 닫는다.
 
     같은 트랜잭션으로 합칠 수 없어(run 은 이미 커밋됐다) 좁은 틈이 남는다 — 둘 사이에 죽으면 계획이
     열린 채 남는다. 그 틈을 없애려면 update_run 과 한 트랜잭션이어야 하는데, 저장 실패 경로마다
@@ -557,9 +566,9 @@ async def approve(
     row, conversation = await _load(conversation_id, user, store)
     session = conversation.session
     await _require_approver(row, user)
+    await _require_cluster_access(store, row, user)   # 잠금 검사보다 먼저 — 그 사이에 await 가 있으면 안 된다
     if conversation.lock.locked():
         raise _busy()
-    await _require_cluster_access(store, row, user)
     run = _open_run(store, conversation_id)
     async with conversation.lock:
         _bind_run(session, run, user)
@@ -585,13 +594,13 @@ async def resume(
     row, conversation = await _load(conversation_id, user, store)
     session = conversation.session
     await _require_approver(row, user)
+    await _require_cluster_access(store, row, user)   # 잠금 검사보다 먼저 — 그 사이에 await 가 있으면 안 된다
     if conversation.lock.locked():
         raise _busy()
     if session.pending is None:
         raise _error(409, "NOT_PENDING", "재개할 승인 건이 없다")
     if session.pending_ids:
         raise _error(409, "PENDING_APPROVAL", f"아직 결정하지 않은 승인 건이 있다: {session.pending_ids}")
-    await _require_cluster_access(store, row, user)
     run = _open_run(store, conversation_id)
     async with conversation.lock:
         _bind_run(session, run, user)
@@ -638,6 +647,7 @@ def _continue_run(
         return outcome
     _save_or_fail(store, conversation.id, run, **failure, status="completed", response_payload=outcome,
                   agent_messages=messages or None, usage_summary=usage)
+    _close_plans(store, run)      # completed 도 종료 상태다 — 남은 계획이 있으면 닫는다
     store.update_session(conversation.id, current_mode=conversation.session.skill.name)
     return outcome
 
