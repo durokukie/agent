@@ -481,3 +481,12 @@ def test_namespace_만_비워_보내면_바꿀_게_없다(client):
 def test_context_의_앞뒤_공백도_뗀다(client):
     """정확히 일치해야 하는 값이라 안 떼면 "그런 context 없다" 는 알아보기 어려운 400 이 된다."""
     assert _register(client, context=" prod ")["context"] == "prod"
+
+
+def test_namespace_를_안_보내면_kubeconfig_가_정한다(client):
+    """등록에서 빈 값·안 보냄은 둘 다 "안 정했다" 다 — kubeconfig 의 namespace 를 쓴다."""
+    from kukie.clusters.kubeconfig import parse_kubeconfig
+
+    kubeconfig_ns = parse_kubeconfig(kubeconfig()).namespace
+    assert _register(client)["namespace"] == kubeconfig_ns
+    assert _register(client, name="운영2", namespace="  ")["namespace"] == kubeconfig_ns

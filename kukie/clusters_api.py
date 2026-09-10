@@ -182,7 +182,9 @@ async def register_cluster(
             insecure=parsed.insecure,
             credential_encrypted=crypto.encrypt(parsed.credential),
             context_name=parsed.context_name,
-            default_namespace=(body.namespace or parsed.namespace or "").strip() or "default",
+            # 둘 다 검증기·parse_kubeconfig 를 거쳐 공백 아닌 값이거나 None 이다
+            # (parsed.namespace 는 kubeconfig.py 에서 이미 "default" 로 채워져 온다)
+            default_namespace=body.namespace or parsed.namespace,
             fingerprint=parsed.fingerprint,
         )
     except IntegrityError:
