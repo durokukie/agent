@@ -485,7 +485,7 @@ async def test_판단_가이드_예외와_빈_출력은_대체문구를_저장�
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
 
-    async def fail_guidance(plan):
+    async def fail_guidance(plan, manifest_preview=None):
         raise error
 
     monkeypatch.setattr(hook, "generate_decision_guidance", fail_guidance)
@@ -1113,3 +1113,107 @@ async def test_기록_실패는_원래_결과에_경고하고_재실행을_차�
         )
 
     duplicate_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_판단_가이드에_매니페스트_본문이_넘어간다(
+    monkeypatch, tmp_path, successful_dry_run
+):
+    """#50 — Plan 에는 해시만 남아서, 안 넘기면 모델이 "본문이 제시되지 않았다" 고 답한다.
+
+    그런데 승인 카드 미리보기에는 본문이 그대로 보여서 한 카드가 자기 모순을 일으켰다.
+    실제로 강효승이 겪고 올린 이슈이며, 2026-09-10 로컬 E2E 에서 재현했다.
+    """
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    받은것 = {}
+
+    async def spy(plan, manifest_preview=None):
+        받은것["plan"] = plan.render_markdown(include_decision_guidance=False)
+        받은것["preview"] = manifest_preview
+        return "확인 사항 1"
+
+    monkeypatch.setattr(hook, "generate_decision_guidance", spy)
+
+    args = {
+        "manifest_yaml": (
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: nginx\n"
+            "spec:\n  containers:\n    - name: nginx\n      image: nginx:latest\n"
+        ),
+        "namespace": None,
+        "intent": "Pod 를 적용한다.",
+        "expected_effects": ["Pod 가 생성된다."],
+        "side_effects": ["노드 자원을 사용한다."],
+    }
+    with pytest.raises(ApprovalRequired):
+        await hook.guardrail(
+            _ctx(), call=_call("apply_manifest"), tool_def=None, args=args, handler=AsyncMock(),
+        )
+
+    # Plan 본문에는 여전히 해시만 있다 — 그 결정은 안 바꿨다
+    assert "nginx:latest" not in 받은것["plan"]
+
+    # 모델에게는 마스킹된 매니페스트가 따로 넘어간다
+    preview = 받은것["preview"]
+    assert preview is not None, "매니페스트가 안 넘어갔다 — #50 이 되살아났다"
+    assert preview[0]["kind"] == "Pod"
+    assert preview[0]["spec"]["containers"][0]["image"] == "nginx:latest"
+
+
+@pytest.mark.asyncio
+async def test_매니페스트가_없는_툴은_미리보기도_없다(
+    monkeypatch, tmp_path, successful_dry_run
+):
+    """scale·restart·delete 는 넘길 본문 자체가 없다. None 이어야 프롬프트가 그 경우를 안다."""
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    받은것 = {}
+
+    async def spy(plan, manifest_preview=None):
+        받은것["preview"] = manifest_preview
+        return "확인 사항 1"
+
+    monkeypatch.setattr(hook, "generate_decision_guidance", spy)
+
+    with pytest.raises(ApprovalRequired):
+        await hook.guardrail(
+            _ctx(), call=_call("scale_resource"), tool_def=None,
+            args={
+                "kind": "deployment", "name": "nginx", "replicas": 3, "namespace": "study",
+                "intent": "레플리카를 늘린다.", "expected_effects": ["3개가 된다."],
+                "side_effects": ["자원을 더 쓴다."],
+            },
+            handler=AsyncMock(),
+        )
+
+    assert 받은것["preview"] is None
+
+
+@pytest.mark.asyncio
+async def test_Secret_은_가린_채로_넘어간다(monkeypatch, tmp_path, successful_dry_run):
+    """승인 화면과 **같은** 마스킹을 쓴다. 화면에 가려진 값이 모델 입력에만 살아 있으면,
+    모델이 사용자 화면에 없는 것을 근거로 조언하게 된다 — #50 과 반대 방향의 같은 병이다."""
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    받은것 = {}
+
+    async def spy(plan, manifest_preview=None):
+        받은것["preview"] = manifest_preview
+        return "확인 사항 1"
+
+    monkeypatch.setattr(hook, "generate_decision_guidance", spy)
+
+    with pytest.raises(ApprovalRequired):
+        await hook.guardrail(
+            _ctx(), call=_call("apply_manifest"), tool_def=None,
+            args={
+                "manifest_yaml": (
+                    "apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\n"
+                    "data:\n  password: aHVudGVyMg==\n"
+                ),
+                "namespace": None, "intent": "Secret 을 적용한다.",
+                "expected_effects": ["Secret 이 생성된다."], "side_effects": ["기존 값을 덮는다."],
+            },
+            handler=AsyncMock(),
+        )
+
+    preview = 받은것["preview"]
+    assert preview[0]["data"]["password"] == "<redacted>"
+    assert "aHVudGVyMg==" not in str(preview)
