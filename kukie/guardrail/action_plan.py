@@ -615,13 +615,16 @@ def sync_markdown(rows: "list[Any]") -> None:
 
 
 def list_plans(
-    user_id: str, *, cluster_id: str | None = None, status: str | None = None,
-    team_ids: list[str] | None = None,
+    user_id: str, *, team_ids: list[str] | None, cluster_id: str | None = None,
+    status: str | None = None,
 ) -> list[Any]:
     """GET /action-plans 와 히스토리 스킬이 같이 쓰는 목록 — 내 방 + 내가 볼 수 있는 shared 방의 요약.
 
-    team_ids 는 부르는 쪽이 회원 서버에서 받아 넘긴다 (대화 목록과 같은 범위). 본문(.md)은 읽지
-    않는다 — 한 줄에 필요한 값은 전부 DB 표에 있다.
+    team_ids 에 **기본값을 두지 않는다**. `None` 은 "shared 전부"(회원 서버가 없는 개발 모드)라
+    fail-open 이므로, 나중에 히스토리 툴이 붙을 때 안 넘겨서 조용히 새는 일이 없게 부르는 쪽이
+    매번 정하게 한다 (자동 리뷰 지적). 값은 회원 서버에서 받아 넘긴다.
+
+    본문(.md)은 읽지 않는다 — 한 줄에 필요한 값은 전부 DB 표에 있다.
     """
     if status is not None and status not in PLAN_STATUSES:
         raise ValueError(f"invalid Action Plan status: {status}")

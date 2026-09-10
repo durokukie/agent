@@ -32,6 +32,7 @@ from kukie.clusters import crypto
 from kukie.clusters.access import ClusterGone, kubeconfig_for
 from kukie.clusters.kubeconfig import KubeconfigRejected, parse_kubeconfig
 from kukie.clusters.settings import allow_local_clusters
+from kukie.fields import blank_is_none, stripped
 from kukie import membership
 from kukie.kubectl import run_kubectl
 from kukie.store import ChatStore, get_store
@@ -60,26 +61,6 @@ def _limiter(name: str, workers: int) -> CapacityLimiter:
 
 # ── 요청 본문 ──────────────────────────────────────────────
 
-def _stripped(cls: object, value: object) -> object:
-    """앞뒤 공백을 떼고 min_length 검사에 넘긴다. 공백만 보낸 이름은 여기서 `''` 가 돼 422 로 막힌다 —
-    안 떼면 min_length=1 을 지나 빈 이름으로 저장된다 (자동 리뷰 지적)."""
-    return value.strip() if isinstance(value, str) else value
-
-
-def _blank_is_none(cls: object, value: object) -> object:
-    """공백을 떼고, 남은 게 없으면 None.
-
-    **빈 문자열은 "값을 안 정했다" 는 뜻 하나**로 고정한다 (자동 리뷰 지적). 등록에서는 kubeconfig
-    가 정하고, 수정에서는 안 바꾼다. 같은 입력이 두 곳에서 다른 뜻이면 폼 전체를 보내는 화면이
-    사용자가 안 건드린 칸을 조용히 갈아엎는다.
-
-    `context` 처럼 정확히 일치해야 하는 값도 여기서 공백을 뗀다 — `"prod "` 가 알아보기 어려운
-    400 으로 나가지 않게.
-    """
-    value = value.strip() if isinstance(value, str) else value
-    return None if value == "" else value
-
-
 class ClusterIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -90,8 +71,8 @@ class ClusterIn(BaseModel):
     team_id: str | None = Field(default=None, max_length=64)
 
     # `team_id: ""` 가 falsy 검사를 지나 팀 `''` 의 클러스터로 저장되면 목록·이름 공간이 갈라진다
-    _blank = field_validator("team_id", "context", "namespace", mode="before")(_blank_is_none)
-    _name = field_validator("name", mode="before")(_stripped)
+    _blank = field_validator("team_id", "context", "namespace", mode="before")(blank_is_none)
+    _name = field_validator("name", mode="before")(stripped)
 
 
 class ClusterPatch(BaseModel):
@@ -103,8 +84,8 @@ class ClusterPatch(BaseModel):
     context: str | None = None
 
     # 등록과 같은 규칙 — 빈 값은 "안 정했다" = 안 바꾼다. 기본값으로 되돌리려면 "default" 를 보낸다.
-    _blank = field_validator("namespace", "context", mode="before")(_blank_is_none)
-    _name = field_validator("name", mode="before")(_stripped)
+    _blank = field_validator("namespace", "context", mode="before")(blank_is_none)
+    _name = field_validator("name", mode="before")(stripped)
 
 
 # ── 응답 ───────────────────────────────────────────────────

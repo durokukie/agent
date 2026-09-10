@@ -30,7 +30,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 
 import kukie.server as _server  # 순환 import: 이름은 호출 시점에만 쓴다
@@ -39,6 +39,7 @@ from kukie.clusters import crypto
 from kukie import membership
 from kukie.clusters.access import ClusterChanged, ClusterGone, kubeconfig_or_none
 from kukie.conversations import Conversation, registry
+from kukie.fields import blank_is_none
 from kukie.skills import SKILLS
 from kukie.store import ChatStore, get_store
 from kukie.store.chat_store import ActiveRunExists, RequestMismatch, RunRow, SessionRow, error_payload
@@ -64,6 +65,11 @@ class ConversationIn(BaseModel):
     cluster_fingerprint: str | None = None    # 문서 3절 — 실제 대상 클러스터 확인값 (아직 서버가 계산하지 않는다)
     title: str = "새 대화"
     shared: bool = False
+
+    # `team_id: ""` 는 falsy 검사(팀 없음)와 IN 검사(그 팀만) 사이로 새어, 목록에서는 사라지는데
+    # 상세는 200 이 되는 방을 만든다 (자동 리뷰 지적). 클러스터 등록과 같은 규칙으로 접는다.
+    _blank = field_validator("cluster_id", "team_id", "context", "namespace",
+                             "installation_id", "cluster_fingerprint", mode="before")(blank_is_none)
 
 
 class ChatIn(BaseModel):

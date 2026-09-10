@@ -48,9 +48,11 @@ def _visible_sessions(user_id: str, team_ids: list[str] | None) -> Any:
     if team_ids is None:
         return or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True))
     my_private = (ChatSession.user_id == user_id) & ChatSession.shared.is_(False)
-    open_shared = ChatSession.shared.is_(True) & or_(
-        ChatSession.team_id.is_(None), ChatSession.team_id.in_(team_ids)
-    )
+    # `""` 도 "팀 없음" 으로 본다 — _load 는 falsy 라 팀 검사를 건너뛰므로, 여기서 IN 에만 맡기면
+    # 목록에선 사라지는데 상세는 200 인 방이 남는다 (자동 리뷰 지적). 새로 들어오는 값은
+    # ConversationIn 이 None 으로 접지만 이미 저장된 행이 있을 수 있다.
+    no_team = or_(ChatSession.team_id.is_(None), ChatSession.team_id == "")
+    open_shared = ChatSession.shared.is_(True) & or_(no_team, ChatSession.team_id.in_(team_ids))
     return or_(my_private, open_shared)
 
 

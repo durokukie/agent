@@ -543,3 +543,37 @@ def test_남의_팀_계획_전문은_404(client, spring):
     assert client.get(f"/action-plans/{보이는계획}", headers=BEARER).status_code == 200
     r = client.get(f"/action-plans/{숨는계획}", headers=BEARER)
     assert r.status_code == 404 and r.json()["detail"]["code"] == "NOT_FOUND"
+
+
+def test_빈_team_id_로_방을_만들_수_없다(client, spring):
+    """`""` 는 falsy 검사(팀 없음)와 IN 검사(그 팀만) 사이로 샌다 — 목록엔 없는데 상세는 200."""
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    room = client.post("/conversations", json={"team_id": "", "shared": True},
+                       headers=BEARER).json()["conversation"]["id"]
+
+    assert get_store().get_session(room).team_id is None
+    ids = {c["id"] for c in client.get("/conversations", headers=BEARER).json()}
+    assert room in ids                                                    # 목록과
+    assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 200   # 상세가 같다
+
+
+def test_이미_저장된_빈_team_id_도_목록과_상세가_같다(client, spring):
+    """정규화가 붙기 전에 들어간 행이 있을 수 있다 — 목록 조건도 ""를 팀 없음으로 본다."""
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    room = get_store().create_session(
+        user_id="다른사람", context_name="c", namespace="n", mode="학습", team_id="", shared=True
+    ).id
+
+    ids = {c["id"] for c in client.get("/conversations", headers=BEARER).json()}
+    assert room in ids
+    assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 200
+
+
+def test_계획_목록은_팀을_안_넘기면_부를_수_없다():
+    """team_ids=None 은 "shared 전부" 라 기본값으로 두면 나중에 붙는 호출자가 조용히 샌다."""
+    import inspect
+
+    from kukie.guardrail import action_plan
+
+    param = inspect.signature(action_plan.list_plans).parameters["team_ids"]
+    assert param.default is inspect.Parameter.empty
