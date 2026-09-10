@@ -389,11 +389,14 @@ async def chat(
             stored = store.find_run(conversation_id, body.request_id) or stored
         return _replay(stored)
 
+    # 권한 검사는 **잠금 검사보다 먼저** 한다. 이유가 둘이다 (자동 리뷰).
+    #   - run 을 만들기 전이어야 한다. 뒤에서 던지면 그 run 이 running 인 채 남고, 같은 request_id 로
+    #     재시도하면 403 대신 409 INTERRUPTED 라는 엉뚱한 안내가 나간다
+    #   - `lock.locked()` 검사와 `async with lock` 사이에 await 가 있으면 안 된다. 그 창에서 루프를
+    #     놓으면 두 요청이 나란히 통과해 같은 방에 run 이 둘 생긴다 (체크리스트 "잠금 틈")
+    await _require_cluster_access(store, row, user)
     if conversation.lock.locked():
         raise _busy()
-    # 권한 검사는 run 을 만들기 **전에** 한다. 뒤에서 던지면 그 run 이 running 인 채 남고, 같은
-    # request_id 로 재시도하면 403 대신 409 INTERRUPTED 라는 엉뚱한 안내가 나간다 (자동 리뷰 지적).
-    await _require_cluster_access(store, row, user)
     if session.pending is not None:
         if session.pending_ids:
             raise _error(409, "PENDING_APPROVAL", "승인 대기 중 — /approve 로 먼저 결정")
@@ -554,9 +557,9 @@ async def approve(
     row, conversation = await _load(conversation_id, user, store)
     session = conversation.session
     await _require_approver(row, user)
+    await _require_cluster_access(store, row, user)   # 잠금 검사보다 먼저 — 그 사이에 await 가 있으면 안 된다
     if conversation.lock.locked():
         raise _busy()
-    await _require_cluster_access(store, row, user)
     run = _open_run(store, conversation_id)
     async with conversation.lock:
         _bind_run(session, run, user)
@@ -582,13 +585,13 @@ async def resume(
     row, conversation = await _load(conversation_id, user, store)
     session = conversation.session
     await _require_approver(row, user)
+    await _require_cluster_access(store, row, user)   # 잠금 검사보다 먼저 — 그 사이에 await 가 있으면 안 된다
     if conversation.lock.locked():
         raise _busy()
     if session.pending is None:
         raise _error(409, "NOT_PENDING", "재개할 승인 건이 없다")
     if session.pending_ids:
         raise _error(409, "PENDING_APPROVAL", f"아직 결정하지 않은 승인 건이 있다: {session.pending_ids}")
-    await _require_cluster_access(store, row, user)
     run = _open_run(store, conversation_id)
     async with conversation.lock:
         _bind_run(session, run, user)

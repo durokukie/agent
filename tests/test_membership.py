@@ -477,3 +477,22 @@ def test_권한_거절이_run_을_남기지_않는다(client, spring):
     assert get_store().list_runs(room) == []          # run 이 안 남는다
     again = client.post(f"/conversations/{room}/chat", json=body, headers=BEARER)
     assert again.status_code == 403                   # 재시도도 같은 안내
+
+
+@pytest.mark.asyncio
+async def test_잠금_검사와_획득_사이에_await_가_없다():
+    """🔴 그 창에서 루프를 놓으면 두 요청이 나란히 통과해 같은 방에 run 이 둘 생긴다.
+
+    소스에서 직접 확인한다 — 동시성 사고는 테스트로 재현하기 어렵고, 규칙은 "그 사이에 await 를
+    두지 않는다" 하나다 (체크리스트 "잠금 틈").
+    """
+    import inspect
+    import re
+
+    from kukie import conversations_api
+
+    source = inspect.getsource(conversations_api)
+    for block in re.findall(
+        r"if conversation\.lock\.locked\(\):(.*?)async with conversation\.lock:", source, re.S
+    ):
+        assert "await " not in block, f"잠금 검사와 획득 사이에 await 가 있다:\n{block}"
