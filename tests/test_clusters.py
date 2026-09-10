@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from kukie import conversations, server
 from kukie.clusters import crypto, runtime
+from kukie.clusters import kubeconfig as kubeconfig_module
 from kukie.clusters.kubeconfig import KubeconfigRejected, parse_kubeconfig
 from kukie.kubectl import KubectlResult
 from kukie.store import get_store, reset_store_for_tests
@@ -49,6 +50,9 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("KUKIE_DEV_AUTH", "1")
     monkeypatch.setenv(crypto.KEY_ENV, crypto.generate_key())
     monkeypatch.delenv("KUKIE_ALLOW_LOCAL_CLUSTER", raising=False)
+    # 등록 경로가 진짜 getaddrinfo 를 탄다. CI 리졸버가 NXDOMAIN 을 사내 주소로 바꿔 주면
+    # 등록 테스트가 통째로 빨개진다 — 해석 결과를 고정한다 (자동 리뷰 지적).
+    monkeypatch.setattr(kubeconfig_module, "_resolved", lambda host: ["93.184.216.34"])
     reset_store_for_tests(f"sqlite:///{tmp_path / 'test.db'}")
     conversations.registry.clear()
     monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
@@ -388,3 +392,10 @@ def test_클러스터의_접속_대상이_바뀌면_기존_방은_거절한다(c
 
     r = client.post(f"/conversations/{room}/chat", json={"text": "안녕"}, headers=USER)
     assert r.status_code == 409 and r.json()["detail"]["code"] == "CLUSTER_CHANGED"
+
+
+def test_팀_클러스터_등록은_아직_막혀_있다(client):
+    """team_id 를 검사할 방법이 이 브랜치에 없다. 열어 두면 409 가 남의 팀 이름을 떠보는 신호가 된다."""
+    r = client.post("/clusters", json={"kubeconfig": kubeconfig(), "name": "운영", "team_id": "t-1"},
+                    headers=USER)
+    assert r.status_code == 501 and r.json()["detail"]["code"] == "TEAM_CLUSTER_UNSUPPORTED"
