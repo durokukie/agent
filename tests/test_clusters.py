@@ -25,14 +25,16 @@ CA = base64.b64encode(b"fake-ca").decode()
 
 
 def kubeconfig(
-    *, server_url="https://api.example.com", ca=CA, user=None, context="prod", extra_context=None
+    *, server_url="https://api.example.com", ca=CA, user=None, context="prod", extra_context=None,
+    namespace="web",
 ) -> str:
     document = {
         "apiVersion": "v1",
         "kind": "Config",
         "clusters": [{"name": "c", "cluster": {"server": server_url, "certificate-authority-data": ca}}],
         "users": [{"name": "u", "user": user if user is not None else {"token": "secret-token"}}],
-        "contexts": [{"name": context, "context": {"cluster": "c", "user": "u", "namespace": "web"}}],
+        "contexts": [{"name": context,
+                      "context": {"cluster": "c", "user": "u", "namespace": namespace}}],
         "current-context": context,
     }
     if extra_context:
@@ -490,3 +492,10 @@ def test_namespace_를_안_보내면_kubeconfig_가_정한다(client):
     kubeconfig_ns = parse_kubeconfig(kubeconfig()).namespace
     assert _register(client)["namespace"] == kubeconfig_ns
     assert _register(client, name="운영2", namespace="  ")["namespace"] == kubeconfig_ns
+
+
+def test_kubeconfig_의_namespace_공백도_뗀다(client):
+    """쓰는 쪽마다 떼면 하나만 빠져도 `"web "` 이 그대로 저장된다 — 읽는 자리에서 한 번 뗀다."""
+    assert parse_kubeconfig(kubeconfig(namespace=" web ")).namespace == "web"
+    assert _register(client, server_kubeconfig=kubeconfig(namespace=" web "))["namespace"] == "web"
+    assert parse_kubeconfig(kubeconfig(namespace="   ")).namespace == "default"
