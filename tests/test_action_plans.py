@@ -92,6 +92,14 @@ def _card(client, room, *, call_id="call-1", headers=USER, args=None, tool="scal
     return r.json()
 
 
+def _front(plan_id: str, plan_dir) -> dict:
+    """.md 사본의 front-matter. 표가 원본이고 사본은 사람이 읽는 용도라 따라와야 한다."""
+    import yaml
+
+    body = (plan_dir / f"{plan_id}.md").read_text(encoding="utf-8")
+    return yaml.safe_load(body.removeprefix("---\n").partition("\n---\n")[0])
+
+
 def _plans(room=None):
     store = get_store()
     runs = store.list_runs(room) if room else []
@@ -405,11 +413,7 @@ def test_저장_실패로_run_이_failed_가_돼도_계획이_닫힌다(client, 
     assert _plans(room)[0].status == "STALE"        # 열린 채 남지 않는다
 
     # .md 사본도 따라온다 — 표만 바꾸면 사본이 옛 상태로 굳고 다시 지나가는 경로가 없다 (자동 리뷰)
-    import yaml
-
-    body = (tmp_path / f"{_plans(room)[0].id}.md").read_text(encoding="utf-8")
-    front = yaml.safe_load(body.removeprefix("---\n").partition("\n---\n")[0])
-    assert front["status"] == "STALE"
+    assert _front(_plans(room)[0].id, tmp_path)["status"] == "STALE"
 
 
 def test_계획_닫기가_실패해도_원래_오류를_돌려준다(client, monkeypatch):
@@ -452,3 +456,51 @@ def test_실행_기록_저장이_실패해도_계획이_열린_채_남지_않는
     assert r.status_code == 200 and r.json()["kind"] == "answer"
     assert get_store().list_runs(room)[-1].status == "completed"
     assert _plans(room)[0].status == "UNKNOWN"     # 승인은 됐는데 결과를 모른다
+
+
+def test_저장에_실패해_남은_run_을_치울_때도_md_가_따라온다(client, tmp_path):
+    """계획을 DB 에서 직접 닫는 네 번째 자리 — 재전송이 결과 저장에 실패한 run 을 치우는 문.
+
+    여기서 .md 를 안 맞추면 표는 STALE 인데 사본은 WAITING_APPROVAL 로 굳고, 다시 지나가는
+    경로가 없다 (자동 리뷰 지적).
+    """
+    room = _room(client)
+    _card(client, room)
+    store = get_store()
+    run = store.list_runs(room)[-1]
+    assert _front(_plans(room)[0].id, tmp_path)["status"] == "WAITING_APPROVAL"
+
+    store.update_run(run.id, status="running")      # 결과를 저장하지 못하고 활성으로 남은 run
+    r = client.post(f"/conversations/{room}/chat",
+                    json={"text": "늘려줘", "request_id": run.request_id}, headers=USER)
+
+    # 치운 run 을 그대로 재생하므로 "중단됐다, 새 요청으로 보내라" 가 나간다
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "INTERRUPTED"
+    assert _plans(room)[0].status == "STALE"
+    assert _front(_plans(room)[0].id, tmp_path)["status"] == "STALE"
+
+
+def test_재시작_복원은_이미_끝난_계획의_md_를_덧쓰지_않는다(client, tmp_path):
+    """방금 닫힌 것만 다시 쓴다 — 그 run 의 닫힌 계획을 전부 쓰면 APPLIED 사본까지 덧쓴다."""
+    room = _room(client)
+    _card(client, room)
+    with agent.override(model=_answer_model()):
+        client.post(f"/conversations/{room}/approve",
+                    json={"call_id": "call-1", "approved": True}, headers=USER)
+    store = get_store()
+    applied = _plans(room)[0]
+    assert applied.status == "APPLIED"
+    before = (tmp_path / f"{applied.id}.md").read_text(encoding="utf-8")
+
+    _card(client, room, call_id="call-2")           # 두 번째 카드
+    새계획 = [p for p in _plans(room) if p.id != applied.id][0]
+    store.update_plan(새계획.id, status="APPROVED",              # 되살릴 수 없는 카드 → run 을 닫는다
+                      decision={"approved": True, "user_id": "u-1", "at": "2026-09-10T00:00:00+00:00"})
+
+    conversations.registry.clear()
+    client.get(f"/conversations/{room}", headers=USER)
+
+    assert get_store().get_plan(새계획.id).status == "UNKNOWN"
+    assert _front(새계획.id, tmp_path)["status"] == "UNKNOWN"
+    # 이미 끝난 계획의 사본은 손대지 않는다 — 같은 run 이 아니어도 전부 다시 쓰면 여기서 어긋난다
+    assert (tmp_path / f"{applied.id}.md").read_text(encoding="utf-8") == before

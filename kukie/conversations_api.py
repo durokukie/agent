@@ -257,7 +257,7 @@ async def chat(
             raise _error(409, "REQUEST_MISMATCH", f"같은 request_id 로 다른 입력을 보냈다: {body.request_id}")
         if stored.status == "running" and not conversation.lock.locked():
             # 실행 중이라는데 이 방의 잠금이 비어 있다 = 결과 저장에 실패한 run 이다. 영원히 BUSY 를 재생하지 않도록 닫는다
-            store.interrupt_active_runs(conversation_id, "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라")
+            _interrupt(store, conversation_id)
             stored = store.find_run(conversation_id, body.request_id) or stored
         return _replay(stored)
 
@@ -276,7 +276,7 @@ async def chat(
         if stale is not None:
             logger.warning("결과가 저장되지 않은 run 을 닫는다 (conversation=%s, run=%s, status=%s)",
                            conversation_id, stale.id, stale.status)
-            store.interrupt_active_runs(conversation_id, "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라")
+            _interrupt(store, conversation_id)
         try:
             run, created = store.start_run(
                 conversation_id, request_id=body.request_id, kind=kind,
@@ -316,6 +316,20 @@ async def chat(
             _close_plans(store, run)
         store.update_session(conversation_id, current_mode=session.skill.name)
         return payload
+
+
+def _interrupt(store: ChatStore, conversation_id: str) -> None:
+    """결과 저장에 실패해 활성으로 남은 run 을 닫는다. 함께 닫힌 계획의 .md 사본도 따라오게 한다 —
+    계획을 DB 에서 직접 닫는 자리는 넷이고 규칙은 한 벌이어야 한다 (자동 리뷰 지적)."""
+    from kukie.guardrail.action_plan import sync_markdown   # 순환 import 회피
+
+    closed = store.interrupt_active_runs(
+        conversation_id, "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라"
+    )
+    try:
+        sync_markdown(closed.plans)
+    except Exception:
+        logger.exception("중단으로 닫힌 계획의 .md 갱신 실패 (conversation=%s)", conversation_id)
 
 
 def _close_plans(store: ChatStore, run: RunRow) -> None:

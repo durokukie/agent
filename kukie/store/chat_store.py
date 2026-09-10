@@ -98,6 +98,18 @@ class RunRow:
 
 
 @dataclass(frozen=True)
+class Interrupted:
+    """중단으로 닫은 run 과, **같은 트랜잭션에서** 함께 닫힌 계획.
+
+    계획까지 돌려주는 것은 부르는 쪽이 `.md` 사본을 따라오게 해야 하기 때문이다. 방금 닫힌 행만
+    주므로 이미 끝난 계획(APPLIED 등)의 사본을 덧쓰지 않는다 (자동 리뷰 지적).
+    """
+
+    runs: list["RunRow"]
+    plans: list["PlanRow"]
+
+
+@dataclass(frozen=True)
 class PlanRow:
     """tbl_action_plan 한 행 (DB 문서 5절). 상태 이름은 DURO-83 결정(대문자)."""
 
@@ -328,14 +340,18 @@ class ChatStore:
                 row.finished_at = None if status in RUN_ACTIVE else datetime.now(timezone.utc)
             db.commit()
 
-    def interrupt_active_runs(self, session_id: str, message: str) -> list[RunRow]:
+    def interrupt_active_runs(self, session_id: str, message: str) -> Interrupted:
         """재시작 복원 때: 활성 run 을 interrupted 로 닫는다. 승인 카드는 만료됐으니 error 로 바꾸고,
-        이미 error(재개 실패, recovery_required)면 그 코드는 남긴다 — 앱이 "확인 필요" 를 계속 보여줘야 한다."""
+        이미 error(재개 실패, recovery_required)면 그 코드는 남긴다 — 앱이 "확인 필요" 를 계속 보여줘야 한다.
+
+        닫은 계획도 함께 돌려준다 — 부르는 쪽이 `.md` 사본을 따라오게 한다 (자동 리뷰 지적).
+        """
         with self._factory() as db:
             rows = db.scalars(
                 select(ChatRun).where(ChatRun.session_id == session_id, ChatRun.status.in_(RUN_ACTIVE))
             ).all()
             now = datetime.now(timezone.utc)
+            closed: list[ActionPlan] = []
             for row in rows:
                 payload = row.response_payload or {}
                 if payload.get("kind") != "error":
@@ -344,9 +360,9 @@ class ChatStore:
                 row.finished_at = now
                 # 계획도 **같은 트랜잭션에서** 닫는다. 따로 커밋하면 그 사이에 죽었을 때 run 은
                 # interrupted 인데 계획은 열린 채 남고, 다시 지나가는 경로가 없다 (자동 리뷰 지적).
-                _close_open_plans(db, row.id)
+                closed += _close_open_plans(db, row.id)
             db.commit()
-            return [RunRow.of(r) for r in rows]
+            return Interrupted([RunRow.of(r) for r in rows], [PlanRow.of(r) for r in closed])
 
     def list_runs(self, session_id: str) -> list[RunRow]:
         with self._factory() as db:
