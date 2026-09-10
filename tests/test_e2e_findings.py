@@ -107,12 +107,37 @@ def test_첫_마디가_새_대화면_다음_턴이_덮어쓰지_않는다(client
     assert get_store().get_session(room).title == "새 대화"
 
 
-def test_제목이_바뀌면_version_도_오른다(client):
-    """세션 행을 고치는 다른 경로와 같아야 앱이 "바뀌었다" 를 알아챈다."""
+def test_제목_쓰기가_version_을_올린다(client):
+    """세션 행을 고치는 다른 경로와 같아야 앱이 "바뀌었다" 를 알아챈다.
+
+    매 chat 턴이 current_mode 갱신으로 이미 version 을 한 번 올리므로(자동 리뷰 지적), 단순히
+    "올랐나" 만 보면 제목 쓰기를 지워도 통과한다. 제목이 바뀌는 첫 턴의 증가분과 안 바뀌는
+    둘째 턴의 증가분을 비교한다.
+    """
     room = _room(client)
     before = get_store().get_session(room).version
-    _say(client, room, "파드 상태 알려줘")
-    assert get_store().get_session(room).version > before
+
+    _say(client, room, "첫 번째 질문")
+    after_first = get_store().get_session(room).version
+
+    _say(client, room, "두 번째 질문")            # 제목은 그대로다
+    after_second = get_store().get_session(room).version
+
+    assert after_first - before == 2              # 모드 갱신 + 제목
+    assert after_second - after_first == 1        # 모드 갱신만
+
+
+def test_모드를_먼저_바꿔도_첫_마디가_제목이_된다(client):
+    """turn_no 로 판단하면 `/mode` 가 1번을 먹어 그 방은 제목을 영영 못 받는다 (자동 리뷰 지적).
+
+    E2E 에서 실제로 나온 순서다 — 모드 바꾸고 나서 변경을 요청한다.
+    """
+    room = client.post("/conversations", json={"shared": True}, headers=USER).json()["conversation"]["id"]
+    client.post(f"/conversations/{room}/chat", json={"text": "/mode 실습"}, headers=USER)
+
+    _say(client, room, "nginx 를 4개로 늘려줘")
+
+    assert get_store().get_session(room).title == "nginx 를 4개로 늘려줘"
 
 
 def test_제목_저장이_실패해도_대화는_성공으로_끝난다(client, monkeypatch):

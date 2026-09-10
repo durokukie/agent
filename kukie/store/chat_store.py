@@ -286,6 +286,9 @@ class ChatStore:
         보냈을 때 다음 턴이 제목을 또 덮어쓴다 — "한 번만 정해진다" 가 깨진다 (자동 리뷰 지적).
         앱이 만들 때 제목을 지정했다면 그것도 건드리지 않는다.
 
+        첫 턴이 실패로 끝나면 그 run 은 chat 으로 남으므로 그 방은 제목을 못 받는다. 살리려면 별도
+        칸(title_set)이 필요해서 지금은 두었다 — 첫 마디가 실패하는 경우가 드물고 표를 늘릴 값은 아니다.
+
         update_session 을 거쳐 version 도 함께 올린다. 세션 행을 고치는 다른 경로와 같아야 앱이
         "바뀌었다" 를 알아챈다. 앱 픽스처와 같은 규칙(앞 30자)이라 화면 동작이 일치한다.
         AI 가 요약해 짓는 방식은 후속이다.
@@ -297,13 +300,16 @@ class ChatStore:
             row = db.get(ChatSession, session_id)
             if row is None or row.title != DEFAULT_TITLE:
                 return None
-            first = db.scalar(
-                select(ChatRun.id).where(
-                    ChatRun.session_id == session_id, ChatRun.kind == "chat", ChatRun.turn_no > 1
-                )
-            )
-            if first is not None:
-                return None       # 이미 지나간 대화다 — 첫 턴이 아니면 제목을 바꾸지 않는다
+            # turn_no 로 판단하면 안 된다 — 번호는 kind 를 가리지 않아서 `/mode` 가 1번을 먹으면
+            # 그다음 첫 chat 이 2번이 되고, 그 방은 제목을 영영 못 받는다 (자동 리뷰 지적).
+            # "나 말고 다른 chat run 이 있나" 로 보면 kind 가 섞여도 답이 같다.
+            earlier = db.scalars(
+                select(ChatRun.id)
+                .where(ChatRun.session_id == session_id, ChatRun.kind == "chat")
+                .limit(2)
+            ).all()
+            if len(earlier) > 1:
+                return None       # 지금 turn 말고 다른 chat run 이 있다 — 첫 chat 턴이 아니다
         self.update_session(session_id, title=title)
         return title
 
