@@ -210,6 +210,16 @@ def _check_applied(status: str | None, result: dict[str, Any] | None) -> None:
         raise ValueError(f"{status} 는 성공한 실행 결과(success=true, exit_code=0)를 요구한다")
 
 
+def titleable(text: str | None) -> bool:
+    """제목이 될 수 있는 마디인가 (#59).
+
+    공백만인 것과 `/mode` 로 시작하는 것은 아니다. 이 판정이 두 곳에 갈라져 있으면 한쪽만 고쳐진다 —
+    저장소(첫 턴 세기)와 API(제목 짓기 건너뛰기)가 같은 함수를 쓴다 (자동 리뷰 지적).
+    """
+    trimmed = " ".join((text or "").split())
+    return bool(trimmed) and not trimmed.startswith("/mode")
+
+
 def _plan_title(plan: ActionPlan) -> str:
     """목록에 보일 한 줄. 변경 툴의 intent(왜 하는지)가 사람이 읽기 가장 좋다."""
     payload = plan.plan_payload or {}
@@ -293,23 +303,24 @@ class ChatStore:
         "바뀌었다" 를 알아챈다. 앱 픽스처와 같은 규칙(앞 30자)이라 화면 동작이 일치한다.
         AI 가 요약해 짓는 방식은 후속이다.
         """
-        title = " ".join(text.split())[:limit].strip()
-        if not title:
+        if not titleable(text):
             return None
+        title = " ".join(text.split())[:limit].strip()
         with self._factory() as db:
             row = db.get(ChatSession, session_id)
             if row is None or row.title != DEFAULT_TITLE:
                 return None
-            # turn_no 로 판단하면 안 된다 — 번호는 kind 를 가리지 않아서 `/mode` 가 1번을 먹으면
-            # 그다음 첫 chat 이 2번이 되고, 그 방은 제목을 영영 못 받는다 (자동 리뷰 지적).
-            # "나 말고 다른 chat run 이 있나" 로 보면 kind 가 섞여도 답이 같다.
+            # 세는 것은 "run 이 있나" 가 아니라 **제목이 될 수 있었던 마디가 있나** 다.
+            # turn_no 는 kind 를 가리지 않아 `/mode` 가 1번을 먹으면 그다음 첫 chat 이 2번이 되고,
+            # run 을 세면 인자 없는 `/mode` 나 공백만 보낸 턴이 자리를 먹고 사라진다. 셋 다 그 방이
+            # 제목을 영영 못 받는 같은 모양의 구멍이었다 (자동 리뷰 3·4차).
             earlier = db.scalars(
-                select(ChatRun.id)
-                .where(ChatRun.session_id == session_id, ChatRun.kind == "chat")
-                .limit(2)
+                select(ChatRun.input_text).where(
+                    ChatRun.session_id == session_id, ChatRun.kind == "chat"
+                )
             ).all()
-            if len(earlier) > 1:
-                return None       # 지금 turn 말고 다른 chat run 이 있다 — 첫 chat 턴이 아니다
+            if sum(1 for spoken in earlier if titleable(spoken)) > 1:
+                return None       # 지금 turn 말고 제목이 될 수 있었던 마디가 있다 — 첫 턴이 아니다
         self.update_session(session_id, title=title)
         return title
 

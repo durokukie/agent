@@ -421,10 +421,10 @@ async def chat(
             usage_summary=_usage_json(result) if result is not None else None,
         )
         store.update_session(conversation_id, current_mode=session.skill.name)
-        # 첫 마디로 방 제목을 짓는다 (#59). 이미 제목이 있거나 첫 턴이 아니면 저장소가 건드리지 않는다.
-        # `/mode` 만 인자 없이 보내면 kind 는 chat 이지만 방 이름이 되면 안 된다 (자동 리뷰 지적) —
-        # 라우팅 조건(`/mode ` 공백 포함)은 router.py·server.py 와 셋이 같아야 하므로 여기만 넓게 막는다.
-        if kind == "chat" and not body.text.startswith("/mode"):
+        # 첫 마디로 방 제목을 짓는다 (#59). 제목이 될 수 있는 마디인지, 첫 턴인지는 저장소가 본다 —
+        # 판정이 두 곳에 갈라지면 한쪽만 고쳐진다 (자동 리뷰 지적). 라우팅 조건(`/mode ` 공백 포함)은
+        # router.py·server.py 와 셋이 같아야 하므로 그쪽은 건드리지 않는다.
+        if kind == "chat":
             try:
                 store.name_from_first_message(conversation_id, body.text)
             except Exception:

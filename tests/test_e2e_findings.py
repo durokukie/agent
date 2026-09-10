@@ -86,17 +86,27 @@ def test_모드_전환은_제목을_정하지_않는다(client):
     assert get_store().get_session(room).title == "새 대화"
 
 
-def test_공백만_보내면_제목을_바꾸지_않는다(client):
+def test_공백만_보내면_제목을_바꾸지_않고_자리도_안_먹는다(client):
     room = _room(client)
     _say(client, room, "   ")
     assert get_store().get_session(room).title == "새 대화"
 
+    _say(client, room, "파드 보여줘")
+    assert get_store().get_session(room).title == "파드 보여줘"
 
-def test_인자_없는_mode_도_제목이_되지_않는다(client):
-    """`/mode` 만 보내면 kind 는 chat 이라 라우팅은 일반 대화지만, 방 이름이 되면 안 된다."""
+
+def test_인자_없는_mode_도_제목이_되지_않고_자리도_안_먹는다(client):
+    """`/mode` 만 보내면 kind 는 chat 이라 라우팅은 일반 대화지만, 방 이름이 되면 안 된다.
+
+    1턴만 보면 구멍이 있는 채로 통과한다 — 그 run 이 "첫 턴" 자리를 먹고 사라지면 다음 마디도
+    제목이 못 된다 (자동 리뷰 4차). 그래서 두 번째 마디까지 본다.
+    """
     room = _room(client)
     _say(client, room, "/mode")
     assert get_store().get_session(room).title == "새 대화"
+
+    _say(client, room, "파드 보여줘")
+    assert get_store().get_session(room).title == "파드 보여줘"
 
 
 def test_첫_마디가_새_대화면_다음_턴이_덮어쓰지_않는다(client):
