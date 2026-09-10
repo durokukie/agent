@@ -314,12 +314,12 @@ def test_승인까지_갔다가_죽은_계획은_되살리지_않고_UNKNOWN으�
     assert _plans(room)[0].status == "UNKNOWN"
 
 
-def test_결정_전_카드도_다른_이유로_run이_닫히면_STALE이_된다(client):
+def test_결정_전_카드도_다른_이유로_run이_닫히면_EXPIRED이_된다(client):
     room = _room(client)
     _card(client, room)
     get_store().interrupt_active_runs(room, "중단")
 
-    assert _plans(room)[0].status == "STALE"
+    assert _plans(room)[0].status == "EXPIRED"
 
 
 def test_실패한_실행_결과로는_APPLIED가_될_수_없다(client):
@@ -374,7 +374,7 @@ def test_한_장을_거절한_뒤_재시작하면_되살리지_않는다(client)
 
     assert body["session"]["pending"] == []          # 되살리지 않는다
     assert body["turns"][-1]["status"] == "interrupted"
-    assert {p.tool_call_id: p.status for p in _plans(room)}["call-2"] == "STALE"
+    assert {p.tool_call_id: p.status for p in _plans(room)}["call-2"] == "EXPIRED"
 
 
 def test_없는_계획을_고치려_하면_조용히_넘어가지_않는다(client):
@@ -382,7 +382,7 @@ def test_없는_계획을_고치려_하면_조용히_넘어가지_않는다(clie
     from kukie.store.chat_store import PlanMissing
 
     with pytest.raises(PlanMissing):
-        get_store().update_plan("없는-계획", status="STALE")
+        get_store().update_plan("없는-계획", status="EXPIRED")
 
 
 def test_run_을_닫으면_계획도_같은_트랜잭션에서_닫힌다(client):
@@ -394,7 +394,7 @@ def test_run_을_닫으면_계획도_같은_트랜잭션에서_닫힌다(client)
     get_store().interrupt_active_runs(room, "중단")
 
     assert all(r.status == "interrupted" for r in get_store().list_runs(room) if r.id == runs[-1].id)
-    assert _plans(room)[0].status == "STALE"
+    assert _plans(room)[0].status == "EXPIRED"
 
 
 def test_저장_실패로_run_이_failed_가_돼도_계획이_닫힌다(client, monkeypatch, tmp_path):
@@ -425,10 +425,10 @@ def test_저장_실패로_run_이_failed_가_돼도_계획이_닫힌다(client, 
     # monkeypatch.undo() 를 부르면 client 픽스처가 건 PLAN_DIR·kubectl 패치까지 함께 풀린다 —
     # 아래 두 줄은 update_run 을 부르지 않으므로 되돌릴 필요가 없다 (자동 리뷰 지적)
     assert get_store().list_runs(room)[-1].status == "failed"
-    assert _plans(room)[0].status == "STALE"        # 열린 채 남지 않는다
+    assert _plans(room)[0].status == "EXPIRED"        # 열린 채 남지 않는다
 
     # .md 사본도 따라온다 — 표만 바꾸면 사본이 옛 상태로 굳고 다시 지나가는 경로가 없다 (자동 리뷰)
-    assert _front(_plans(room)[0].id, tmp_path)["status"] == "STALE"
+    assert _front(_plans(room)[0].id, tmp_path)["status"] == "EXPIRED"
 
 
 def test_계획_닫기가_실패해도_원래_오류를_돌려준다(client, monkeypatch):
@@ -476,7 +476,7 @@ def test_실행_기록_저장이_실패해도_계획이_열린_채_남지_않는
 def test_저장에_실패해_남은_run_을_치울_때도_md_가_따라온다(client, tmp_path):
     """계획을 DB 에서 직접 닫는 네 번째 자리 — 재전송이 결과 저장에 실패한 run 을 치우는 문.
 
-    여기서 .md 를 안 맞추면 표는 STALE 인데 사본은 WAITING_APPROVAL 로 굳고, 다시 지나가는
+    여기서 .md 를 안 맞추면 표는 EXPIRED 인데 사본은 WAITING_APPROVAL 로 굳고, 다시 지나가는
     경로가 없다 (자동 리뷰 지적).
     """
     room = _room(client)
@@ -491,8 +491,8 @@ def test_저장에_실패해_남은_run_을_치울_때도_md_가_따라온다(cl
 
     # 치운 run 을 그대로 재생하므로 "중단됐다, 새 요청으로 보내라" 가 나간다
     assert r.status_code == 409 and r.json()["detail"]["code"] == "INTERRUPTED"
-    assert _plans(room)[0].status == "STALE"
-    assert _front(_plans(room)[0].id, tmp_path)["status"] == "STALE"
+    assert _plans(room)[0].status == "EXPIRED"
+    assert _front(_plans(room)[0].id, tmp_path)["status"] == "EXPIRED"
 
 
 def test_재시작_복원은_방금_닫힌_계획만_다시_쓴다(client, tmp_path, monkeypatch):

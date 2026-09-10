@@ -252,7 +252,8 @@ def _close_open_plans(db: Session, run_id: str) -> list[ActionPlan]:
     """열린 계획을 닫는 **유일한** 전이 규칙 (DURO-83). 커밋은 부르는 쪽이 한다.
 
     승인까지 갔는데 실행 결과가 없으면 UNKNOWN — kubectl 이 돌았는지 모른다 (DB 문서 5절, run 의
-    recovery_required 와 같은 뜻). 아직 승인 전이면 STALE — 그 카드는 더 이상 쓸 수 없다.
+    recovery_required 와 같은 뜻). 아직 승인 전이면 EXPIRED — 그 카드는 더 이상 쓸 수 없다.
+    STALE 이 아니다: 클러스터는 그대로고 카드만 못 쓰게 된 것이다 (models.py 의 주석 참고).
 
     규칙을 두 벌로 두면 한쪽만 고쳐진다 (자동 리뷰 지적).
     """
@@ -261,7 +262,7 @@ def _close_open_plans(db: Session, run_id: str) -> list[ActionPlan]:
     ).all()
     for row in rows:
         approved = bool(row.decision and row.decision.get("approved"))
-        row.status = "UNKNOWN" if approved and row.execution_result is None else "STALE"
+        row.status = "UNKNOWN" if approved and row.execution_result is None else "EXPIRED"
     return list(rows)
 
 

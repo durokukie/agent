@@ -892,7 +892,7 @@ async def test_apply_manifest_원문이_달라지면_해시_불일치로_실행�
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["APPLIED", "REJECTED", "STALE"])
+@pytest.mark.parametrize("status", ["APPLIED", "REJECTED", "EXPIRED"])
 async def test_terminal_Plan은_handler를_실행하지_않는다(
     monkeypatch, tmp_path, successful_dry_run, successful_guidance, status
 ):
