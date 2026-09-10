@@ -208,6 +208,23 @@ def _check_applied(status: str | None, result: dict[str, Any] | None) -> None:
         raise ValueError(f"{status} 는 성공한 실행 결과(success=true, exit_code=0)를 요구한다")
 
 
+def _close_open_plans(db: Session, run_id: str) -> list[ActionPlan]:
+    """열린 계획을 닫는 **유일한** 전이 규칙 (DURO-83). 커밋은 부르는 쪽이 한다.
+
+    승인까지 갔는데 실행 결과가 없으면 UNKNOWN — kubectl 이 돌았는지 모른다 (DB 문서 5절, run 의
+    recovery_required 와 같은 뜻). 아직 승인 전이면 STALE — 그 카드는 더 이상 쓸 수 없다.
+
+    규칙을 두 벌로 두면 한쪽만 고쳐진다 (자동 리뷰 지적).
+    """
+    rows = db.scalars(
+        select(ActionPlan).where(ActionPlan.run_id == run_id, ActionPlan.status.in_(PLAN_OPEN))
+    ).all()
+    for row in rows:
+        approved = bool(row.decision and row.decision.get("approved"))
+        row.status = "UNKNOWN" if approved and row.execution_result is None else "STALE"
+    return list(rows)
+
+
 def _plan_title(plan: ActionPlan) -> str:
     """목록에 보일 한 줄. 변경 툴의 intent(왜 하는지)가 사람이 읽기 가장 좋다."""
     payload = plan.plan_payload or {}
@@ -374,13 +391,7 @@ class ChatStore:
                 row.finished_at = now
                 # 계획도 **같은 트랜잭션에서** 닫는다. 따로 커밋하면 그 사이에 죽었을 때 run 은
                 # interrupted 인데 계획은 열린 채 남고, 다시 지나가는 경로가 없다 (자동 리뷰 지적).
-                for plan in db.scalars(
-                    select(ActionPlan).where(
-                        ActionPlan.run_id == row.id, ActionPlan.status.in_(PLAN_OPEN)
-                    )
-                ).all():
-                    approved = bool(plan.decision and plan.decision.get("approved"))
-                    plan.status = "UNKNOWN" if approved and plan.execution_result is None else "STALE"
+                _close_open_plans(db, row.id)
             db.commit()
             return [RunRow.of(r) for r in rows]
 
@@ -458,18 +469,9 @@ class ChatStore:
             return [PlanRow.of(r) for r in rows]
 
     def expire_open_plans(self, run_id: str) -> list[PlanRow]:
-        """run 이 중단될 때 남은 계획을 닫는다 (DURO-83).
-
-        승인까지 갔는데 실행 결과가 없으면 UNKNOWN — kubectl 이 돌았는지 모른다 (문서 5절, run 의 recovery_required 와 같은 뜻).
-        아직 승인 전이면 STALE — 그 승인 카드는 더 이상 쓸 수 없다.
-        """
+        """run 이 종료 상태로 닫힐 때 남은 계획을 닫는다 (DURO-83). 전이 규칙은 _close_open_plans 한 벌."""
         with self._factory() as db:
-            rows = db.scalars(
-                select(ActionPlan).where(ActionPlan.run_id == run_id, ActionPlan.status.in_(PLAN_OPEN))
-            ).all()
-            for row in rows:
-                approved = bool(row.decision and row.decision.get("approved"))
-                row.status = "UNKNOWN" if approved and row.execution_result is None else "STALE"
+            rows = _close_open_plans(db, run_id)
             db.commit()
             return [PlanRow.of(r) for r in rows]
 

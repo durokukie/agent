@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from anyio import to_thread
+from anyio import CapacityLimiter, to_thread
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, ConfigDict, Field
@@ -40,6 +40,11 @@ from kukie.store.chat_store import ClusterInUse, ClusterRow
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/clusters", tags=["clusters"])
+
+#: kubeconfig 검사(이름 해석)에 쓸 수 있는 스레드 수. AnyIO 의 공용 워커 풀은 기본 40개인데,
+#: getaddrinfo 는 타임아웃을 줄 수 없어 느린 이름 몇 개가 그 풀을 통째로 물면 같은 풀을 쓰는
+#: 다른 일까지 함께 멈춘다 (자동 리뷰 지적). 등록은 드문 동작이라 넉넉히 4면 된다.
+_RESOLVE_LIMIT = CapacityLimiter(4)
 
 
 # ── 요청 본문 ──────────────────────────────────────────────
@@ -131,7 +136,7 @@ async def _parse(body_text: str, context: str | None):
         return parse_kubeconfig(body_text, context_name=context, allow_local=allow_local_clusters())
 
     try:
-        return await to_thread.run_sync(run)
+        return await to_thread.run_sync(run, limiter=_RESOLVE_LIMIT)
     except KubeconfigRejected as exc:
         raise _error(400, "KUBECONFIG_REJECTED", str(exc)) from None
 
@@ -145,7 +150,12 @@ async def register_cluster(
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
     _require_key()
-    if body.team_id and membership.available():
+    # 아래 PR 은 소속을 물을 방법이 없어 팀 지정 등록을 501 로 막아 뒀다. 여기서는 회원 서버에
+    # 물을 수 있으므로 연다 — 검사 없이 열면 409 가 남의 팀 이름을 떠보는 신호가 된다 (자동 리뷰).
+    if body.team_id:
+        if not membership.available():
+            raise _error(501, "TEAM_CLUSTER_UNSUPPORTED",
+                         "회원 서버가 없어 팀 클러스터를 등록할 수 없습니다")
         await membership.require_admin(user, body.team_id)   # 팀 클러스터 등록은 Admin 만 (기획 02 §3)
     parsed = await _parse(body.kubeconfig, body.context)
     try:
