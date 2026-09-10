@@ -93,9 +93,13 @@ def _check_api_server(url: str, *, allow_local: bool) -> None:
     parsed = urlparse(url)
     _require(parsed.scheme == "https", f"클러스터 주소는 https 여야 합니다: {url}")
     _require(bool(parsed.hostname), f"클러스터 주소에 호스트가 없습니다: {url}")
+    host = str(parsed.hostname)
+    # urlparse 는 호스트 안의 공백을 그대로 남긴다 — `https://127.0.0.1 ` 의 호스트는 `"127.0.0.1 "`
+    # 이고, ip_address 가 못 읽어 _blocked 가 False 가 되고 getaddrinfo 도 못 풀어 사설·로컬 검사가
+    # 통째로 조용히 지나간다 (자동 리뷰 지적). 검사 전에 막는다.
+    _require(not any(ch.isspace() for ch in host), f"클러스터 주소에 공백이 들어 있습니다: {url}")
     if allow_local:
         return
-    host = str(parsed.hostname)
     _require(not _blocked(host), f"사설·로컬 주소는 등록할 수 없습니다: {host}")
     # 호스트명도 **실제로 풀리는 주소**까지 본다. 이름만 보면 사내망이나 127.0.0.1 로 풀리는
     # 이름을 등록해 서버가 대신 접속하게 만들 수 있다 (자동 리뷰 P1).
@@ -179,7 +183,8 @@ def parse_kubeconfig(
              "파일 경로(certificate-authority)는 쓸 수 없습니다 — 인라인 값만 받습니다")
     server = cluster.get("server")
     _require(isinstance(server, str) and server.strip() != "", "클러스터 주소(server)가 없습니다")
-    _check_api_server(str(server), allow_local=allow_local)
+    server = str(server).strip()          # namespace 와 같이 읽는 자리에서 한 번 뗀다
+    _check_api_server(server, allow_local=allow_local)
 
     insecure = bool(cluster.get("insecure-skip-tls-verify"))
     ca = cluster.get("certificate-authority-data")
@@ -201,7 +206,7 @@ def parse_kubeconfig(
     namespace = namespace.strip() if isinstance(namespace, str) else ""
     return ParsedCluster(
         context_name=str(chosen),
-        api_server=str(server).rstrip("/"),
+        api_server=server.rstrip("/"),
         ca_data=ca_data,
         namespace=namespace or "default",
         credential=_credential(user),
