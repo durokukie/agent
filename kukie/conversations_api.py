@@ -42,6 +42,7 @@ from kukie.conversations import Conversation, registry
 from kukie.skills import SKILLS
 from kukie.store import ChatStore, get_store
 from kukie.store.chat_store import ActiveRunExists, RequestMismatch, RunRow, SessionRow, error_payload
+from kukie.store.models import DEFAULT_TITLE
 from kukie.tools.mutate import MUTATING_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ class ConversationIn(BaseModel):
     namespace: str | None = None
     installation_id: str | None = None        # 문서 3절 — kubectl 을 실행하는 agent 설치 환경 (앱이 알면 준다)
     cluster_fingerprint: str | None = None    # 문서 3절 — 실제 대상 클러스터 확인값 (아직 서버가 계산하지 않는다)
-    title: str = "새 대화"
+    title: str = DEFAULT_TITLE
     shared: bool = False
 
 
@@ -400,9 +401,15 @@ async def chat(
             usage_summary=_usage_json(result) if result is not None else None,
         )
         store.update_session(conversation_id, current_mode=session.skill.name)
-        if kind == "chat":
-            # 첫 마디로 방 제목을 짓는다 (#59). 이미 제목이 있으면 저장소가 건드리지 않는다.
-            store.name_from_first_message(conversation_id, body.text)
+        # 첫 마디로 방 제목을 짓는다 (#59). 이미 제목이 있거나 첫 턴이 아니면 저장소가 건드리지 않는다.
+        # `/mode` 만 인자 없이 보내면 kind 는 chat 이지만 방 이름이 되면 안 된다 (자동 리뷰 지적) —
+        # 라우팅 조건(`/mode ` 공백 포함)은 router.py·server.py 와 셋이 같아야 하므로 여기만 넓게 막는다.
+        if kind == "chat" and not body.text.startswith("/mode"):
+            try:
+                store.name_from_first_message(conversation_id, body.text)
+            except Exception:
+                # 제목은 부가 정보다. 여기서 터지면 이미 completed 로 저장한 run 이 500 으로 뒤집힌다
+                logger.exception("제목 저장 실패 (conversation=%s)", conversation_id)
         return payload
 
 

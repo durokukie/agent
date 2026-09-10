@@ -280,9 +280,14 @@ class ChatStore:
             db.commit()
 
     def name_from_first_message(self, session_id: str, text: str, *, limit: int = 30) -> str | None:
-        """첫 마디로 제목을 짓는다 (#59, 기획 05 §6). 이미 사용자가·AI 가 지은 제목이면 건드리지 않는다.
+        """첫 마디로 제목을 짓는다 (#59, 기획 05 §6). 반환은 새 제목, 안 바꿨으면 None.
 
-        반환은 새 제목, 안 바꿨으면 None. 앱 픽스처와 같은 규칙(앞 30자)이라 화면 동작이 일치한다.
+        **첫 chat 턴에서만** 바꾼다. 제목 글자만 보고 판단하면 사용자가 첫 마디로 정확히 "새 대화" 를
+        보냈을 때 다음 턴이 제목을 또 덮어쓴다 — "한 번만 정해진다" 가 깨진다 (자동 리뷰 지적).
+        앱이 만들 때 제목을 지정했다면 그것도 건드리지 않는다.
+
+        update_session 을 거쳐 version 도 함께 올린다. 세션 행을 고치는 다른 경로와 같아야 앱이
+        "바뀌었다" 를 알아챈다. 앱 픽스처와 같은 규칙(앞 30자)이라 화면 동작이 일치한다.
         AI 가 요약해 짓는 방식은 후속이다.
         """
         title = " ".join(text.split())[:limit].strip()
@@ -292,9 +297,15 @@ class ChatStore:
             row = db.get(ChatSession, session_id)
             if row is None or row.title != DEFAULT_TITLE:
                 return None
-            row.title = title
-            db.commit()
-            return title
+            first = db.scalar(
+                select(ChatRun.id).where(
+                    ChatRun.session_id == session_id, ChatRun.kind == "chat", ChatRun.turn_no > 1
+                )
+            )
+            if first is not None:
+                return None       # 이미 지나간 대화다 — 첫 턴이 아니면 제목을 바꾸지 않는다
+        self.update_session(session_id, title=title)
+        return title
 
     # ── run ──────────────────────────────────────────────────
 

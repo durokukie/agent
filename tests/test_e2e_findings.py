@@ -7,12 +7,15 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from pydantic_ai.messages import ToolCallPart
+
 import pytest
 from fastapi.testclient import TestClient
 
 from kukie import agent as agent_module
 from kukie import conversations, server
 from kukie.kubectl import KubectlResult
+from kukie.agent import agent
 from kukie.skills import SKILLS
 from kukie.store import get_store, reset_store_for_tests
 from kukie.tools import read as read_tools
@@ -89,6 +92,39 @@ def test_공백만_보내면_제목을_바꾸지_않는다(client):
     assert get_store().get_session(room).title == "새 대화"
 
 
+def test_인자_없는_mode_도_제목이_되지_않는다(client):
+    """`/mode` 만 보내면 kind 는 chat 이라 라우팅은 일반 대화지만, 방 이름이 되면 안 된다."""
+    room = _room(client)
+    _say(client, room, "/mode")
+    assert get_store().get_session(room).title == "새 대화"
+
+
+def test_첫_마디가_새_대화면_다음_턴이_덮어쓰지_않는다(client):
+    """제목 글자만 보고 판단하면 "한 번만 정해진다" 가 이 경우에 깨진다 (자동 리뷰 지적)."""
+    room = _room(client)
+    _say(client, room, "새 대화")
+    _say(client, room, "두 번째 질문")
+    assert get_store().get_session(room).title == "새 대화"
+
+
+def test_제목이_바뀌면_version_도_오른다(client):
+    """세션 행을 고치는 다른 경로와 같아야 앱이 "바뀌었다" 를 알아챈다."""
+    room = _room(client)
+    before = get_store().get_session(room).version
+    _say(client, room, "파드 상태 알려줘")
+    assert get_store().get_session(room).version > before
+
+
+def test_제목_저장이_실패해도_대화는_성공으로_끝난다(client, monkeypatch):
+    """제목은 부가 정보다. 여기서 터지면 이미 completed 로 저장한 run 이 500 으로 뒤집힌다."""
+    def boom(*a, **k):
+        raise RuntimeError("DB 넘어짐")
+
+    monkeypatch.setattr(get_store(), "name_from_first_message", boom)
+    room = _room(client)
+    assert _say(client, room, "안녕").status_code == 200
+
+
 # ── #60 현재 모드 못 박기 ──────────────────────────────────
 
 def _instruction(skill_name: str) -> str:
@@ -109,13 +145,59 @@ def test_지금_쓸_수_있는_툴을_함께_말한다():
     assert "scale_resource" not in 학습
 
 
-def test_과거_모드의_거절을_따르지_말라고_못_박는다():
-    """대화 기록에 남은 이전 모드의 거절 답변이 모델을 끌던 것이 #60 의 원인이었다."""
+def test_과거_모드의_거절을_따르지_말라고_못_박되_다른_모드로_한정한다():
+    """대화 기록에 남은 **이전 모드의** 거절 답변이 모델을 끌던 것이 #60 의 원인이었다.
+
+    한정을 빼면 반대 방향으로 아프다 — 학습 모드에서 변경을 요청받았을 때의 **정당한 거절**까지
+    눌러 버린다. 앱의 [실습 모드로] 버튼이 그 안내에서 나온다 (자동 리뷰 지적).
+    """
     text = _instruction("실습")
-    assert "과거 답변을 근거로 거절하지 마라" in text
-    assert "지나간 상태" in text
+    assert "다른 모드에서" in text and "지나간 상태" in text
+    assert "**다른 모드의 과거 답변을** 근거로 거절하지 마라" in text
+    assert "그건 올바른 답변이다" in text          # 지금 모드에 없는 일은 거절해도 된다
 
 
-def test_모드를_바꾸면_지시문도_바뀐다(client):
-    """`/mode` 는 LLM 을 부르지 않아 기록에 흔적이 없다 — 지시문이 유일한 통로다."""
-    assert _instruction("학습") != _instruction("실습")
+def test_출력_툴은_금지_목록에_걸리지_않는다():
+    """allowed_tools 에는 응답을 마무리하는 출력 툴이 없다. "이것뿐" 이라고만 하면 모델이
+    필수 출력 툴을 안 부를 수 있다 (자동 리뷰 P1)."""
+    text = _instruction("학습")
+    assert "클러스터에 쓸 수 있는 툴" in text
+    assert "출력 툴은 여기 해당하지 않는다" in text
+
+
+def test_모드를_바꾸면_다음_턴의_지시문이_실제로_바뀐다(client):
+    """#60 은 문구가 아니라 **전환이 ctx.deps.skill 까지 오느냐** 의 문제였다.
+
+    `/mode` 를 실제로 보낸 뒤, 다음 chat 턴이 도는 시점의 deps 를 잡아 지시문을 확인한다.
+    """
+    from pydantic_ai import ModelResponse
+    from pydantic_ai.messages import TextPart
+    from pydantic_ai.models.function import FunctionModel
+
+    seen: list[str] = []
+
+    def capture(messages, info):
+        # @agent.instructions 의 결과는 ModelRequest.instructions 로 온다 (parts 가 아니다)
+        for message in messages:
+            text = getattr(message, "instructions", None)
+            if isinstance(text, str) and "[현재 모드:" in text:
+                seen.append(text[text.index("[현재 모드:"):][:20])
+        out = info.output_tools[0]
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name=out.name,
+            args={"narration": "답변입니다.", "suggested_next_action": None},
+        )])
+
+    # 실습 모드는 shared 방에서만 된다 (기획 05 §3)
+    room = client.post("/conversations", json={"shared": True}, headers=USER).json()["conversation"]["id"]
+    with agent.override(model=FunctionModel(capture)):
+        client.post(f"/conversations/{room}/chat", json={"text": "안녕"}, headers=USER)
+    assert seen and "학습" in seen[-1]
+
+    # 모드를 바꾼다 — 이 요청은 LLM 을 부르지 않는다
+    r = client.post(f"/conversations/{room}/chat", json={"text": "/mode 실습"}, headers=USER)
+    assert r.json()["skill"] == "실습"
+
+    with agent.override(model=FunctionModel(capture)):
+        client.post(f"/conversations/{room}/chat", json={"text": "nginx 를 늘려줘"}, headers=USER)
+    assert "실습" in seen[-1]          # 전환이 다음 턴의 deps 까지 왔다
