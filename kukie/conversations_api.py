@@ -390,8 +390,10 @@ def _close_plans(store: ChatStore, run: RunRow) -> None:
     열린 채 남는다. 그 틈을 없애려면 update_run 과 한 트랜잭션이어야 하는데, 저장 실패 경로마다
     상태·payload 가 달라 지금 구조로는 묶이지 않는다 (자동 리뷰 지적). 다음 정리 대상으로 남긴다.
     """
+    from kukie.guardrail.action_plan import sync_markdown   # 순환 import 회피 — 부를 때만 가져온다
+
     try:
-        store.expire_open_plans(run.id)
+        sync_markdown(store.expire_open_plans(run.id))
     except Exception:
         logger.exception("계획 닫기 실패 — run 은 이미 종료로 닫혔다 (run=%s)", run.id)
 

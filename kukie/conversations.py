@@ -92,7 +92,8 @@ class ConversationRegistry:
         active = store.active_run(conversation_id)
         pending = _restore_pending(store, active) if active is not None else None
         if pending is None:
-            store.interrupt_active_runs(conversation_id, INTERRUPTED_MESSAGE)
+            for closed in store.interrupt_active_runs(conversation_id, INTERRUPTED_MESSAGE):
+                _sync_plan_files(store, closed.id)
         row = store.get_session(conversation_id)
         assert row is not None
         conversation = self.register(
@@ -124,6 +125,16 @@ def _unanswered_calls(messages: list[Any]) -> dict[str, ToolCallPart]:
             elif isinstance(part, (ToolReturnPart, RetryPromptPart)) and part.tool_call_id:
                 answered.add(part.tool_call_id)
     return {cid: call for cid, call in calls.items() if cid not in answered}
+
+
+def _sync_plan_files(store: ChatStore, run_id: str) -> None:
+    """중단으로 닫힌 계획의 .md 사본을 따라오게 한다. 표가 원본이고 사본은 사람이 읽는 용도다."""
+    from kukie.guardrail.action_plan import sync_markdown   # 순환 import 회피
+
+    try:
+        sync_markdown([p for p in store.list_plans_for_run(run_id) if not p.open])
+    except Exception:
+        logger.exception("만료된 계획의 .md 갱신 실패 (run=%s)", run_id)
 
 
 def _restore_pending(store: ChatStore, run: RunRow) -> DeferredToolRequests | None:
