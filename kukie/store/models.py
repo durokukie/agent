@@ -53,11 +53,17 @@ MODES = ("학습", "진단", "실습")
 # plan 상태 — DURO-83 결정 (기획 10 이름 + REJECTED). DB 문서 5절의 소문자 목록을 대체한다 (issue #58 댓글에 대응표).
 # 정상 흐름: DRAFT → WAITING_APPROVAL → APPROVED → EXECUTING → APPLIED → EFFECT_VERIFIED
 PLAN_OPEN = ("DRAFT", "WAITING_APPROVAL", "APPROVED", "EXECUTING")   # 아직 끝나지 않은 계획
-PLAN_CLOSED = ("APPLIED", "EFFECT_VERIFIED", "REJECTED", "STALE", "FAILED", "UNKNOWN")
+PLAN_CLOSED = ("APPLIED", "EFFECT_VERIFIED", "REJECTED", "EXPIRED", "STALE", "FAILED", "UNKNOWN")
 PLAN_STATUSES = PLAN_OPEN + PLAN_CLOSED
 
 # APPLIED = kubectl 이 성공했다. EFFECT_VERIFIED = 그 효과까지 확인했다 (기획 09, 아직 아무도 안 채운다).
-# STALE = 중단·재시작으로 승인이 더는 유효하지 않다. UNKNOWN = 실행 여부를 모른다 (run 의 recovery_required 짝).
+# UNKNOWN = 실행 여부를 모른다 (run 의 recovery_required 짝).
+#
+# EXPIRED 와 STALE 은 **다른 상황**이다 (DURO-83 의 "어긋나는 지점" 이 둘을 갈라 적었다).
+#   EXPIRED = 중단·재시작으로 **승인 카드가 못 쓰게 됐다.** 클러스터는 그대로다
+#   STALE   = **클러스터 상태가 바뀌어 전제가 깨졌다** (기획 08). 아직 판정하는 코드가 없다
+# 사용자 안내가 갈린다 — "카드가 만료됐으니 다시 요청하세요" vs "상황이 바뀌었으니 다시 계획합니다".
+# 예전에는 앞엣것에 STALE 을 썼는데, DURO-83 이 그 이름을 08 용으로 정해 둔 것을 어긴 것이었다.
 PLAN_FAILURE_REASONS = (
     "PERMISSION_DENIED",           # RBAC 거부
     "CONCURRENT_MODIFICATION",     # 다른 사람이 먼저 바꿨다 (기획 08, 아직 판정하지 않는다)
