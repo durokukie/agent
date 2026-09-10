@@ -39,6 +39,7 @@ from kukie.conversations import Conversation, registry
 from kukie.skills import SKILLS
 from kukie.store import ChatStore, get_store
 from kukie.store.chat_store import ActiveRunExists, RequestMismatch, RunRow, SessionRow, error_payload
+from kukie.store.models import RUN_ACTIVE
 from kukie.tools.mutate import MUTATING_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -294,13 +295,13 @@ async def chat(
         except HTTPException as exc:
             wrapped = _wrap(exc)
             store.update_run(run.id, status="failed", response_payload=_error_record(wrapped))
-            store.expire_open_plans(run.id)   # failed 는 종료 상태다 — 여기서 안 닫으면 계획이 영원히 열린 채 남는다
+            _close_plans(store, run)   # failed 는 종료 상태다 — 안 닫으면 계획이 영원히 열린 채 남는다
             raise wrapped
         except Exception as exc:                 # 모델·툴 예외 — run 은 실패로 남기고 세션은 유지
             logger.exception("run 실패 (conversation=%s, run=%s)", conversation_id, run.id)
             failed = _error(500, "RUN_FAILED", f"요청 처리에 실패했다 ({type(exc).__name__}) — 서버 로그 참고")
             store.update_run(run.id, status="failed", response_payload=_error_record(failed))
-            store.expire_open_plans(run.id)
+            _close_plans(store, run)
             raise failed from exc
 
         # 승인 카드면 run 은 열린 채(awaiting_approval) 남는다 — approve/resume 이 이어서 끝낸다 (문서 7절)
@@ -313,6 +314,19 @@ async def chat(
         )
         store.update_session(conversation_id, current_mode=session.skill.name)
         return payload
+
+
+def _close_plans(store: ChatStore, run: RunRow) -> None:
+    """run 이 종료 상태로 닫힐 때 남은 계획도 닫는다. **여기서 터져도 원래 응답을 삼키면 안 된다.**
+
+    같은 트랜잭션으로 합칠 수 없어(run 은 이미 커밋됐다) 좁은 틈이 남는다 — 둘 사이에 죽으면 계획이
+    열린 채 남는다. 그 틈을 없애려면 update_run 과 한 트랜잭션이어야 하는데, 저장 실패 경로마다
+    상태·payload 가 달라 지금 구조로는 묶이지 않는다 (자동 리뷰 지적). 다음 정리 대상으로 남긴다.
+    """
+    try:
+        store.expire_open_plans(run.id)
+    except Exception:
+        logger.exception("계획 닫기 실패 — run 은 이미 종료로 닫혔다 (run=%s)", run.id)
 
 
 def _save_or_fail(
@@ -334,6 +348,10 @@ def _save_or_fail(
                 store.update_run(run.id, status=failure_status, response_payload=_error_record(on_failure))
         except Exception:
             logger.exception("실패 표시도 저장하지 못했다 (run=%s)", run.id)
+        # failed 는 종료 상태다 — 이 문으로 닫힌 run 의 계획도 함께 닫아야 한다 (자동 리뷰 지적).
+        # recovery_required·awaiting_approval 은 활성이라 나중에 interrupt 가 지나간다.
+        if failure_status not in RUN_ACTIVE:
+            _close_plans(store, run)
         raise on_failure from exc
 
 
