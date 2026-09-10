@@ -492,7 +492,54 @@ async def test_잠금_검사와_획득_사이에_await_가_없다():
     from kukie import conversations_api
 
     source = inspect.getsource(conversations_api)
-    for block in re.findall(
+    blocks = re.findall(
         r"if conversation\.lock\.locked\(\):(.*?)async with conversation\.lock:", source, re.S
-    ):
+    )
+    # 정규식이 하나도 안 걸리면 for 문은 검사 없이 통과한다 — 주석 한 줄이나 줄바꿈만으로 감시가
+    # 사라져도 초록이 된다 (자동 리뷰 지적). 잠그는 자리 수와 맞는지부터 본다.
+    taken = source.count("async with conversation.lock:")
+    assert taken >= 3, f"잠그는 자리가 {taken} 곳뿐이다 — 감시 대상이 사라졌는지 본다"
+    assert len(blocks) == taken, (
+        f"잠그는 자리 {taken} 곳 중 {len(blocks)} 곳만 정규식에 걸렸다 — "
+        "앞의 locked() 검사가 없어졌거나 사이에 다른 코드가 끼었다"
+    )
+    for block in blocks:
         assert "await " not in block, f"잠금 검사와 획득 사이에 await 가 있다:\n{block}"
+
+
+def _plan_in_room(team_id: str | None, *, owner: str = "다른사람", shared: bool = True) -> str:
+    """그 방에 계획 하나를 만들어 id 를 돌려준다. 대시보드 범위 검사용."""
+    store = get_store()
+    room = store.create_session(
+        user_id=owner, context_name="c", namespace="n", mode="운영",
+        team_id=team_id, shared=shared,
+    ).id
+    run, _ = store.start_run(room, request_id=f"req-{team_id}-{owner}", kind="chat",
+                             mode="운영", input_text="지워줘")
+    plan = store.create_plan(
+        plan_id=f"ap-{team_id}-{owner}", run_id=run.id, tool_call_id="call-1",
+        tool_name="delete_resource", risk="DESTRUCTIVE",
+        plan_payload={"intent": "정리"}, request_hash="h",
+    )
+    return plan.id
+
+
+def test_계획_목록도_남의_팀_것을_안_보여준다(client, spring):
+    """대화 목록만 팀을 보고 계획 목록은 안 보면, 같은 방의 계획이 대시보드로 새어 나간다."""
+    spring["teams"] = [{"id": "t-1", "role": "MEMBER"}]
+    보이는계획 = _plan_in_room("t-1")
+    숨는계획 = _plan_in_room("t-9")
+
+    ids = {p["id"] for p in client.get("/action-plans", headers=BEARER).json()}
+    assert 보이는계획 in ids and 숨는계획 not in ids
+
+
+def test_남의_팀_계획_전문은_404(client, spring):
+    """목록에서 가렸어도 id 를 알면 전문(명령·대상·결과)이 그대로 열리면 안 된다."""
+    spring["teams"] = [{"id": "t-1", "role": "MEMBER"}]
+    보이는계획 = _plan_in_room("t-1")
+    숨는계획 = _plan_in_room("t-9")
+
+    assert client.get(f"/action-plans/{보이는계획}", headers=BEARER).status_code == 200
+    r = client.get(f"/action-plans/{숨는계획}", headers=BEARER)
+    assert r.status_code == 404 and r.json()["detail"]["code"] == "NOT_FOUND"

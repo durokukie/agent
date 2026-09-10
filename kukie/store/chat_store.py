@@ -39,6 +39,32 @@ class ClusterInUse(RuntimeError):
     """이 클러스터를 쓰는 채팅방이 남아 있어 지울 수 없다."""
 
 
+def _visible_sessions(user_id: str, team_ids: list[str] | None) -> Any:
+    """내가 볼 수 있는 방을 고르는 조건 한 벌 — 방 목록·계획 목록이 같은 규칙을 써야 한다.
+
+    _load(conversations_api) 와 같은 규칙이어야 "목록에 있는데 열 수 없는 것" 이 안 생긴다.
+      private 방 → 내 것이면 보인다 (자기 기록이라 읽기는 열어 뒀다)
+      shared 방  → 팀이 없거나 내가 그 팀 구성원일 때만. **내가 만든 방도 마찬가지**다
+    team_ids 를 안 주면(개발 모드 = 회원 서버 없음) 예전처럼 shared 전부.
+    """
+    if team_ids is None:
+        return or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True))
+    my_private = (ChatSession.user_id == user_id) & ChatSession.shared.is_(False)
+    open_shared = ChatSession.shared.is_(True) & or_(
+        ChatSession.team_id.is_(None), ChatSession.team_id.in_(team_ids)
+    )
+    return or_(my_private, open_shared)
+
+
+@dataclass(frozen=True)
+class PlanScope:
+    """계획이 속한 방의 권한 정보 — plans_api 가 _load 와 같은 규칙을 걸 때 쓴다."""
+
+    owner_id: str
+    shared: bool
+    team_id: str | None
+
+
 @dataclass(frozen=True)
 class SessionRow:
     id: str
@@ -294,19 +320,7 @@ class ChatStore:
         맞춘다 (자동 리뷰 지적). 주지 않으면(개발 모드) 예전처럼 shared 전부.
         """
         with self._factory() as db:
-            if team_ids is None:
-                stmt = select(ChatSession).where(
-                    or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True))
-                )
-            else:
-                # _load 와 같은 규칙이어야 "목록에 있는데 열 수 없는 방" 이 안 생긴다 (자동 리뷰 지적).
-                #   private 방 → 내 것이면 보인다 (자기 기록이라 읽기는 열어 뒀다)
-                #   shared 방  → 팀이 없거나 내가 그 팀 구성원일 때만. **내가 만든 방도 마찬가지**다
-                my_private = (ChatSession.user_id == user_id) & ChatSession.shared.is_(False)
-                open_shared = ChatSession.shared.is_(True) & or_(
-                    ChatSession.team_id.is_(None), ChatSession.team_id.in_(team_ids)
-                )
-                stmt = select(ChatSession).where(or_(my_private, open_shared))
+            stmt = select(ChatSession).where(_visible_sessions(user_id, team_ids))
             if cluster_id is not None:
                 stmt = stmt.where(ChatSession.cluster_id == cluster_id)
             stmt = stmt.order_by(ChatSession.updated_at.desc())
@@ -531,18 +545,22 @@ class ChatStore:
 
     def list_plan_summaries(
         self, user_id: str, *, cluster_id: str | None = None, status: str | None = None,
+        team_ids: list[str] | None = None,
     ) -> list[PlanSummaryRow]:
-        """대시보드 목록. 내 방 + shared 방의 계획만 (list_sessions 와 같은 범위).
+        """대시보드 목록. 내 방 + 내가 볼 수 있는 shared 방의 계획만 (list_sessions 와 **같은 범위**).
+
+        team_ids 는 부르는 쪽이 회원 서버에서 받아 넘긴다 — 안 넘기면 남의 팀 방 계획까지 섞인다
+        (자동 리뷰 지적). 대화 목록과 규칙이 다르면 "목록엔 있는데 열 수 없는 계획" 이 생긴다.
 
         requested_by 는 방 주인이다 — run 에 요청자 칸이 없다 (문서 6절 "회원 id 를 중복 저장하지 않는다").
-        shared 방에서 팀원이 보낸 요청도 방 주인으로 표시된다. 팀 API 가 붙을 때 다시 본다.
+        shared 방에서 팀원이 보낸 요청도 방 주인으로 표시된다.
         """
         with self._factory() as db:
             stmt = (
                 select(ActionPlan, ChatSession.cluster_id, ChatSession.user_id)
                 .join(ChatRun, ActionPlan.run_id == ChatRun.id)
                 .join(ChatSession, ChatRun.session_id == ChatSession.id)
-                .where(or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True)))
+                .where(_visible_sessions(user_id, team_ids))
             )
             if cluster_id is not None:
                 stmt = stmt.where(ChatSession.cluster_id == cluster_id)
@@ -568,16 +586,20 @@ class ChatStore:
                 for plan, cluster, owner in found
             ]
 
-    def plan_scope(self, plan_id: str) -> tuple[str, bool] | None:
-        """이 계획이 속한 방의 (주인, shared) — 접근 권한 검사용. plan 에 회원 id 를 두지 않으므로 거슬러 올라간다 (문서 6절)."""
+    def plan_scope(self, plan_id: str) -> "PlanScope | None":
+        """이 계획이 속한 방의 (주인, shared, 팀) — 접근 권한 검사용.
+
+        plan 에 회원 id 를 두지 않으므로 run → session 으로 거슬러 올라간다 (문서 6절). 팀까지 주는
+        것은 부르는 쪽이 _load 와 같은 규칙(팀 방은 구성원만)을 걸 수 있어야 하기 때문이다.
+        """
         with self._factory() as db:
             row = db.execute(
-                select(ChatSession.user_id, ChatSession.shared)
+                select(ChatSession.user_id, ChatSession.shared, ChatSession.team_id)
                 .join(ChatRun, ChatRun.session_id == ChatSession.id)
                 .join(ActionPlan, ActionPlan.run_id == ChatRun.id)
                 .where(ActionPlan.id == plan_id)
             ).first()
-            return (row[0], bool(row[1])) if row is not None else None
+            return PlanScope(row[0], bool(row[1]), row[2]) if row is not None else None
 
     # ── 클러스터 (기획 04 §8) ─────────────────────────────
 

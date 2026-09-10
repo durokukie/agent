@@ -389,7 +389,7 @@ def test_run_을_닫으면_계획도_같은_트랜잭션에서_닫힌다(client)
     assert _plans(room)[0].status == "STALE"
 
 
-def test_저장_실패로_run_이_failed_가_돼도_계획이_닫힌다(client, monkeypatch):
+def test_저장_실패로_run_이_failed_가_돼도_계획이_닫힌다(client, monkeypatch, tmp_path):
     """세 번째 failed 문 — _save_or_fail 의 대체 쓰기 경로 (자동 리뷰 지적).
 
     여기서 안 닫으면 run 은 종료 상태인데 계획은 열린 채 남고, active_run 이 그 run 을 더 이상
@@ -414,9 +414,17 @@ def test_저장_실패로_run_이_failed_가_돼도_계획이_닫힌다(client, 
         r = client.post(f"/conversations/{room}/chat", json={"text": "늘려줘"}, headers=USER)
 
     assert r.status_code == 503 and r.json()["detail"]["code"] == "STORE_FAILED"
-    monkeypatch.undo()
+    # monkeypatch.undo() 를 부르면 client 픽스처가 건 PLAN_DIR·kubectl 패치까지 함께 풀린다 —
+    # 아래 두 줄은 update_run 을 부르지 않으므로 되돌릴 필요가 없다 (자동 리뷰 지적)
     assert get_store().list_runs(room)[-1].status == "failed"
     assert _plans(room)[0].status == "STALE"        # 열린 채 남지 않는다
+
+    # .md 사본도 따라온다 — 표만 바꾸면 사본이 옛 상태로 굳고 다시 지나가는 경로가 없다 (자동 리뷰)
+    import yaml
+
+    body = (tmp_path / f"{_plans(room)[0].id}.md").read_text(encoding="utf-8")
+    front = yaml.safe_load(body.removeprefix("---\n").partition("\n---\n")[0])
+    assert front["status"] == "STALE"
 
 
 def test_계획_닫기가_실패해도_원래_오류를_돌려준다(client, monkeypatch):
@@ -457,6 +465,5 @@ def test_실행_기록_저장이_실패해도_계획이_열린_채_남지_않는
                         json={"call_id": "call-1", "approved": True}, headers=USER)
 
     assert r.status_code == 200 and r.json()["kind"] == "answer"
-    monkeypatch.undo()
     assert get_store().list_runs(room)[-1].status == "completed"
     assert _plans(room)[0].status == "UNKNOWN"     # 승인은 됐는데 결과를 모른다
