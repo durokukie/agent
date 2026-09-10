@@ -60,16 +60,15 @@ def _dry_run_unsupported(stderr: str) -> bool:
 def _guidance_manifest(manifest_yaml: str | None) -> list[dict] | None:
     """판단 가이드에 실을 매니페스트. 승인 카드와 같은 마스킹을 쓴다 (#50).
 
-    여기서 터져도 가이드만 못 만들 뿐이라 조용히 넘긴다 — 승인 카드 쪽 _manifest_preview 가
-    같은 입력으로 다시 돌면서 제대로 된 오류를 낸다.
+    **실패를 삼키지 않는다.** 삼키고 None 을 주면 프롬프트의 "미리보기가 없는 작업(scale·
+    restart·delete)" 규칙에 걸려 모델이 apply_manifest 를 삭제·스케일 계열로 읽는다 —
+    "본문이 없다" 는 말만 안 할 뿐 판단 칸이 다시 화면과 어긋난다 (PR #74 리뷰).
+
+    호출부의 except 가 받아 "guidance unavailable" 로 둔다. 어차피 같은 입력으로
+    build_approval_request 가 다시 돌다 터져 카드 자체가 안 뜨는 자리라, 거기에 유료
+    모델을 한 번 더 부르지 않는 편이 낫다.
     """
-    if not manifest_yaml:
-        return None
-    try:
-        return _manifest_preview(manifest_yaml)
-    except Exception:
-        logger.exception("가이드용 매니페스트 미리보기 실패")
-        return None
+    return _manifest_preview(manifest_yaml) if manifest_yaml else None
 
 
 def _manifest_resources(manifest_yaml: str) -> list[dict[str, str]]:

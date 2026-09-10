@@ -542,7 +542,7 @@ async def test_Plan은_server_dry_run_전에_저장된다(
 async def test_dry_run_실패는_Plan을_failed로_남기고_중단한다(monkeypatch, tmp_path):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
 
-    async def unexpected_guidance(plan):
+    async def unexpected_guidance(plan, manifest_preview=None):
         pytest.fail("dry-run 실패에서는 guidance를 생성하면 안 된다")
 
     monkeypatch.setattr(hook, "generate_decision_guidance", unexpected_guidance)
@@ -634,7 +634,7 @@ async def test_dry_run_미지원은_판단_가이드_없이_원인을_남기고_
     )
     handler = AsyncMock()
 
-    async def unexpected_guidance(plan):
+    async def unexpected_guidance(plan, manifest_preview=None):
         pytest.fail("dry-run 미지원에서는 guidance를 생성하면 안 된다")
 
     monkeypatch.setattr(
@@ -1217,3 +1217,41 @@ async def test_Secret_은_가린_채로_넘어간다(monkeypatch, tmp_path, succ
     preview = 받은것["preview"]
     assert preview[0]["data"]["password"] == "<redacted>"
     assert "aHVudGVyMg==" not in str(preview)
+
+
+@pytest.mark.asyncio
+async def test_미리보기가_실패하면_가이드_모델을_아예_안_부른다(
+    monkeypatch, tmp_path, successful_dry_run
+):
+    """미리보기 실패를 삼키고 None 을 넘기면, 프롬프트의 "미리보기가 없는 작업
+    (scale·restart·delete)" 규칙에 걸려 모델이 apply_manifest 를 삭제 계열로 읽는다.
+    "본문이 없다" 는 말만 안 할 뿐 판단 칸이 다시 화면과 어긋난다 (PR #74 리뷰).
+
+    어차피 build_approval_request 가 같은 입력으로 다시 돌다 터져 카드 자체가 안 뜨는
+    자리라, 거기에 유료 모델을 한 번 더 부를 이유가 없다.
+    """
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+
+    def 못만든다(manifest_yaml):
+        raise ValueError("pending approval mismatch: manifest is too large")
+
+    monkeypatch.setattr(hook, "_manifest_preview", 못만든다)
+
+    async def 부르면안된다(plan, manifest_preview=None):
+        pytest.fail("미리보기가 없으면 모델에게 잘못된 전제를 주게 된다")
+
+    monkeypatch.setattr(hook, "generate_decision_guidance", 부르면안된다)
+
+    with pytest.raises(ApprovalRequired):
+        await hook.guardrail(
+            _ctx(), call=_call("apply_manifest"), tool_def=None,
+            args={
+                "manifest_yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: nginx\n",
+                "namespace": None, "intent": "Pod 를 적용한다.",
+                "expected_effects": ["Pod 가 생성된다."], "side_effects": ["자원을 쓴다."],
+            },
+            handler=AsyncMock(),
+        )
+
+    plan = action_plan.ActionPlan.find_by_call_id("call-123")
+    assert plan.decision_guidance == "guidance unavailable"

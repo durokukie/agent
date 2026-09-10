@@ -436,7 +436,7 @@ def test_여러_승인을_모은뒤_승인과_거절을_한번만_재개한다(
             success=True,
         )
 
-    async def fixed_guidance(plan):
+    async def fixed_guidance(plan, manifest_preview=None):
         return "대상과 롤백 기준을 확인한다."
 
     def handler_run(command, **kwargs):

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
 
 from dotenv import load_dotenv
 from pydantic_ai import Agent
@@ -60,11 +61,34 @@ guidance_agent = Agent(
 )
 
 
+def _json_safe(value: Any) -> Any:
+    """json.dumps 가 모르는 값을 문자열로 바꾼다.
+
+    PyYAML 은 따옴표 없는 날짜를 `datetime.date` 로, `!!set` 을 `set` 으로 만드는데
+    _safe_scalar 는 bytes·float 만 손대므로 그대로 미리보기까지 나온다. 승인 카드는
+    pydantic 이 직렬화해 멀쩡하고 **여기서만** TypeError 가 났다 (PR #74 리뷰).
+
+    빠뜨리지 않고 문자열로 남긴다 — 모델에게 안 보여 주는 것이 곧 #50 이다.
+    dict 키까지 바꾸는 이유는 `default=` 가 키에는 안 걸리기 때문이다.
+    """
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def _with_manifest(context: str, preview: list[dict] | None) -> str:
-    """Plan 본문 뒤에 마스킹된 매니페스트를 붙인다. 없으면 그대로 (#50)."""
+    """Plan 본문 뒤에 마스킹된 매니페스트를 붙인다. 없으면 그대로 (#50).
+
+    길이 상한을 두지 않는다 — 이 본문은 **모델이 직접 쓴 것**이라 (사용자는 한국어만 보낸다)
+    모델의 출력 한도보다 클 수 없다. 상한이 필요해지는 건 사람이 올린 파일을 싣게 될 때다.
+    """
     if not preview:
         return context
-    body = json.dumps(preview, ensure_ascii=False, indent=2)
+    body = json.dumps(_json_safe(preview), ensure_ascii=False, indent=2)
     return f"{context}\n\n## 매니페스트 미리보기 (민감값은 <redacted>)\n\n```json\n{body}\n```\n"
 
 
