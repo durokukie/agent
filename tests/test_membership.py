@@ -286,3 +286,45 @@ async def test_200_인데_JSON_이_아니면_503(spring, monkeypatch):
     with pytest.raises(HTTPException) as raised:
         await membership.team_roles(_user())
     assert raised.value.status_code == 503
+
+
+def test_남의_팀_shared_방에는_들어갈_수_없다(client, spring):
+    """🔴 소유권 검사를 방 만들 때만 걸면, shared 방으로 들어가 그 클러스터에 kubectl 을 돌릴 수 있다."""
+    spring["teams"] = [{"id": "t-내팀", "role": "ADMIN"}]
+    room = get_store().create_session(
+        user_id="다른사람", context_name="ctx", namespace="default", mode="학습",
+        team_id="t-남의팀", shared=True,
+    ).id
+    assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 404
+    assert client.post(f"/conversations/{room}/chat", json={"text": "안녕"},
+                       headers=BEARER).status_code == 404
+
+
+def test_같은_팀_shared_방에는_들어간다(client, spring):
+    spring["teams"] = [{"id": "t-1", "role": "MEMBER"}]
+    room = get_store().create_session(
+        user_id="다른사람", context_name="ctx", namespace="default", mode="학습",
+        team_id="t-1", shared=True,
+    ).id
+    assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 200
+
+
+def test_팀에서_나가면_그_팀_클러스터로_방을_못_만든다(client, spring):
+    """🔴 방을 만드는 쪽이 registered_by 만 보면, /clusters 에서 막은 것이 방 경로로 샌다."""
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    cluster = _cluster("t-1", owner="u-1")          # 내가 등록한 팀 클러스터
+    assert client.post("/conversations", json={"cluster_id": cluster},
+                       headers=BEARER).status_code == 200
+
+    membership.clear_cache()
+    spring["teams"] = []                            # 팀에서 나갔다
+    r = client.post("/conversations", json={"cluster_id": cluster}, headers=BEARER)
+    assert r.status_code == 404
+
+
+def test_같은_팀이면_남이_등록한_클러스터로도_방을_만든다(client, spring):
+    """반대 방향 — 규칙이 어긋나면 팀원인데 방을 못 만든다."""
+    spring["teams"] = [{"id": "t-1", "role": "MEMBER"}]
+    cluster = _cluster("t-1", owner="다른사람")
+    assert client.post("/conversations", json={"cluster_id": cluster},
+                       headers=BEARER).status_code == 200

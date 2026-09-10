@@ -115,11 +115,19 @@ def _error(status: int, code: str, message: str) -> HTTPException:
     return HTTPException(status, {"code": code, "message": message})
 
 
-def _load(conversation_id: str, user: User, store: ChatStore) -> tuple[SessionRow, Conversation]:
-    """private 방은 주인만 (남에게는 없는 방, 404). shared 방은 팀원 누구나 읽고 입력한다 (문서 05 §4)."""
+async def _load(conversation_id: str, user: User, store: ChatStore) -> tuple[SessionRow, Conversation]:
+    """private 방은 주인만 (남에게는 없는 방, 404). shared 방은 **그 팀의 구성원**이 읽고 입력한다 (기획 05 §4).
+
+    팀 검사가 여기에도 있어야 한다. `/chat` 은 이 방의 클러스터로 kubectl 을 돌리므로, 로그인한
+    아무나 들어올 수 있으면 클러스터 소유권 검사를 방 만들 때만 걸어 둔 것이 무의미해진다 (자동 리뷰 🔴).
+    팀이 없는 방과 회원 서버가 없는 개발 모드는 예전대로 로그인한 사용자면 된다.
+    """
     row = store.get_session(conversation_id)
     if row is None or (row.user_id != user.id and not row.shared):
         raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
+    if row.user_id != user.id and row.team_id and membership.available():
+        if not await membership.is_member(user, row.team_id):
+            raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
     if registry.get(conversation_id) is None:
         registry.get_or_load(conversation_id, store)   # 복원하면서 밀린 run 을 닫으므로 row 를 다시 읽는다
         row = store.get_session(conversation_id) or row
@@ -244,7 +252,15 @@ async def create_conversation(
         # 그 방에서 승인해 남의 클러스터를 바꿀 수 있다 (자동 리뷰 P1). 실행할 때 자격증명이
         # 복호화되어 kubectl 로 가므로 조회로 끝나지 않는다.
         cluster = store.get_cluster(body.cluster_id)
-        if cluster is None or cluster.registered_by != user.id:
+        if cluster is None:
+            raise _error(404, "NOT_FOUND", f"클러스터가 없다: {body.cluster_id}")
+        # 판단 규칙은 /clusters 의 _readable 과 같아야 한다 (자동 리뷰 🔴). 팀 클러스터는 등록자여도
+        # 지금 소속으로, 개인 클러스터는 등록한 사람만. 두 규칙이 어긋나면 양방향으로 샌다 —
+        # 팀에서 나간 사람이 방을 통해 계속 바꾸거나, 팀원인데 방을 못 만들거나.
+        if cluster.team_id and membership.available():
+            if not await membership.is_member(user, cluster.team_id):
+                raise _error(404, "NOT_FOUND", f"클러스터가 없다: {body.cluster_id}")
+        elif cluster.registered_by != user.id:
             raise _error(404, "NOT_FOUND", f"클러스터가 없다: {body.cluster_id}")
         context = cluster.context_name
         namespace = namespace or cluster.default_namespace
@@ -294,7 +310,7 @@ async def get_conversation(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    row, conversation = _load(conversation_id, user, store)
+    row, conversation = await _load(conversation_id, user, store)
     return {
         "conversation": _conversation_view(row, running=_is_running(row)),
         "session": _server._session_view(conversation.session),
@@ -309,7 +325,7 @@ async def chat(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    row, conversation = _load(conversation_id, user, store)
+    row, conversation = await _load(conversation_id, user, store)
     session = conversation.session
     is_mode = body.text.startswith("/mode ")
     kind = "mode_change" if is_mode else "chat"
@@ -463,7 +479,7 @@ async def approve(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    row, conversation = _load(conversation_id, user, store)
+    row, conversation = await _load(conversation_id, user, store)
     session = conversation.session
     await _require_approver(row, user)
     if conversation.lock.locked():
@@ -490,7 +506,7 @@ async def resume(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    row, conversation = _load(conversation_id, user, store)
+    row, conversation = await _load(conversation_id, user, store)
     session = conversation.session
     await _require_approver(row, user)
     if conversation.lock.locked():
