@@ -18,6 +18,7 @@ from kukie.kubectl import KubectlResult
 from kukie.agent import agent
 from kukie.skills import SKILLS
 from kukie.store import get_store, reset_store_for_tests
+from kukie.store.models import DEFAULT_TITLE
 from kukie.tools import read as read_tools
 
 USER = {"X-User": "u-1"}
@@ -236,3 +237,13 @@ def test_모드를_바꾸면_다음_턴의_지시문이_실제로_바뀐다(clie
     with agent.override(model=FunctionModel(capture)):
         client.post(f"/conversations/{room}/chat", json={"text": "nginx 를 늘려줘"}, headers=USER)
     assert "실습" in seen[-1]          # 전환이 다음 턴의 deps 까지 왔다
+
+
+def test_빈_제목으로_만든_방도_첫_마디로_제목을_받는다(client):
+    """title: "" 는 DEFAULT_TITLE 과 달라서 "아직 기본 제목" 검사를 영영 통과 못 한다."""
+    room = client.post("/conversations", json={"title": "  ", "shared": True},
+                       headers=USER).json()["conversation"]["id"]
+    assert get_store().get_session(room).title == DEFAULT_TITLE
+
+    _say(client, room, "파드 상태 알려줘")
+    assert get_store().get_session(room).title == "파드 상태 알려줘"

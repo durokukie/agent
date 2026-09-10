@@ -71,6 +71,12 @@ class ConversationIn(BaseModel):
     _blank = field_validator("cluster_id", "team_id", "context", "namespace",
                              "installation_id", "cluster_fingerprint", mode="before")(blank_is_none)
 
+    # 빈 제목은 기본 제목으로. `title: ""` 로 만든 방은 `row.title != DEFAULT_TITLE` 이 늘 참이라
+    # 첫 마디로 제목을 받을 자격을 영영 잃는다 (자동 리뷰 지적).
+    _title = field_validator("title", mode="before")(
+        lambda cls, value: DEFAULT_TITLE if blank_is_none(cls, value) is None else value.strip()
+    )
+
 
 class ChatIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
