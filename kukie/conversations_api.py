@@ -430,6 +430,7 @@ async def chat(
             return _replay(run)
 
         _bind_run(session, run, user)
+        before = list(session.history)   # 저장에 실패해 이 턴을 버릴 때 되돌릴 자리 (자동 리뷰 지적)
         try:
             with _with_cluster(store, session, row):
                 payload, result = await _server._chat_turn(session, body.text)
@@ -453,7 +454,7 @@ async def chat(
         status = "awaiting_approval" if payload.get("kind") == "approval" else "completed"
         _save_or_fail(
             store, conversation_id, run, on_failure=_chat_store_failure(), failure_status="failed",
-            session=session, status=status, response_payload=payload,
+            session=session, history_before=before, status=status, response_payload=payload,
             agent_messages=_messages_json(result) if result is not None else None,
             usage_summary=_usage_json(result) if result is not None else None,
         )
@@ -498,18 +499,26 @@ def _close_plans(store: ChatStore, run: RunRow) -> None:
 
 def _save_or_fail(
     store: ChatStore, conversation_id: str, run: RunRow, *, on_failure: HTTPException, failure_status: str,
-    session: Any = None, keep_payload: bool = False, **fields: Any,
+    session: Any = None, history_before: list[Any] | None = None, keep_payload: bool = False,
+    **fields: Any,
 ) -> None:
     """실행 결과 저장. 실패하면 run 을 failure_status 로라도 남기고 on_failure 를 던진다 — 그것도 안 되면 다음 chat 이
     잠금을 쥔 채 활성 run 을 닫는다. 호출자가 상태·문구를 고른다: 모델 답변만 잃은 chat 은 failed, kubectl 이 이미 돈
     승인·재개는 recovery_required ("변경은 적용됐을 수 있다", 문서 4절). keep_payload 면 대체 쓰기가 payload 를
     건드리지 않는다 — "여기서 계속하라" 는 경로는 계속할 재료(남은 카드)를 기록에 남겨야 한다.
 
-    **종료 상태로 닫으면 메모리의 승인 티켓도 함께 버린다** (팀원 리뷰). DB 의 run 은 닫혔는데
-    session.pending 이 남으면 그 방은 이 프로세스가 사는 동안 아무것도 못 한다 — /chat 은
-    PENDING_APPROVAL, /approve 는 활성 run 이 없어 NOT_PENDING, /resume 은 다시 PENDING_APPROVAL
-    이고, 다음 chat 의 복구 로직은 pending 검사에 먼저 막혀 닿지 못한다. 활성 상태로 남기는
-    경로(awaiting_approval·recovery_required)는 티켓이 있어야 이어갈 수 있으므로 그대로 둔다.
+    **종료 상태로 닫으면 메모리의 승인 티켓도, 그 턴의 기록도 함께 버린다** (팀원 리뷰 + 자동 리뷰).
+    DB 의 run 은 닫혔는데 session.pending 이 남으면 그 방은 이 프로세스가 사는 동안 아무것도 못
+    한다 — /chat 은 PENDING_APPROVAL, /approve 는 활성 run 이 없어 NOT_PENDING, /resume 은 다시
+    PENDING_APPROVAL 이고, 다음 chat 의 복구 로직은 pending 검사에 먼저 막혀 닿지 못한다.
+
+    history 도 같이 되돌린다. _to_payload 는 카드 분기에서도 history 를 먼저 갱신하므로, 티켓만
+    비우면 **결과 없는 tool call 로 끝난 기록**이 메모리에 남는다. 그걸 실은 채 다음 chat 을 돌리면
+    모델이 대화를 거부해 500 이 나고, 그때는 _to_payload 가 안 돌아 history 가 그대로라 무한
+    반복이다. 재시작 복원이 지키는 규칙(conversations.py 머리말)과 같은 규칙이다.
+
+    활성 상태로 남기는 경로(awaiting_approval·recovery_required)는 티켓·기록이 있어야 이어갈 수
+    있으므로 그대로 둔다.
     """
     try:
         store.update_run(run.id, **fields)
@@ -523,13 +532,16 @@ def _save_or_fail(
         except Exception:
             logger.exception("실패 표시도 저장하지 못했다 (run=%s)", run.id)
         # failed 는 종료 상태다 — 이 문으로 닫힌 run 의 계획도 함께 닫고(자동 리뷰 지적),
-        # 메모리의 승인 티켓도 함께 버린다(팀원 리뷰). 둘 다 "DB 가 닫았으면 나머지도 닫는다" 다.
+        # 메모리의 승인 티켓과 그 턴의 기록도 함께 버린다(팀원 리뷰 + 자동 리뷰).
+        # 셋 다 "DB 가 닫았으면 나머지도 닫는다" 하나다.
         # recovery_required·awaiting_approval 은 활성이라 나중에 interrupt 가 지나간다.
         if failure_status not in RUN_ACTIVE:
             _close_plans(store, run)
             if session is not None:
                 session.pending = None
                 session.decisions.clear()
+                if history_before is not None:
+                    session.history = history_before
         raise on_failure from exc
 
 

@@ -838,3 +838,38 @@ def test_저장_실패로_닫힌_카드는_approve_도_resume_도_받지_않는�
     assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
     r = client.post(f"/conversations/{cid}/resume", headers=USER)
     assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
+
+
+def test_저장_실패로_버린_카드의_기록도_history에서_뺀다(client, monkeypatch):
+    """자동 리뷰 10차: 티켓만 버리고 history 를 두면 결과 없는 tool call 로 끝난 기록이 남는다.
+
+    그 기록을 실은 채 다음 chat 을 돌리면 모델이 대화를 거부하고, 그때는 _to_payload 가 안 돌아
+    history 가 그대로라 무한 반복이다 — registry.clear() 전에는 그 방을 못 쓴다. 재시작 복원이
+    지키는 규칙(conversations.py 머리말 "결과 없는 tool call 은 버린다")과 같아야 한다.
+    """
+    from kukie.store import get_store
+
+    store = get_store()
+    original = store.update_run
+    dead = {"on": False}
+
+    def flaky(run_id, **fields):
+        if dead["on"] and fields.get("status") == "awaiting_approval":
+            raise RuntimeError("db down")
+        return original(run_id, **fields)
+
+    monkeypatch.setattr(store, "update_run", flaky)
+    cid = _new(client, shared=True)
+    _, ticket = _pending_ticket_for_server("hist")
+    첫마디 = [ModelRequest(parts=[UserPromptPart(content="nginx 3개로")])]
+    restore = _swap_run_agent([_fake(ticket, 첫마디), _fake(KukieResponse(narration="다시 됨"), 첫마디)])
+    try:
+        dead["on"] = True
+        client.post(f"/conversations/{cid}/chat", json={"text": "nginx 3개로"}, headers=USER)
+        dead["on"] = False
+        assert conversations.registry.get(cid).session.history == []    # 버린 턴의 메시지도 버린다
+
+        r = client.post(f"/conversations/{cid}/chat", json={"text": "다시"}, headers=USER)
+        assert r.status_code == 200 and r.json()["response"]["narration"] == "다시 됨"
+    finally:
+        restore()
