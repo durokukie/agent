@@ -616,14 +616,18 @@ def sync_markdown(rows: "list[Any]") -> None:
 
 def list_plans(
     user_id: str, *, cluster_id: str | None = None, status: str | None = None,
+    team_ids: list[str] | None = None,
 ) -> list[Any]:
-    """GET /action-plans 와 히스토리 스킬이 같이 쓰는 목록 — 내 방 + shared 방의 계획 요약.
+    """GET /action-plans 와 히스토리 스킬이 같이 쓰는 목록 — 내 방 + 내가 볼 수 있는 shared 방의 요약.
 
-    본문(.md)은 읽지 않는다. 한 줄에 필요한 값은 전부 DB 표에 있다.
+    team_ids 는 부르는 쪽이 회원 서버에서 받아 넘긴다 (대화 목록과 같은 범위). 본문(.md)은 읽지
+    않는다 — 한 줄에 필요한 값은 전부 DB 표에 있다.
     """
     if status is not None and status not in PLAN_STATUSES:
         raise ValueError(f"invalid Action Plan status: {status}")
-    return _store().list_plan_summaries(user_id, cluster_id=cluster_id, status=status)
+    return _store().list_plan_summaries(
+        user_id, cluster_id=cluster_id, status=status, team_ids=team_ids
+    )
 
 
 def get_plan(plan_id: str) -> str:
