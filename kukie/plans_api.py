@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 import kukie.server as _server   # 순환 import: 이름은 호출 시점에만 쓴다
 from kukie import membership
 from kukie.auth import User, current_user
+from kukie.fields import none_if_blank
 from kukie.guardrail import action_plan
 from kukie.store import ChatStore, get_store
 from kukie.store.chat_store import PlanSummaryRow
@@ -49,7 +50,10 @@ async def list_action_plans(
     # 대화 목록과 같은 범위여야 "목록엔 있는데 열 수 없는 계획" 이 안 생긴다 (자동 리뷰 지적)
     mine = list(await membership.team_roles(user)) if membership.available() else None
     try:
-        rows = action_plan.list_plans(user.id, cluster_id=cluster_id, status=status, team_ids=mine)
+        rows = action_plan.list_plans(
+            user.id, cluster_id=none_if_blank(cluster_id), status=none_if_blank(status),
+            team_ids=mine,
+        )
     except ValueError as exc:
         raise HTTPException(400, {"code": "BAD_STATUS", "message": str(exc)}) from None
     return [_summary_view(row) for row in rows]
