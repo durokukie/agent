@@ -30,7 +30,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 
 import kukie.server as _server  # 순환 import: 이름은 호출 시점에만 쓴다
@@ -39,6 +39,7 @@ from kukie.clusters import crypto
 from kukie import membership
 from kukie.clusters.access import ClusterChanged, ClusterGone, kubeconfig_or_none
 from kukie.conversations import Conversation, registry
+from kukie.fields import blank_is_none
 from kukie.skills import SKILLS
 from kukie.store import ChatStore, get_store
 from kukie.store.chat_store import ActiveRunExists, RequestMismatch, RunRow, SessionRow, error_payload
@@ -64,6 +65,11 @@ class ConversationIn(BaseModel):
     cluster_fingerprint: str | None = None    # 문서 3절 — 실제 대상 클러스터 확인값 (아직 서버가 계산하지 않는다)
     title: str = DEFAULT_TITLE
     shared: bool = False
+
+    # `team_id: ""` 는 falsy 검사(팀 없음)와 IN 검사(그 팀만) 사이로 새어, 목록에서는 사라지는데
+    # 상세는 200 이 되는 방을 만든다 (자동 리뷰 지적). 클러스터 등록과 같은 규칙으로 접는다.
+    _blank = field_validator("cluster_id", "team_id", "context", "namespace",
+                             "installation_id", "cluster_fingerprint", mode="before")(blank_is_none)
 
 
 class ChatIn(BaseModel):
@@ -385,7 +391,7 @@ async def chat(
             raise _error(409, "REQUEST_MISMATCH", f"같은 request_id 로 다른 입력을 보냈다: {body.request_id}")
         if stored.status == "running" and not conversation.lock.locked():
             # 실행 중이라는데 이 방의 잠금이 비어 있다 = 결과 저장에 실패한 run 이다. 영원히 BUSY 를 재생하지 않도록 닫는다
-            store.interrupt_active_runs(conversation_id, "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라")
+            _interrupt(store, conversation_id)
             stored = store.find_run(conversation_id, body.request_id) or stored
         return _replay(stored)
 
@@ -410,7 +416,7 @@ async def chat(
         if stale is not None:
             logger.warning("결과가 저장되지 않은 run 을 닫는다 (conversation=%s, run=%s, status=%s)",
                            conversation_id, stale.id, stale.status)
-            store.interrupt_active_runs(conversation_id, "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라")
+            _interrupt(store, conversation_id)
         try:
             run, created = store.start_run(
                 conversation_id, request_id=body.request_id, kind=kind,
@@ -464,6 +470,20 @@ async def chat(
                 # 제목은 부가 정보다. 여기서 터지면 이미 completed 로 저장한 run 이 500 으로 뒤집힌다
                 logger.exception("제목 저장 실패 (conversation=%s)", conversation_id)
         return payload
+
+
+def _interrupt(store: ChatStore, conversation_id: str) -> None:
+    """결과 저장에 실패해 활성으로 남은 run 을 닫는다. 함께 닫힌 계획의 .md 사본도 따라오게 한다 —
+    계획을 DB 에서 직접 닫는 자리는 넷이고 규칙은 한 벌이어야 한다 (자동 리뷰 지적)."""
+    from kukie.guardrail.action_plan import sync_markdown   # 순환 import 회피
+
+    closed = store.interrupt_active_runs(
+        conversation_id, "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라"
+    )
+    try:
+        sync_markdown(closed.plans)
+    except Exception:
+        logger.exception("중단으로 닫힌 계획의 .md 갱신 실패 (conversation=%s)", conversation_id)
 
 
 def _close_plans(store: ChatStore, run: RunRow) -> None:

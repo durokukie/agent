@@ -462,11 +462,31 @@ def test_빈_team_id_쿼리는_좁히지_않는다(client):
     assert len(client.get("/clusters?team_id=", headers=USER).json()) == 1
 
 
-def test_빈_namespace_는_기본값으로_되돌린다(client):
-    """PATCH {"namespace": ""} 는 "기본값 복귀" 다 — None 으로 접으면 바꿀 게 없다며 400 이 난다."""
+def test_빈_namespace_는_안_바꾼다(client):
+    """빈 값의 뜻은 등록·수정에서 하나여야 한다 — "안 정했다".
+
+    등록은 kubeconfig 가 정하고 수정은 안 바꾼다. 수정에서만 "기본값 복귀" 로 읽으면, 폼 전체를
+    보내는 화면이 사용자가 안 건드린 namespace 를 default 로 조용히 갈아엎는다 (자동 리뷰 지적).
+    되돌리려면 "default" 를 그대로 보낸다.
+    """
     registered = _register(client, namespace="prod")
     assert registered["namespace"] == "prod"
 
-    r = client.patch(f"/clusters/{registered['id']}", json={"namespace": ""}, headers=USER)
+    r = client.patch(f"/clusters/{registered['id']}", json={"namespace": "  ", "name": "운영2"},
+                     headers=USER)
     assert r.status_code == 200, r.text
-    assert r.json()["namespace"] == "default"
+    assert r.json()["namespace"] == "prod"          # 안 건드린 칸은 그대로
+
+    r = client.patch(f"/clusters/{registered['id']}", json={"namespace": "default"}, headers=USER)
+    assert r.status_code == 200 and r.json()["namespace"] == "default"
+
+
+def test_namespace_만_비워_보내면_바꿀_게_없다(client):
+    registered = _register(client, namespace="prod")
+    r = client.patch(f"/clusters/{registered['id']}", json={"namespace": ""}, headers=USER)
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "NOTHING_TO_UPDATE"
+
+
+def test_context_의_앞뒤_공백도_뗀다(client):
+    """정확히 일치해야 하는 값이라 안 떼면 "그런 context 없다" 는 알아보기 어려운 400 이 된다."""
+    assert _register(client, context=" prod ")["context"] == "prod"
