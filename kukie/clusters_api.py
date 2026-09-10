@@ -54,6 +54,12 @@ def _limiter(name: str, workers: int) -> CapacityLimiter:
 
 # ── 요청 본문 ──────────────────────────────────────────────
 
+def _stripped(cls: object, value: object) -> object:
+    """앞뒤 공백을 떼고 min_length 검사에 넘긴다. 공백만 보낸 이름은 여기서 `''` 가 돼 422 로 막힌다 —
+    안 떼면 min_length=1 을 지나 빈 이름으로 저장된다 (자동 리뷰 지적)."""
+    return value.strip() if isinstance(value, str) else value
+
+
 class ClusterIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -70,6 +76,8 @@ class ClusterIn(BaseModel):
         목록·이름 공간이 그 값으로 갈라진다 (자동 리뷰 지적)."""
         return None if isinstance(value, str) and not value.strip() else value
 
+    _name = field_validator("name", mode="before")(_stripped)
+
 
 class ClusterPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -79,9 +87,12 @@ class ClusterPatch(BaseModel):
     kubeconfig: str | None = None         # 자격증명 교체
     context: str | None = None
 
-    _blank = field_validator("namespace", "context", mode="before")(
+    # namespace 는 여기 없다 — PATCH {"namespace": ""} 는 "기본값(default) 으로 되돌리기" 라서
+    # None(=안 바꿈) 으로 접으면 그 뜻이 사라진다 (자동 리뷰 지적).
+    _blank = field_validator("context", mode="before")(
         lambda cls, value: None if isinstance(value, str) and not value.strip() else value
     )
+    _name = field_validator("name", mode="before")(_stripped)
 
 
 # ── 응답 ───────────────────────────────────────────────────
@@ -179,6 +190,10 @@ async def list_clusters(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> list[dict[str, Any]]:
+    # 본문과 같은 정규화 — `?team_id=` 를 그대로 넘기면 팀 `''` 로 좁혀져 항상 빈 목록이 나온다
+    # (자동 리뷰 지적). 값이 없으면 좁히지 않는다는 뜻으로 읽는다.
+    if team_id is not None and not team_id.strip():
+        team_id = None
     return [_view(row) for row in store.list_clusters(user.id, team_id=team_id)]
 
 
