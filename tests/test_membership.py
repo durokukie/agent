@@ -614,7 +614,7 @@ def test_목록_쿼리를_만드는_층도_팀을_안_넘기면_못_부른다():
 
     from kukie.store.chat_store import ChatStore
 
-    for name in ("list_sessions", "list_plan_summaries"):
+    for name in ("list_sessions", "list_plan_summaries", "list_clusters"):
         param = inspect.signature(getattr(ChatStore, name)).parameters["team_ids"]
         assert param.default is inspect.Parameter.empty, name
 
@@ -655,3 +655,31 @@ def test_빈_team_id_는_개인_클러스터로_저장돼_이름이_겹치지_�
 
     with pytest.raises(IntegrityError):
         _cluster(None, owner="u-1")          # 같은 사람 + 같은 이름 = 막힌다
+
+
+def _legacy_blank_team(cluster_id: str) -> None:
+    """정규화가 붙기 전에 들어간 행을 흉내 낸다 — create_cluster 를 거치지 않고 "" 를 박는다."""
+    get_store().update_cluster(cluster_id, team_id="")
+
+
+def test_정규화_전에_들어간_빈_team_id_행도_목록과_상세가_같다(client, spring):
+    """create_cluster 가 입구를 닫아도 옛 행은 남는다 — 읽는 쪽 규칙이 그 행까지 덮어야 한다."""
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    cluster = _cluster(None, owner="u-1")
+    _legacy_blank_team(cluster)
+    assert get_store().get_cluster(cluster).team_id == ""
+
+    ids = {c["id"] for c in client.get("/clusters", headers=BEARER).json()}
+    assert cluster in ids
+    assert client.get(f"/clusters/{cluster}", headers=BEARER).status_code == 200
+
+
+def test_빈_team_id_행도_개인_이름_유일성에_걸린다(client, spring):
+    """인덱스 조건이 IS NULL 뿐이면 옛 "" 행이 유일성 밖에 남아 같은 이름이 둘 뜬다."""
+    from sqlalchemy.exc import IntegrityError
+
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    _legacy_blank_team(_cluster(None, owner="u-1"))       # 이름 "c" 인 옛 행
+
+    with pytest.raises(IntegrityError):
+        _cluster(None, owner="u-1")                       # 같은 사람 + 같은 이름
