@@ -312,12 +312,18 @@ async def chat(
             agent_messages=_messages_json(result) if result is not None else None,
             usage_summary=_usage_json(result) if result is not None else None,
         )
+        if status == "completed":
+            _close_plans(store, run)
         store.update_session(conversation_id, current_mode=session.skill.name)
         return payload
 
 
 def _close_plans(store: ChatStore, run: RunRow) -> None:
     """run 이 종료 상태로 닫힐 때 남은 계획도 닫는다. **여기서 터져도 원래 응답을 삼키면 안 된다.**
+
+    성공(completed)에도 부른다. 정상 흐름이면 그 시점에 열린 계획이 없지만, kubectl 이 돈 뒤
+    record_execution 이 실패하면 훅이 경고만 붙이고 결과를 정상 반환해 run 은 completed 로 닫히고
+    계획은 EXECUTING 으로 남는다 (자동 리뷰 지적). 종료 상태면 종류를 가리지 않고 닫는다.
 
     같은 트랜잭션으로 합칠 수 없어(run 은 이미 커밋됐다) 좁은 틈이 남는다 — 둘 사이에 죽으면 계획이
     열린 채 남는다. 그 틈을 없애려면 update_run 과 한 트랜잭션이어야 하는데, 저장 실패 경로마다
@@ -485,6 +491,7 @@ def _continue_run(
         return outcome
     _save_or_fail(store, conversation.id, run, **failure, status="completed", response_payload=outcome,
                   agent_messages=messages or None, usage_summary=usage)
+    _close_plans(store, run)      # completed 도 종료 상태다 — 남은 계획이 있으면 닫는다
     store.update_session(conversation.id, current_mode=conversation.session.skill.name)
     return outcome
 

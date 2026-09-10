@@ -418,3 +418,30 @@ def test_계획_닫기가_실패해도_원래_오류를_돌려준다(client, mon
         r = client.post(f"/conversations/{room}/chat", json={"text": "늘려줘"}, headers=USER)
 
     assert r.status_code == 500 and r.json()["detail"]["code"] == "RUN_FAILED"
+
+
+def test_실행_기록_저장이_실패해도_계획이_열린_채_남지_않는다(client, monkeypatch):
+    """네 번째 문 — completed (자동 리뷰 지적).
+
+    kubectl 이 돈 뒤 record_execution 이 실패하면 훅은 경고만 붙이고 결과를 정상 반환한다.
+    모델이 최종 답변을 내고 run 은 completed 로 닫히는데, 그 경로에 계획 닫기가 없었다.
+    """
+    room = _room(client)
+    _card(client, room)
+
+    real = get_store().update_plan
+
+    def flaky(plan_id, **fields):
+        if fields.get("status") in {"APPLIED", "FAILED"}:
+            raise RuntimeError("실행 기록 저장 실패")
+        return real(plan_id, **fields)
+
+    monkeypatch.setattr(get_store(), "update_plan", flaky)
+    with agent.override(model=_answer_model()):
+        r = client.post(f"/conversations/{room}/approve",
+                        json={"call_id": "call-1", "approved": True}, headers=USER)
+
+    assert r.status_code == 200 and r.json()["kind"] == "answer"
+    monkeypatch.undo()
+    assert get_store().list_runs(room)[-1].status == "completed"
+    assert _plans(room)[0].status == "UNKNOWN"     # 승인은 됐는데 결과를 모른다
