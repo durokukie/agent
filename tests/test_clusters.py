@@ -499,3 +499,16 @@ def test_kubeconfig_의_namespace_공백도_뗀다(client):
     assert parse_kubeconfig(kubeconfig(namespace=" web ")).namespace == "web"
     assert _register(client, server_kubeconfig=kubeconfig(namespace=" web "))["namespace"] == "web"
     assert parse_kubeconfig(kubeconfig(namespace="   ")).namespace == "default"
+
+
+def test_주소의_공백은_떼고_안쪽_공백은_막는다(client):
+    """urlparse 가 호스트 안 공백을 남겨 `https://127.0.0.1 ` 의 사설 주소 검사가 통째로 새었다."""
+    parsed = parse_kubeconfig(kubeconfig(server_url=" https://api.example.com/ "))
+    assert parsed.api_server == "https://api.example.com"
+
+    with pytest.raises(KubeconfigRejected, match="사설"):
+        parse_kubeconfig(kubeconfig(server_url="https://127.0.0.1"))
+    with pytest.raises(KubeconfigRejected, match="사설"):          # 앞뒤 공백은 떼고 나서 걸린다
+        parse_kubeconfig(kubeconfig(server_url="https://127.0.0.1 "))
+    with pytest.raises(KubeconfigRejected, match="공백"):          # 안쪽 공백은 뗄 수 없다
+        parse_kubeconfig(kubeconfig(server_url="https:// 127.0.0.1"))
