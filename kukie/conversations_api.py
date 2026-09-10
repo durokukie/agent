@@ -125,7 +125,10 @@ async def _load(conversation_id: str, user: User, store: ChatStore) -> tuple[Ses
     row = store.get_session(conversation_id)
     if row is None or (row.user_id != user.id and not row.shared):
         raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
-    if row.user_id != user.id and row.team_id and membership.available():
+    # 팀이 붙은 방은 **만든 사람에게도** 지금 소속을 묻는다. 주인을 먼저 통과시키면 팀에서 나가기
+    # 전에 만들어 둔 방으로 그 팀 클러스터를 계속 쓸 수 있다 (자동 리뷰 🔴) — /clusters 의
+    # _readable 과 답이 같아야 한다. 회원 서버가 죽었을 때도 여기서 함께 막힌다.
+    if row.team_id and membership.available():
         if not await membership.is_member(user, row.team_id):
             raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
     if registry.get(conversation_id) is None:
@@ -149,7 +152,8 @@ def _private_change_blocked(row: SessionRow) -> HTTPException:
 async def _require_approver(row: SessionRow, user: User) -> None:
     """승인·재개 = 클러스터 변경. 기획 06 §3 은 팀 Admin 에게 연다.
 
-    팀이 붙은 shared 방은 Spring 에 역할을 물어 Admin 이면 통과시킨다 (kukie/membership.py).
+    팀이 붙은 shared 방은 Spring 에 역할을 물어 **구성원인지 먼저 보고**, Admin 이거나 방을 만든
+    사람이면 통과시킨다 (kukie/membership.py).
     팀이 없는 방이나 회원 서버가 없는 개발 모드는 예전 규칙대로 **만든 사람만** — 로그인한 아무나
     남의 클러스터를 바꾸지 못하게 (팀원 리뷰 6).
 
@@ -157,10 +161,14 @@ async def _require_approver(row: SessionRow, user: User) -> None:
     """
     if not row.shared:
         raise _private_change_blocked(row)
-    if row.user_id == user.id:
-        return
     if row.team_id and membership.available():
-        await membership.require_admin(user, row.team_id)
+        # 소속을 먼저 본다. 주인을 먼저 통과시키면 나간 사람이 옛 방에서 계속 승인한다 (자동 리뷰 🔴).
+        # 소속만 확인되면 Admin 이거나 **자기가 만든 방**이면 승인할 수 있다 — 기획 06 §3 의
+        # "요청한 사용자 본인도 자신의 Plan 을 승인할 수 있다".
+        if await membership.require_member(user, row.team_id) == "ADMIN" or row.user_id == user.id:
+            return
+        raise _error(403, "NOT_TEAM_ADMIN", "승인·재개는 팀 Admin 이나 대화를 만든 사람만 할 수 있다")
+    if row.user_id == user.id:
         return
     raise _error(403, "FORBIDDEN", "승인·재개는 대화를 만든 사람이나 팀 Admin 만 할 수 있다")
 

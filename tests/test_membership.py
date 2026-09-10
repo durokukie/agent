@@ -328,3 +328,50 @@ def test_같은_팀이면_남이_등록한_클러스터로도_방을_만든다(c
     cluster = _cluster("t-1", owner="다른사람")
     assert client.post("/conversations", json={"cluster_id": cluster},
                        headers=BEARER).status_code == 200
+
+
+def test_나가기_전에_만든_방도_막힌다(client, spring):
+    """🔴 주인을 먼저 통과시키면 팀에서 나가기 전에 만든 방으로 계속 쓸 수 있다.
+
+    새 방만 확인하던 이전 테스트가 이걸 놓쳤다.
+    """
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    cluster = _cluster("t-1", owner="u-1")
+    room = client.post("/conversations", json={"cluster_id": cluster, "shared": True},
+                       headers=BEARER).json()["conversation"]["id"]
+    assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 200
+
+    membership.clear_cache()
+    spring["teams"] = []                    # 팀에서 나갔다 — 방은 그대로 남아 있다
+    assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 404
+    assert client.post(f"/conversations/{room}/chat", json={"text": "늘려줘"},
+                       headers=BEARER).status_code == 404
+    assert client.post(f"/conversations/{room}/approve", json={"call_id": "c1", "approved": True},
+                       headers=BEARER).status_code == 404
+
+
+def test_회원_서버가_죽으면_옛_방도_못_쓴다(client, spring):
+    """이 경로가 membership.available() 조차 안 보면 fail-closed 가 여기서만 깨진다."""
+    import httpx
+
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    cluster = _cluster("t-1", owner="u-1")
+    room = client.post("/conversations", json={"cluster_id": cluster, "shared": True},
+                       headers=BEARER).json()["conversation"]["id"]
+
+    membership.clear_cache()
+    spring["boom"] = httpx.ConnectError("연결 실패")
+    assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 503
+
+
+def test_팀원이면_자기가_만든_방은_승인할_수_있다(client, spring):
+    """기획 06 §3 — 요청한 사용자 본인도 자신의 Plan 을 승인할 수 있다."""
+    spring["teams"] = [{"id": "t-1", "role": "MEMBER"}]
+    room = get_store().create_session(
+        user_id="u-1", context_name="ctx", namespace="default", mode="실습",
+        team_id="t-1", shared=True,
+    ).id
+    # 권한에서 막히면 403, 통과하면 대기 카드가 없어 409 NOT_PENDING
+    r = client.post(f"/conversations/{room}/approve", json={"call_id": "c1", "approved": True},
+                    headers=BEARER)
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
