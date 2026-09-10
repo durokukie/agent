@@ -125,10 +125,12 @@ async def _load(conversation_id: str, user: User, store: ChatStore) -> tuple[Ses
     row = store.get_session(conversation_id)
     if row is None or (row.user_id != user.id and not row.shared):
         raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
-    # 팀이 붙은 방은 **만든 사람에게도** 지금 소속을 묻는다. 주인을 먼저 통과시키면 팀에서 나가기
-    # 전에 만들어 둔 방으로 그 팀 클러스터를 계속 쓸 수 있다 (자동 리뷰 🔴) — /clusters 의
-    # _readable 과 답이 같아야 한다. 회원 서버가 죽었을 때도 여기서 함께 막힌다.
-    if row.team_id and membership.available():
+    # 팀이 붙은 **shared** 방은 만든 사람에게도 지금 소속을 묻는다. 팀 공간이므로 나간 사람은 보면 안 된다.
+    #
+    # private 방은 읽기까지 막지 않는다. 자기 대화 기록인데 팀에서 나갔다는 이유로 열 수 없으면
+    # 되돌릴 방법이 없다 (대화 삭제 API 도 없다 — 자동 리뷰 지적). 대신 **클러스터를 쓰는 것**은
+    # 아래 _require_cluster_access 가 막는다. 읽기는 열고 실행은 닫는다.
+    if row.shared and row.team_id and membership.available():
         if not await membership.is_member(user, row.team_id):
             raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
     if registry.get(conversation_id) is None:
@@ -216,6 +218,22 @@ def _cluster_error(exc: Exception, cluster_id: str | None) -> HTTPException:
     return _error(503, "CREDENTIAL_UNREADABLE", str(exc))
 
 
+async def _require_cluster_access(store: ChatStore, row: SessionRow, user: User) -> None:
+    """이 방의 클러스터를 지금 쓸 수 있나. 읽기(_load)와 달리 **실행 직전**에 본다.
+
+    팀에서 나간 사람이 자기 private 방은 계속 읽되 그 팀 클러스터로 kubectl 을 돌리지는 못하게 한다.
+    판단 규칙은 /clusters 의 _readable 과 같다.
+    """
+    if not row.cluster_id or not membership.available():
+        return
+    cluster = store.get_cluster(row.cluster_id)
+    if cluster is None or not cluster.team_id:
+        return
+    if not await membership.is_member(user, cluster.team_id):
+        raise _error(403, "NOT_TEAM_MEMBER",
+                     "이 대화가 쓰는 클러스터의 팀 구성원이 아닙니다")
+
+
 def _with_cluster(store: ChatStore, session: Any, row: SessionRow):
     """실행 동안만 임시 kubeconfig 를 연다 (기획 04 §8). 블록을 벗어나면 파일이 지워진다.
 
@@ -282,6 +300,11 @@ async def create_conversation(
                 raise _error(404, "NOT_FOUND", f"클러스터가 없다: {body.cluster_id}")
         elif cluster.registered_by != user.id:
             raise _error(404, "NOT_FOUND", f"클러스터가 없다: {body.cluster_id}")
+        if body.team_id and body.team_id != cluster.team_id:
+            # 조용히 덮으면 요청보다 **더 열린** 방이 된다 — 개인 클러스터를 고르고 team_id 를 같이
+            # 보내면 team_id 가 None 으로 사라져 "팀으로 좁혀 달라" 가 "전원 공개" 가 됐다 (자동 리뷰).
+            raise _error(400, "CLUSTER_TEAM_MISMATCH",
+                         "고른 클러스터의 팀과 team_id 가 다릅니다 — 방의 팀은 클러스터가 정합니다")
         context = cluster.context_name
         namespace = namespace or cluster.default_namespace
         fingerprint = cluster.fingerprint      # 방이 지문을 복사해 "승인한 대상 = 실행 대상" 을 확인한다
@@ -315,7 +338,9 @@ async def list_conversations(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> list[dict[str, Any]]:
-    rows = store.list_sessions(user.id, cluster_id=cluster_id)
+    # 목록과 상세의 답이 같아야 한다 — 열 수 없는 방이 목록에 뜨면 사용자가 막다른 길에 선다
+    mine = list(await membership.team_roles(user)) if membership.available() else None
+    rows = store.list_sessions(user.id, cluster_id=cluster_id, team_ids=mine)
     return [_conversation_view(r, running=_is_running(r)) for r in rows]
 
 
@@ -392,6 +417,7 @@ async def chat(
             return _replay(run)
 
         _bind_run(session, run, user)
+        await _require_cluster_access(store, row, user)
         try:
             with _with_cluster(store, session, row):
                 payload, result = await _server._chat_turn(session, body.text)
@@ -507,6 +533,7 @@ async def approve(
     run = _open_run(store, conversation_id)
     async with conversation.lock:
         _bind_run(session, run, user)
+        await _require_cluster_access(store, row, user)
         # 재개가 돌면 _to_payload 가 티켓을 지우므로, 저장 실패 안내에 실을 Plan id(승인한 카드만)는 여기서 미리 뽑는다
         plan_ids = _approved_plan_ids(session, body.call_id if body.approved else None)
         # 결정 검사·기록은 server._approve 가 한다 (문자열 detail). 여기서는 코드 객체로 감싼다.
@@ -538,6 +565,7 @@ async def resume(
     run = _open_run(store, conversation_id)
     async with conversation.lock:
         _bind_run(session, run, user)
+        await _require_cluster_access(store, row, user)
         plan_ids = _approved_plan_ids(session)
         try:
             with _with_cluster(store, session, row):

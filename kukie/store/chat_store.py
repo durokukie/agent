@@ -255,12 +255,22 @@ class ChatStore:
                 return None
             return SessionRow.of(row, running=self._has_run_with(db, session_id, ("running",)))
 
-    def list_sessions(self, user_id: str, *, cluster_id: str | None = None) -> list[SessionRow]:
-        """내 방 + shared 방 (기획 05 §4: 팀원이 같이 본다). 팀 소속으로 좁히는 건 Spring 팀 API 뒤 — 지금은 shared 전부."""
+    def list_sessions(
+        self, user_id: str, *, cluster_id: str | None = None, team_ids: list[str] | None = None
+    ) -> list[SessionRow]:
+        """내 방 + 내가 볼 수 있는 shared 방 (기획 05 §4: 팀원이 같이 본다).
+
+        team_ids 는 부르는 쪽이 회원 서버에서 받아 넘긴다. 주면 팀이 붙은 shared 방은 그 목록에
+        든 팀만 보인다 — 목록과 상세(_load)의 답이 달라 "목록에 있는데 열 수 없는 방" 이 생기던 것을
+        맞춘다 (자동 리뷰 지적). 주지 않으면(개발 모드) 예전처럼 shared 전부.
+        """
         with self._factory() as db:
-            stmt = select(ChatSession).where(
-                or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True))
-            )
+            visible = ChatSession.shared.is_(True)
+            if team_ids is not None:
+                visible = visible & or_(
+                    ChatSession.team_id.is_(None), ChatSession.team_id.in_(team_ids)
+                )
+            stmt = select(ChatSession).where(or_(ChatSession.user_id == user_id, visible))
             if cluster_id is not None:
                 stmt = stmt.where(ChatSession.cluster_id == cluster_id)
             stmt = stmt.order_by(ChatSession.updated_at.desc())

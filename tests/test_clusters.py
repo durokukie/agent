@@ -331,10 +331,19 @@ def test_방의_팀은_클러스터가_정한다(client):
         ca_data=CA, insecure=False, credential_encrypted=crypto.encrypt({"token": "t"}),
         context_name="ctx", default_namespace="default", fingerprint="fp",
     ).id
-    created = client.post(
-        "/conversations", json={"cluster_id": cluster, "team_id": "t-거짓"}, headers=USER
-    ).json()
+    created = client.post("/conversations", json={"cluster_id": cluster}, headers=USER).json()
     assert created["conversation"]["team_id"] == "t-진짜"
+
+
+def test_클러스터의_팀과_다른_team_id_는_거절한다(client):
+    """조용히 덮으면 요청보다 더 열린 방이 된다 — 개인 클러스터면 team_id 가 사라진다 (자동 리뷰)."""
+    personal = get_store().create_cluster(
+        registered_by="u-1", name="개인", api_server="https://k.example",
+        ca_data=CA, insecure=False, credential_encrypted=crypto.encrypt({"token": "t"}),
+        context_name="ctx", default_namespace="default", fingerprint="fp2",
+    ).id
+    r = client.post("/conversations", json={"cluster_id": personal, "team_id": "t-1"}, headers=USER)
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "CLUSTER_TEAM_MISMATCH"
 
 
 def test_CA_와_insecure_를_함께_쓰면_거부한다():
