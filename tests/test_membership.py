@@ -749,3 +749,55 @@ def test_flat_엔드포인트는_개발_모드에서는_그대로다(client, mon
     _dev_mode(monkeypatch)
     monkeypatch.setattr(server, "_session", None)
     assert client.post("/session").status_code == 200
+
+
+@pytest.mark.parametrize("restart", [True, False])
+def test_클러스터_없는_옛_방에_걸린_승인_카드는_불러올_때_닫힌다(client, spring, monkeypatch, tmp_path, restart):
+    """#76 리뷰 — 그런 방은 chat·approve·resume 이 전부 CLUSTER_REQUIRED 라 카드를 닫을 길이 없었다.
+
+    활성 run 을 닫는 자리(chat 의 잠금 안쪽)는 그 409 뒤에 있고, 재시작 복원은 카드를 되살린다.
+    restart=True 는 배포 상황(메모리가 비어 DB 에서 복원), False 는 메모리에 카드가 떠 있는 상황.
+    """
+    from pydantic_ai import ModelResponse
+    from pydantic_ai.messages import ToolCallPart
+    from pydantic_ai.models.function import FunctionModel
+
+    from kukie.agent import agent
+    from kukie.guardrail import action_plan, hook
+    from kukie.kubectl import KubectlResult
+    from kukie.tools import mutate
+
+    ok = KubectlResult(command="kubectl …", stdout="ok\n", stderr="", success=True, exit_code=0)
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    monkeypatch.setattr(hook, "run_kubectl", lambda *a, **k: ok)
+    monkeypatch.setattr(mutate, "run_kubectl", lambda *a, **k: ok)
+
+    async def guidance(plan):
+        return "현재 replica 를 확인한다."
+
+    monkeypatch.setattr(hook, "generate_decision_guidance", guidance)
+
+    # #75 이전 — 개발 모드에서 클러스터 없는 shared 방에 승인 카드를 띄운다
+    _dev_mode(monkeypatch)
+    room = client.post("/conversations", json={"shared": True}, headers=DEV).json()["conversation"]["id"]
+    client.post(f"/conversations/{room}/chat", json={"text": "/mode 실습"}, headers=DEV)
+    scale = {"kind": "deployment", "name": "nginx", "replicas": 3, "namespace": "study",
+             "intent": "nginx 를 3개로 늘린다.", "expected_effects": ["3개가 된다."], "side_effects": ["자원을 더 쓴다."]}
+    model = FunctionModel(lambda messages, info: ModelResponse(parts=[ToolCallPart(
+        tool_name="scale_resource", args=scale, tool_call_id="call-1")]))
+    with agent.override(model=model):
+        r = client.post(f"/conversations/{room}/chat", json={"text": "늘려줘"}, headers=DEV)
+    assert r.json()["kind"] == "approval"
+
+    # 배포 — 회원 서버 모드로 다시 뜬다
+    if restart:
+        conversations.registry.clear()
+    monkeypatch.setenv("KUKIE_MEMBER_URL", MEMBER_URL)
+    monkeypatch.delenv("KUKIE_DEV_AUTH")
+    membership.clear_cache()
+
+    body = client.get(f"/conversations/{room}", headers=BEARER).json()
+    assert body["session"]["pending"] == []
+    assert body["turns"][-1]["status"] == "interrupted"
+    store = get_store()
+    assert [p.status for run in store.list_runs(room) for p in store.list_plans_for_run(run.id)] == ["EXPIRED"]
