@@ -134,11 +134,19 @@ async def _load(conversation_id: str, user: User, store: ChatStore) -> tuple[Ses
         raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
     # 팀이 붙은 **shared** 방은 만든 사람에게도 지금 소속을 묻는다. 팀 공간이므로 나간 사람은 보면 안 된다.
     #
+    # 팀이 없는 shared 방은 **만든 사람만** 연다 (#75). 누구에게 열지 물을 팀이 없는데, 예전처럼
+    # "로그인한 아무나" 로 열면 남이 서버 kubeconfig 로 도는 방에 들어온다. 회원 서버 모드에서 새로
+    # 생기는 팀 없는 방은 개인 클러스터 방뿐이고(그 클러스터는 등록한 사람만 쓴다 — _readable),
+    # 전에 만들어진 클러스터 없는 방도 남아 있다.
+    #
     # private 방은 읽기까지 막지 않는다. 자기 대화 기록인데 팀에서 나갔다는 이유로 열 수 없으면
     # 되돌릴 방법이 없다 (대화 삭제 API 도 없다 — 자동 리뷰 지적). 대신 **클러스터를 쓰는 것**은
     # 아래 _require_cluster_access 가 막는다. 읽기는 열고 실행은 닫는다.
-    if row.shared and row.team_id and membership.available():
-        if not await membership.is_member(user, row.team_id):
+    if row.shared and membership.available():
+        if not row.team_id:
+            if row.user_id != user.id:
+                raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
+        elif not await membership.is_member(user, row.team_id):
             raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
     if registry.get(conversation_id) is None:
         registry.get_or_load(conversation_id, store)   # 복원하면서 밀린 run 을 닫으므로 row 를 다시 읽는다
@@ -230,9 +238,16 @@ async def _require_cluster_access(store: ChatStore, row: SessionRow, user: User)
 
     팀에서 나간 사람이 자기 private 방은 계속 읽되 그 팀 클러스터로 kubectl 을 돌리지는 못하게 한다.
     판단 규칙은 /clusters 의 _readable 과 같다.
+
+    회원 서버 모드에서 클러스터가 없는 방은 실행하지 않는다 (#75). 그런 방은 _with_cluster 가 서버
+    컴퓨터의 kubeconfig 를 쓰는데, 그 클러스터가 누구 것인지 물을 곳이 없다 — 기획 05 §1 의
+    Team → Cluster → Session 에도 없는 모양이다. 개발 모드는 예전대로 그 kubeconfig 로 돈다.
     """
-    if not row.cluster_id or not membership.available():
+    if not membership.available():
         return
+    if not row.cluster_id:
+        raise _error(409, "CLUSTER_REQUIRED",
+                     "이 대화에는 클러스터가 없어 실행할 수 없습니다 — 클러스터를 골라 새 대화를 시작해 주세요")
     cluster = store.get_cluster(row.cluster_id)
     if cluster is None or not cluster.team_id:
         return
@@ -284,12 +299,13 @@ async def create_conversation(
     namespace = (body.namespace or "").strip()
     fingerprint = body.cluster_fingerprint
     team_id = body.team_id
-    if team_id and not body.cluster_id and membership.available():
-        # 클러스터를 고르지 않은 방은 team_id 를 클라이언트가 정한다. 이 값이 이제 방을 여닫는
-        # 열쇠라(_load) 검사 없이 두면 두 가지가 깨진다 (자동 리뷰 🔴):
-        #   ① 없는 팀을 적으면 만든 사람도 자기 방에 못 들어가고 지울 방법도 없다
-        #   ② 남의 팀을 적으면 그 팀 구성원이 들어오는 방을 외부인이 심을 수 있다
-        await membership.require_member(user, team_id)
+    if not body.cluster_id and membership.available():
+        # 회원 서버 모드에서는 등록된 클러스터를 골라야 방이 생긴다 (#75, 기획 05 §1 Team → Cluster → Session).
+        # 클러스터 없는 방은 서버 컴퓨터의 kubeconfig 로 도는데, 예전에는 팀만 적거나 아무것도 안 적으면
+        # 만들어져서 로그인한 누구나 그 kubeconfig 를 쓰는 방을 열 수 있었다. 팀만 적은 방도 막는다 —
+        # 서버 kubeconfig 는 그 팀의 클러스터가 아니다.
+        raise _error(400, "CLUSTER_REQUIRED",
+                     "클러스터를 골라야 대화를 만들 수 있습니다 — 팀 설정에서 클러스터를 먼저 연결해 주세요")
     if body.cluster_id:
         # 등록된 클러스터를 골랐다 (기획 04 §8). 접속 대상은 그 행이 정한다 — 화면이 보낸 값보다 우선한다.
         #

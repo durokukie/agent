@@ -23,6 +23,10 @@ decisions 는 온전하므로(전부 run 성공 후에만 갱신) 503 RESUME_RET
 사용자가 한다.
 
 세션 상태(대화 기록·대기 티켓)는 메모리에만 있다. 서버가 꺼지면 대기 중인 승인은 만료된다 (MVP 결정).
+
+이 4개는 **회원 서버가 없는 로컬 개발 전용**이다 (#75). 인증도 팀 검사도 없이 서버의 kubeconfig 로
+돌기 때문에, 회원 서버 모드에서 열어 두면 /conversations 의 검사를 통째로 건너뛰는 옆문이 된다.
+회원 서버 모드에서는 404 — 앱은 /conversations 를 쓴다.
 """
 from __future__ import annotations
 
@@ -31,11 +35,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict
 from pydantic_ai.messages import ModelMessage, ToolCallPart
 from pydantic_ai.tools import DeferredToolRequests, ToolApproved, ToolDenied
 
+from kukie import membership
 from kukie.agent import agent
 from kukie.deps import Deps
 from kukie.guardrail.action_plan import ActionPlan
@@ -157,7 +162,17 @@ def _to_payload(session: Session, result) -> dict[str, Any]:
 app = FastAPI(title="Kukie local server")
 
 
-@app.post("/session")
+def _dev_only() -> None:
+    """flat 엔드포인트의 문. 회원 서버 모드면 없는 주소처럼 닫는다 (모듈 설명, #75)."""
+    if membership.available():
+        raise HTTPException(404, {"code": "NOT_FOUND",
+                                  "message": "회원 서버 모드에서는 쓰지 않는 개발용 엔드포인트다 — /conversations 를 쓴다"})
+
+
+DEV_ONLY = [Depends(_dev_only)]
+
+
+@app.post("/session", dependencies=DEV_ONLY)
 async def start_session() -> dict[str, Any]:
     """kubeconfig 의 현재 대상을 읽어 세션을 연다. 앱은 이 값을 "맞나요?" 화면에 띄운다.
 
@@ -178,7 +193,7 @@ async def start_session() -> dict[str, Any]:
     return _session_view(_session)
 
 
-@app.get("/session")
+@app.get("/session", dependencies=DEV_ONLY)
 def get_session() -> dict[str, Any]:
     return _session_view(_require_session())
 
@@ -192,7 +207,7 @@ def _session_view(session: Session) -> dict[str, Any]:
     }
 
 
-@app.post("/chat")
+@app.post("/chat", dependencies=DEV_ONLY)
 async def chat(body: ChatIn) -> dict[str, Any]:
     session = _require_session()
     if session.processing:
@@ -225,7 +240,7 @@ async def _chat_turn(session: Session, text: str) -> tuple[dict[str, Any], Any]:
         session.processing = False
 
 
-@app.post("/approve")
+@app.post("/approve", dependencies=DEV_ONLY)
 async def approve(body: ApproveIn) -> dict[str, Any]:
     session = _require_session()
     if session.processing:
@@ -295,7 +310,7 @@ async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict
     return await _resume(session)
 
 
-@app.post("/resume")
+@app.post("/resume", dependencies=DEV_ONLY)
 async def resume() -> dict[str, Any]:
     """재개 실패(503 RESUME_RETRYABLE) 뒤 같은 결정으로 다시 시도한다.
 

@@ -211,7 +211,7 @@ def test_팀_Admin_은_남의_shared_방도_승인할_수_있다(client, spring)
     spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
     room = get_store().create_session(
         user_id="다른사람", context_name="ctx", namespace="default", mode="실습",
-        team_id="t-1", shared=True,
+        team_id="t-1", cluster_id=_cluster("t-1", owner="다른사람"), shared=True,
     ).id
     # 대기 중인 승인이 없으니 NOT_PENDING 이어야 한다 — 403(권한)에서 막히지 않았다는 뜻
     r = client.post(f"/conversations/{room}/approve", json={"call_id": "c1", "approved": True},
@@ -223,21 +223,22 @@ def test_팀_Member_는_남의_shared_방을_승인하지_못한다(client, spri
     spring["teams"] = [{"id": "t-1", "role": "MEMBER"}]
     room = get_store().create_session(
         user_id="다른사람", context_name="ctx", namespace="default", mode="실습",
-        team_id="t-1", shared=True,
+        team_id="t-1", cluster_id=_cluster("t-1", owner="다른사람"), shared=True,
     ).id
     r = client.post(f"/conversations/{room}/approve", json={"call_id": "c1", "approved": True},
                     headers=BEARER)
     assert r.status_code == 403 and r.json()["detail"]["code"] == "NOT_TEAM_ADMIN"
 
 
-def test_팀이_없는_방은_예전대로_만든_사람만(client, spring):
+def test_팀이_없는_남의_shared_방은_승인은커녕_열리지도_않는다(client, spring):
+    """#75 전에는 열리고 승인만 만든 사람으로 막혔다 — 남이 서버 kubeconfig 로 도는 방에 입력할 수 있었다."""
     spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
     room = get_store().create_session(
         user_id="다른사람", context_name="ctx", namespace="default", mode="실습", shared=True,
     ).id
     r = client.post(f"/conversations/{room}/approve", json={"call_id": "c1", "approved": True},
                     headers=BEARER)
-    assert r.status_code == 403 and r.json()["detail"]["code"] == "FORBIDDEN"
+    assert r.status_code == 404 and r.json()["detail"]["code"] == "NOT_FOUND"
 
 
 # ── 자동 리뷰 반영 ─────────────────────────────────────────
@@ -377,7 +378,7 @@ def test_팀원이면_자기가_만든_방은_승인할_수_있다(client, sprin
     spring["teams"] = [{"id": "t-1", "role": "MEMBER"}]
     room = get_store().create_session(
         user_id="u-1", context_name="ctx", namespace="default", mode="실습",
-        team_id="t-1", shared=True,
+        team_id="t-1", cluster_id=_cluster("t-1", owner="다른사람"), shared=True,
     ).id
     # 권한에서 막히면 403, 통과하면 대기 카드가 없어 409 NOT_PENDING
     r = client.post(f"/conversations/{room}/approve", json={"call_id": "c1", "approved": True},
@@ -389,29 +390,33 @@ def test_클러스터_없이_남의_팀에_방을_심을_수_없다(client, spri
     """🔴 team_id 가 방을 여는 열쇠가 됐는데 클러스터 없는 경로는 그 값을 검사하지 않았다.
 
     외부인이 심은 방에 그 팀 구성원이 들어오고, 방의 context·namespace 는 외부인이 정한 값이다.
+    #75 부터는 클러스터 없는 방 자체가 만들어지지 않는다.
     """
     spring["teams"] = [{"id": "t-내팀", "role": "ADMIN"}]
     r = client.post("/conversations", json={"team_id": "t-남의팀", "shared": True}, headers=BEARER)
-    assert r.status_code == 403 and r.json()["detail"]["code"] == "NOT_TEAM_MEMBER"
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "CLUSTER_REQUIRED"
 
 
 def test_없는_팀을_적으면_방이_만들어지지_않는다(client, spring):
     """만들어지고 나면 만든 사람도 못 들어가는데 지울 방법이 없다."""
     spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
     r = client.post("/conversations", json={"team_id": "t-없음", "shared": True}, headers=BEARER)
-    assert r.status_code == 403
+    assert r.status_code == 400
 
     ids = [c["id"] for c in client.get("/conversations", headers=BEARER).json()]
     assert ids == []                      # 죽은 방이 목록에 남지 않는다
 
 
-def test_내_팀이면_클러스터_없이도_방을_만든다(client, spring):
-    spring["teams"] = [{"id": "t-1", "role": "MEMBER"}]
-    created = client.post("/conversations", json={"team_id": "t-1", "shared": True},
-                          headers=BEARER)
-    assert created.status_code == 200
-    room = created.json()["conversation"]["id"]
-    assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 200
+@pytest.mark.parametrize("body", [{}, {"shared": True}, {"team_id": "t-1", "shared": True}])
+def test_내_팀이어도_클러스터_없이는_방을_만들지_않는다(client, spring, body):
+    """#75 — 클러스터 없는 방은 서버 컴퓨터의 kubeconfig 로 돈다. 그건 이 팀의 클러스터가 아니다.
+
+    예전에는 팀만 적으면 만들어졌다. 기획 05 §1 은 Team → Cluster → Session 이다.
+    """
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    r = client.post("/conversations", json=body, headers=BEARER)
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "CLUSTER_REQUIRED"
+    assert client.get("/conversations", headers=BEARER).json() == []
 
 
 def test_팀에서_나가도_내_private_방은_읽을_수_있다(client, spring):
@@ -556,7 +561,8 @@ def test_남의_팀_계획_전문은_404(client, spring):
 def test_빈_team_id_로_방을_만들_수_없다(client, spring):
     """`""` 는 falsy 검사(팀 없음)와 IN 검사(그 팀만) 사이로 샌다 — 목록엔 없는데 상세는 200."""
     spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
-    room = client.post("/conversations", json={"team_id": "", "shared": True},
+    personal = _cluster(None, owner="u-1")      # #75 부터 방은 클러스터가 있어야 생긴다 — 팀 없는 개인 클러스터로
+    room = client.post("/conversations", json={"cluster_id": personal, "team_id": "", "shared": True},
                        headers=BEARER).json()["conversation"]["id"]
 
     assert get_store().get_session(room).team_id is None
@@ -566,15 +572,22 @@ def test_빈_team_id_로_방을_만들_수_없다(client, spring):
 
 
 def test_이미_저장된_빈_team_id_도_목록과_상세가_같다(client, spring):
-    """정규화가 붙기 전에 들어간 행이 있을 수 있다 — 목록 조건도 ""를 팀 없음으로 본다."""
+    """정규화가 붙기 전에 들어간 행이 있을 수 있다 — 목록 조건도 ""를 팀 없음으로 본다.
+
+    팀 없는 shared 방은 만든 사람만 본다 (#75). 남의 방은 둘 다 없고, 내 방은 둘 다 있다.
+    """
     spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
-    room = get_store().create_session(
+    남의방 = get_store().create_session(
         user_id="다른사람", context_name="c", namespace="n", mode="학습", team_id="", shared=True
+    ).id
+    내방 = get_store().create_session(
+        user_id="u-1", context_name="c", namespace="n", mode="학습", team_id="", shared=True
     ).id
 
     ids = {c["id"] for c in client.get("/conversations", headers=BEARER).json()}
-    assert room in ids
-    assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 200
+    assert 남의방 not in ids and 내방 in ids
+    assert client.get(f"/conversations/{남의방}", headers=BEARER).status_code == 404
+    assert client.get(f"/conversations/{내방}", headers=BEARER).status_code == 200
 
 
 def test_계획_목록은_팀을_안_넘기면_부를_수_없다():
@@ -683,3 +696,56 @@ def test_빈_team_id_행도_개인_이름_유일성에_걸린다(client, spring)
 
     with pytest.raises(IntegrityError):
         _cluster(None, owner="u-1")                       # 같은 사람 + 같은 이름
+
+
+# ── 클러스터 없는 방 · flat 엔드포인트 (#75) ──────────────────
+
+@pytest.mark.parametrize("team_id", [None, "t-1"])
+def test_클러스터_없는_옛_방은_주인이어도_실행되지_않는다(client, spring, team_id):
+    """#75 전에 만들어진 방이 남아 있다. 서버 컴퓨터의 kubeconfig 로 도는 방이라 누구의 클러스터인지 물을 곳이 없다.
+
+    읽기는 열어 둔다 — 자기 대화 기록이고 지울 API 가 없다.
+    """
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    room = get_store().create_session(
+        user_id="u-1", context_name="ctx", namespace="default", mode="실습", team_id=team_id, shared=True,
+    ).id
+
+    assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 200
+    for path, body in [("chat", {"text": "파드 보여줘"}),
+                       ("approve", {"call_id": "c1", "approved": True}),
+                       ("resume", None)]:
+        r = client.post(f"/conversations/{room}/{path}", json=body, headers=BEARER)
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "CLUSTER_REQUIRED", path
+    assert client.get(f"/conversations/{room}", headers=BEARER).json()["turns"] == []   # run 도 안 남는다
+
+
+def test_팀_없는_남의_shared_방_계획은_목록에도_전문에도_없다(client, spring):
+    """plans_api 도 _load 와 같은 규칙이어야 방은 닫혔는데 계획 전문(명령·대상·결과)이 열리는 일이 없다."""
+    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+    남의계획 = _plan_in_room(None, owner="다른사람")
+    내계획 = _plan_in_room(None, owner="u-1")
+
+    ids = {p["id"] for p in client.get("/action-plans", headers=BEARER).json()}
+    assert 남의계획 not in ids and 내계획 in ids
+    assert client.get(f"/action-plans/{남의계획}", headers=BEARER).status_code == 404
+    assert client.get(f"/action-plans/{내계획}", headers=BEARER).status_code == 200
+
+
+@pytest.mark.parametrize("method, path, body", [
+    ("post", "/session", None),
+    ("get", "/session", None),
+    ("post", "/chat", {"text": "파드 보여줘"}),
+    ("post", "/approve", {"call_id": "c1", "approved": True}),
+    ("post", "/resume", None),
+])
+def test_flat_엔드포인트는_회원_서버_모드에서_닫힌다(client, spring, method, path, body):
+    """#75 — 로그인도 팀 검사도 없이 서버 kubeconfig 로 도는 옆문이었다. 앱은 /conversations 만 쓴다."""
+    r = getattr(client, method)(path, **({"json": body} if body else {}))
+    assert r.status_code == 404 and r.json()["detail"]["code"] == "NOT_FOUND"
+
+
+def test_flat_엔드포인트는_개발_모드에서는_그대로다(client, monkeypatch):
+    _dev_mode(monkeypatch)
+    monkeypatch.setattr(server, "_session", None)
+    assert client.post("/session").status_code == 200

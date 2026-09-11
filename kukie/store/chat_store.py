@@ -41,19 +41,20 @@ def _visible_sessions(user_id: str, team_ids: list[str] | None) -> Any:
     """내가 볼 수 있는 방을 고르는 조건 한 벌 — 방 목록·계획 목록이 같은 규칙을 써야 한다.
 
     _load(conversations_api) 와 같은 규칙이어야 "목록에 있는데 열 수 없는 것" 이 안 생긴다.
-      private 방 → 내 것이면 보인다 (자기 기록이라 읽기는 열어 뒀다)
-      shared 방  → 팀이 없거나 내가 그 팀 구성원일 때만. **내가 만든 방도 마찬가지**다
+      private 방          → 내 것이면 보인다 (자기 기록이라 읽기는 열어 뒀다)
+      팀이 있는 shared 방 → 내가 그 팀 구성원일 때만. **내가 만든 방도 마찬가지**다
+      팀이 없는 shared 방 → 내 것일 때만 (#75). 열어 줄 팀이 없다
     team_ids 를 안 주면(개발 모드 = 회원 서버 없음) 예전처럼 shared 전부.
     """
     if team_ids is None:
         return or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True))
-    my_private = (ChatSession.user_id == user_id) & ChatSession.shared.is_(False)
-    # `""` 도 "팀 없음" 으로 본다 — _load 는 falsy 라 팀 검사를 건너뛰므로, 여기서 IN 에만 맡기면
-    # 목록에선 사라지는데 상세는 200 인 방이 남는다 (자동 리뷰 지적). 새로 들어오는 값은
-    # ConversationIn 이 None 으로 접지만 이미 저장된 행이 있을 수 있다.
+    # `""` 도 "팀 없음" 으로 본다 — _load 는 falsy 로 가르므로, 여기서 IN 에만 맡기면 목록과 상세의
+    # 답이 갈린다 (자동 리뷰 지적). 새로 들어오는 값은 ConversationIn 이 None 으로 접지만 이미
+    # 저장된 행이 있을 수 있다.
     no_team = or_(ChatSession.team_id.is_(None), ChatSession.team_id == "")
-    open_shared = ChatSession.shared.is_(True) & or_(no_team, ChatSession.team_id.in_(team_ids))
-    return or_(my_private, open_shared)
+    mine = (ChatSession.user_id == user_id) & or_(ChatSession.shared.is_(False), no_team)
+    team_shared = ChatSession.shared.is_(True) & ChatSession.team_id.in_(team_ids)
+    return or_(mine, team_shared)
 
 
 @dataclass(frozen=True)
