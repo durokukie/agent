@@ -24,6 +24,7 @@ row.team_id 로 붙인다 — 지금은 로그인한 사용자면 된다. Privat
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import uuid
 from typing import Any
@@ -165,6 +166,12 @@ def _usage_json(result: Any) -> dict[str, Any] | None:
     }
 
 
+def _bind_run(session: Any, run: RunRow, user: User) -> None:
+    """이번 요청이 어느 run 의 것이고 누가 보냈는지 세션에 싣는다 — 가드레일 훅이 Action Plan 을
+    tbl_action_plan 에 넣고 decision 에 결정자를 적을 때 쓴다 (#58). 매 요청 새로 덮어쓴다."""
+    session.deps = dataclasses.replace(session.deps, run_id=run.id, user_id=user.id)
+
+
 def _busy() -> HTTPException:
     return _error(409, "BUSY", "이전 요청 처리 중 — 끝난 뒤 다시 보내라")
 
@@ -250,7 +257,7 @@ async def chat(
             raise _error(409, "REQUEST_MISMATCH", f"같은 request_id 로 다른 입력을 보냈다: {body.request_id}")
         if stored.status == "running" and not conversation.lock.locked():
             # 실행 중이라는데 이 방의 잠금이 비어 있다 = 결과 저장에 실패한 run 이다. 영원히 BUSY 를 재생하지 않도록 닫는다
-            store.interrupt_active_runs(conversation_id, "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라")
+            _interrupt(store, conversation_id)
             stored = store.find_run(conversation_id, body.request_id) or stored
         return _replay(stored)
 
@@ -269,7 +276,7 @@ async def chat(
         if stale is not None:
             logger.warning("결과가 저장되지 않은 run 을 닫는다 (conversation=%s, run=%s, status=%s)",
                            conversation_id, stale.id, stale.status)
-            store.interrupt_active_runs(conversation_id, "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라")
+            _interrupt(store, conversation_id)
         try:
             run, created = store.start_run(
                 conversation_id, request_id=body.request_id, kind=kind,
@@ -282,17 +289,20 @@ async def chat(
         if not created:
             return _replay(run)
 
+        _bind_run(session, run, user)
         before = list(session.history)   # 저장에 실패해 이 턴을 버릴 때 되돌릴 자리 (자동 리뷰 지적)
         try:
             payload, result = await _server._chat_turn(session, body.text)
         except HTTPException as exc:
             wrapped = _wrap(exc)
             store.update_run(run.id, status="failed", response_payload=_error_record(wrapped))
+            _close_plans(store, run)   # failed 는 종료 상태다 — 안 닫으면 계획이 영원히 열린 채 남는다
             raise wrapped
         except Exception as exc:                 # 모델·툴 예외 — run 은 실패로 남기고 세션은 유지
             logger.exception("run 실패 (conversation=%s, run=%s)", conversation_id, run.id)
             failed = _error(500, "RUN_FAILED", f"요청 처리에 실패했다 ({type(exc).__name__}) — 서버 로그 참고")
             store.update_run(run.id, status="failed", response_payload=_error_record(failed))
+            _close_plans(store, run)
             raise failed from exc
 
         # 승인 카드면 run 은 열린 채(awaiting_approval) 남는다 — approve/resume 이 이어서 끝낸다 (문서 7절)
@@ -303,8 +313,43 @@ async def chat(
             agent_messages=_messages_json(result) if result is not None else None,
             usage_summary=_usage_json(result) if result is not None else None,
         )
+        if status == "completed":
+            _close_plans(store, run)
         store.update_session(conversation_id, current_mode=session.skill.name)
         return payload
+
+
+def _interrupt(store: ChatStore, conversation_id: str) -> None:
+    """결과 저장에 실패해 활성으로 남은 run 을 닫는다. 함께 닫힌 계획의 .md 사본도 따라오게 한다 —
+    계획을 DB 에서 직접 닫는 자리는 넷이고 규칙은 한 벌이어야 한다 (자동 리뷰 지적)."""
+    from kukie.guardrail.action_plan import sync_markdown   # 순환 import 회피
+
+    closed = store.interrupt_active_runs(
+        conversation_id, "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라"
+    )
+    try:
+        sync_markdown(closed.plans)
+    except Exception:
+        logger.exception("중단으로 닫힌 계획의 .md 갱신 실패 (conversation=%s)", conversation_id)
+
+
+def _close_plans(store: ChatStore, run: RunRow) -> None:
+    """run 이 종료 상태로 닫힐 때 남은 계획도 닫는다. **여기서 터져도 원래 응답을 삼키면 안 된다.**
+
+    성공(completed)에도 부른다. 정상 흐름이면 그 시점에 열린 계획이 없지만, kubectl 이 돈 뒤
+    record_execution 이 실패하면 훅이 경고만 붙이고 결과를 정상 반환해 run 은 completed 로 닫히고
+    계획은 EXECUTING 으로 남는다 (자동 리뷰 지적). 종료 상태면 종류를 가리지 않고 닫는다.
+
+    같은 트랜잭션으로 합칠 수 없어(run 은 이미 커밋됐다) 좁은 틈이 남는다 — 둘 사이에 죽으면 계획이
+    열린 채 남는다. 그 틈을 없애려면 update_run 과 한 트랜잭션이어야 하는데, 저장 실패 경로마다
+    상태·payload 가 달라 지금 구조로는 묶이지 않는다 (자동 리뷰 지적). 다음 정리 대상으로 남긴다.
+    """
+    from kukie.guardrail.action_plan import sync_markdown   # 순환 import 회피 — 부를 때만 가져온다
+
+    try:
+        sync_markdown(store.expire_open_plans(run.id))
+    except Exception:
+        logger.exception("계획 닫기 실패 — run 은 이미 종료로 닫혔다 (run=%s)", run.id)
 
 
 def _save_or_fail(
@@ -341,11 +386,17 @@ def _save_or_fail(
                 store.update_run(run.id, status=failure_status, response_payload=_error_record(on_failure))
         except Exception:
             logger.exception("실패 표시도 저장하지 못했다 (run=%s)", run.id)
-        if session is not None and failure_status not in RUN_ACTIVE:
-            session.pending = None
-            session.decisions.clear()
-            if history_before is not None:
-                session.history = history_before
+        # failed 는 종료 상태다 — 이 문으로 닫힌 run 의 계획도 함께 닫고(자동 리뷰 지적),
+        # 메모리의 승인 티켓과 그 턴의 기록도 함께 버린다(팀원 리뷰 + 자동 리뷰).
+        # 셋 다 "DB 가 닫았으면 나머지도 닫는다" 하나다.
+        # recovery_required·awaiting_approval 은 활성이라 나중에 interrupt 가 지나간다.
+        if failure_status not in RUN_ACTIVE:
+            _close_plans(store, run)
+            if session is not None:
+                session.pending = None
+                session.decisions.clear()
+                if history_before is not None:
+                    session.history = history_before
         raise on_failure from exc
 
 
@@ -410,6 +461,7 @@ async def approve(
         raise _busy()
     run = _open_run(store, conversation_id)
     async with conversation.lock:
+        _bind_run(session, run, user)
         # 재개가 돌면 _to_payload 가 티켓을 지우므로, 저장 실패 안내에 실을 Plan id(승인한 카드만)는 여기서 미리 뽑는다
         plan_ids = _approved_plan_ids(session, body.call_id if body.approved else None)
         # 결정 검사·기록은 server._approve 가 한다 (문자열 detail). 여기서는 코드 객체로 감싼다.
@@ -437,6 +489,7 @@ async def resume(
         raise _error(409, "PENDING_APPROVAL", f"아직 결정하지 않은 승인 건이 있다: {session.pending_ids}")
     run = _open_run(store, conversation_id)
     async with conversation.lock:
+        _bind_run(session, run, user)
         plan_ids = _approved_plan_ids(session)
         try:
             outcome, result = await _server._resume(session)
@@ -477,6 +530,7 @@ def _continue_run(
         return outcome
     _save_or_fail(store, conversation.id, run, **failure, status="completed", response_payload=outcome,
                   agent_messages=messages or None, usage_summary=usage)
+    _close_plans(store, run)      # completed 도 종료 상태다 — 남은 계획이 있으면 닫는다
     store.update_session(conversation.id, current_mode=conversation.session.skill.name)
     return outcome
 

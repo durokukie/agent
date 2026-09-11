@@ -4,7 +4,8 @@
   tbl_chat_session.team_id, cluster_id, shared  — 없으면 "팀 공유 대화" 를 고를 수 없다.
 
 tbl_user 는 Spring 회원 서버 것이라 여기 없다 (user_id 는 문자열로만 들고 소유권만 검사한다).
-tbl_action_plan 은 아직 .md 파일(guardrail/action_plan.py)이 원본이다 — 다음 이슈.
+tbl_action_plan 은 이 표가 원본이다 (#58). .md 파일은 사람이 읽는 사본으로만 남는다.
+plan 상태 이름은 DB 문서 5절의 소문자가 아니라 DURO-83 결정(기획 10, 대문자)을 따른다 — 대응표는 issue #58 댓글.
 실패 정보는 별도 컬럼이 아니라 response_payload 에 {"kind": "error", ...} 로 남긴다 (문서에 error 컬럼이 없다).
 """
 from __future__ import annotations
@@ -12,7 +13,17 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -38,6 +49,32 @@ RUN_STATUSES = RUN_ACTIVE + RUN_FINAL
 RUN_KINDS = ("chat", "mode_change")
 
 MODES = ("학습", "진단", "실습")
+
+# plan 상태 — DURO-83 결정 (기획 10 이름 + REJECTED). DB 문서 5절의 소문자 목록을 대체한다 (issue #58 댓글에 대응표).
+# 정상 흐름: DRAFT → WAITING_APPROVAL → APPROVED → EXECUTING → APPLIED → EFFECT_VERIFIED
+PLAN_OPEN = ("DRAFT", "WAITING_APPROVAL", "APPROVED", "EXECUTING")   # 아직 끝나지 않은 계획
+PLAN_CLOSED = ("APPLIED", "EFFECT_VERIFIED", "REJECTED", "EXPIRED", "STALE", "FAILED", "UNKNOWN")
+PLAN_STATUSES = PLAN_OPEN + PLAN_CLOSED
+
+# APPLIED = kubectl 이 성공했다. EFFECT_VERIFIED = 그 효과까지 확인했다 (기획 09, 아직 아무도 안 채운다).
+# UNKNOWN = 실행 여부를 모른다 (run 의 recovery_required 짝).
+#
+# EXPIRED 와 STALE 은 **다른 상황**이다 (DURO-83 의 "어긋나는 지점" 이 둘을 갈라 적었다).
+#   EXPIRED = 중단·재시작으로 **승인 카드가 못 쓰게 됐다.** 클러스터는 그대로다
+#   STALE   = **클러스터 상태가 바뀌어 전제가 깨졌다** (기획 08). 아직 판정하는 코드가 없다
+# 사용자 안내가 갈린다 — "카드가 만료됐으니 다시 요청하세요" vs "상황이 바뀌었으니 다시 계획합니다".
+# 예전에는 앞엣것에 STALE 을 썼는데, DURO-83 이 그 이름을 08 용으로 정해 둔 것을 어긴 것이었다.
+PLAN_FAILURE_REASONS = (
+    "PERMISSION_DENIED",           # RBAC 거부
+    "CONCURRENT_MODIFICATION",     # 다른 사람이 먼저 바꿨다 (기획 08, 아직 판정하지 않는다)
+    "DRY_RUN_FAILED",              # 승인 전 예행에서 떨어졌다
+    "EXECUTION_FAILED",            # kubectl 이 실패했다
+    "VERIFICATION_FAILED",         # 적용은 됐지만 효과 확인이 실패했다 (기획 09)
+    "VERIFICATION_TIMEOUT",
+)
+
+PLAN_RISKS = ("caution", "destructive")
+
 
 
 class ChatSession(Base):
@@ -91,3 +128,50 @@ class ChatRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     session: Mapped[ChatSession] = relationship(back_populates="runs")
+    plans: Mapped[list["ActionPlan"]] = relationship(back_populates="run", order_by="ActionPlan.created_at")
+
+
+class ActionPlan(Base):
+    """Kubernetes 변경 1건의 계획·결정·실행 결과 (DB 문서 5절).
+
+    읽기 도구 호출은 여기 오지 않는다 — 변경 툴 4종만. plan 은 반드시 run 에 속하므로
+    run 이 없는 flat 엔드포인트(/chat, /approve)의 계획은 이 표에 들어오지 않고 .md 로만 남는다.
+    소유자는 run_id → session_id → user_id 로 거슬러 찾는다 (문서 6절, 회원 id 를 여기 중복 저장하지 않는다).
+    """
+
+    __tablename__ = "tbl_action_plan"
+    __table_args__ = (
+        # 문서 5절 "tool_call_id 는 실행 안에서 중복 불가"
+        UniqueConstraint("run_id", "tool_call_id", name="uq_plan_tool_call"),
+        # 문서 5절: 승인·실행 상태에는 그에 맞는 결정·결과가 있어야 한다. 저장된 값의 앞뒤가 맞는지만 보는 검사이고,
+        # 클러스터의 현재 상태를 증명하지는 않는다.
+        CheckConstraint(
+            "status NOT IN ('APPROVED', 'EXECUTING', 'APPLIED', 'EFFECT_VERIFIED') OR decision IS NOT NULL",
+            name="ck_plan_decision_present",
+        ),
+        CheckConstraint(
+            "status NOT IN ('APPLIED', 'EFFECT_VERIFIED') OR (execution_result IS NOT NULL AND applied_at IS NOT NULL)",
+            name="ck_plan_applied_has_result",
+        ),
+        CheckConstraint("status <> 'FAILED' OR failure_reason IS NOT NULL", name="ck_plan_failed_has_reason"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)                 # ap-260910-1530-scale-resource (.md 파일 이름과 같다)
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tbl_chat_run.id", ondelete="RESTRICT"), index=True,
+    )
+    tool_call_id: Mapped[str] = mapped_column(String(64), index=True)             # 모델의 도구 호출 id
+    tool_name: Mapped[str] = mapped_column(String(50))                            # MUTATING_TOOLS
+    status: Mapped[str] = mapped_column(String(30))                               # PLAN_STATUSES
+    risk: Mapped[str] = mapped_column(String(20))                                 # PLAN_RISKS
+    plan_payload: Mapped[dict] = mapped_column(JSON)                              # 명령·대상·인자·의도·예상 효과·부작용·예행·판단 가이드
+    request_hash: Mapped[str] = mapped_column(String(64))                         # 승인한 내용과 실행 요청이 같은지 확인
+    decision: Mapped[dict | None] = mapped_column(JSON, nullable=True)            # {approved, user_id, at}. 결정 전 null
+    execution_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)    # {success, exit_code, stdout, stderr, at}
+    failure_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)  # PLAN_FAILURE_REASONS
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # ↑ 검증이 실패해도(FAILED + VERIFICATION_FAILED) "적용은 됐다" 는 사실이 남게 별도 칸 (DURO-83, 강효승 요청)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    run: Mapped[ChatRun] = relationship(back_populates="plans")
