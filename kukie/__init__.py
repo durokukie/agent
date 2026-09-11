@@ -7,9 +7,9 @@
     cli.py         진입점 (kukie chat)
     validators.py  출력 검증 (설명 필드 강제 — 기능 1 핵심 훅)
     kubectl/       kubectl 실행 계층 (조립·subprocess)
-    tools/         읽기 6종 + 변경 4종
-    skills/        스킬 5종 (프롬프트 + 툴 목록 + 응답 스키마)
-    guardrail/     가드레일 훅 (룰 엔진·Action Plan·승인) — 기능 2
+    tools/         읽기 5종 + 변경 4종
+    skills/        스킬 3종 (프롬프트 + 툴 목록 + 응답 스키마)
+    guardrail/     가드레일 훅 (dry-run·Action Plan·Deferred 승인) — 기능 2
 
 설정(.env)은 여기서 가장 먼저 읽는다. KUKIE_MODEL·KUKIE_GUIDANCE_MODEL 은 각 모듈이
 import 시점에 os.environ 에서 읽으므로, 그 전에 로드되지 않으면 .env 값이 무시된다.
