@@ -219,7 +219,7 @@ def test_apply_manifest_결정과_cluster상태가_일치한다(
     assert e2e_namespace != e2e_session_namespace
     calls = []
 
-    def traced_run(command, *, context, dry_run=False, stdin=None, timeout=30):
+    def traced_run(command, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None):
         calls.append((list(command), context, dry_run, stdin))
         return real_run_kubectl(
             command,
@@ -227,6 +227,7 @@ def test_apply_manifest_결정과_cluster상태가_일치한다(
             dry_run=dry_run,
             stdin=stdin,
             timeout=timeout,
+            kubeconfig=kubeconfig,
         )
 
     monkeypatch.setattr(hook, "run_kubectl", traced_run)
