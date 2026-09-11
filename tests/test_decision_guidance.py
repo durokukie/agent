@@ -2,7 +2,6 @@ import os
 from pathlib import Path
 
 import pytest
-from pydantic_ai import models
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
@@ -14,8 +13,6 @@ from kukie.guardrail.decision_guidance import (
     generate_decision_guidance,
     guidance_agent,
 )
-
-models.ALLOW_MODEL_REQUESTS = False
 
 
 def _ready_plan(monkeypatch, tmp_path: Path) -> ActionPlan:
