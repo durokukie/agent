@@ -35,7 +35,10 @@ def database_url() -> str:
 def _connect(url: str) -> tuple[Engine, sessionmaker[Session]]:
     connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
     engine = create_engine(url, connect_args=connect_args, future=True)
-    Base.metadata.create_all(engine)   # Alembic 은 Postgres 로 갈 때. SQLite MVP 는 create_all 로 충분
+    # create_all 은 **없는 표만** 만든다(checkfirst). 이미 있는 표의 열·인덱스 조건을 바꿔도
+    # 옛 DB 에는 안 나간다 — 예: Cluster 의 이름 유일성 인덱스에 `team_id = ''` 를 넣은 변경은
+    # 새로 만드는 DB 에만 적용된다 (자동 리뷰 지적, issue #67). Alembic 은 Postgres 로 갈 때.
+    Base.metadata.create_all(engine)
     return engine, sessionmaker(bind=engine, expire_on_commit=False)
 
 

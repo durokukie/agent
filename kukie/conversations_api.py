@@ -30,14 +30,16 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 
 import kukie.server as _server  # 순환 import: 이름은 호출 시점에만 쓴다
 from kukie.auth import User, current_user
 from kukie.clusters import crypto
+from kukie import membership
 from kukie.clusters.access import ClusterChanged, ClusterGone, kubeconfig_or_none
 from kukie.conversations import Conversation, registry
+from kukie.fields import blank_is_none, none_if_blank
 from kukie.skills import SKILLS
 from kukie.store import ChatStore, get_store
 from kukie.store.chat_store import ActiveRunExists, RequestMismatch, RunRow, SessionRow, error_payload
@@ -63,6 +65,11 @@ class ConversationIn(BaseModel):
     cluster_fingerprint: str | None = None    # 문서 3절 — 실제 대상 클러스터 확인값 (아직 서버가 계산하지 않는다)
     title: str = "새 대화"
     shared: bool = False
+
+    # `team_id: ""` 는 falsy 검사(팀 없음)와 IN 검사(그 팀만) 사이로 새어, 목록에서는 사라지는데
+    # 상세는 200 이 되는 방을 만든다 (자동 리뷰 지적). 클러스터 등록과 같은 규칙으로 접는다.
+    _blank = field_validator("cluster_id", "team_id", "context", "namespace",
+                             "installation_id", "cluster_fingerprint", mode="before")(blank_is_none)
 
 
 class ChatIn(BaseModel):
@@ -115,11 +122,24 @@ def _error(status: int, code: str, message: str) -> HTTPException:
     return HTTPException(status, {"code": code, "message": message})
 
 
-def _load(conversation_id: str, user: User, store: ChatStore) -> tuple[SessionRow, Conversation]:
-    """private 방은 주인만 (남에게는 없는 방, 404). shared 방은 팀원 누구나 읽고 입력한다 (문서 05 §4)."""
+async def _load(conversation_id: str, user: User, store: ChatStore) -> tuple[SessionRow, Conversation]:
+    """private 방은 주인만 (남에게는 없는 방, 404). shared 방은 **그 팀의 구성원**이 읽고 입력한다 (기획 05 §4).
+
+    팀 검사가 여기에도 있어야 한다. `/chat` 은 이 방의 클러스터로 kubectl 을 돌리므로, 로그인한
+    아무나 들어올 수 있으면 클러스터 소유권 검사를 방 만들 때만 걸어 둔 것이 무의미해진다 (자동 리뷰 🔴).
+    팀이 없는 방과 회원 서버가 없는 개발 모드는 예전대로 로그인한 사용자면 된다.
+    """
     row = store.get_session(conversation_id)
     if row is None or (row.user_id != user.id and not row.shared):
         raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
+    # 팀이 붙은 **shared** 방은 만든 사람에게도 지금 소속을 묻는다. 팀 공간이므로 나간 사람은 보면 안 된다.
+    #
+    # private 방은 읽기까지 막지 않는다. 자기 대화 기록인데 팀에서 나갔다는 이유로 열 수 없으면
+    # 되돌릴 방법이 없다 (대화 삭제 API 도 없다 — 자동 리뷰 지적). 대신 **클러스터를 쓰는 것**은
+    # 아래 _require_cluster_access 가 막는다. 읽기는 열고 실행은 닫는다.
+    if row.shared and row.team_id and membership.available():
+        if not await membership.is_member(user, row.team_id):
+            raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
     if registry.get(conversation_id) is None:
         registry.get_or_load(conversation_id, store)   # 복원하면서 밀린 run 을 닫으므로 row 를 다시 읽는다
         row = store.get_session(conversation_id) or row
@@ -138,13 +158,34 @@ def _private_change_blocked(row: SessionRow) -> HTTPException:
                   "Private 대화에서는 클러스터를 변경할 수 없다 — 변경은 Shared 대화를 새로 만들어서 (기획 05)")
 
 
-def _require_approver(row: SessionRow, user: User) -> None:
-    """승인·재개 = 클러스터 변경. 기획 06 은 Admin 또는 대상의 Operator 인 팀원에게 여는데, 팀·권한 정보는 Spring 팀 API 가
-    생겨야 온다. 그 전까지는 로그인한 아무나 승인하지 않도록 **방을 만든 사람만** (팀원 리뷰 6) — 팀 API 가 붙으면 넓힌다."""
+async def _require_approver(row: SessionRow, user: User) -> None:
+    """승인·재개 = 클러스터 변경. 기획 06 §3 은 팀 Admin 에게 연다.
+
+    팀이 붙은 shared 방은 Spring 에 역할을 물어 **구성원인지 먼저 보고**, Admin 이거나 방을 만든
+    사람이면 통과시킨다 (kukie/membership.py).
+    팀이 없는 방이나 회원 서버가 없는 개발 모드는 예전 규칙대로 **만든 사람만** — 로그인한 아무나
+    남의 클러스터를 바꾸지 못하게 (팀원 리뷰 6).
+
+    기획 06 은 "대상의 Operator 권한이 있는 Member" 도 승인할 수 있다고 하는데 Operator 는 아직 없다 (기획 03).
+    """
     if not row.shared:
         raise _private_change_blocked(row)
-    if row.user_id != user.id:
-        raise _error(403, "FORBIDDEN", "승인·재개는 지금은 대화를 만든 사람만 할 수 있다 (팀 권한 검사가 붙기 전까지)")
+    if row.team_id and membership.available():
+        # 소속을 먼저 본다. 주인을 먼저 통과시키면 나간 사람이 옛 방에서 계속 승인한다 (자동 리뷰 🔴).
+        # 소속만 확인되면 Admin 이거나 **방을 만든 사람**이면 승인할 수 있다.
+        #
+        # 기획 06 §3 은 "요청한 사용자 본인도 자신의 Plan 을 승인할 수 있다" 인데, 여기 비교하는 값은
+        # 요청자가 아니라 방 생성자다 — run 에 요청자 칸이 없다 (DB 문서 6절이 회원 id 중복 저장을
+        # 금한다). shared 방은 팀원 누구나 입력하므로 둘이 갈릴 수 있다 (자동 리뷰 지적):
+        # 남이 요청한 카드를 방 주인이 누를 수 있고, 요청한 Member 는 자기 카드를 못 누른다.
+        # 팀 밖으로 새지는 않아 지금은 이대로 두고, 요청자를 run 에 남길지는 #62 의 requested_by
+        # 질문과 함께 정한다.
+        if await membership.require_member(user, row.team_id) == "ADMIN" or row.user_id == user.id:
+            return
+        raise _error(403, "NOT_TEAM_ADMIN", "승인·재개는 팀 Admin 이나 대화를 만든 사람만 할 수 있다")
+    if row.user_id == user.id:
+        return
+    raise _error(403, "FORBIDDEN", "승인·재개는 대화를 만든 사람이나 팀 Admin 만 할 수 있다")
 
 
 def _messages_json(result: Any) -> list[Any]:
@@ -182,6 +223,22 @@ def _cluster_error(exc: Exception, cluster_id: str | None) -> HTTPException:
     if isinstance(exc, crypto.SecretKeyMissing):
         return _error(503, "SECRET_KEY_MISSING", str(exc))
     return _error(503, "CREDENTIAL_UNREADABLE", str(exc))
+
+
+async def _require_cluster_access(store: ChatStore, row: SessionRow, user: User) -> None:
+    """이 방의 클러스터를 지금 쓸 수 있나. 읽기(_load)와 달리 **실행 직전**에 본다.
+
+    팀에서 나간 사람이 자기 private 방은 계속 읽되 그 팀 클러스터로 kubectl 을 돌리지는 못하게 한다.
+    판단 규칙은 /clusters 의 _readable 과 같다.
+    """
+    if not row.cluster_id or not membership.available():
+        return
+    cluster = store.get_cluster(row.cluster_id)
+    if cluster is None or not cluster.team_id:
+        return
+    if not await membership.is_member(user, cluster.team_id):
+        raise _error(403, "NOT_TEAM_MEMBER",
+                     "이 대화가 쓰는 클러스터의 팀 구성원이 아닙니다")
 
 
 def _with_cluster(store: ChatStore, session: Any, row: SessionRow):
@@ -227,6 +284,12 @@ async def create_conversation(
     namespace = (body.namespace or "").strip()
     fingerprint = body.cluster_fingerprint
     team_id = body.team_id
+    if team_id and not body.cluster_id and membership.available():
+        # 클러스터를 고르지 않은 방은 team_id 를 클라이언트가 정한다. 이 값이 이제 방을 여닫는
+        # 열쇠라(_load) 검사 없이 두면 두 가지가 깨진다 (자동 리뷰 🔴):
+        #   ① 없는 팀을 적으면 만든 사람도 자기 방에 못 들어가고 지울 방법도 없다
+        #   ② 남의 팀을 적으면 그 팀 구성원이 들어오는 방을 외부인이 심을 수 있다
+        await membership.require_member(user, team_id)
     if body.cluster_id:
         # 등록된 클러스터를 골랐다 (기획 04 §8). 접속 대상은 그 행이 정한다 — 화면이 보낸 값보다 우선한다.
         #
@@ -234,8 +297,21 @@ async def create_conversation(
         # 그 방에서 승인해 남의 클러스터를 바꿀 수 있다 (자동 리뷰 P1). 실행할 때 자격증명이
         # 복호화되어 kubectl 로 가므로 조회로 끝나지 않는다.
         cluster = store.get_cluster(body.cluster_id)
-        if cluster is None or cluster.registered_by != user.id:
+        if cluster is None:
             raise _error(404, "NOT_FOUND", f"클러스터가 없다: {body.cluster_id}")
+        # 판단 규칙은 /clusters 의 _readable 과 같아야 한다 (자동 리뷰 🔴). 팀 클러스터는 등록자여도
+        # 지금 소속으로, 개인 클러스터는 등록한 사람만. 두 규칙이 어긋나면 양방향으로 샌다 —
+        # 팀에서 나간 사람이 방을 통해 계속 바꾸거나, 팀원인데 방을 못 만들거나.
+        if cluster.team_id and membership.available():
+            if not await membership.is_member(user, cluster.team_id):
+                raise _error(404, "NOT_FOUND", f"클러스터가 없다: {body.cluster_id}")
+        elif cluster.registered_by != user.id:
+            raise _error(404, "NOT_FOUND", f"클러스터가 없다: {body.cluster_id}")
+        if body.team_id and body.team_id != cluster.team_id:
+            # 조용히 덮으면 요청보다 **더 열린** 방이 된다 — 개인 클러스터를 고르고 team_id 를 같이
+            # 보내면 team_id 가 None 으로 사라져 "팀으로 좁혀 달라" 가 "전원 공개" 가 됐다 (자동 리뷰).
+            raise _error(400, "CLUSTER_TEAM_MISMATCH",
+                         "고른 클러스터의 팀과 team_id 가 다릅니다 — 방의 팀은 클러스터가 정합니다")
         context = cluster.context_name
         namespace = namespace or cluster.default_namespace
         fingerprint = cluster.fingerprint      # 방이 지문을 복사해 "승인한 대상 = 실행 대상" 을 확인한다
@@ -269,7 +345,9 @@ async def list_conversations(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> list[dict[str, Any]]:
-    rows = store.list_sessions(user.id, cluster_id=cluster_id)
+    # 목록과 상세의 답이 같아야 한다 — 열 수 없는 방이 목록에 뜨면 사용자가 막다른 길에 선다
+    mine = list(await membership.team_roles(user)) if membership.available() else None
+    rows = store.list_sessions(user.id, cluster_id=none_if_blank(cluster_id), team_ids=mine)
     return [_conversation_view(r, running=_is_running(r)) for r in rows]
 
 
@@ -284,7 +362,7 @@ async def get_conversation(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    row, conversation = _load(conversation_id, user, store)
+    row, conversation = await _load(conversation_id, user, store)
     return {
         "conversation": _conversation_view(row, running=_is_running(row)),
         "session": _server._session_view(conversation.session),
@@ -299,7 +377,7 @@ async def chat(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    row, conversation = _load(conversation_id, user, store)
+    row, conversation = await _load(conversation_id, user, store)
     session = conversation.session
     is_mode = body.text.startswith("/mode ")
     kind = "mode_change" if is_mode else "chat"
@@ -317,6 +395,12 @@ async def chat(
             stored = store.find_run(conversation_id, body.request_id) or stored
         return _replay(stored)
 
+    # 권한 검사는 **잠금 검사보다 먼저** 한다. 이유가 둘이다 (자동 리뷰).
+    #   - run 을 만들기 전이어야 한다. 뒤에서 던지면 그 run 이 running 인 채 남고, 같은 request_id 로
+    #     재시도하면 403 대신 409 INTERRUPTED 라는 엉뚱한 안내가 나간다
+    #   - `lock.locked()` 검사와 `async with lock` 사이에 await 가 있으면 안 된다. 그 창에서 루프를
+    #     놓으면 두 요청이 나란히 통과해 같은 방에 run 이 둘 생긴다 (체크리스트 "잠금 틈")
+    await _require_cluster_access(store, row, user)
     if conversation.lock.locked():
         raise _busy()
     if session.pending is not None:
@@ -515,9 +599,10 @@ async def approve(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    row, conversation = _load(conversation_id, user, store)
+    row, conversation = await _load(conversation_id, user, store)
     session = conversation.session
-    _require_approver(row, user)
+    await _require_approver(row, user)
+    await _require_cluster_access(store, row, user)   # 잠금 검사보다 먼저 — 그 사이에 await 가 있으면 안 된다
     if conversation.lock.locked():
         raise _busy()
     run = _open_run(store, conversation_id)
@@ -542,9 +627,10 @@ async def resume(
     user: User = Depends(current_user),
     store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    row, conversation = _load(conversation_id, user, store)
+    row, conversation = await _load(conversation_id, user, store)
     session = conversation.session
-    _require_approver(row, user)
+    await _require_approver(row, user)
+    await _require_cluster_access(store, row, user)   # 잠금 검사보다 먼저 — 그 사이에 await 가 있으면 안 된다
     if conversation.lock.locked():
         raise _busy()
     if session.pending is None:

@@ -37,6 +37,34 @@ class ClusterInUse(RuntimeError):
     """이 클러스터를 쓰는 채팅방이 남아 있어 지울 수 없다."""
 
 
+def _visible_sessions(user_id: str, team_ids: list[str] | None) -> Any:
+    """내가 볼 수 있는 방을 고르는 조건 한 벌 — 방 목록·계획 목록이 같은 규칙을 써야 한다.
+
+    _load(conversations_api) 와 같은 규칙이어야 "목록에 있는데 열 수 없는 것" 이 안 생긴다.
+      private 방 → 내 것이면 보인다 (자기 기록이라 읽기는 열어 뒀다)
+      shared 방  → 팀이 없거나 내가 그 팀 구성원일 때만. **내가 만든 방도 마찬가지**다
+    team_ids 를 안 주면(개발 모드 = 회원 서버 없음) 예전처럼 shared 전부.
+    """
+    if team_ids is None:
+        return or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True))
+    my_private = (ChatSession.user_id == user_id) & ChatSession.shared.is_(False)
+    # `""` 도 "팀 없음" 으로 본다 — _load 는 falsy 라 팀 검사를 건너뛰므로, 여기서 IN 에만 맡기면
+    # 목록에선 사라지는데 상세는 200 인 방이 남는다 (자동 리뷰 지적). 새로 들어오는 값은
+    # ConversationIn 이 None 으로 접지만 이미 저장된 행이 있을 수 있다.
+    no_team = or_(ChatSession.team_id.is_(None), ChatSession.team_id == "")
+    open_shared = ChatSession.shared.is_(True) & or_(no_team, ChatSession.team_id.in_(team_ids))
+    return or_(my_private, open_shared)
+
+
+@dataclass(frozen=True)
+class PlanScope:
+    """계획이 속한 방의 권한 정보 — plans_api 가 _load 와 같은 규칙을 걸 때 쓴다."""
+
+    owner_id: str
+    shared: bool
+    team_id: str | None
+
+
 @dataclass(frozen=True)
 class SessionRow:
     id: str
@@ -285,12 +313,17 @@ class ChatStore:
                 return None
             return SessionRow.of(row, running=self._has_run_with(db, session_id, ("running",)))
 
-    def list_sessions(self, user_id: str, *, cluster_id: str | None = None) -> list[SessionRow]:
-        """내 방 + shared 방 (기획 05 §4: 팀원이 같이 본다). 팀 소속으로 좁히는 건 Spring 팀 API 뒤 — 지금은 shared 전부."""
+    def list_sessions(
+        self, user_id: str, *, team_ids: list[str] | None, cluster_id: str | None = None
+    ) -> list[SessionRow]:
+        """내 방 + 내가 볼 수 있는 shared 방 (기획 05 §4: 팀원이 같이 본다).
+
+        team_ids 는 부르는 쪽이 회원 서버에서 받아 넘긴다. 주면 팀이 붙은 shared 방은 그 목록에
+        든 팀만 보인다 — 목록과 상세(_load)의 답이 달라 "목록에 있는데 열 수 없는 방" 이 생기던 것을
+        맞춘다 (자동 리뷰 지적). 주지 않으면(개발 모드) 예전처럼 shared 전부.
+        """
         with self._factory() as db:
-            stmt = select(ChatSession).where(
-                or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True))
-            )
+            stmt = select(ChatSession).where(_visible_sessions(user_id, team_ids))
             if cluster_id is not None:
                 stmt = stmt.where(ChatSession.cluster_id == cluster_id)
             stmt = stmt.order_by(ChatSession.updated_at.desc())
@@ -483,19 +516,23 @@ class ChatStore:
             return [PlanRow.of(r) for r in rows]
 
     def list_plan_summaries(
-        self, user_id: str, *, cluster_id: str | None = None, status: str | None = None,
+        self, user_id: str, *, team_ids: list[str] | None, cluster_id: str | None = None,
+        status: str | None = None,
     ) -> list[PlanSummaryRow]:
-        """대시보드 목록. 내 방 + shared 방의 계획만 (list_sessions 와 같은 범위).
+        """대시보드 목록. 내 방 + 내가 볼 수 있는 shared 방의 계획만 (list_sessions 와 **같은 범위**).
+
+        team_ids 는 부르는 쪽이 회원 서버에서 받아 넘긴다 — 안 넘기면 남의 팀 방 계획까지 섞인다
+        (자동 리뷰 지적). 대화 목록과 규칙이 다르면 "목록엔 있는데 열 수 없는 계획" 이 생긴다.
 
         requested_by 는 방 주인이다 — run 에 요청자 칸이 없다 (문서 6절 "회원 id 를 중복 저장하지 않는다").
-        shared 방에서 팀원이 보낸 요청도 방 주인으로 표시된다. 팀 API 가 붙을 때 다시 본다.
+        shared 방에서 팀원이 보낸 요청도 방 주인으로 표시된다.
         """
         with self._factory() as db:
             stmt = (
                 select(ActionPlan, ChatSession.cluster_id, ChatSession.user_id)
                 .join(ChatRun, ActionPlan.run_id == ChatRun.id)
                 .join(ChatSession, ChatRun.session_id == ChatSession.id)
-                .where(or_(ChatSession.user_id == user_id, ChatSession.shared.is_(True)))
+                .where(_visible_sessions(user_id, team_ids))
             )
             if cluster_id is not None:
                 stmt = stmt.where(ChatSession.cluster_id == cluster_id)
@@ -521,16 +558,20 @@ class ChatStore:
                 for plan, cluster, owner in found
             ]
 
-    def plan_scope(self, plan_id: str) -> tuple[str, bool] | None:
-        """이 계획이 속한 방의 (주인, shared) — 접근 권한 검사용. plan 에 회원 id 를 두지 않으므로 거슬러 올라간다 (문서 6절)."""
+    def plan_scope(self, plan_id: str) -> "PlanScope | None":
+        """이 계획이 속한 방의 (주인, shared, 팀) — 접근 권한 검사용.
+
+        plan 에 회원 id 를 두지 않으므로 run → session 으로 거슬러 올라간다 (문서 6절). 팀까지 주는
+        것은 부르는 쪽이 _load 와 같은 규칙(팀 방은 구성원만)을 걸 수 있어야 하기 때문이다.
+        """
         with self._factory() as db:
             row = db.execute(
-                select(ChatSession.user_id, ChatSession.shared)
+                select(ChatSession.user_id, ChatSession.shared, ChatSession.team_id)
                 .join(ChatRun, ChatRun.session_id == ChatSession.id)
                 .join(ActionPlan, ActionPlan.run_id == ChatRun.id)
                 .where(ActionPlan.id == plan_id)
             ).first()
-            return (row[0], bool(row[1])) if row is not None else None
+            return PlanScope(row[0], bool(row[1]), row[2]) if row is not None else None
 
     # ── 클러스터 (기획 04 §8) ─────────────────────────────
 
@@ -540,6 +581,9 @@ class ChatStore:
         fingerprint: str, team_id: str | None = None, provider: str = "GENERIC",
     ) -> ClusterRow:
         with self._factory() as db:
+            # `""` 를 그대로 넣으면 이름 유일성 인덱스(WHERE team_id IS NULL)에 안 걸려 한 사람의
+            # 개인 목록에 같은 이름이 둘 뜬다. 읽는 쪽과 같은 규칙으로 여기서 접는다 (자동 리뷰 지적).
+            team_id = team_id or None
             row = Cluster(
                 team_id=team_id, registered_by=registered_by, name=name, provider=provider,
                 api_server=api_server, ca_data=ca_data, insecure=insecure,
@@ -562,16 +606,34 @@ class ChatStore:
             row = db.get(Cluster, cluster_id)
             return row.credential_encrypted if row is not None else None
 
-    def list_clusters(self, user_id: str, *, team_id: str | None = None) -> list[ClusterRow]:
-        """내가 등록한 것 + 내 팀 것. 팀 소속 검사는 부르는 쪽(Spring 팀 API)이 한다 — 지금은 team_id 로만 좁힌다."""
+    def list_clusters(
+        self, user_id: str, *, team_ids: list[str] | None, team_id: str | None = None
+    ) -> list[ClusterRow]:
+        """내가 볼 수 있는 클러스터. team_ids 는 부르는 쪽이 회원 서버에서 받아 넘긴다 (기본값 없음).
+
+        규칙은 clusters_api._readable 과 **한 벌**이어야 한다 — 다르면 "목록엔 없는데 상세·/test·
+        DELETE 는 되는" 행이 남는다 (자동 리뷰 지적).
+          개인 클러스터(팀 없음) → 등록한 사람만
+          팀 클러스터           → 지금 그 팀 구성원만. 등록자여도 나갔으면 안 보인다 (자동 리뷰 P1)
+          team_ids 가 None      → 회원 서버 없는 개발 모드. _readable 이 등록자로 판정하므로 같게 둔다
+
+        team_id 는 그 위에 **좁히기만** 한다. 소유·소속 조건을 대신하면 개발 모드에서 윗층
+        require_member 도 건너뛰어 남의 팀 목록이 그대로 나간다 (자동 리뷰 지적).
+        """
         with self._factory() as db:
-            stmt = select(Cluster)
+            # `""` 도 "팀 없음" 으로 본다 — _readable 은 falsy 라 팀 검사를 건너뛰므로, 여기서
+            # IS NULL 에만 맡기면 목록엔 없는데 상세는 되는 행이 남는다.
+            no_team = or_(Cluster.team_id.is_(None), Cluster.team_id == "")
+            if team_ids is None:
+                visible = Cluster.registered_by == user_id          # 개발 모드
+            else:
+                visible = or_(
+                    (Cluster.registered_by == user_id) & no_team,
+                    ~no_team & Cluster.team_id.in_(team_ids),
+                )
+            stmt = select(Cluster).where(visible)
             if team_id is not None:
                 stmt = stmt.where(Cluster.team_id == team_id)
-            else:
-                stmt = stmt.where(
-                    or_(Cluster.registered_by == user_id, Cluster.team_id.is_not(None))
-                )
             rows = db.scalars(stmt.order_by(Cluster.created_at)).all()
             return [ClusterRow.of(r) for r in rows]
 

@@ -1,7 +1,8 @@
 """요청이 누구 것인지 — Spring 회원 서버(kukie-server) 에 토큰을 확인한다.
 
 앱은 Spring 에서 받은 JWT 를 모든 요청에 `Authorization: Bearer` 로 붙인다 (api-spec 5절).
-agent 는 그 토큰으로 Spring `GET /users/me` 를 불러 회원 id 를 얻는다. 팀·권한 판단도 Spring 몫이다.
+agent 는 그 토큰으로 Spring `GET /users/me` 를 불러 회원 id 를 얻는다. 팀·권한 판단도 Spring 몫이라
+같은 토큰으로 `GET /teams` 를 물어 역할을 받는다 (kukie/membership.py).
 
 fail-closed: 설정이 빠지면 거부한다.
   - KUKIE_MEMBER_URL 이 있으면 Bearer 토큰만 받는다. 개발용 헤더·변수는 무시.
@@ -24,6 +25,9 @@ class User:
     id: str
     email: str | None = None
     name: str | None = None
+    # 이 요청의 Bearer 토큰. 팀 소속을 물을 때 같은 토큰을 그대로 쓴다 (kukie/membership.py).
+    # 요청 처리 동안 메모리에만 있고 저장·기록되지 않는다. 개발 모드면 None.
+    token: str | None = None
 
 
 def _member_url() -> str | None:
@@ -51,7 +55,7 @@ async def _lookup(token: str, member_url: str) -> User:
     if response.status_code != 200:
         raise HTTPException(503, {"code": "MEMBER_UNAVAILABLE", "message": f"회원 서버 응답 {response.status_code}"})
     body = response.json()
-    return User(id=str(body["id"]), email=body.get("email"), name=body.get("name"))
+    return User(id=str(body["id"]), email=body.get("email"), name=body.get("name"), token=token)
 
 
 async def current_user(
