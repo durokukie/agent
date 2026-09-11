@@ -34,7 +34,7 @@ def client(monkeypatch, tmp_path):
     conversations.registry.clear()
     monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
     monkeypatch.setattr(read_tools, "run_kubectl",
-                        lambda args, *, context, dry_run=False, stdin=None, timeout=30:
+                        lambda args, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None:
                         KubectlResult(command=FAKE_COMMAND, stdout="nginx Running", stderr="", success=True))
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     return TestClient(server.app)
@@ -57,10 +57,9 @@ def test_채팅방을_만들면_kubeconfig_대상으로_세션이_열린다(clie
 
 def test_context를_직접_주면_kubeconfig를_읽지_않는다(client, monkeypatch):
     monkeypatch.setattr(server, "read_kubeconfig", lambda: (_ for _ in ()).throw(AssertionError("읽으면 안 됨")))
-    r = client.post("/conversations", json={"context": "prod", "namespace": "web", "cluster_id": "cl-1"},
-                    headers=USER)
+    r = client.post("/conversations", json={"context": "prod", "namespace": "web"}, headers=USER)
     assert r.json()["session"]["context"] == "prod"
-    assert r.json()["conversation"]["cluster_id"] == "cl-1"
+    assert r.json()["conversation"]["cluster_id"] is None
 
 
 def test_kubeconfig를_못_읽으면_503_KUBECONFIG(client, monkeypatch):

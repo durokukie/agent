@@ -50,7 +50,7 @@ def client(monkeypatch, tmp_path):
 def guarded_runtime(monkeypatch):
     executions = []
 
-    def dry_run(command, *, context, dry_run=False, stdin=None, timeout=30):
+    def dry_run(command, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None):
         assert context == "kind-dev"
         assert dry_run is True
         return KubectlResult(
@@ -64,7 +64,7 @@ def guarded_runtime(monkeypatch):
     async def guidance(plan):
         return "대상과 복구 기준을 확인한다."
 
-    def execute(command, *, context, dry_run=False, stdin=None, timeout=30):
+    def execute(command, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None):
         executions.append((command, context, stdin))
         return KubectlResult(
             command=f"kubectl --context {context} {' '.join(command)}",

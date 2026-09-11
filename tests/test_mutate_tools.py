@@ -17,7 +17,7 @@ INTENT = dict(intent="테스트 의도", expected_effects=["영향"], side_effec
 
 
 def _ctx(context="kind-dev", namespace="study"):
-    return SimpleNamespace(deps=SimpleNamespace(context=context, namespace=namespace))
+    return SimpleNamespace(deps=SimpleNamespace(context=context, namespace=namespace, kubeconfig=None))
 
 
 @pytest.fixture
@@ -25,7 +25,7 @@ def captured():
     """run_kubectl을 가로채 조립된 args와 stdin을 기록한다."""
     box = {}
 
-    def fake_run(args, *, context, dry_run=False, stdin=None, timeout=30):
+    def fake_run(args, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None):
         box.update(args=args, context=context, dry_run=dry_run, stdin=stdin)
         return KubectlResult(command=" ".join(args), stdout="", stderr="", success=True)
 

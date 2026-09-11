@@ -31,7 +31,7 @@ def client(monkeypatch, tmp_path):
     server._session = None
     monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
     monkeypatch.setattr(read_tools, "run_kubectl",
-                        lambda args, *, context, dry_run=False, stdin=None, timeout=30:
+                        lambda args, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None:
                         KubectlResult(command=FAKE_COMMAND, stdout="nginx Running", stderr="", success=True))
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)   # 홈의 실제 계획서를 읽지 않게
     return TestClient(server.app)

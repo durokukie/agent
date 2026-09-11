@@ -362,3 +362,4 @@ async def _resume(session: Session) -> tuple[dict[str, Any], Any]:
 # 라우터 등록은 conversations_api 가 자기 맨 아래에서 app.include_router 로 한다.
 import kukie.conversations_api  # noqa: E402, F401
 import kukie.plans_api  # noqa: E402, F401
+import kukie.clusters_api  # noqa: E402, F401

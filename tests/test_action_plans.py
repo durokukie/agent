@@ -13,6 +13,7 @@ from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
 from kukie import conversations, server
+from kukie.clusters import crypto
 from kukie.agent import agent
 from kukie.guardrail import action_plan, hook
 from kukie.kubectl import KubectlResult
@@ -46,6 +47,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.delenv("KUKIE_MEMBER_URL", raising=False)
     monkeypatch.delenv("KUKIE_DEV_USER", raising=False)
     monkeypatch.setenv("KUKIE_DEV_AUTH", "1")
+    monkeypatch.setenv(crypto.KEY_ENV, crypto.generate_key())   # 클러스터 자격증명 암호화 (기획 04 §8)
     reset_store_for_tests(f"sqlite:///{tmp_path / 'test.db'}")
     conversations.registry.clear()
     monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
@@ -81,6 +83,17 @@ def _room(client, headers=USER, **body) -> str:
     r = client.post("/conversations", json=body, headers=headers)
     assert r.status_code == 200, r.text
     return r.json()["conversation"]["id"]
+
+
+
+def _register_cluster(cluster_id_hint: str = "cl-1", *, user_id: str = "u-1") -> str:
+    """등록된 클러스터 한 줄. 방의 cluster_id 는 이제 tbl_cluster 를 가리켜야 한다 (기획 04 §8)."""
+    row = get_store().create_cluster(
+        registered_by=user_id, name=cluster_id_hint, api_server="https://cluster.example",
+        ca_data="QQ==", insecure=False, credential_encrypted=crypto.encrypt({"token": "t"}), context_name="kind-dev",
+        default_namespace="study", fingerprint="f-" + cluster_id_hint,
+    )
+    return row.id
 
 
 def _card(client, room, *, call_id="call-1", headers=USER, args=None, tool="scale_resource"):
@@ -195,14 +208,15 @@ def test_run이_없는_flat_엔드포인트의_계획은_표에_들어가지_않
 # ── GET /action-plans ─────────────────────────────────────
 
 def test_목록은_내_방과_shared_방의_계획을_최신순으로_준다(client):
-    room = _room(client, cluster_id="cl-1")
+    cluster = _register_cluster()
+    room = _room(client, cluster_id=cluster)
     card = _card(client, room)
     rows = client.get("/action-plans", headers=USER).json()
 
     assert len(rows) == 1
     assert rows[0] == {
         "id": card["approvals"][0]["plan_id"],
-        "cluster_id": "cl-1",
+        "cluster_id": cluster,
         "title": SCALE_ARGS["intent"],          # 제목은 왜 하는지(intent)
         "status": "WAITING_APPROVAL",
         "running": False,
@@ -227,10 +241,11 @@ def test_남의_private_방_계획은_목록에도_상세에도_없다(client):
 
 
 def test_cluster_id와_status로_거른다(client):
-    room = _room(client, cluster_id="cl-1")
+    cluster = _register_cluster()
+    room = _room(client, cluster_id=cluster)
     _card(client, room)
 
-    assert len(client.get("/action-plans?cluster_id=cl-1", headers=USER).json()) == 1
+    assert len(client.get(f"/action-plans?cluster_id={cluster}", headers=USER).json()) == 1
     assert client.get("/action-plans?cluster_id=cl-2", headers=USER).json() == []
     assert len(client.get("/action-plans?status=WAITING_APPROVAL", headers=USER).json()) == 1
     assert client.get("/action-plans?status=APPLIED", headers=USER).json() == []
