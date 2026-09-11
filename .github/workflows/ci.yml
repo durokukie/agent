@@ -19,3 +19,27 @@ jobs:
           python-version: "3.10"
       - run: python -m pip install -e '.[dev]'
       - run: python -m pytest
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      KIND_VERSION: v0.32.0
+      KUKIE_E2E_CONTEXT: kind-kukie-e2e
+      KUKIE_MODEL: test
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: python -m pip install -e '.[dev]'
+      - name: Install kind
+        run: |
+          curl -fsSLO "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          curl -fsSLO "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64.sha256sum"
+          sha256sum -c kind-linux-amd64.sha256sum
+          sudo install -m 0755 kind-linux-amd64 /usr/local/bin/kind
+      - run: kind create cluster --name kukie-e2e --wait 120s
+      - run: python -m pytest -q -m e2e
+      - if: always()
+        run: kind delete cluster --name kukie-e2e
