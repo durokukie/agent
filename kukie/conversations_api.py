@@ -39,11 +39,11 @@ from kukie.clusters import crypto
 from kukie import membership
 from kukie.clusters.access import ClusterChanged, ClusterGone, kubeconfig_or_none
 from kukie.conversations import Conversation, registry
-from kukie.fields import blank_is_none, none_if_blank
+from kukie.fields import blank_is_none, none_if_blank, stripped
 from kukie.skills import SKILLS
 from kukie.store import ChatStore, get_store
 from kukie.store.chat_store import ActiveRunExists, RequestMismatch, RunRow, SessionRow, error_payload
-from kukie.store.models import RUN_ACTIVE
+from kukie.store.models import DEFAULT_TITLE, RUN_ACTIVE
 from kukie.tools.mutate import MUTATING_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -63,13 +63,21 @@ class ConversationIn(BaseModel):
     namespace: str | None = None
     installation_id: str | None = None        # 문서 3절 — kubectl 을 실행하는 agent 설치 환경 (앱이 알면 준다)
     cluster_fingerprint: str | None = None    # 문서 3절 — 실제 대상 클러스터 확인값 (아직 서버가 계산하지 않는다)
-    title: str = "새 대화"
+    title: str = DEFAULT_TITLE
     shared: bool = False
 
     # `team_id: ""` 는 falsy 검사(팀 없음)와 IN 검사(그 팀만) 사이로 새어, 목록에서는 사라지는데
     # 상세는 200 이 되는 방을 만든다 (자동 리뷰 지적). 클러스터 등록과 같은 규칙으로 접는다.
     _blank = field_validator("cluster_id", "team_id", "context", "namespace",
                              "installation_id", "cluster_fingerprint", mode="before")(blank_is_none)
+
+    # 빈 제목은 기본 제목으로. `title: ""` 로 만든 방은 `row.title != DEFAULT_TITLE` 이 늘 참이라
+    # 첫 마디로 제목을 받을 자격을 영영 잃는다 (자동 리뷰 지적).
+    _title = field_validator("title", mode="before")(
+        # 문자열이 아닌 값은 stripped 가 그대로 흘려보내 str 검사에서 422 가 된다. 여기서 바로
+        # value.strip() 을 부르면 `{"title": 123}` 이 AttributeError → 500 으로 샌다 (자동 리뷰 지적).
+        lambda cls, value: DEFAULT_TITLE if blank_is_none(cls, value) is None else stripped(cls, value)
+    )
 
 
 class ChatIn(BaseModel):
@@ -461,6 +469,15 @@ async def chat(
         if status == "completed":
             _close_plans(store, run)
         store.update_session(conversation_id, current_mode=session.skill.name)
+        # 첫 마디로 방 제목을 짓는다 (#59). 제목이 될 수 있는 마디인지, 첫 턴인지는 저장소가 본다 —
+        # 판정이 두 곳에 갈라지면 한쪽만 고쳐진다 (자동 리뷰 지적). 라우팅 조건(`/mode ` 공백 포함)은
+        # router.py·server.py 와 셋이 같아야 하므로 그쪽은 건드리지 않는다.
+        if kind == "chat":
+            try:
+                store.name_from_first_message(conversation_id, body.text)
+            except Exception:
+                # 제목은 부가 정보다. 여기서 터지면 이미 completed 로 저장한 run 이 500 으로 뒤집힌다
+                logger.exception("제목 저장 실패 (conversation=%s)", conversation_id)
         return payload
 
 
