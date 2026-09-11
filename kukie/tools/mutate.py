@@ -81,7 +81,7 @@ def delete_resource(ctx: RunContext[Deps], kind: str, name: str, namespace: str,
 MUTATE_TOOLS = [apply_manifest, scale_resource, rollout_restart, delete_resource]
 
 # 위험도 스티커 — 함수를 만들 때 여기 등급을 함께 등록한다.
-# 등록 안 된 변경 툴은 훅에서 최고 등급으로 취급 (fail-closed).
+# 등록 안 된 변경 툴은 훅에서 승인 요청 전 실행 거부 (fail-closed).
 RISK_STICKERS: dict[str, Risk] = {
     "apply_manifest": Risk.CAUTION,
     "scale_resource": Risk.CAUTION,
