@@ -166,7 +166,12 @@ def _close_unrunnable(store: ChatStore, conversation_id: str) -> None:
     카드를 되살린다. 그래서 **불러올 때** 닫는다. 되살릴 수 없는 카드를 get_or_load 가 닫는 것과 같은
     규칙이고, 계획도 같이 EXPIRED / UNKNOWN 으로 닫힌다.
 
+    메모리에 떠 있는 세션은 고치지 않고 **버린다**. 카드만 지우면 history 에 답 없는 tool call 이 남아,
+    완료된 run 만 모으는 재시작 복원(_restore_history)과 상태가 갈린다 (PR #76 리뷰). 버리면 _load 의
+    get_or_load 가 재시작과 같은 규칙으로 다시 만들고, row 도 같이 다시 읽힌다.
+
     실행 중인 방은 건드리지 않는다. locked() 검사와 닫기 사이에 await 가 없다 (체크리스트 "잠금 틈").
+    회원 서버 모드에서 이 방은 잠금을 잡기 전에 CLUSTER_REQUIRED 로 끊기므로 실제로는 닿지 않는 방어다.
     """
     live = registry.get(conversation_id)
     if live is not None and live.lock.locked():
@@ -175,9 +180,7 @@ def _close_unrunnable(store: ChatStore, conversation_id: str) -> None:
         return
     _interrupt(store, conversation_id,
                "클러스터 없는 대화라 실행할 수 없어 닫았다 — 클러스터를 골라 새 대화를 시작해 주세요")
-    if live is not None:
-        live.session.pending = None
-        live.session.decisions.clear()
+    registry.forget(conversation_id)
 
 
 def _mutating_mode(name: str) -> bool:

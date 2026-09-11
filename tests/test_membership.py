@@ -801,3 +801,24 @@ def test_클러스터_없는_옛_방에_걸린_승인_카드는_불러올_때_�
     assert body["turns"][-1]["status"] == "interrupted"
     store = get_store()
     assert [p.status for run in store.list_runs(room) for p in store.list_plans_for_run(run.id)] == ["EXPIRED"]
+    # 두 갈래가 같은 상태여야 한다 — 메모리 쪽만 카드를 지우면 history 에 답 없는 tool call 이 남는다 (PR #76 리뷰)
+    assert conversations._unanswered_calls(conversations.registry.get(room).session.history) == {}
+
+
+@pytest.mark.asyncio
+async def test_실행_중인_클러스터_없는_방은_불러와도_닫지_않는다(client, spring):
+    """잠금을 쥔 run 을 밖에서 닫으면 끝난 뒤 결과를 닫힌 run 에 쓴다. 회원 서버 모드에서는 이 방이
+    잠금을 잡기 전에 CLUSTER_REQUIRED 로 끊겨 실제로는 닿지 않는다 — 방어용 갈래를 직접 부른다."""
+    from kukie import conversations_api
+
+    store = get_store()
+    room = store.create_session(
+        user_id="u-1", context_name="ctx", namespace="default", mode="학습", shared=True,
+    ).id
+    live = conversations.registry.register(store.get_session(room))
+    store.start_run(room, request_id="r-1", kind="chat", mode="학습", input_text="파드")
+
+    async with live.lock:
+        conversations_api._close_unrunnable(store, room)
+    assert store.active_run(room) is not None
+    assert conversations.registry.get(room) is live
