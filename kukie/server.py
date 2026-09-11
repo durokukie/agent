@@ -198,19 +198,28 @@ async def chat(body: ChatIn) -> dict[str, Any]:
         raise HTTPException(409, "이전 요청 처리 중 — 끝난 뒤 다시 보내라")
     if session.pending is not None:
         raise HTTPException(409, "승인 대기 중 — /approve 로 먼저 결정")
+    payload, _ = await _chat_turn(session, body.text)
+    return payload
 
-    skill = pick_skill(body.text, session.skill)
+
+async def _chat_turn(session: Session, text: str) -> tuple[dict[str, Any], Any]:
+    """한 턴. flat /chat 과 /conversations/{id}/chat 이 같이 쓴다.
+
+    반환 (payload, run 결과). 모드 전환만 한 입력은 LLM 을 안 부르므로 결과가 None 이다.
+    잠금·티켓 검사는 부르는 쪽이 한다 (flat 은 processing 플래그, 대화 단위는 asyncio.Lock).
+    """
+    skill = pick_skill(text, session.skill)
     if skill is not session.skill:
         session.deps = dataclasses.replace(session.deps, skill=skill)
-    if body.text.startswith("/mode "):          # 모드 전환만 한 입력은 LLM 을 부르지 않는다
-        requested = body.text.removeprefix("/mode ").strip()
-        return {"kind": "mode", "skill": session.skill.name,
-                "known": requested in SKILLS}   # 모르는 모드면 현재 스킬 유지 + known=False
+    if text.startswith("/mode "):          # 모드 전환만 한 입력은 LLM 을 부르지 않는다
+        requested = text.removeprefix("/mode ").strip()
+        return ({"kind": "mode", "skill": session.skill.name,
+                 "known": requested in SKILLS}, None)   # 모르는 모드면 현재 스킬 유지 + known=False
 
     session.processing = True
     try:
-        result = await _run_agent(session, user_prompt=body.text)
-        return _to_payload(session, result)
+        result = await _run_agent(session, user_prompt=text)
+        return _to_payload(session, result), result
     finally:
         session.processing = False
 
@@ -220,27 +229,36 @@ async def approve(body: ApproveIn) -> dict[str, Any]:
     session = _require_session()
     if session.processing:
         raise HTTPException(409, "이전 요청 처리 중 — 끝난 뒤 다시 보내라")
+    payload, _ = await _approve(session, body.call_id, body.approved)
+    return payload
+
+
+async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict[str, Any], Any]:
+    """승인 카드 한 장의 결정. flat /approve 와 /conversations/{id}/approve 가 같이 쓴다.
+
+    반환 (payload, run 결과). 남은 카드가 있어 재전송만 하면 결과가 None 이다.
+    """
     requests = session.pending
     if requests is None:
-        raise HTTPException(409, f"대기 중인 승인 건이 아니다: {body.call_id}")
-    if body.call_id in session.decisions:
-        raise HTTPException(409, f"이미 결정한 승인 건이다: {body.call_id}")
+        raise HTTPException(409, f"대기 중인 승인 건이 아니다: {call_id}")
+    if call_id in session.decisions:
+        raise HTTPException(409, f"이미 결정한 승인 건이다: {call_id}")
 
     call = next(
         (
             item
             for item in requests.approvals
-            if item.tool_call_id == body.call_id
+            if item.tool_call_id == call_id
         ),
         None,
     )
     if call is None:
-        raise HTTPException(409, f"대기 중인 승인 건이 아니다: {body.call_id}")
+        raise HTTPException(409, f"대기 중인 승인 건이 아니다: {call_id}")
 
     try:
         approval_request = build_approval_request(
             call,
-            requests.metadata.get(body.call_id, {}),
+            requests.metadata.get(call_id, {}),
             default_namespace=session.deps.namespace,
         )
     except (FileNotFoundError, ValueError) as exc:
@@ -248,16 +266,16 @@ async def approve(body: ApproveIn) -> dict[str, Any]:
 
     # 거절 기록은 run 밖에서 — 로컬 파일 쓰기일 뿐이라 실패해도 LLM 도 클러스터도 건드리지 않았다.
     # 결정을 남기지 않고 티켓을 그대로 두면 사용자가 같은 카드를 다시 누를 수 있다 (DURO-66 결정 불필요 1).
-    if not body.approved:
+    if not approved:
         try:
             ActionPlan.find_by_call_id(approval_request.tool_call_id).reject()
         except (OSError, ValueError) as exc:
             logger.exception("거절 기록 실패 — 티켓 유지 (call_id=%s, plan_id=%s)",
-                             body.call_id, approval_request.plan_id)
+                             call_id, approval_request.plan_id)
             raise HTTPException(503, f"거절을 기록하지 못했다. 같은 카드를 다시 결정하라: {exc}") from exc
-    session.decisions[body.call_id] = (
+    session.decisions[call_id] = (
         ToolApproved()
-        if body.approved
+        if approved
         else ToolDenied("사용자가 변경 요청을 거절했습니다.")
     )
 
@@ -267,7 +285,7 @@ async def approve(body: ApproveIn) -> dict[str, Any]:
         if call.tool_call_id not in session.decisions
     ]
     if remaining:
-        return _approval_payload(session, requests, remaining)
+        return _approval_payload(session, requests, remaining), None
     return await _resume(session)
 
 
@@ -284,7 +302,8 @@ async def resume() -> dict[str, Any]:
         raise HTTPException(409, "재개할 승인 건이 없다")
     if session.pending_ids:
         raise HTTPException(409, f"아직 결정하지 않은 승인 건이 있다: {session.pending_ids}")
-    return await _resume(session)
+    payload, _ = await _resume(session)
+    return payload
 
 
 def _pending_plan_ids(session: Session) -> list[str]:
@@ -297,7 +316,7 @@ def _pending_plan_ids(session: Session) -> list[str]:
     ]
 
 
-async def _resume(session: Session) -> dict[str, Any]:
+async def _resume(session: Session) -> tuple[dict[str, Any], Any]:
     """저장된 결정으로 run 을 재개한다. /approve(마지막 결정)와 /resume(재시도)이 함께 쓴다.
 
     실패해도 session.pending / decisions 를 건드리지 않는다 — 그대로 남아 있어야 /resume 이
@@ -309,7 +328,7 @@ async def _resume(session: Session) -> dict[str, Any]:
     try:
         results = session.pending.build_results(approvals=session.decisions)
         result = await _run_agent(session, deferred_tool_results=results)
-        return _to_payload(session, result)
+        return _to_payload(session, result), result
     except Exception as exc:
         logger.exception(
             "승인 재개 실패 — 세션·티켓 유지, /resume 으로 재시도 가능 (call_ids=%s, plan_ids=%s)",
@@ -329,3 +348,10 @@ async def _resume(session: Session) -> dict[str, Any]:
         ) from exc
     finally:
         session.processing = False
+
+
+# ── 대화(채팅방) 단위 엔드포인트 — kukie/conversations_api.py ──
+# flat 엔드포인트와 같은 _chat_turn / _approve / _resume 을 쓴다. 그 모듈이 이 모듈을 참조하므로
+# 맨 아래에서 plain import 만 한다 (from-import 는 순환 시 이름이 아직 없어 깨진다).
+# 라우터 등록은 conversations_api 가 자기 맨 아래에서 app.include_router 로 한다.
+import kukie.conversations_api  # noqa: E402, F401
