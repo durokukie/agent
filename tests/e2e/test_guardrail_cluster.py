@@ -219,7 +219,7 @@ def test_apply_manifest_결정과_cluster상태가_일치한다(
     assert e2e_namespace != e2e_session_namespace
     calls = []
 
-    def traced_run(command, *, context, dry_run=False, stdin=None, timeout=30):
+    def traced_run(command, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None):
         calls.append((list(command), context, dry_run, stdin))
         return real_run_kubectl(
             command,
@@ -227,6 +227,7 @@ def test_apply_manifest_결정과_cluster상태가_일치한다(
             dry_run=dry_run,
             stdin=stdin,
             timeout=timeout,
+            kubeconfig=kubeconfig,
         )
 
     monkeypatch.setattr(hook, "run_kubectl", traced_run)
@@ -255,7 +256,7 @@ def test_apply_manifest_결정과_cluster상태가_일치한다(
         "-n", e2e_session_namespace, "--ignore-not-found=true", "-o", "name",
     ).stdout.strip() == ""
     assert plan.target["namespace"] == e2e_namespace
-    assert plan.status == ("executed" if approved else "rejected")
+    assert plan.status == ("APPLIED" if approved else "REJECTED")
     expected_command = ["apply", "-f", "-", "-n", e2e_namespace]
     assert calls[0] == (expected_command, e2e_context, True, CONFIG_MAP)
     if approved:
@@ -294,7 +295,7 @@ def test_scale_resource_결정과_cluster상태가_일치한다(
         "jsonpath={.spec.replicas}",
     ).stdout
     assert replicas == ("2" if approved else "1")
-    assert plan.status == ("executed" if approved else "rejected")
+    assert plan.status == ("APPLIED" if approved else "REJECTED")
 
 
 @pytest.mark.parametrize("approved", [False, True])
@@ -326,7 +327,7 @@ def test_rollout_restart_결정과_cluster상태가_일치한다(
         "jsonpath={.spec.template.metadata.annotations.kubectl\\.kubernetes\\.io/restartedAt}",
     ).stdout
     assert bool(restarted_at) is approved
-    assert plan.status == ("executed" if approved else "rejected")
+    assert plan.status == ("APPLIED" if approved else "REJECTED")
 
 
 @pytest.mark.parametrize("approved", [False, True])
@@ -358,4 +359,4 @@ def test_delete_resource_결정과_cluster상태가_일치한다(
         "-o", "name",
     )
     assert found.stdout.strip() == ("" if approved else "deployment.apps/guardrail-nginx")
-    assert plan.status == ("executed" if approved else "rejected")
+    assert plan.status == ("APPLIED" if approved else "REJECTED")

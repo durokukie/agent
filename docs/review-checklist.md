@@ -6,11 +6,11 @@
 ## 🔴 머지 전에 반드시 — 가드레일 (안전)
 
 - **훅 우회**: 변경 툴(`MUTATING_TOOLS`)이 `guardrail/hook.py` 의 `guardrail()` 을 거치지 않고 `run_kubectl` 을 부르는 경로가 생겼나. 새 툴을 추가했으면 `MUTATING_TOOLS`·`RISK_STICKERS` 에 등록됐나 (누락 시 fail-closed 로 `ToolFailed` 여야 함).
-- **중복 실행**: 승인 재개가 kubectl 을 두 번 돌릴 수 있나. 훅의 승인 분기는 `execution_result` → `approval` → `approve_for_execution` 순서로 Plan 파일을 먼저 본다. 이 순서를 바꾸거나 건너뛰는 변경은 위험.
+- **중복 실행**: 승인 재개가 kubectl 을 두 번 돌릴 수 있나. 훅의 승인 분기는 `execution_result` → `decision` → `approve_for_execution` → `mark_executing` 순서로 Plan 을 먼저 본다. 이 순서를 바꾸거나 건너뛰는 변경은 위험.
 - **승인 = 실행 동일성**: `assemble()` 밖에서 kubectl args 를 조립하나 (`kubectl/assemble.py` 재조립 금지 원칙). 승인 화면의 command 와 실행 command 가 같은 함수·같은 입력에서 나와야 한다.
 - **args 검증 우회**: 승인 후 `approve_for_execution` 의 tool/args/command/risk/target 비교를 약화시켰나. `apply_manifest` 는 원문 대신 `manifest_sha256` 으로 비교한다.
-- **위험도 자기신고**: LLM 이 채우는 필드(narration, intent 등)로 위험도·승인 여부·실행 결과를 판단하는 코드가 생겼나. 위험도는 `RISK_STICKERS`, 실행 결과는 `KubectlResult`/Plan 파일만이 근거다.
-- **Plan 파일 상태 전이**: `draft → executed/failed/rejected` 외의 전이, 또는 `approval`/`execution_result` 를 지우거나 덮어쓰는 코드.
+- **위험도 자기신고**: LLM 이 채우는 필드(narration, intent 등)로 위험도·승인 여부·실행 결과를 판단하는 코드가 생겼나. 위험도는 `RISK_STICKERS`, 실행 결과는 `KubectlResult`/Plan 만이 근거다.
+- **Plan 상태 전이**: `DRAFT → WAITING_APPROVAL → APPROVED → EXECUTING → APPLIED → (EFFECT_VERIFIED)` 와 옆길(`REJECTED`·`EXPIRED`·`STALE`·`FAILED`·`UNKNOWN`) 외의 전이 (`EFFECT_VERIFIED` 는 기획 09, `STALE` 은 기획 08 — 아직 채우는 곳이 없다), 또는 `decision`/`execution_result` 를 지우거나 덮어쓰는 코드. 허용 전이는 `guardrail/action_plan.py` 머리말과 각 메서드의 상태 검사가 원본이다. Plan 의 원본은 `tbl_action_plan` 이고 `.md` 는 사본이다 (run 에 속하지 않는 flat `/chat`·`/approve` 계획만 파일로만 남는다).
 
 ## 🔴 머지 전에 반드시 — 응답·세션
 

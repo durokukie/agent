@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+from pathlib import Path
 
 from pydantic import BaseModel
 
@@ -16,7 +17,8 @@ class KubectlResult(BaseModel):
 
 
 def run_kubectl(args: list[str], *, context: str, dry_run: bool = False,
-                stdin: str | None = None, timeout: int = 30) -> KubectlResult:
+                stdin: str | None = None, timeout: int = 30,
+                kubeconfig: "Path | None" = None) -> KubectlResult:
     """조립된 args를 실행한다.
 
     - shell=False (기본값) + 리스트 인자 — 명령어 인젝션 차단.
@@ -24,8 +26,11 @@ def run_kubectl(args: list[str], *, context: str, dry_run: bool = False,
     - dry_run=True면 --dry-run=server만 부착해 객체 YAML이 아닌 안전한 요약을 받는다.
     - stdin: `apply -f -` 처럼 표준입력으로 본문(매니페스트)을 넘길 때. 임시파일을 만들지 않아
       조립(assemble)이 순수 함수로 유지된다 — 승인 화면의 명령과 실행 명령이 항상 동일.
+    - kubeconfig: 등록된 클러스터로 실행할 때의 임시 파일 (기획 04 §8). 주지 않으면 예전처럼
+      서버 컴퓨터의 기본 kubeconfig 를 쓴다 — 로컬 개발 경로다.
     """
-    full = ["kubectl", "--context", context, *args]
+    location = ["--kubeconfig", str(kubeconfig)] if kubeconfig is not None else []
+    full = ["kubectl", *location, "--context", context, *args]
     if dry_run:
         full.append("--dry-run=server")
     try:

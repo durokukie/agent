@@ -31,7 +31,7 @@ def client(monkeypatch, tmp_path):
     server._session = None
     monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
     monkeypatch.setattr(read_tools, "run_kubectl",
-                        lambda args, *, context, dry_run=False, stdin=None, timeout=30:
+                        lambda args, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None:
                         KubectlResult(command=FAKE_COMMAND, stdout="nginx Running", stderr="", success=True))
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)   # 홈의 실제 계획서를 읽지 않게
     return TestClient(server.app)
@@ -167,6 +167,7 @@ def _ready_plan_for_server(call_id: str) -> ActionPlan:
     )
     plan.record_dry_run("succeeded", "deployment.apps/nginx configured\n", "")
     plan.record_decision_guidance("현재 replica와 가용 자원을 확인한다.")
+    plan.offer_for_approval()
     return plan
 
 
@@ -364,7 +365,7 @@ def test_승인은_원본_history와_ToolApproved로_재개한다(client, monkey
     assert seen["history"] == original_history
     assert isinstance(seen["results"], DeferredToolResults)
     assert seen["results"].approvals == {"c1": ToolApproved()}
-    assert ActionPlan.load(plan.path).status == "draft"
+    assert ActionPlan.load(plan.path).status == "WAITING_APPROVAL"
     assert client.get("/session").json()["pending"] == []
 
 
@@ -413,8 +414,8 @@ def test_거절은_Plan을_한번만_기록하고_ToolDenied로_재개한다(
     assert isinstance(seen["results"], DeferredToolResults)
     assert isinstance(seen["results"].approvals["c1"], ToolDenied)
     loaded = ActionPlan.load(plan.path)
-    assert loaded.status == "rejected"
-    assert loaded.approval is None
+    assert loaded.status == "REJECTED"
+    assert loaded.decision == {"approved": False, "user_id": None, "at": loaded.decision["at"]}
     assert loaded.execution_result is None
 
 
@@ -520,7 +521,7 @@ def test_여러_승인을_모은뒤_승인과_거절을_한번만_재개한다(
             "/approve", json={"call_id": "c-denied", "approved": False}
         ).status_code == 409
         assert isinstance(server._session.decisions["c-denied"], ToolDenied)
-        assert ActionPlan.find_by_call_id("c-denied").status == "rejected"
+        assert ActionPlan.find_by_call_id("c-denied").status == "REJECTED"
         assert model_calls == 1
         assert executions == []
 
@@ -536,8 +537,8 @@ def test_여러_승인을_모은뒤_승인과_거절을_한번만_재개한다(
     assert executions[0][0] == [
         "scale", "deployment", "nginx", "--replicas=3", "-n", "study"
     ]
-    assert ActionPlan.find_by_call_id("c-approved").status == "executed"
-    assert ActionPlan.find_by_call_id("c-denied").status == "rejected"
+    assert ActionPlan.find_by_call_id("c-approved").status == "APPLIED"
+    assert ActionPlan.find_by_call_id("c-denied").status == "REJECTED"
     assert server._session.pending is None
     assert server._session.processing is False
     assert server._session.decisions == {}
@@ -580,7 +581,7 @@ def test_재개실패는_세션과_티켓을_유지하고_resume으로_다시_�
     assert session.pending is ticket
     assert "c1" in session.decisions
     assert session.processing is False
-    assert ActionPlan.load(plan.path).status == ("draft" if approved else "rejected")
+    assert ActionPlan.load(plan.path).status == ("WAITING_APPROVAL" if approved else "REJECTED")
     # 새 결정을 받는 문은 닫혀 있고 (/chat: 승인 대기, /approve: 이미 결정), 재시도 문만 열려 있다
     assert client.post("/chat", json={"text": "다음 질문"}).status_code == 409
     assert client.post("/approve", json={"call_id": "c1", "approved": approved}).status_code == 409
@@ -676,7 +677,7 @@ def test_거절_기록_실패는_결정을_남기지_않고_티켓을_유지한�
     monkeypatch.setattr(server, "_run_agent", unexpected_run)
     original_reject = ActionPlan.reject
 
-    def disk_full(self):
+    def disk_full(self, user_id=None):
         raise OSError("disk full")
 
     monkeypatch.setattr(ActionPlan, "reject", disk_full)
@@ -689,7 +690,7 @@ def test_거절_기록_실패는_결정을_남기지_않고_티켓을_유지한�
     assert session.pending is ticket
     assert session.decisions == {}                            # 결정을 남기지 않았다
     assert session.processing is False
-    assert ActionPlan.load(plan.path).status == "draft"
+    assert ActionPlan.load(plan.path).status == "WAITING_APPROVAL"
     assert client.get("/session").json()["pending"] == ["c1"]   # 카드가 그대로 떠 있다
     assert "disk full" in caplog.text
 
@@ -697,7 +698,7 @@ def test_거절_기록_실패는_결정을_남기지_않고_티켓을_유지한�
     monkeypatch.setattr(ActionPlan, "reject", original_reject)
     monkeypatch.setattr(server, "_run_agent", lambda session, **kwargs: _async_ok())
     assert client.post("/approve", json={"call_id": "c1", "approved": False}).status_code == 200
-    assert ActionPlan.load(plan.path).status == "rejected"
+    assert ActionPlan.load(plan.path).status == "REJECTED"
 
 
 async def _async_ok():

@@ -141,7 +141,7 @@ def test_등록된_mutation은_모두_Hook을_거쳐_Deferred요청이된다(
 
     assert isinstance(result.output, DeferredToolRequests)
     assert result.output.approvals[0].tool_name == tool_name
-    assert ActionPlan.find_by_call_id(f"call-{tool_name}").status == "draft"
+    assert ActionPlan.find_by_call_id(f"call-{tool_name}").status == "WAITING_APPROVAL"
 
 
 def test_ToolApproved_재개는_기존_history와_handler를_한번_사용한다(
@@ -200,7 +200,7 @@ def test_ToolApproved_재개는_기존_history와_handler를_한번_사용한다
 
     assert resumed.output.narration
     assert len(executions) == 1
-    assert ActionPlan.find_by_call_id("call-123").status == "executed"
+    assert ActionPlan.find_by_call_id("call-123").status == "APPLIED"
 
 
 def test_ToolDenied_재개는_2차Hook과_handler를_호출하지않는다(

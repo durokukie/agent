@@ -249,11 +249,12 @@ def build_approval_request(
     metadata: dict[str, Any],
     *,
     default_namespace: str,
+    run_id: str | None = None,
 ) -> ApprovalRequest:
     call_id = call.tool_call_id
     if not call_id:
         raise ValueError("pending approval mismatch: missing call_id")
-    plan = ActionPlan.find_by_call_id(call_id)
+    plan = ActionPlan.find_by_call_id(call_id, run_id=run_id)
     canonical = canonicalize_mutation_args(
         call.tool_name,
         call.args_as_dict(raise_if_invalid=True),
@@ -266,7 +267,7 @@ def build_approval_request(
         or canonical.normalized.get("intent") != plan.intent
         or canonical.normalized.get("expected_effects") != plan.expected_effects
         or canonical.normalized.get("side_effects") != plan.side_effects
-        or plan.status != "draft"
+        or plan.status != "WAITING_APPROVAL"
         or not isinstance(plan.dry_run_result, dict)
         or plan.dry_run_result.get("status") not in {"succeeded", "unsupported"}
         or not plan.decision_guidance
