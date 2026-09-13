@@ -70,10 +70,13 @@ async def get_action_plan(
     missing = HTTPException(404, {"code": "NOT_FOUND", "message": f"계획이 없다: {plan_id}"})
     if scope is None or (scope.owner_id != user.id and not scope.shared):
         raise missing
-    # 팀이 붙은 shared 방은 _load 와 같이 지금 소속을 묻는다 — 안 물으면 로그인한 아무나 남의 팀
-    # 계획 전문(명령·대상·결과)을 읽는다 (자동 리뷰 지적).
-    if scope.shared and scope.team_id and membership.available():
-        if not await membership.is_member(user, scope.team_id):
+    # shared 방은 _load 와 같은 규칙이다. 팀이 붙었으면 지금 소속을 묻는다 — 안 물으면 로그인한 아무나
+    # 남의 팀 계획 전문(명령·대상·결과)을 읽는다 (자동 리뷰 지적). 팀이 없으면 만든 사람만 (#75).
+    if scope.shared and membership.available():
+        if not scope.team_id:
+            if scope.owner_id != user.id:
+                raise missing
+        elif not await membership.is_member(user, scope.team_id):
             raise missing
     row = store.get_plan(plan_id)
     assert row is not None

@@ -142,18 +142,53 @@ async def _load(conversation_id: str, user: User, store: ChatStore) -> tuple[Ses
         raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
     # 팀이 붙은 **shared** 방은 만든 사람에게도 지금 소속을 묻는다. 팀 공간이므로 나간 사람은 보면 안 된다.
     #
+    # 팀이 없는 shared 방은 **만든 사람만** 연다 (#75). 누구에게 열지 물을 팀이 없는데, 예전처럼
+    # "로그인한 아무나" 로 열면 남이 서버 kubeconfig 로 도는 방에 들어온다. 회원 서버 모드에서 새로
+    # 생기는 팀 없는 방은 개인 클러스터 방뿐이고(그 클러스터는 등록한 사람만 쓴다 — _readable),
+    # 전에 만들어진 클러스터 없는 방도 남아 있다.
+    #
     # private 방은 읽기까지 막지 않는다. 자기 대화 기록인데 팀에서 나갔다는 이유로 열 수 없으면
     # 되돌릴 방법이 없다 (대화 삭제 API 도 없다 — 자동 리뷰 지적). 대신 **클러스터를 쓰는 것**은
     # 아래 _require_cluster_access 가 막는다. 읽기는 열고 실행은 닫는다.
-    if row.shared and row.team_id and membership.available():
-        if not await membership.is_member(user, row.team_id):
+    if row.shared and membership.available():
+        if not row.team_id:
+            if row.user_id != user.id:
+                raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
+        elif not await membership.is_member(user, row.team_id):
             raise _error(404, "NOT_FOUND", f"대화가 없다: {conversation_id}")
+    if membership.available() and not row.cluster_id:
+        _close_unrunnable(store, conversation_id)   # 복원(get_or_load)보다 먼저 — 닫힌 카드는 되살아나지 않는다
     if registry.get(conversation_id) is None:
         registry.get_or_load(conversation_id, store)   # 복원하면서 밀린 run 을 닫으므로 row 를 다시 읽는다
         row = store.get_session(conversation_id) or row
     conversation = registry.get(conversation_id)
     assert conversation is not None
     return row, conversation
+
+
+def _close_unrunnable(store: ChatStore, conversation_id: str) -> None:
+    """회원 서버 모드의 클러스터 없는 방에 걸린 활성 run 을 닫는다 (#75, PR #76 리뷰).
+
+    그런 방은 chat · approve · resume 이 전부 CLUSTER_REQUIRED 로 끊긴다. 승인 카드가 걸려 있으면
+    닫을 길이 없다 — 활성 run 을 정리하는 자리(chat 의 잠금 안쪽)가 그 409 뒤에 있고, 재시작 복원은
+    카드를 되살린다. 그래서 **불러올 때** 닫는다. 되살릴 수 없는 카드를 get_or_load 가 닫는 것과 같은
+    규칙이고, 계획도 같이 EXPIRED / UNKNOWN 으로 닫힌다.
+
+    메모리에 떠 있는 세션은 고치지 않고 **버린다**. 카드만 지우면 history 에 답 없는 tool call 이 남아,
+    완료된 run 만 모으는 재시작 복원(_restore_history)과 상태가 갈린다 (PR #76 리뷰). 버리면 _load 의
+    get_or_load 가 재시작과 같은 규칙으로 다시 만들고, row 도 같이 다시 읽힌다.
+
+    실행 중인 방은 건드리지 않는다. locked() 검사와 닫기 사이에 await 가 없다 (체크리스트 "잠금 틈").
+    회원 서버 모드에서 이 방은 잠금을 잡기 전에 CLUSTER_REQUIRED 로 끊기므로 실제로는 닿지 않는 방어다.
+    """
+    live = registry.get(conversation_id)
+    if live is not None and live.lock.locked():
+        return
+    if store.active_run(conversation_id) is None:
+        return
+    _interrupt(store, conversation_id,
+               "클러스터 없는 대화라 실행할 수 없어 닫았다 — 클러스터를 골라 새 대화를 시작해 주세요")
+    registry.forget(conversation_id)
 
 
 def _mutating_mode(name: str) -> bool:
@@ -173,6 +208,12 @@ async def _require_approver(row: SessionRow, user: User) -> None:
     사람이면 통과시킨다 (kukie/membership.py).
     팀이 없는 방이나 회원 서버가 없는 개발 모드는 예전 규칙대로 **만든 사람만** — 로그인한 아무나
     남의 클러스터를 바꾸지 못하게 (팀원 리뷰 6).
+
+    회원 서버 모드에서 팀이 없는 shared 방은 개인 클러스터 방뿐이다 (#75 뒤로 클러스터 없는 방은 못 쓴다).
+    그 방은 만든 사람만 보므로(_load) shared 는 "같이 본다" 가 아니라 **변경 모드를 여는 것**만 남고,
+    승인도 만든 사람 자신이 한다 — 클러스터가 등록한 사람 것이라 자기 승인이다 (PR #76 리뷰).
+    앱은 클러스터를 항상 팀으로 등록하므로 이 조합을 만들지 않는다. 회원 서버 모드에 개인 클러스터를
+    둘지는 기획 02 §2("Cluster 는 하나의 Team 에 소속") 결정으로 넘긴다.
 
     기획 06 은 "대상의 Operator 권한이 있는 Member" 도 승인할 수 있다고 하는데 Operator 는 아직 없다 (기획 03).
     """
@@ -238,9 +279,16 @@ async def _require_cluster_access(store: ChatStore, row: SessionRow, user: User)
 
     팀에서 나간 사람이 자기 private 방은 계속 읽되 그 팀 클러스터로 kubectl 을 돌리지는 못하게 한다.
     판단 규칙은 /clusters 의 _readable 과 같다.
+
+    회원 서버 모드에서 클러스터가 없는 방은 실행하지 않는다 (#75). 그런 방은 _with_cluster 가 서버
+    컴퓨터의 kubeconfig 를 쓰는데, 그 클러스터가 누구 것인지 물을 곳이 없다 — 기획 05 §1 의
+    Team → Cluster → Session 에도 없는 모양이다. 개발 모드는 예전대로 그 kubeconfig 로 돈다.
     """
-    if not row.cluster_id or not membership.available():
+    if not membership.available():
         return
+    if not row.cluster_id:
+        raise _error(409, "CLUSTER_REQUIRED",
+                     "이 대화에는 클러스터가 없어 실행할 수 없습니다 — 클러스터를 골라 새 대화를 시작해 주세요")
     cluster = store.get_cluster(row.cluster_id)
     if cluster is None or not cluster.team_id:
         return
@@ -292,12 +340,13 @@ async def create_conversation(
     namespace = (body.namespace or "").strip()
     fingerprint = body.cluster_fingerprint
     team_id = body.team_id
-    if team_id and not body.cluster_id and membership.available():
-        # 클러스터를 고르지 않은 방은 team_id 를 클라이언트가 정한다. 이 값이 이제 방을 여닫는
-        # 열쇠라(_load) 검사 없이 두면 두 가지가 깨진다 (자동 리뷰 🔴):
-        #   ① 없는 팀을 적으면 만든 사람도 자기 방에 못 들어가고 지울 방법도 없다
-        #   ② 남의 팀을 적으면 그 팀 구성원이 들어오는 방을 외부인이 심을 수 있다
-        await membership.require_member(user, team_id)
+    if not body.cluster_id and membership.available():
+        # 회원 서버 모드에서는 등록된 클러스터를 골라야 방이 생긴다 (#75, 기획 05 §1 Team → Cluster → Session).
+        # 클러스터 없는 방은 서버 컴퓨터의 kubeconfig 로 도는데, 예전에는 팀만 적거나 아무것도 안 적으면
+        # 만들어져서 로그인한 누구나 그 kubeconfig 를 쓰는 방을 열 수 있었다. 팀만 적은 방도 막는다 —
+        # 서버 kubeconfig 는 그 팀의 클러스터가 아니다.
+        raise _error(400, "CLUSTER_REQUIRED",
+                     "클러스터를 골라야 대화를 만들 수 있습니다 — 팀 설정에서 클러스터를 먼저 연결해 주세요")
     if body.cluster_id:
         # 등록된 클러스터를 골랐다 (기획 04 §8). 접속 대상은 그 행이 정한다 — 화면이 보낸 값보다 우선한다.
         #
@@ -481,14 +530,13 @@ async def chat(
         return payload
 
 
-def _interrupt(store: ChatStore, conversation_id: str) -> None:
-    """결과 저장에 실패해 활성으로 남은 run 을 닫는다. 함께 닫힌 계획의 .md 사본도 따라오게 한다 —
+def _interrupt(store: ChatStore, conversation_id: str,
+               message: str = "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라") -> None:
+    """활성으로 남은 run 을 닫는다. 함께 닫힌 계획의 .md 사본도 따라오게 한다 —
     계획을 DB 에서 직접 닫는 자리는 넷이고 규칙은 한 벌이어야 한다 (자동 리뷰 지적)."""
     from kukie.guardrail.action_plan import sync_markdown   # 순환 import 회피
 
-    closed = store.interrupt_active_runs(
-        conversation_id, "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라"
-    )
+    closed = store.interrupt_active_runs(conversation_id, message)
     try:
         sync_markdown(closed.plans)
     except Exception:
