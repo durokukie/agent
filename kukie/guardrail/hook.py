@@ -20,6 +20,7 @@ from pydantic_ai import ApprovalRequired, ModelRetry, ToolFailed
 from pydantic_ai.capabilities.hooks import Hooks
 
 from kukie.guardrail.action_plan import ActionPlan, PlanTarget
+from kukie.guardrail.approval import _manifest_preview
 from kukie.guardrail.decision_guidance import generate_decision_guidance
 from kukie.guardrail.mutation_request import canonicalize_mutation_args
 from kukie.kubectl import KubectlResult, assemble, run_kubectl
@@ -54,6 +55,20 @@ def _dry_run_unsupported(stderr: str) -> bool:
         "does not support dry run" in message
         or "unknown flag: --dry-run" in message
     )
+
+
+def _guidance_manifest(manifest_yaml: str | None) -> list[dict] | None:
+    """판단 가이드에 실을 매니페스트. 승인 카드와 같은 마스킹을 쓴다 (#50).
+
+    **실패를 삼키지 않는다.** 삼키고 None 을 주면 프롬프트의 "미리보기가 없는 작업(scale·
+    restart·delete)" 규칙에 걸려 모델이 apply_manifest 를 삭제·스케일 계열로 읽는다 —
+    "본문이 없다" 는 말만 안 할 뿐 판단 칸이 다시 화면과 어긋난다 (PR #74 리뷰).
+
+    호출부의 except 가 받아 "guidance unavailable" 로 둔다. 어차피 같은 입력으로
+    build_approval_request 가 다시 돌다 터져 카드 자체가 안 뜨는 자리라, 거기에 유료
+    모델을 한 번 더 부르지 않는 편이 낫다.
+    """
+    return _manifest_preview(manifest_yaml) if manifest_yaml else None
 
 
 def _manifest_resources(manifest_yaml: str) -> list[dict[str, str]]:
@@ -254,7 +269,9 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
     guidance = "guidance unavailable"
     if dry_run_status == "succeeded":
         try:
-            guidance = await generate_decision_guidance(plan)
+            # 승인 화면과 **같은** 마스킹을 거친 매니페스트를 함께 준다 (#50). Plan 에는 본문 대신
+            # 해시만 남으므로, 안 주면 모델이 "본문이 제시되지 않았다" 고 답해 카드가 자기 모순이 된다.
+            guidance = await generate_decision_guidance(plan, _guidance_manifest(stdin))
         except Exception:
             logger.exception("decision guidance unavailable: plan_id=%s", plan.id)
 

@@ -61,7 +61,7 @@ def guarded_runtime(monkeypatch):
             exit_code=0,
         )
 
-    async def guidance(plan):
+    async def guidance(plan, manifest_preview=None):
         return "대상과 복구 기준을 확인한다."
 
     def execute(command, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None):
@@ -198,7 +198,7 @@ def test_판단보조실패는_승인DTO에_표시하고_사용자결정을_기�
             success=False, exit_code=1,
         ))
 
-    async def unavailable(plan):
+    async def unavailable(plan, manifest_preview=None):
         if failure == "unsupported":
             pytest.fail("dry-run 미지원이면 guidance를 생성하면 안 된다")
         raise RuntimeError("guidance service unavailable")

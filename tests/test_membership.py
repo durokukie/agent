@@ -772,7 +772,7 @@ def test_클러스터_없는_옛_방에_걸린_승인_카드는_불러올_때_�
     monkeypatch.setattr(hook, "run_kubectl", lambda *a, **k: ok)
     monkeypatch.setattr(mutate, "run_kubectl", lambda *a, **k: ok)
 
-    async def guidance(plan):
+    async def guidance(plan, manifest_preview=None):
         return "현재 replica 를 확인한다."
 
     monkeypatch.setattr(hook, "generate_decision_guidance", guidance)

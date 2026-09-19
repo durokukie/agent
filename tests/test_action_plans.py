@@ -57,7 +57,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(hook, "run_kubectl", lambda *a, **k: _ok())          # dry-run 성공
     monkeypatch.setattr(mutate, "run_kubectl", lambda *a, **k: _ok("scaled\n"))  # 실제 실행
 
-    async def guidance(plan):
+    async def guidance(plan, manifest_preview=None):
         return "현재 replica 와 가용 자원을 확인한다."
 
     monkeypatch.setattr(hook, "generate_decision_guidance", guidance)
@@ -134,6 +134,9 @@ def test_승인_카드가_뜨면_계획이_표에_WAITING_APPROVAL로_남는다(
     assert plan.decision is None and plan.execution_result is None and plan.applied_at is None
     assert plan.plan_payload["intent"] == SCALE_ARGS["intent"]
     assert plan.id == card["approvals"][0]["plan_id"]        # 카드의 plan_id 와 같은 행이다
+    # 대역이 훅의 인자를 못 받으면 TypeError 가 훅의 except 에 먹혀 "guidance unavailable" 이 된다.
+    # 그 조용한 실패를 여기서 잡는다 (#50 리뷰).
+    assert card["approvals"][0]["decision_guidance"] == "현재 replica 와 가용 자원을 확인한다."
 
 
 def test_승인하면_APPLIED와_적용시각_결정자가_남는다(client):

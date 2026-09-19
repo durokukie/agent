@@ -119,7 +119,7 @@ def test_등록된_mutation은_모두_Hook을_거쳐_Deferred요청이된다(
         ),
     )
 
-    async def fixed_guidance(plan):
+    async def fixed_guidance(plan, manifest_preview=None):
         return "대상과 롤백 기준을 확인한다."
 
     monkeypatch.setattr(hook, "generate_decision_guidance", fixed_guidance)
@@ -159,7 +159,7 @@ def test_ToolApproved_재개는_기존_history와_handler를_한번_사용한다
         ),
     )
 
-    async def fixed_guidance(plan):
+    async def fixed_guidance(plan, manifest_preview=None):
         return "대상과 롤백 기준을 확인한다."
 
     monkeypatch.setattr(hook, "generate_decision_guidance", fixed_guidance)
@@ -218,7 +218,7 @@ def test_ToolDenied_재개는_2차Hook과_handler를_호출하지않는다(
         ),
     )
 
-    async def fixed_guidance(plan):
+    async def fixed_guidance(plan, manifest_preview=None):
         return "대상과 롤백 기준을 확인한다."
 
     monkeypatch.setattr(hook, "generate_decision_guidance", fixed_guidance)

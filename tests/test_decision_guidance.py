@@ -1,4 +1,6 @@
+import json
 import os
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -7,6 +9,7 @@ from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
 from kukie.guardrail import action_plan
+from kukie.guardrail.approval import _manifest_preview
 from kukie.guardrail import decision_guidance
 from kukie.guardrail.action_plan import ActionPlan
 from kukie.guardrail.decision_guidance import (
@@ -168,3 +171,76 @@ def test_판단_가이드_모델은_빈_환경변수를_미설정과_같게_본�
     Agent("") 가 import 시점에 UserError 로 터지면 안 된다 — `or` 기본값 회귀 방지."""
     monkeypatch.setenv("KUKIE_GUIDANCE_MODEL", "")
     assert decision_guidance._guidance_model() == "openai:gpt-5.6-luna"
+
+
+def _capture_prompt() -> tuple[list[str], FunctionModel]:
+    """모델이 실제로 받은 프롬프트를 담아 두는 FunctionModel."""
+    received: list[str] = []
+
+    def capture(messages, info):
+        received.append(str(messages))
+        return ModelResponse(parts=[TextPart("추가 판단 없음")])
+
+    return received, FunctionModel(capture)
+
+
+@pytest.mark.asyncio
+async def test_매니페스트_본문이_모델_프롬프트에_실제로_들어간다(monkeypatch, tmp_path):
+    """훅과의 경계만 보던 테스트(test_guardrail_hook.py)로는 _with_manifest 호출을
+    지워도 초록이었다 — #50 이 되살아나도 아무도 모른다 (PR #74 리뷰)."""
+    plan = _ready_plan(monkeypatch, tmp_path)
+    received, model = _capture_prompt()
+
+    with decision_guidance.guidance_agent.override(model=model):
+        await generate_decision_guidance(
+            plan, [{"kind": "Pod", "spec": {"image": "nginx:latest"}}]
+        )
+
+    assert "nginx:latest" in received[0]
+    assert "## 매니페스트 미리보기" in received[0]   # 지시문에도 같은 낱말이 있어 제목으로 본다
+
+
+@pytest.mark.asyncio
+async def test_미리보기가_없으면_그_절도_없다(monkeypatch, tmp_path):
+    plan = _ready_plan(monkeypatch, tmp_path)
+    received, model = _capture_prompt()
+
+    with decision_guidance.guidance_agent.override(model=model):
+        await generate_decision_guidance(plan)
+
+    assert "## 매니페스트 미리보기" not in received[0]
+
+
+@pytest.mark.asyncio
+async def test_YAML이_만든_날짜_집합도_프롬프트에_남는다(monkeypatch, tmp_path):
+    """PyYAML 은 따옴표 없는 날짜를 date 로 만든다. json.dumps 가 그걸 못 실어
+    TypeError 로 터지면 훅이 삼켜 판단 칸이 통째로 빈다 — 이 PR 전에는 정상이던
+    매니페스트가 더 나빠지는 방향이다 (PR #74 리뷰)."""
+    preview = _manifest_preview(
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  annotations:\n"
+        "    deployed-on: 2026-09-10\n"
+        "spec:\n"
+        "  image: nginx:1.27\n"
+    )
+    assert isinstance(preview[0]["metadata"]["annotations"]["deployed-on"], date)
+
+    plan = _ready_plan(monkeypatch, tmp_path)
+    received, model = _capture_prompt()
+
+    with decision_guidance.guidance_agent.override(model=model):
+        guidance = await generate_decision_guidance(plan, preview)
+
+    assert guidance == "추가 판단 없음"
+    assert "2026-09-10" in received[0]   # 빠뜨리지 않고 문자열로 남는다
+    assert "nginx:1.27" in received[0]
+
+
+def test_json이_모르는_키도_버리지_않는다():
+    """`default=` 는 값에만 걸리고 키에는 안 걸린다. 키를 빠뜨리면 모델이 못 보는
+    설정이 생기고, 그게 #50 이 고치려던 병이다."""
+    safe = decision_guidance._json_safe({date(2026, 9, 10): {"a"}})
+
+    assert safe == {"2026-09-10": "{'a'}"}
+    assert json.dumps(safe)
