@@ -5,8 +5,9 @@ httpOnly 쿠키 `kukie_access` 로 (kukie-server #26 — 브라우저는 헤더�
 헤더가 있으면 헤더만(모양이 틀리면 401, 값이 비면 없는 것), 없을 때만 쿠키. 쿠키로만 인증된 요청은 브라우저가
 `Sec-Fetch-Site` 로 same-origin(우리 페이지) 또는 none(주소창 직접 입력)이라고 알려 줄 때만 받는다 — 없거나
 cross-site/same-site 면 403 CROSS_SITE_COOKIE. 브라우저는 이 헤더를 **HTTPS(또는 localhost)에서만** 붙이므로
-웹은 HTTPS 로 배포한다는 전제다. 평문 HTTP 로 띄우면: 쿠키가 Secure(기본)면 애초에 안 실려 **401**, Secure 를 끈
-채(AUTH_COOKIE_SECURE=false)면 쿠키는 오지만 헤더가 없어 **403** — 어느 쪽이든 HTTPS 로 올리라는 신호다.
+웹은 HTTPS 로 배포한다는 전제다. localhost 가 아닌 평문 HTTP 로 띄우면: 쿠키가 Secure(kukie-server `auth.cookie.secure`,
+기본 true)면 애초에 안 실려 **401**, Secure 를 끈 채면 쿠키는 오지만 헤더가 없어 **403** — 어느 쪽이든 HTTPS 로 올리라는
+신호다. (브라우저는 http://localhost 에는 Secure 쿠키도 보내고 헤더도 붙이므로 로컬 개발은 평문이어도 그대로 돈다.)
 agent 는 그 토큰으로 Spring `GET /users/me` 를 불러 회원 id 를 얻는다. 팀·권한 판단도 Spring 몫이라
 같은 토큰으로 `GET /teams` 를 물어 역할을 받는다 (kukie/membership.py).
 
@@ -71,7 +72,8 @@ SAME_ORIGIN_VALUES = frozenset({"same-origin", "none"})
 def _from_same_origin(request: Request) -> bool:
     """쿠키 인증은 브라우저가 출처를 알려 줄 때만 받는다. 헤더가 없으면 통과가 아니라 거부다 — 통과시키면 그 경우엔
     검사가 없는 것과 같다 (fail-closed). 브라우저는 HTTPS·localhost 에서만 이 헤더를 붙인다 (Fetch Metadata 스펙의
-    potentially trustworthy 조건). 평문 HTTP 로 띄우면 웹 로그인이 전부 403 이 되는데, 그건 배포가 HTTPS 여야 한다는 뜻이다."""
+    potentially trustworthy 조건). localhost 가 아닌 평문 HTTP 에서는 여기까지 오기 전에 Secure 쿠키가 안 실려 401 이고,
+    Secure 를 끈 경우에만 여기서 403 이 난다 — 어느 쪽이든 배포가 HTTPS 여야 한다는 뜻이다 (모듈 머리 참고)."""
     return request.headers.get("sec-fetch-site", "").strip().lower() in SAME_ORIGIN_VALUES
 
 
