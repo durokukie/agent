@@ -55,10 +55,14 @@ def client():
     return TestClient(app)
 
 
-def _with_cookie(client: TestClient, name: str, value: str) -> TestClient:
-    """브라우저처럼 쿠키를 들고 다니게 한다 (httpx 는 요청마다 넘기는 cookies= 를 버리는 중)."""
+def _with_cookie(client: TestClient, name: str, value: str, site: str | None = "same-origin") -> TestClient:
+    """브라우저처럼 쿠키를 들고 다니고, 우리 페이지에서 부른 것처럼 Sec-Fetch-Site 를 붙인다
+    (httpx 는 요청마다 넘기는 cookies= 를 버리는 중이라 클라이언트에 심는다)."""
     client.cookies.clear()
     client.cookies.set(name, value)
+    client.headers.pop("Sec-Fetch-Site", None)
+    if site is not None:
+        client.headers["Sec-Fetch-Site"] = site
     return client
 
 
@@ -87,16 +91,16 @@ def test_헤더가_있으면_모양이_틀려도_쿠키로_넘어가지_않는�
     assert spring["calls"] == []
 
 
-def test_다른_사이트에서_시작된_요청은_쿠키로_인증하지_않는다(client, spring):
-    """SameSite=Lax 도 top-level GET 은 통과시킨다. 브라우저가 붙이는 Sec-Fetch-Site 로 한 번 더 거른다."""
-    c = _with_cookie(client, "kukie_access", "tok-cookie")
-    r = c.get("/whoami", headers={"Sec-Fetch-Site": "cross-site"})
-    assert r.status_code == 403 and r.json()["detail"]["code"] == "CROSS_SITE_COOKIE"
+def test_다른_사이트에서_시작됐거나_출처를_모르는_요청은_쿠키로_인증하지_않는다(client, spring):
+    """SameSite=Lax 도 top-level GET 은 통과시킨다. 브라우저가 붙이는 Sec-Fetch-Site 로 한 번 더 거른다 —
+    헤더가 없어도 거부(fail-closed). 통과시키면 그 브라우저에서는 검사가 없는 것과 같다."""
+    for site in ("cross-site", None):
+        r = _with_cookie(client, "kukie_access", "tok-cookie", site=site).get("/whoami")
+        assert r.status_code == 403 and r.json()["detail"]["code"] == "CROSS_SITE_COOKIE", site
     assert spring["calls"] == []
-    # 같은 사이트 · 주소창 직접 입력 · 헤더가 없는 옛 브라우저는 통과
+    # 같은 사이트 · 주소창 직접 입력은 통과
     for site in ("same-origin", "same-site", "none"):
-        assert c.get("/whoami", headers={"Sec-Fetch-Site": site}).status_code == 200
-    assert c.get("/whoami").status_code == 200
+        assert _with_cookie(client, "kukie_access", "tok-cookie", site=site).get("/whoami").status_code == 200
 
 
 def test_헤더_토큰은_다른_사이트에서_와도_받는다(client, spring):
@@ -104,6 +108,14 @@ def test_헤더_토큰은_다른_사이트에서_와도_받는다(client, spring
     client.cookies.clear()
     r = client.get("/whoami", headers={"Authorization": "Bearer tok-header", "Sec-Fetch-Site": "cross-site"})
     assert r.status_code == 200
+    assert client.get("/whoami", headers={"Authorization": "Bearer tok-header"}).status_code == 200
+
+
+def test_값이_빈_Authorization_헤더는_없는_것으로_친다(client, spring):
+    """`Authorization:` 만 붙인 클라이언트가 쿠키 로그인을 통째로 잃지 않게 — 빈 값엔 존중할 뜻이 없다."""
+    c = _with_cookie(client, "kukie_access", "tok-cookie")
+    assert c.get("/whoami", headers={"Authorization": ""}).json()["id"] == "u-cookie"
+    assert c.get("/whoami", headers={"Authorization": "   "}).json()["id"] == "u-cookie"
 
 
 def test_둘_다_없으면_401(client, spring):

@@ -56,9 +56,15 @@ def _cookie_token(request: Request) -> str | None:
     return value.strip() if value and value.strip() else None
 
 
-def _cross_site(request: Request) -> bool:
-    """브라우저가 붙이는 Sec-Fetch-Site 가 cross-site 면 다른 사이트에서 시작된 요청이다 (링크·폼·이미지 태그)."""
-    return request.headers.get("sec-fetch-site", "").strip().lower() == "cross-site"
+# 브라우저가 붙이는 Sec-Fetch-Site 중 "우리 사이트에서 시작됐다" 로 볼 수 있는 값. same-origin/same-site 는 우리 페이지가
+# 부른 것, none 은 사용자가 주소창에 직접 친 것. cross-site 는 남의 사이트 링크·폼·이미지 태그.
+SAME_SITE_VALUES = frozenset({"same-origin", "same-site", "none"})
+
+
+def _from_same_site(request: Request) -> bool:
+    """쿠키 인증은 브라우저가 출처를 알려 줄 때만 받는다. 헤더가 없으면(옛 브라우저·curl) 통과가 아니라 거부다 —
+    통과시키면 그 브라우저에서는 검사가 없는 것과 같다 (fail-closed). 최신 브라우저는 모두 이 헤더를 붙인다."""
+    return request.headers.get("sec-fetch-site", "").strip().lower() in SAME_SITE_VALUES
 
 
 async def _lookup(token: str, member_url: str) -> User:
@@ -85,8 +91,9 @@ async def current_user(
     if member_url:
         # 헤더가 **있으면** 헤더만 본다 — 모양이 틀려도 쿠키로 넘어가지 않는다. 헤더는 부르는 쪽이 이번 요청에
         # 일부러 붙인 값이라 그 뜻을 존중한다 (Basic 을 보낸 클라이언트가 조용히 남의 쿠키 세션으로 도는 일이 없게).
-        # 헤더가 **없을 때만** 쿠키. kukie-server AuthenticationInterceptor 와 같은 규칙.
-        if authorization is not None:
+        # 값이 빈 헤더(`Authorization:`)는 존중할 뜻이 없으니 없는 것으로 친다. 헤더가 **없을 때만** 쿠키.
+        # kukie-server AuthenticationInterceptor 와 같은 규칙.
+        if authorization is not None and authorization.strip():
             token = _bearer(authorization)
             if token is None:
                 raise HTTPException(401, {"code": "UNAUTHORIZED", "message": "Authorization 헤더는 Bearer <토큰> 모양이어야 한다"})
@@ -99,9 +106,13 @@ async def current_user(
                 "message": f"Authorization: Bearer <토큰> 헤더나 {_access_cookie_name()} 쿠키가 필요하다",
             })
         # 쿠키는 브라우저가 알아서 붙이므로 다른 사이트가 시킨 요청에도 실릴 수 있다 (SameSite=Lax 도 top-level GET 은
-        # 통과시킨다). 쿠키로만 인증된 요청은 같은 사이트에서 시작된 것만 받는다. 헤더 토큰은 이 검사를 안 거친다.
-        if _cross_site(request):
-            raise HTTPException(403, {"code": "CROSS_SITE_COOKIE", "message": "다른 사이트에서 시작된 요청은 쿠키로 인증하지 않는다"})
+        # 통과시킨다). 쿠키로만 인증된 요청은 브라우저가 "같은 사이트에서 시작됐다" 고 알려 줄 때만 받는다.
+        # 헤더 토큰은 이 검사를 안 거친다.
+        if not _from_same_site(request):
+            raise HTTPException(403, {
+                "code": "CROSS_SITE_COOKIE",
+                "message": "다른 사이트에서 시작됐거나 출처(Sec-Fetch-Site)를 알 수 없는 요청은 쿠키로 인증하지 않는다",
+            })
         return await _lookup(token, member_url)
 
     if not _dev_auth():
