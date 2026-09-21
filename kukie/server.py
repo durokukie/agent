@@ -177,9 +177,12 @@ def _dev_only() -> None:
     "회원 서버가 없으면 열림" 이 아니라 "개발 모드를 켰을 때만 열림" 인 이유: 컴포즈에서 KUKIE_MEMBER_URL 이 빠지거나
     오타 나면 /conversations 는 503 으로 닫히는데(auth.py, fail-closed) 여기만 인증 없이 열려 있었다 (PR #82 리뷰).
     같은 방향으로 맞춘다 — 설정 한 줄 실수가 무인증 에이전트 실행이 되지 않게."""
-    if membership.available() or not auth.dev_auth_enabled():
+    if membership.available():
         raise HTTPException(404, {"code": "NOT_FOUND",
                                   "message": "회원 서버 모드에서는 쓰지 않는 개발용 엔드포인트다 — /conversations 를 쓴다"})
+    if not auth.dev_auth_enabled():
+        raise HTTPException(404, {"code": "NOT_FOUND",
+                                  "message": "개발용 엔드포인트는 KUKIE_DEV_AUTH=1 일 때만 열린다 — 회원 서버 없이 로컬에서 쓰려면 .env 에 넣는다"})
 
 
 DEV_ONLY = [Depends(_dev_only)]

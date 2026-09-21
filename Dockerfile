@@ -31,6 +31,7 @@ ENV HOME=/data PYTHONUNBUFFERED=1
 EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
   CMD python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"
-# --proxy-headers 는 두지 않는다 — 코드가 scheme·client IP 를 읽는 데가 없고, "아무나 보낸 X-Forwarded-* 를 믿는" 설정은 나중에 IP 기반 판단이
-# 생길 때 조용히 무너지는 자리다 (PR #82 리뷰). 필요해지면 프록시 서브넷을 FORWARDED_ALLOW_IPS 로 좁혀 켠다
+# --forwarded-allow-ips 는 기본값(127.0.0.1)으로 둔다 — uvicorn 은 proxy-headers 미들웨어가 기본으로 켜져 있고, 그 헤더를 믿을지는 이 값이 정한다.
+# 코드가 scheme·client IP 를 읽는 데가 없고 8000 은 컴포즈 밖에 안 열리므로 지금은 아무 헤더도 안 믿는 쪽이 맞다 (PR #82 리뷰).
+# 나중에 IP 기반 판단(레이트리밋·감사 로그)이 생기면 프록시 서브넷을 FORWARDED_ALLOW_IPS 로 좁혀 연다
 CMD ["uvicorn", "kukie.server:app", "--host", "0.0.0.0", "--port", "8000"]

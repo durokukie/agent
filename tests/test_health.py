@@ -29,5 +29,7 @@ def test_flat_endpoints_are_closed_unless_dev_mode_is_opted_in(monkeypatch):
     monkeypatch.delenv("KUKIE_DEV_AUTH", raising=False)
     with TestClient(app) as client:
         for method, path in [("post", "/session"), ("post", "/chat"), ("post", "/approve"), ("post", "/resume"), ("get", "/session")]:
-            assert client.request(method, path, json={}).status_code == 404, path
+            r = client.request(method, path, json={})
+            assert r.status_code == 404, path
+            assert "KUKIE_DEV_AUTH" in r.json()["detail"]["message"]   # 왜 닫혔는지 — 회원 서버 모드 문구와 다르다
         assert client.get("/health").status_code == 200
