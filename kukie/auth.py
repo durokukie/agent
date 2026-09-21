@@ -7,7 +7,8 @@ httpOnly 쿠키 `kukie_access` 로 (kukie-server #26 — 브라우저는 헤더�
 cross-site/same-site 면 403 CROSS_SITE_COOKIE. 브라우저는 이 헤더를 **HTTPS(또는 localhost)에서만** 붙이므로
 웹은 HTTPS 로 배포한다는 전제다. localhost 가 아닌 평문 HTTP 로 띄우면: 쿠키가 Secure(kukie-server `auth.cookie.secure`,
 기본 true)면 애초에 안 실려 **401**, Secure 를 끈 채면 쿠키는 오지만 헤더가 없어 **403** — 어느 쪽이든 HTTPS 로 올리라는
-신호다. (브라우저는 http://localhost 에는 Secure 쿠키도 보내고 헤더도 붙이므로 로컬 개발은 평문이어도 그대로 돈다.)
+신호다. 로컬 개발은 kukie-server 를 `auth.cookie.secure=false` 로 띄워 평문 http://localhost 에서 돈다 — 헤더는 localhost 면
+어느 브라우저나 붙이고, Secure 쿠키를 http://localhost 에 보내는 예외는 Chrome·Firefox 에서만 확인했다.
 agent 는 그 토큰으로 Spring `GET /users/me` 를 불러 회원 id 를 얻는다. 팀·권한 판단도 Spring 몫이라
 같은 토큰으로 `GET /teams` 를 물어 역할을 받는다 (kukie/membership.py).
 
