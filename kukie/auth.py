@@ -48,6 +48,11 @@ def _dev_auth() -> bool:
     return os.environ.get("KUKIE_DEV_AUTH", "") == "1"
 
 
+def dev_auth_enabled() -> bool:
+    """개발 모드(KUKIE_DEV_AUTH=1)인가. server.py 의 flat 엔드포인트 문이 같은 스위치를 본다 — 두 군데가 다른 조건으로 갈리지 않게."""
+    return _dev_auth()
+
+
 def _bearer(authorization: str | None) -> str | None:
     if authorization and authorization.lower().startswith("bearer "):
         return authorization[7:].strip() or None

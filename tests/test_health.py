@@ -20,3 +20,14 @@ def test_health_stays_open_in_member_server_mode(monkeypatch):
     with TestClient(app) as client:
         assert client.get("/health").status_code == 200
         assert client.post("/session", json={}).status_code == 404
+
+
+def test_flat_endpoints_are_closed_unless_dev_mode_is_opted_in(monkeypatch):
+    """회원 서버 주소가 빠졌다고 flat 4개가 인증 없이 열리면(fail-open) 설정 한 줄 실수가 무인증 에이전트 실행이 된다 (PR #82 리뷰).
+    /conversations 의 503 과 같은 방향 — 회원 서버도 KUKIE_DEV_AUTH=1 도 없으면 닫힌다."""
+    monkeypatch.delenv("KUKIE_MEMBER_URL", raising=False)
+    monkeypatch.delenv("KUKIE_DEV_AUTH", raising=False)
+    with TestClient(app) as client:
+        for method, path in [("post", "/session"), ("post", "/chat"), ("post", "/approve"), ("post", "/resume"), ("get", "/session")]:
+            assert client.request(method, path, json={}).status_code == 404, path
+        assert client.get("/health").status_code == 200
