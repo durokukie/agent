@@ -56,6 +56,11 @@ def _cookie_token(request: Request) -> str | None:
     return value.strip() if value and value.strip() else None
 
 
+def _cross_site(request: Request) -> bool:
+    """브라우저가 붙이는 Sec-Fetch-Site 가 cross-site 면 다른 사이트에서 시작된 요청이다 (링크·폼·이미지 태그)."""
+    return request.headers.get("sec-fetch-site", "").strip().lower() == "cross-site"
+
+
 async def _lookup(token: str, member_url: str) -> User:
     try:
         async with httpx.AsyncClient(timeout=MEMBER_TIMEOUT) as http:
@@ -78,14 +83,25 @@ async def current_user(
     """FastAPI 의존성. 라우트 인자에 `user: User = Depends(current_user)`."""
     member_url = _member_url()
     if member_url:
-        # 헤더 먼저, 없을 때만 쿠키. 둘 다 있으면 헤더 — 헤더는 부르는 쪽이 이번 요청에 일부러 붙인 값이고
-        # 쿠키는 브라우저가 알아서 붙이는 값이라서다 (kukie-server AuthenticationInterceptor 와 같은 규칙).
-        token = _bearer(authorization) or _cookie_token(request)
+        # 헤더가 **있으면** 헤더만 본다 — 모양이 틀려도 쿠키로 넘어가지 않는다. 헤더는 부르는 쪽이 이번 요청에
+        # 일부러 붙인 값이라 그 뜻을 존중한다 (Basic 을 보낸 클라이언트가 조용히 남의 쿠키 세션으로 도는 일이 없게).
+        # 헤더가 **없을 때만** 쿠키. kukie-server AuthenticationInterceptor 와 같은 규칙.
+        if authorization is not None:
+            token = _bearer(authorization)
+            if token is None:
+                raise HTTPException(401, {"code": "UNAUTHORIZED", "message": "Authorization 헤더는 Bearer <토큰> 모양이어야 한다"})
+            return await _lookup(token, member_url)
+
+        token = _cookie_token(request)
         if token is None:
             raise HTTPException(401, {
                 "code": "UNAUTHORIZED",
                 "message": f"Authorization: Bearer <토큰> 헤더나 {_access_cookie_name()} 쿠키가 필요하다",
             })
+        # 쿠키는 브라우저가 알아서 붙이므로 다른 사이트가 시킨 요청에도 실릴 수 있다 (SameSite=Lax 도 top-level GET 은
+        # 통과시킨다). 쿠키로만 인증된 요청은 같은 사이트에서 시작된 것만 받는다. 헤더 토큰은 이 검사를 안 거친다.
+        if _cross_site(request):
+            raise HTTPException(403, {"code": "CROSS_SITE_COOKIE", "message": "다른 사이트에서 시작된 요청은 쿠키로 인증하지 않는다"})
         return await _lookup(token, member_url)
 
     if not _dev_auth():

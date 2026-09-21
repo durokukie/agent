@@ -79,6 +79,33 @@ def test_헤더와_쿠키가_둘_다_있으면_헤더를_쓴다(client, spring):
     assert spring["calls"][-1]["headers"]["Authorization"] == "Bearer tok-header"
 
 
+def test_헤더가_있으면_모양이_틀려도_쿠키로_넘어가지_않는다(client, spring):
+    """Basic 이나 빈 Bearer 를 보낸 클라이언트가 조용히 남의 쿠키 세션으로 도는 일이 없게 — 헤더가 있으면 헤더만."""
+    c = _with_cookie(client, "kukie_access", "tok-cookie")
+    assert c.get("/whoami", headers={"Authorization": "Basic abc"}).status_code == 401
+    assert c.get("/whoami", headers={"Authorization": "Bearer "}).status_code == 401
+    assert spring["calls"] == []
+
+
+def test_다른_사이트에서_시작된_요청은_쿠키로_인증하지_않는다(client, spring):
+    """SameSite=Lax 도 top-level GET 은 통과시킨다. 브라우저가 붙이는 Sec-Fetch-Site 로 한 번 더 거른다."""
+    c = _with_cookie(client, "kukie_access", "tok-cookie")
+    r = c.get("/whoami", headers={"Sec-Fetch-Site": "cross-site"})
+    assert r.status_code == 403 and r.json()["detail"]["code"] == "CROSS_SITE_COOKIE"
+    assert spring["calls"] == []
+    # 같은 사이트 · 주소창 직접 입력 · 헤더가 없는 옛 브라우저는 통과
+    for site in ("same-origin", "same-site", "none"):
+        assert c.get("/whoami", headers={"Sec-Fetch-Site": site}).status_code == 200
+    assert c.get("/whoami").status_code == 200
+
+
+def test_헤더_토큰은_다른_사이트에서_와도_받는다(client, spring):
+    """cross-site 검사는 쿠키에만. 헤더는 부르는 쪽이 일부러 붙인 값이라 CSRF 와 무관하다."""
+    client.cookies.clear()
+    r = client.get("/whoami", headers={"Authorization": "Bearer tok-header", "Sec-Fetch-Site": "cross-site"})
+    assert r.status_code == 200
+
+
 def test_둘_다_없으면_401(client, spring):
     r = client.get("/whoami")
     assert r.status_code == 401
