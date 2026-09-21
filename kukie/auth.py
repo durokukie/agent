@@ -5,7 +5,8 @@ httpOnly 쿠키 `kukie_access` 로 (kukie-server #26 — 브라우저는 헤더�
 헤더가 있으면 헤더만(모양이 틀리면 401, 값이 비면 없는 것), 없을 때만 쿠키. 쿠키로만 인증된 요청은 브라우저가
 `Sec-Fetch-Site` 로 same-origin(우리 페이지) 또는 none(주소창 직접 입력)이라고 알려 줄 때만 받는다 — 없거나
 cross-site/same-site 면 403 CROSS_SITE_COOKIE. 브라우저는 이 헤더를 **HTTPS(또는 localhost)에서만** 붙이므로
-웹은 HTTPS 로 배포한다는 전제다 (쿠키도 Secure 라 평문 HTTP 에는 애초에 안 실린다).
+웹은 HTTPS 로 배포한다는 전제다. 평문 HTTP 로 띄우면: 쿠키가 Secure(기본)면 애초에 안 실려 **401**, Secure 를 끈
+채(AUTH_COOKIE_SECURE=false)면 쿠키는 오지만 헤더가 없어 **403** — 어느 쪽이든 HTTPS 로 올리라는 신호다.
 agent 는 그 토큰으로 Spring `GET /users/me` 를 불러 회원 id 를 얻는다. 팀·권한 판단도 Spring 몫이라
 같은 토큰으로 `GET /teams` 를 물어 역할을 받는다 (kukie/membership.py).
 
@@ -112,9 +113,9 @@ async def current_user(
                 "code": "UNAUTHORIZED",
                 "message": f"Authorization: Bearer <토큰> 헤더나 {_access_cookie_name()} 쿠키가 필요하다",
             })
-        # 쿠키는 브라우저가 알아서 붙이므로 다른 사이트가 시킨 요청에도 실릴 수 있다 (SameSite=Lax 도 top-level GET 은
-        # 통과시킨다). 쿠키로만 인증된 요청은 브라우저가 "같은 사이트에서 시작됐다" 고 알려 줄 때만 받는다.
-        # 헤더 토큰은 이 검사를 안 거친다.
+        # 쿠키는 브라우저가 알아서 붙이므로 다른 곳이 시킨 요청에도 실릴 수 있다 (SameSite=Lax 도 top-level GET 과
+        # 같은 사이트의 다른 서브도메인은 통과시킨다). 쿠키로만 인증된 요청은 브라우저가 "우리 페이지(same-origin)에서
+        # 시작됐다" 고 알려 줄 때만 받는다. 헤더 토큰은 이 검사를 안 거친다.
         if not _from_same_origin(request):
             raise HTTPException(403, {
                 "code": "CROSS_SITE_COOKIE",
