@@ -61,7 +61,7 @@ LLM 이 delete_resource(...) 호출
 ```
 kukie-electron (데스크톱 앱)  ──HTTP──▶  kukie agent (이 레포)  ──subprocess──▶  kubectl ──▶ 클러스터
                                               │
-                                              ├─ Bearer 토큰 검증 ──▶ kukie-server (Spring, 회원·팀·권한)
+                                              ├─ 토큰 검증(Bearer 헤더 · 웹은 kukie_access 쿠키) ──▶ kukie-server (Spring, 회원·팀·권한)
                                               └─ 대화·계획·클러스터 ──▶ SQLite / PostgreSQL
 ```
 

@@ -1,11 +1,12 @@
 """요청이 누구 것인지 — Spring 회원 서버(kukie-server) 에 토큰을 확인한다.
 
-앱은 Spring 에서 받은 JWT 를 모든 요청에 `Authorization: Bearer` 로 붙인다 (api-spec 5절).
-agent 는 그 토큰으로 Spring `GET /users/me` 를 불러 회원 id 를 얻는다. 팀·권한 판단도 Spring 몫이라
+토큰은 두 길로 온다. 앱(Electron)은 `Authorization: Bearer` 헤더로 (api-spec 5절), 웹 브라우저는 Spring 이 구워 준
+httpOnly 쿠키 `kukie_access` 로 (kukie-server #26 — 브라우저는 헤더를 못 붙이고 쿠키만 자동으로 붙인다).
+헤더가 있으면 헤더, 없을 때만 쿠키. agent 는 그 토큰으로 Spring `GET /users/me` 를 불러 회원 id 를 얻는다. 팀·권한 판단도 Spring 몫이라
 같은 토큰으로 `GET /teams` 를 물어 역할을 받는다 (kukie/membership.py).
 
 fail-closed: 설정이 빠지면 거부한다.
-  - KUKIE_MEMBER_URL 이 있으면 Bearer 토큰만 받는다. 개발용 헤더·변수는 무시.
+  - KUKIE_MEMBER_URL 이 있으면 토큰(헤더 또는 쿠키)만 받는다. 개발용 헤더·변수는 무시.
   - 없으면 KUKIE_DEV_AUTH=1 일 때만 개발 모드 — `X-User: <id>` 헤더나 KUKIE_DEV_USER 를 회원 id 로 쓴다.
   - 둘 다 없으면 503 AUTH_NOT_CONFIGURED. (변수 하나 빠뜨렸다고 무인증 서버가 되지 않게.)
 """
@@ -15,9 +16,11 @@ import os
 from dataclasses import dataclass
 
 import httpx
-from fastapi import Header, HTTPException
+from fastapi import Header, HTTPException, Request
 
 MEMBER_TIMEOUT = 5.0
+# Spring 이 굽는 access 쿠키 이름 (kukie-server `auth.cookie.access-name`). 바꾸면 양쪽을 같이 바꾼다.
+DEFAULT_ACCESS_COOKIE = "kukie_access"
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,15 @@ def _bearer(authorization: str | None) -> str | None:
     return None
 
 
+def _access_cookie_name() -> str:
+    return os.environ.get("KUKIE_ACCESS_COOKIE", "").strip() or DEFAULT_ACCESS_COOKIE
+
+
+def _cookie_token(request: Request) -> str | None:
+    value = request.cookies.get(_access_cookie_name())
+    return value.strip() if value and value.strip() else None
+
+
 async def _lookup(token: str, member_url: str) -> User:
     try:
         async with httpx.AsyncClient(timeout=MEMBER_TIMEOUT) as http:
@@ -59,15 +71,21 @@ async def _lookup(token: str, member_url: str) -> User:
 
 
 async def current_user(
+    request: Request,
     authorization: str | None = Header(default=None),
     x_user: str | None = Header(default=None),
 ) -> User:
     """FastAPI 의존성. 라우트 인자에 `user: User = Depends(current_user)`."""
     member_url = _member_url()
     if member_url:
-        token = _bearer(authorization)
+        # 헤더 먼저, 없을 때만 쿠키. 둘 다 있으면 헤더 — 헤더는 부르는 쪽이 이번 요청에 일부러 붙인 값이고
+        # 쿠키는 브라우저가 알아서 붙이는 값이라서다 (kukie-server AuthenticationInterceptor 와 같은 규칙).
+        token = _bearer(authorization) or _cookie_token(request)
         if token is None:
-            raise HTTPException(401, {"code": "UNAUTHORIZED", "message": "Authorization: Bearer <토큰> 이 필요하다"})
+            raise HTTPException(401, {
+                "code": "UNAUTHORIZED",
+                "message": f"Authorization: Bearer <토큰> 헤더나 {_access_cookie_name()} 쿠키가 필요하다",
+            })
         return await _lookup(token, member_url)
 
     if not _dev_auth():
