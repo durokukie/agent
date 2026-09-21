@@ -162,6 +162,14 @@ def _to_payload(session: Session, result) -> dict[str, Any]:
 app = FastAPI(title="Kukie local server")
 
 
+@app.get("/health")
+def health() -> dict[str, str]:
+    """배포 확인용 (DURO-107). 인증 없음, 상태를 바꾸지 않는다 — 회원 서버 모드에서도 열려 있다 (아래 dev 전용 4개와 다르다).
+
+    리버스 프록시 뒤에서는 /api/health. 컨테이너 HEALTHCHECK 와 `curl https://<도메인>/api/health` 가 이걸 본다."""
+    return {"status": "ok"}
+
+
 def _dev_only() -> None:
     """flat 엔드포인트의 문. 회원 서버 모드면 없는 주소처럼 닫는다 (모듈 설명, #75)."""
     if membership.available():
