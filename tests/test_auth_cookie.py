@@ -91,15 +91,16 @@ def test_헤더가_있으면_모양이_틀려도_쿠키로_넘어가지_않는�
     assert spring["calls"] == []
 
 
-def test_다른_사이트에서_시작됐거나_출처를_모르는_요청은_쿠키로_인증하지_않는다(client, spring):
+def test_다른_오리진에서_시작됐거나_출처를_모르는_요청은_쿠키로_인증하지_않는다(client, spring):
     """SameSite=Lax 도 top-level GET 은 통과시킨다. 브라우저가 붙이는 Sec-Fetch-Site 로 한 번 더 거른다 —
-    헤더가 없어도 거부(fail-closed). 통과시키면 그 브라우저에서는 검사가 없는 것과 같다."""
-    for site in ("cross-site", None):
+    헤더가 없어도 거부(fail-closed), 같은 도메인의 다른 서브도메인(same-site)도 거부. 웹은 agent 와 같은 오리진이라
+    same-origin 만으로 다 돈다."""
+    for site in ("cross-site", "same-site", None):
         r = _with_cookie(client, "kukie_access", "tok-cookie", site=site).get("/whoami")
         assert r.status_code == 403 and r.json()["detail"]["code"] == "CROSS_SITE_COOKIE", site
     assert spring["calls"] == []
-    # 같은 사이트 · 주소창 직접 입력은 통과
-    for site in ("same-origin", "same-site", "none"):
+    # 우리 페이지 · 주소창 직접 입력은 통과
+    for site in ("same-origin", "none"):
         assert _with_cookie(client, "kukie_access", "tok-cookie", site=site).get("/whoami").status_code == 200
 
 

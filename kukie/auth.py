@@ -2,7 +2,11 @@
 
 토큰은 두 길로 온다. 앱(Electron)은 `Authorization: Bearer` 헤더로 (api-spec 5절), 웹 브라우저는 Spring 이 구워 준
 httpOnly 쿠키 `kukie_access` 로 (kukie-server #26 — 브라우저는 헤더를 못 붙이고 쿠키만 자동으로 붙인다).
-헤더가 있으면 헤더, 없을 때만 쿠키. agent 는 그 토큰으로 Spring `GET /users/me` 를 불러 회원 id 를 얻는다. 팀·권한 판단도 Spring 몫이라
+헤더가 있으면 헤더만(모양이 틀리면 401, 값이 비면 없는 것), 없을 때만 쿠키. 쿠키로만 인증된 요청은 브라우저가
+`Sec-Fetch-Site` 로 same-origin(우리 페이지) 또는 none(주소창 직접 입력)이라고 알려 줄 때만 받는다 — 없거나
+cross-site/same-site 면 403 CROSS_SITE_COOKIE. 브라우저는 이 헤더를 **HTTPS(또는 localhost)에서만** 붙이므로
+웹은 HTTPS 로 배포한다는 전제다 (쿠키도 Secure 라 평문 HTTP 에는 애초에 안 실린다).
+agent 는 그 토큰으로 Spring `GET /users/me` 를 불러 회원 id 를 얻는다. 팀·권한 판단도 Spring 몫이라
 같은 토큰으로 `GET /teams` 를 물어 역할을 받는다 (kukie/membership.py).
 
 fail-closed: 설정이 빠지면 거부한다.
@@ -56,15 +60,18 @@ def _cookie_token(request: Request) -> str | None:
     return value.strip() if value and value.strip() else None
 
 
-# 브라우저가 붙이는 Sec-Fetch-Site 중 "우리 사이트에서 시작됐다" 로 볼 수 있는 값. same-origin/same-site 는 우리 페이지가
-# 부른 것, none 은 사용자가 주소창에 직접 친 것. cross-site 는 남의 사이트 링크·폼·이미지 태그.
-SAME_SITE_VALUES = frozenset({"same-origin", "same-site", "none"})
+# 브라우저가 붙이는 Sec-Fetch-Site 중 "우리 페이지에서 시작됐다" 로 볼 수 있는 값. same-origin 은 우리 페이지가 부른 것
+# (웹은 리버스 프록시로 agent 와 같은 오리진이다 — DURO-102 결정 2), none 은 사용자가 주소창에 직접 친 것.
+# same-site(같은 도메인의 다른 서브도메인)·cross-site(남의 사이트 링크·폼·이미지 태그)는 받지 않는다 — 서브도메인 하나에
+# XSS 가 있으면 그 경로로 들어오기 때문에, 한 오리진이면 same-origin 만으로 충분하다 (자동 리뷰 지적).
+SAME_ORIGIN_VALUES = frozenset({"same-origin", "none"})
 
 
-def _from_same_site(request: Request) -> bool:
-    """쿠키 인증은 브라우저가 출처를 알려 줄 때만 받는다. 헤더가 없으면(옛 브라우저·curl) 통과가 아니라 거부다 —
-    통과시키면 그 브라우저에서는 검사가 없는 것과 같다 (fail-closed). 최신 브라우저는 모두 이 헤더를 붙인다."""
-    return request.headers.get("sec-fetch-site", "").strip().lower() in SAME_SITE_VALUES
+def _from_same_origin(request: Request) -> bool:
+    """쿠키 인증은 브라우저가 출처를 알려 줄 때만 받는다. 헤더가 없으면 통과가 아니라 거부다 — 통과시키면 그 경우엔
+    검사가 없는 것과 같다 (fail-closed). 브라우저는 HTTPS·localhost 에서만 이 헤더를 붙인다 (Fetch Metadata 스펙의
+    potentially trustworthy 조건). 평문 HTTP 로 띄우면 웹 로그인이 전부 403 이 되는데, 그건 배포가 HTTPS 여야 한다는 뜻이다."""
+    return request.headers.get("sec-fetch-site", "").strip().lower() in SAME_ORIGIN_VALUES
 
 
 async def _lookup(token: str, member_url: str) -> User:
@@ -108,10 +115,11 @@ async def current_user(
         # 쿠키는 브라우저가 알아서 붙이므로 다른 사이트가 시킨 요청에도 실릴 수 있다 (SameSite=Lax 도 top-level GET 은
         # 통과시킨다). 쿠키로만 인증된 요청은 브라우저가 "같은 사이트에서 시작됐다" 고 알려 줄 때만 받는다.
         # 헤더 토큰은 이 검사를 안 거친다.
-        if not _from_same_site(request):
+        if not _from_same_origin(request):
             raise HTTPException(403, {
                 "code": "CROSS_SITE_COOKIE",
-                "message": "다른 사이트에서 시작됐거나 출처(Sec-Fetch-Site)를 알 수 없는 요청은 쿠키로 인증하지 않는다",
+                "message": "다른 오리진에서 시작됐거나 출처(Sec-Fetch-Site)를 알 수 없는 요청은 쿠키로 인증하지 않는다 "
+                           "(브라우저는 HTTPS·localhost 에서만 이 헤더를 보낸다)",
             })
         return await _lookup(token, member_url)
 
