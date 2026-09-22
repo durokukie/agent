@@ -93,6 +93,7 @@ def test_kind_context는_관리_cluster와_API_identity가_같아야한다(
 
 @pytest.fixture
 def client(monkeypatch, tmp_path, e2e_context, e2e_session_namespace):
+    monkeypatch.setenv("KUKIE_DEV_AUTH", "1")
     server._session = None
     monkeypatch.setattr(
         server,

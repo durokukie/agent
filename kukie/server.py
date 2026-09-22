@@ -26,7 +26,7 @@ decisions 는 온전하므로(전부 run 성공 후에만 갱신) 503 RESUME_RET
 
 이 4개는 **회원 서버가 없는 로컬 개발 전용**이다 (#75). 인증도 팀 검사도 없이 서버의 kubeconfig 로
 돌기 때문에, 회원 서버 모드에서 열어 두면 /conversations 의 검사를 통째로 건너뛰는 옆문이 된다.
-회원 서버 모드에서는 404 — 앱은 /conversations 를 쓴다.
+KUKIE_DEV_AUTH=1 로 개발 모드를 켰을 때만 열리고, 그 밖(회원 서버 모드, 아무 설정 없음)에는 404 — 앱은 /conversations 를 쓴다.
 """
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ from pydantic import BaseModel, ConfigDict
 from pydantic_ai.messages import ModelMessage, ToolCallPart
 from pydantic_ai.tools import DeferredToolRequests, ToolApproved, ToolDenied
 
-from kukie import membership
+from kukie import auth, membership
 from kukie.agent import agent
 from kukie.deps import Deps
 from kukie.guardrail.action_plan import ActionPlan
@@ -162,11 +162,27 @@ def _to_payload(session: Session, result) -> dict[str, Any]:
 app = FastAPI(title="Kukie local server")
 
 
+@app.get("/health")
+async def health() -> dict[str, str]:
+    """배포 확인용 (DURO-107). 인증 없음, 상태를 바꾸지 않는다 — 회원 서버 모드에서도 열려 있다 (아래 dev 전용 4개와 다르다).
+
+    리버스 프록시 뒤에서는 /api/health. 컨테이너 HEALTHCHECK 와 `curl https://<도메인>/api/health` 가 이걸 본다.
+    async def: 동기 def 면 kubectl·DB 와 같은 스레드풀에 줄 서서, 가장 바쁠 때 헬스체크가 늦어 unhealthy 로 찍힌다 (PR #82 리뷰)."""
+    return {"status": "ok"}
+
+
 def _dev_only() -> None:
-    """flat 엔드포인트의 문. 회원 서버 모드면 없는 주소처럼 닫는다 (모듈 설명, #75)."""
+    """flat 엔드포인트의 문. **개발 모드(KUKIE_DEV_AUTH=1)이고 회원 서버가 없을 때만** 열린다 — 그 밖에는 없는 주소처럼 닫는다 (#75).
+
+    "회원 서버가 없으면 열림" 이 아니라 "개발 모드를 켰을 때만 열림" 인 이유: 컴포즈에서 KUKIE_MEMBER_URL 이 빠지거나
+    오타 나면 /conversations 는 503 으로 닫히는데(auth.py, fail-closed) 여기만 인증 없이 열려 있었다 (PR #82 리뷰).
+    같은 방향으로 맞춘다 — 설정 한 줄 실수가 무인증 에이전트 실행이 되지 않게."""
     if membership.available():
         raise HTTPException(404, {"code": "NOT_FOUND",
                                   "message": "회원 서버 모드에서는 쓰지 않는 개발용 엔드포인트다 — /conversations 를 쓴다"})
+    if not auth.dev_auth_enabled():
+        raise HTTPException(404, {"code": "NOT_FOUND",
+                                  "message": "개발용 엔드포인트는 KUKIE_DEV_AUTH=1 일 때만 열린다 — 회원 서버 없이 로컬에서 쓰려면 .env 에 넣는다"})
 
 
 DEV_ONLY = [Depends(_dev_only)]

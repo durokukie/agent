@@ -36,6 +36,7 @@ DELETE_ARGS = {
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
+    monkeypatch.setenv("KUKIE_DEV_AUTH", "1")   # flat 엔드포인트는 개발 모드를 켰을 때만 열린다 (#82)
     server._session = None
     monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)

@@ -28,6 +28,7 @@ FAKE_COMMAND = "kubectl --context kind-dev get pods -n study -o wide"
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
+    monkeypatch.setenv("KUKIE_DEV_AUTH", "1")   # flat 엔드포인트는 개발 모드를 켰을 때만 열린다 (#82) — README 의 로컬 실행과 같은 설정
     server._session = None
     monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
     monkeypatch.setattr(read_tools, "run_kubectl",
