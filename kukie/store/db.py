@@ -17,7 +17,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine, event, inspect, text
-from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine import Connection, Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from kukie.store.chat_store import ChatStore
@@ -35,6 +35,7 @@ _init_lock = threading.Lock()   # 동기 dependency 는 스레드풀에서 돈�
 def database_url() -> str:
     url = os.environ.get("KUKIE_DATABASE_URL")
     if url:
+        _reject_memory_sqlite(url)   # CLI(alembic.ini → env.py)도 이 함수를 거친다 — 서버 기동과 같은 문에서 막는다
         return url
     DEFAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     return f"sqlite:///{DEFAULT_DB_PATH}"
@@ -142,14 +143,23 @@ def _migration_engine(url: str) -> Engine:
 
 
 def _is_memory_sqlite(url: str) -> bool:
-    return url.startswith("sqlite") and (url.rstrip("/") == "sqlite:" or ":memory:" in url)
+    """sqlite:// · sqlite+pysqlite:// (경로 없음) · …/:memory: · file::memory:?… 전부 — 글자가 아니라 주소를 파싱해 본다."""
+    parsed = make_url(url)
+    if parsed.get_backend_name() != "sqlite":
+        return False
+    database = parsed.database or ""
+    return database == "" or ":memory:" in database
+
+
+def _reject_memory_sqlite(url: str) -> None:
+    """엔진이 둘(마이그레이션용·서비스용)이라 메모리 DB 는 서로 다른 DB 를 연다 — 표는 버려지는 쪽에 생기고
+    첫 쿼리가 no such table 로 죽는다. 조용히 깨지느니 문에서 막는다 (PR #83 리뷰 4·5차)."""
+    if _is_memory_sqlite(url):
+        raise ValueError("KUKIE_DATABASE_URL 에 메모리 SQLite(sqlite:// · :memory:)는 쓸 수 없다 — 파일 주소를 써라")
 
 
 def _connect(url: str) -> tuple[Engine, sessionmaker[Session]]:
-    if _is_memory_sqlite(url):
-        # 엔진이 둘(마이그레이션용·서비스용)이라 메모리 DB 는 서로 다른 DB 를 연다 — 표는 버려지는 쪽에 생기고
-        # 첫 쿼리가 no such table 로 죽는다. 조용히 깨지느니 여기서 막는다 (PR #83 리뷰 4차).
-        raise ValueError("KUKIE_DATABASE_URL 에 메모리 SQLite(sqlite:// · :memory:)는 쓸 수 없다 — 파일 주소를 써라")
+    _reject_memory_sqlite(url)
     migration_engine = _migration_engine(url)
     try:
         _migrate(migration_engine)
