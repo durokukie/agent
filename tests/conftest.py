@@ -14,3 +14,4 @@ def _member_server_off_by_default(monkeypatch):
     직접 켠다 (test_membership.py 의 spring 픽스처).
     """
     monkeypatch.delenv("KUKIE_MEMBER_URL", raising=False)
+    monkeypatch.delenv("KUKIE_ACCESS_COOKIE", raising=False)  # 쿠키 이름도 .env 에서 올라올 수 있다 (#79)
