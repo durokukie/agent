@@ -15,9 +15,10 @@ from kukie.store import reset_store_for_tests
 from kukie.store.models import Base
 
 HEAD = "0002"
-# Alembic 이전 create_all 이 만들던 인덱스 — 노트북의 옛 ~/.kukie/kukie.db 에서 그대로 읽은 SQL
+BASELINE = "0001"
+# Alembic 이전 create_all 이 만든 실제 DB 의 모양 — 노트북의 옛 ~/.kukie/kukie.db 에서 그대로 뜬 sqlite_master
+LEGACY_SCHEMA = Path(__file__).with_name("data") / "legacy_schema_2026-09-22.sql"
 OLD_PERSONAL = "CREATE UNIQUE INDEX uq_cluster_personal_name ON tbl_cluster (registered_by, name) WHERE team_id IS NULL"
-OLD_TEAM = "CREATE UNIQUE INDEX uq_cluster_team_name ON tbl_cluster (team_id, name) WHERE team_id IS NOT NULL"
 
 
 def _normalize(kind: str, sql: str) -> str:
@@ -65,15 +66,16 @@ def model_schema(tmp_path: Path) -> dict[tuple[str, str], str]:
     return schema(path)
 
 
-def make_old_db(path: Path, clusters: list[tuple[str, str | None, str, str]]) -> None:
-    """Alembic 이전 DB 를 재현한다 — 표는 지금 모델, 인덱스만 옛 조건. clusters = (id, team_id, registered_by, name)."""
+def make_old_db(path: Path, clusters: list[tuple[str, str | None, str, str]], *, drop_table: str | None = None) -> None:
+    """Alembic 이전 DB 를 재현한다 — 실제 옛 DB 의 sqlite_master 스냅샷 그대로. clusters = (id, team_id, registered_by, name).
+    drop_table 을 주면 그 표가 아직 없던 더 옛 DB (예: tbl_action_plan 이 #58 로 생기기 전)."""
+    con0 = sqlite3.connect(path)
+    con0.executescript("\n".join(line for line in LEGACY_SCHEMA.read_text().splitlines() if not line.startswith("--")))
+    if drop_table:
+        con0.execute(f"DROP TABLE {drop_table}")
+    con0.commit(); con0.close()
     engine = create_engine(f"sqlite:///{path}")
-    Base.metadata.create_all(engine)
     with engine.begin() as con:
-        con.execute(text("DROP INDEX uq_cluster_personal_name"))
-        con.execute(text("DROP INDEX uq_cluster_team_name"))
-        con.execute(text(OLD_PERSONAL))
-        con.execute(text(OLD_TEAM))
         for cid, team_id, by, name in clusters:
             con.execute(text(
                 "INSERT INTO tbl_cluster (id, team_id, registered_by, name, provider, api_server, insecure, "
@@ -131,3 +133,51 @@ def test_팀_없는_이름이_겹치는_옛_DB는_멈추고_어느_행인지_말
     # 데이터와 인덱스는 손대지 않았다 — 사람이 정리한 뒤 다시 켜면 이어서 간다
     assert team_ids(db) == {"a": "", "b": None}
     assert schema(db)[("index", "uq_cluster_personal_name")] == OLD_PERSONAL
+
+
+def test_0001은_실제_옛_DB의_모양과_같다(tmp_path):
+    """도장(stamp)이 거짓말이 아니려면 0001 이 만드는 표·인덱스가 옛 create_all 의 결과와 같아야 한다.
+    노트북 옛 DB 에서 뜬 스냅샷과, 빈 DB 에 0001 만 적용한 결과를 대조한다."""
+    from alembic import command
+    from kukie.store.db import _alembic_config
+
+    legacy = tmp_path / "legacy.db"
+    make_old_db(legacy, [])
+    baseline = tmp_path / "baseline.db"
+    engine = create_engine(f"sqlite:///{baseline}")
+    with engine.begin() as con:
+        command.upgrade(_alembic_config(con), BASELINE)
+    engine.dispose()
+
+    assert schema(baseline) == schema(legacy)
+
+
+def test_표가_덜_만들어진_옛_DB는_도장을_찍지_않고_멈춘다(tmp_path):
+    """tbl_action_plan(#58)·tbl_cluster(#61) 이전에 만든 DB. 예전엔 create_all 이 빠진 표를 채웠지만,
+    0001 도장을 찍어 버리면 그 표는 영영 안 생긴다 (PR #83 리뷰) — 멈추고 무엇이 없는지 말한다."""
+    db = tmp_path / "older.db"
+    make_old_db(db, [], drop_table="tbl_action_plan")
+
+    with pytest.raises(RuntimeError, match=r"없는 표 \['tbl_action_plan'\]"):
+        reset_store_for_tests(f"sqlite:///{db}")
+
+    assert version(db) is None                        # 도장을 안 찍었다 — 사람이 정리한 뒤 이어서 갈 수 있다
+    assert ("table", "tbl_action_plan") not in schema(db)
+
+
+def test_겹침으로_멈춘_뒤_정리하고_다시_켜면_이어서_간다(tmp_path):
+    """SQLite 는 DDL 이 롤백되지 않아 첫 시도가 alembic_version 표만 빈 채 남긴다. 그 표의 존재만 보고
+    도장을 건너뛰면 0001 을 처음부터 돌리다 'already exists' 로 죽는다 (PR #83 리뷰) — 현재 리비전으로 본다."""
+    db = tmp_path / "old.db"
+    make_old_db(db, [("a", "", "u1", "운영"), ("b", None, "u1", "운영")])
+    with pytest.raises(RuntimeError):
+        reset_store_for_tests(f"sqlite:///{db}")
+
+    con = sqlite3.connect(db)
+    con.execute("UPDATE tbl_cluster SET name = '운영-2' WHERE id = 'b'")   # 사람이 겹침을 정리
+    con.commit(); con.close()
+    reset_store_for_tests(f"sqlite:///{db}")
+
+    assert version(db) == HEAD
+    assert team_ids(db) == {"a": None, "b": None}
+    assert schema(db) == model_schema(tmp_path)

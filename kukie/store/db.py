@@ -15,7 +15,8 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect
+from alembic.runtime.migration import MigrationContext
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -47,19 +48,66 @@ def _alembic_config(connection: Connection) -> Config:
     return config
 
 
+def _shape(connection: Connection) -> dict[str, frozenset[str]]:
+    """표 이름 → 열 이름 집합. alembic_version 은 마이그레이션의 부산물이라 뺀다 (실패한 첫 시도 뒤 빈 채 남을 수 있다)."""
+    inspector = inspect(connection)
+    return {
+        table: frozenset(column["name"] for column in inspector.get_columns(table))
+        for table in inspector.get_table_names()
+        if table != "alembic_version"
+    }
+
+
+def _baseline_shape() -> dict[str, frozenset[str]]:
+    """0001 이 만드는 표·열 — 빈 메모리 DB 에 0001 만 적용해 읽는다 (모델이 아니라 리비전이 기준)."""
+    engine = create_engine("sqlite://", future=True)
+    try:
+        with engine.begin() as connection:
+            command.upgrade(_alembic_config(connection), BASELINE_REVISION)
+            return _shape(connection)
+    finally:
+        engine.dispose()
+
+
 def _migrate(engine: Engine) -> None:
     """표 모양을 리비전 순서대로 최신(head)으로.
 
-    Alembic 이전에 create_all 로 만든 DB(표는 있는데 alembic_version 이 없음)는 그 모양 그대로 얼려 둔
-    0001 로 도장만 찍고 그 뒤 리비전만 적용한다 — 0001 을 실제로 돌리면 이미 있는 표를 또 만들려다 죽는다.
-    한 트랜잭션으로 묶어, 중간 리비전이 멈추면(예: 0002 의 이름 겹침) 그 앞까지도 남기지 않는다 (SQLite 는
-    DDL 이 일부 커밋될 수 있어 완전하진 않지만, 리비전 자체가 검사 → 변경 순서라 데이터는 안 건드린다).
+    Alembic 이전에 create_all 로 만든 DB(표는 있는데 리비전 기록이 없음)는, 표·열이 0001 과 같을 때만
+    0001 로 도장을 찍고 그 뒤 리비전만 적용한다 — 0001 을 실제로 돌리면 이미 있는 표를 또 만들려다 죽는다.
+    표가 덜 만들어졌거나 열이 다른 옛 DB 는 도장을 찍으면 영영 못 낫는 채 남으므로(PR #83 리뷰) 멈추고
+    사람이 읽을 메시지를 낸다. 리비전 기록의 유무는 표 존재가 아니라 현재 리비전으로 본다 — 첫 시도가 중간에
+    멈추면 SQLite 는 alembic_version 표만 빈 채 남긴다(아래).
+
+    리비전을 쓰는 규칙: **SQLite 는 DDL 이 롤백되지 않는다** (pysqlite 는 DML 앞에서만 BEGIN 을 친다).
+    리비전이 중간에 실패하면 alembic_version 갱신(DML)은 되돌아가지만 이미 친 CREATE/DROP 은 남아, 다시
+    켤 때 같은 DDL 이 "already exists" 로 죽는다. 그러니 되돌릴 수 없는 변경(DDL)은 검사를 다 마친 뒤
+    마지막에 둔다 — 0002 가 검사 → UPDATE → 인덱스 재생성 순서인 이유.
+
+    여러 프로세스가 동시에 뜨면(Aurora + 복제본, uvicorn --workers) 같이 upgrade 에 들어와 한쪽이 죽는다.
+    Postgres 는 트랜잭션 잠금으로 줄을 세운다. SQLite 는 단일 프로세스 전제(_init_lock 은 프로세스 안쪽만).
     """
     with engine.begin() as connection:
+        if connection.dialect.name == "postgresql":
+            connection.execute(text("SELECT pg_advisory_xact_lock(7378616)"))   # 'kukie' 를 숫자로 — 임의 상수
         config = _alembic_config(connection)
-        tables = set(inspect(connection).get_table_names())
-        if "alembic_version" not in tables and "tbl_chat_session" in tables:
-            command.stamp(config, BASELINE_REVISION)
+        if MigrationContext.configure(connection).get_current_revision() is None:
+            actual = _shape(connection)
+            if actual:   # Alembic 이전 DB
+                expected = _baseline_shape()
+                if actual != expected:
+                    missing = sorted(set(expected) - set(actual))
+                    extra = sorted(set(actual) - set(expected))
+                    columns = sorted(
+                        f"{table}({', '.join(sorted(actual[table] ^ expected[table]))})"
+                        for table in set(actual) & set(expected) if actual[table] != expected[table]
+                    )
+                    raise RuntimeError(
+                        "Alembic 이전 DB 의 표 모양이 기준(0001)과 달라 마이그레이션을 시작할 수 없다 — "
+                        f"없는 표 {missing or '없음'} · 모르는 표 {extra or '없음'} · 열이 다른 표 {columns or '없음'}. "
+                        "개발용 DB 면 지우고 다시 켜라 (기본 ~/.kukie/kukie.db). 남겨야 할 데이터가 있으면 "
+                        "0001 모양에 맞춰 손으로 고친 뒤 다시 켜라"
+                    )
+                command.stamp(config, BASELINE_REVISION)
         command.upgrade(config, "head")
 
 
