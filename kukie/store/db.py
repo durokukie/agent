@@ -141,7 +141,15 @@ def _migration_engine(url: str) -> Engine:
     return engine
 
 
+def _is_memory_sqlite(url: str) -> bool:
+    return url.startswith("sqlite") and (url.rstrip("/") == "sqlite:" or ":memory:" in url)
+
+
 def _connect(url: str) -> tuple[Engine, sessionmaker[Session]]:
+    if _is_memory_sqlite(url):
+        # 엔진이 둘(마이그레이션용·서비스용)이라 메모리 DB 는 서로 다른 DB 를 연다 — 표는 버려지는 쪽에 생기고
+        # 첫 쿼리가 no such table 로 죽는다. 조용히 깨지느니 여기서 막는다 (PR #83 리뷰 4차).
+        raise ValueError("KUKIE_DATABASE_URL 에 메모리 SQLite(sqlite:// · :memory:)는 쓸 수 없다 — 파일 주소를 써라")
     migration_engine = _migration_engine(url)
     try:
         _migrate(migration_engine)

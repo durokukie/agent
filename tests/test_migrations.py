@@ -216,14 +216,32 @@ def test_SQLite에서도_DDL이_트랜잭션과_함께_되돌아간다(tmp_path)
 
 def test_서비스_엔진에는_BEGIN_레시피를_걸지_않는다(tmp_path):
     """레시피는 마이그레이션 엔진에만. 서비스 엔진에 걸면 세션의 첫 SELECT 가 SHARED 잠금을 쥐어 같은 세션의
-    이어 쓰기가 잠금 승격에서 기다리지 못하고 바로 'database is locked' 를 맞는다 (PR #83 리뷰 3차)."""
+    이어 쓰기가 잠금 승격에서 기다리지 못하고 바로 'database is locked' 를 맞는다 (PR #83 리뷰 3차).
+    리스너 유무가 아니라 드라이버 커넥션의 in_transaction 으로 본다 — isolation_level 만 바뀌는 회귀도 잡게 (4차)."""
     from kukie.store import db as db_module
     from kukie.store.db import _migration_engine
 
     url = f"sqlite:///{tmp_path / 'svc.db'}"
     reset_store_for_tests(url)
 
-    assert not list(db_module._engine.dispatch.begin)           # 서비스 엔진: 드라이버 기본
+    with db_module._engine.connect() as con:                       # 서비스 엔진: 드라이버 기본
+        con.execute(text("SELECT 1"))
+        assert con.connection.dbapi_connection.in_transaction is False      # SELECT 는 트랜잭션 밖 — 잠금을 안 쥔다
+        con.execute(text("INSERT INTO tbl_chat_session (id, user_id, title, current_mode, context_name, namespace, "
+                         "version, created_at, updated_at, shared) VALUES ('s', 'u', 't', 'study', 'c', 'n', 1, "
+                         "'2026-09-01 00:00:00', '2026-09-01 00:00:00', 0)"))
+        assert con.connection.dbapi_connection.in_transaction is True       # 쓰기 앞에서는 BEGIN 을 친다 (autocommit 이 아니다)
+        con.rollback()
+
     migration = _migration_engine(url)
-    assert list(migration.dispatch.begin)                         # 마이그레이션 엔진: BEGIN 직접
+    with migration.begin() as con:                                 # 마이그레이션 엔진: BEGIN 을 직접 — SELECT 도 트랜잭션 안
+        con.execute(text("SELECT 1"))
+        assert con.connection.dbapi_connection.in_transaction is True
     migration.dispose()
+
+
+def test_메모리_SQLite_주소는_막는다(tmp_path):
+    """엔진이 둘이라 메모리 DB 는 서로 다른 DB 를 연다 — 표는 버려지는 쪽에 생기고 첫 쿼리가 죽는다 (PR #83 리뷰 4차)."""
+    for url in ("sqlite://", "sqlite:///:memory:"):
+        with pytest.raises(ValueError, match="메모리 SQLite"):
+            reset_store_for_tests(url)
