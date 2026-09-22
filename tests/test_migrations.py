@@ -200,10 +200,10 @@ def test_남의_표만_있는_DB는_옛_DB가_아니라_새_DB다(tmp_path):
 def test_SQLite에서도_DDL이_트랜잭션과_함께_되돌아간다(tmp_path):
     """pysqlite 기본값은 DDL 을 트랜잭션 밖에 둔다 — 리비전이 중간에 멈추면 표만 남아 다음 기동이 'already exists'
     로 죽는다. 엔진이 BEGIN 을 직접 쳐서 DDL 까지 되돌린다 (PR #83 리뷰 2차)."""
-    from kukie.store.db import _make_engine
+    from kukie.store.db import _migration_engine
 
     db = tmp_path / "ddl.db"
-    engine = _make_engine(f"sqlite:///{db}")
+    engine = _migration_engine(f"sqlite:///{db}")
     with pytest.raises(RuntimeError):
         with engine.begin() as con:
             con.execute(text("CREATE TABLE half_done (x INTEGER)"))
@@ -212,3 +212,18 @@ def test_SQLite에서도_DDL이_트랜잭션과_함께_되돌아간다(tmp_path)
     engine.dispose()
 
     assert ("table", "half_done") not in schema(db)
+
+
+def test_서비스_엔진에는_BEGIN_레시피를_걸지_않는다(tmp_path):
+    """레시피는 마이그레이션 엔진에만. 서비스 엔진에 걸면 세션의 첫 SELECT 가 SHARED 잠금을 쥐어 같은 세션의
+    이어 쓰기가 잠금 승격에서 기다리지 못하고 바로 'database is locked' 를 맞는다 (PR #83 리뷰 3차)."""
+    from kukie.store import db as db_module
+    from kukie.store.db import _migration_engine
+
+    url = f"sqlite:///{tmp_path / 'svc.db'}"
+    reset_store_for_tests(url)
+
+    assert not list(db_module._engine.dispatch.begin)           # 서비스 엔진: 드라이버 기본
+    migration = _migration_engine(url)
+    assert list(migration.dispatch.begin)                         # 마이그레이션 엔진: BEGIN 직접
+    migration.dispose()

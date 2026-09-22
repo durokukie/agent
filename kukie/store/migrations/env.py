@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 from alembic import context
-from sqlalchemy import create_engine
 
 from kukie.store.models import Base
 
@@ -29,10 +28,10 @@ def run_migrations() -> None:
     if connection is not None:
         _run(connection)
         return
-    from kukie.store.db import database_url  # CLI 에서만 — 순환 import 를 피해 여기서
+    from kukie.store.db import _migration_engine, database_url  # CLI 에서만 — 순환 import 를 피해 여기서
 
-    engine = create_engine(database_url(), future=True)
-    with engine.connect() as connection:
+    engine = _migration_engine(database_url())   # 서버 기동과 같은 엔진 — SQLite 도 DDL 이 트랜잭션 안
+    with engine.begin() as connection:
         _run(connection)
     engine.dispose()
 

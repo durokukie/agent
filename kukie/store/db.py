@@ -78,11 +78,11 @@ def _migrate(engine: Engine) -> None:
     사람이 읽을 메시지를 낸다. 리비전 기록의 유무는 표 존재가 아니라 현재 리비전으로 본다 — 첫 시도가 중간에
     멈추면 SQLite 는 alembic_version 표만 빈 채 남긴다(아래).
 
-    리비전 하나는 한 트랜잭션이다 — 중간에 멈추면 표·인덱스·데이터·alembic_version 전부 되돌아가고, 다음
-    기동이 같은 자리에서 처음부터 다시 한다. SQLite 도 그렇다: pysqlite 는 기본으로 DML 앞에서만 BEGIN 을
-    쳐서 DDL 이 트랜잭션 밖에 남는데, _make_engine 이 BEGIN 을 직접 치게 해 DDL 까지 트랜잭션 안에 둔다
-    (SQLAlchemy 의 pysqlite 레시피, PR #83 리뷰 2차). 그래도 리비전은 검사 → 변경 순서로 쓴다 — 멈출 거면
-    아무것도 안 건드리고 멈추는 편이 읽기 쉽다.
+    한 번의 기동에서 적용하는 리비전 전부(도장 포함)가 **트랜잭션 하나**다 — env.py 가 넘겨받은 커넥션의
+    트랜잭션을 그대로 쓰고 transaction_per_migration 을 켜지 않으므로. 중간에 멈추면 그 기동에서 한 것이 전부
+    되돌아가고(0002·0003 이 되고 0004 가 멈추면 셋 다), 다음 기동이 처음부터 다시 한다. SQLite 도 그렇다:
+    _migration_engine 이 BEGIN 을 직접 쳐서 DDL 까지 트랜잭션 안에 둔다 (PR #83 리뷰 2차). 그래도 리비전은
+    검사 → 변경 순서로 쓴다 — 멈출 거면 아무것도 안 건드리고 멈추는 편이 읽기 쉽다.
 
     여러 프로세스가 동시에 뜨면(Aurora + 복제본, uvicorn --workers) 같이 upgrade 에 들어와 한쪽이 죽는다.
     Postgres 는 트랜잭션 잠금으로 줄을 세운다. SQLite 는 단일 프로세스 전제(_init_lock 은 프로세스 안쪽만).
@@ -112,13 +112,24 @@ def _migrate(engine: Engine) -> None:
         command.upgrade(config, "head")
 
 
-def _make_engine(url: str) -> Engine:
+def _service_engine(url: str) -> Engine:
+    """평소 요청이 쓰는 엔진 — 드라이버 기본 동작 그대로."""
+    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
+    return create_engine(url, connect_args=connect_args, future=True)
+
+
+def _migration_engine(url: str) -> Engine:
+    """마이그레이션에만 쓰는 엔진. 켜질 때 한 번 쓰고 버린다.
+
+    SQLite 에는 SQLAlchemy 의 pysqlite 레시피를 건다: 드라이버의 암묵 BEGIN(DML 앞에서만, DDL 은 트랜잭션 밖)을
+    끄고 트랜잭션을 열 때 BEGIN 을 직접 친다 → DDL 도 롤백된다. 서비스 엔진에는 걸지 않는다 — 걸면 세션의 첫
+    SELECT 부터 SHARED 잠금을 쥐어, 같은 세션에서 이어 쓰는 곳이 잠금 승격에서 기다리지 못하고 바로
+    `database is locked` 를 맞는다 (PR #83 리뷰 3차).
+    """
     if not url.startswith("sqlite"):
         return create_engine(url, future=True)
     engine = create_engine(url, connect_args={"check_same_thread": False}, future=True)
 
-    # pysqlite 는 DML 앞에서만 BEGIN 을 치고 DDL 은 트랜잭션 밖에 둔다 — 마이그레이션이 중간에 멈추면 표만 남는다.
-    # 드라이버의 암묵 BEGIN 을 끄고 SQLAlchemy 가 트랜잭션을 열 때 BEGIN 을 직접 친다 → DDL 도 롤백된다.
     @event.listens_for(engine, "connect")
     def _no_implicit_begin(dbapi_connection, _record) -> None:
         dbapi_connection.isolation_level = None
@@ -131,8 +142,12 @@ def _make_engine(url: str) -> Engine:
 
 
 def _connect(url: str) -> tuple[Engine, sessionmaker[Session]]:
-    engine = _make_engine(url)
-    _migrate(engine)
+    migration_engine = _migration_engine(url)
+    try:
+        _migrate(migration_engine)
+    finally:
+        migration_engine.dispose()
+    engine = _service_engine(url)
     return engine, sessionmaker(bind=engine, expire_on_commit=False)
 
 
