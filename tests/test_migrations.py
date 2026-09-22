@@ -243,7 +243,8 @@ def test_서비스_엔진에는_BEGIN_레시피를_걸지_않는다(tmp_path):
 def test_메모리_SQLite_주소는_막는다(tmp_path):
     """엔진이 둘이라 메모리 DB 는 서로 다른 DB 를 연다 — 표는 버려지는 쪽에 생기고 첫 쿼리가 죽는다 (PR #83 리뷰 4차)."""
     for url in ("sqlite://", "sqlite:///:memory:", "sqlite+pysqlite://", "sqlite+pysqlite:///:memory:",
-                "sqlite:///file::memory:?cache=shared&uri=true"):
+                "sqlite:///file::memory:?cache=shared&uri=true",
+                "sqlite:///file:memdb1?mode=memory&cache=shared&uri=true"):   # 이름 있는 메모리 DB — 쿼리 인자로만 안다
         with pytest.raises(ValueError, match="메모리 SQLite"):
             reset_store_for_tests(url)
 

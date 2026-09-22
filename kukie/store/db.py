@@ -148,7 +148,8 @@ def _is_memory_sqlite(url: str) -> bool:
     if parsed.get_backend_name() != "sqlite":
         return False
     database = parsed.database or ""
-    return database == "" or ":memory:" in database
+    # 이름 있는 메모리 DB(file:memdb1?mode=memory&cache=shared&uri=true)는 경로가 아니라 쿼리 인자가 말한다
+    return database == "" or ":memory:" in database or parsed.query.get("mode") == "memory"
 
 
 def _reject_memory_sqlite(url: str) -> None:
