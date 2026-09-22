@@ -11,6 +11,7 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.30",
     "sqlalchemy>=2.0",      # 채팅방·run 저장 (kukie/store)
+    "alembic>=1.13",        # 표 모양 변경 이력 — 켜질 때 적용 (kukie/store/migrations, issue #67)
     "httpx>=0.27",          # Spring 회원 서버 /users/me 호출 (kukie/auth)
     "cryptography>=42",     # 클러스터 자격증명 대칭 암호화 (kukie/clusters, 기획 04 §8)
 ]
