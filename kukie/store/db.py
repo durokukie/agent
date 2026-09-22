@@ -16,7 +16,7 @@ from pathlib import Path
 from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -78,10 +78,11 @@ def _migrate(engine: Engine) -> None:
     사람이 읽을 메시지를 낸다. 리비전 기록의 유무는 표 존재가 아니라 현재 리비전으로 본다 — 첫 시도가 중간에
     멈추면 SQLite 는 alembic_version 표만 빈 채 남긴다(아래).
 
-    리비전을 쓰는 규칙: **SQLite 는 DDL 이 롤백되지 않는다** (pysqlite 는 DML 앞에서만 BEGIN 을 친다).
-    리비전이 중간에 실패하면 alembic_version 갱신(DML)은 되돌아가지만 이미 친 CREATE/DROP 은 남아, 다시
-    켤 때 같은 DDL 이 "already exists" 로 죽는다. 그러니 되돌릴 수 없는 변경(DDL)은 검사를 다 마친 뒤
-    마지막에 둔다 — 0002 가 검사 → UPDATE → 인덱스 재생성 순서인 이유.
+    리비전 하나는 한 트랜잭션이다 — 중간에 멈추면 표·인덱스·데이터·alembic_version 전부 되돌아가고, 다음
+    기동이 같은 자리에서 처음부터 다시 한다. SQLite 도 그렇다: pysqlite 는 기본으로 DML 앞에서만 BEGIN 을
+    쳐서 DDL 이 트랜잭션 밖에 남는데, _make_engine 이 BEGIN 을 직접 치게 해 DDL 까지 트랜잭션 안에 둔다
+    (SQLAlchemy 의 pysqlite 레시피, PR #83 리뷰 2차). 그래도 리비전은 검사 → 변경 순서로 쓴다 — 멈출 거면
+    아무것도 안 건드리고 멈추는 편이 읽기 쉽다.
 
     여러 프로세스가 동시에 뜨면(Aurora + 복제본, uvicorn --workers) 같이 upgrade 에 들어와 한쪽이 죽는다.
     Postgres 는 트랜잭션 잠금으로 줄을 세운다. SQLite 는 단일 프로세스 전제(_init_lock 은 프로세스 안쪽만).
@@ -91,19 +92,19 @@ def _migrate(engine: Engine) -> None:
             connection.execute(text("SELECT pg_advisory_xact_lock(7378616)"))   # 'kukie' 를 숫자로 — 임의 상수
         config = _alembic_config(connection)
         if MigrationContext.configure(connection).get_current_revision() is None:
-            actual = _shape(connection)
-            if actual:   # Alembic 이전 DB
-                expected = _baseline_shape()
+            expected = _baseline_shape()
+            # kukie 표만 본다 — 남의 표(공유 DB·예전 도구)는 create_all 때처럼 무시한다 (PR #83 리뷰 2차)
+            actual = {table: columns for table, columns in _shape(connection).items() if table in expected}
+            if actual:   # 리비전 기록 없이 kukie 표가 있다 — Alembic 이전 DB, 또는 첫 기동이 중간에 끊긴 DB
                 if actual != expected:
                     missing = sorted(set(expected) - set(actual))
-                    extra = sorted(set(actual) - set(expected))
                     columns = sorted(
                         f"{table}({', '.join(sorted(actual[table] ^ expected[table]))})"
-                        for table in set(actual) & set(expected) if actual[table] != expected[table]
+                        for table in actual if actual[table] != expected[table]
                     )
                     raise RuntimeError(
-                        "Alembic 이전 DB 의 표 모양이 기준(0001)과 달라 마이그레이션을 시작할 수 없다 — "
-                        f"없는 표 {missing or '없음'} · 모르는 표 {extra or '없음'} · 열이 다른 표 {columns or '없음'}. "
+                        "리비전 기록이 없는데 kukie 표의 모양이 기준(0001)과 다르다 — Alembic 이전에 만들다 만 DB 거나 "
+                        f"첫 기동이 중간에 끊긴 DB 다. 없는 표 {missing or '없음'} · 열이 다른 표 {columns or '없음'}. "
                         "개발용 DB 면 지우고 다시 켜라 (기본 ~/.kukie/kukie.db). 남겨야 할 데이터가 있으면 "
                         "0001 모양에 맞춰 손으로 고친 뒤 다시 켜라"
                     )
@@ -111,9 +112,26 @@ def _migrate(engine: Engine) -> None:
         command.upgrade(config, "head")
 
 
+def _make_engine(url: str) -> Engine:
+    if not url.startswith("sqlite"):
+        return create_engine(url, future=True)
+    engine = create_engine(url, connect_args={"check_same_thread": False}, future=True)
+
+    # pysqlite 는 DML 앞에서만 BEGIN 을 치고 DDL 은 트랜잭션 밖에 둔다 — 마이그레이션이 중간에 멈추면 표만 남는다.
+    # 드라이버의 암묵 BEGIN 을 끄고 SQLAlchemy 가 트랜잭션을 열 때 BEGIN 을 직접 친다 → DDL 도 롤백된다.
+    @event.listens_for(engine, "connect")
+    def _no_implicit_begin(dbapi_connection, _record) -> None:
+        dbapi_connection.isolation_level = None
+
+    @event.listens_for(engine, "begin")
+    def _explicit_begin(connection) -> None:
+        connection.exec_driver_sql("BEGIN")
+
+    return engine
+
+
 def _connect(url: str) -> tuple[Engine, sessionmaker[Session]]:
-    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-    engine = create_engine(url, connect_args=connect_args, future=True)
+    engine = _make_engine(url)
     _migrate(engine)
     return engine, sessionmaker(bind=engine, expire_on_commit=False)
 

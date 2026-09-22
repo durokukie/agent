@@ -181,3 +181,34 @@ def test_겹침으로_멈춘_뒤_정리하고_다시_켜면_이어서_간다(tmp
     assert version(db) == HEAD
     assert team_ids(db) == {"a": None, "b": None}
     assert schema(db) == model_schema(tmp_path)
+
+
+def test_남의_표만_있는_DB는_옛_DB가_아니라_새_DB다(tmp_path):
+    """공유 DB 에 다른 도구의 표가 있어도 create_all 때처럼 무시하고 kukie 표를 만든다 (PR #83 리뷰 2차)."""
+    db = tmp_path / "shared.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE somebody_else (x INTEGER)")
+    con.commit(); con.close()
+
+    reset_store_for_tests(f"sqlite:///{db}")
+
+    assert version(db) == HEAD
+    assert ("table", "somebody_else") in schema(db)                # 남의 표는 그대로
+    assert ("table", "tbl_cluster") in schema(db)
+
+
+def test_SQLite에서도_DDL이_트랜잭션과_함께_되돌아간다(tmp_path):
+    """pysqlite 기본값은 DDL 을 트랜잭션 밖에 둔다 — 리비전이 중간에 멈추면 표만 남아 다음 기동이 'already exists'
+    로 죽는다. 엔진이 BEGIN 을 직접 쳐서 DDL 까지 되돌린다 (PR #83 리뷰 2차)."""
+    from kukie.store.db import _make_engine
+
+    db = tmp_path / "ddl.db"
+    engine = _make_engine(f"sqlite:///{db}")
+    with pytest.raises(RuntimeError):
+        with engine.begin() as con:
+            con.execute(text("CREATE TABLE half_done (x INTEGER)"))
+            con.execute(text("INSERT INTO half_done VALUES (1)"))
+            raise RuntimeError("리비전이 중간에 멈춤")
+    engine.dispose()
+
+    assert ("table", "half_done") not in schema(db)
