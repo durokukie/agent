@@ -7,21 +7,28 @@ SQLite 쪽 test_migrations.py 와 같은 시나리오를 Postgres 카탈로그(i
 from __future__ import annotations
 
 import os
+import threading
 import uuid
 
+import psycopg
 import pytest
+from alembic import command
+from alembic.autogenerate import compare_metadata
+from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 from kukie.store import reset_store_for_tests
+from kukie.store.db import BASELINE_REVISION, LOCK_KEY, _alembic_config
 from kukie.store.models import Base
 
 ADMIN_URL = os.environ.get("KUKIE_TEST_POSTGRES_URL")
+if os.environ.get("KUKIE_REQUIRE_POSTGRES_TESTS") and not ADMIN_URL:
+    # CI 의 migrations-postgres 잡 — 전부 skip 이어도 pytest 는 0 으로 끝나 초록이 된다. 잡은 이 파일이 실제로 돌길 요구한다
+    raise RuntimeError("KUKIE_REQUIRE_POSTGRES_TESTS 인데 KUKIE_TEST_POSTGRES_URL 이 없다 — 잡의 env 를 확인")
 pytestmark = pytest.mark.skipif(not ADMIN_URL, reason="KUKIE_TEST_POSTGRES_URL 이 없다 — Postgres 실기는 CI 의 postgres 잡에서")
 
 HEAD = "0002"
-OLD_PERSONAL = "CREATE UNIQUE INDEX uq_cluster_personal_name ON tbl_cluster (registered_by, name) WHERE team_id IS NULL"
-OLD_TEAM = "CREATE UNIQUE INDEX uq_cluster_team_name ON tbl_cluster (team_id, name) WHERE team_id IS NOT NULL"
 INSERT = ("INSERT INTO tbl_cluster (id, team_id, registered_by, name, provider, api_server, insecure, credential_encrypted, "
           "context_name, default_namespace, fingerprint, status, created_at, updated_at) VALUES "
           "(:id, :team_id, :by, :name, 'GENERIC', 'https://x', false, 'enc', 'ctx', 'default', :id, 'disconnected', now(), now())")
@@ -65,18 +72,17 @@ def where_of(url: str, index: str) -> str:
 
 
 def make_old_db(url: str, clusters: list[tuple[str, str | None, str, str]]) -> None:
-    """Alembic 이전 모양 — 지금 모델 + 옛 인덱스 조건. Postgres 엔 옛 실물이 없어 이렇게 재현한다."""
+    """Alembic 이전 모양 = 0001 이 만드는 모양 (옛 인덱스 조건까지 얼려 둠 — test_migrations 가 실물과 대조한다).
+    0001 만 적용하고 카드를 지운다. 지금 모델의 create_all 로 만들면 다음 리비전이 열을 더할 때 가짜로 빨개진다 (PR #83 리뷰 8차)."""
     engine = create_engine(url)
-    Base.metadata.create_all(engine)
     with engine.begin() as con:
-        con.execute(text("DROP INDEX uq_cluster_personal_name"))
-        con.execute(text("DROP INDEX uq_cluster_team_name"))
-        con.execute(text(OLD_PERSONAL))
-        con.execute(text(OLD_TEAM))
+        command.upgrade(_alembic_config(con), BASELINE_REVISION)
+        con.execute(text("DROP TABLE alembic_version"))
         for cid, team_id, by, name in clusters:
             con.execute(text(INSERT), {"id": cid, "team_id": team_id, "by": by, "name": name})
     engine.dispose()
     assert version(url) is None
+    assert where_of(url, "uq_cluster_personal_name") == "(team_id IS NULL)"   # 정말 옛 조건인지
 
 
 def test_빈_DB는_head까지_만들어지고_부분_인덱스_조건이_새_규칙이다(db_url):
@@ -86,6 +92,11 @@ def test_빈_DB는_head까지_만들어지고_부분_인덱스_조건이_새_규
     assert tables(db_url) == ["alembic_version", "tbl_action_plan", "tbl_chat_run", "tbl_chat_session", "tbl_cluster"]
     assert where_of(db_url, "uq_cluster_personal_name") == "((team_id IS NULL) OR ((team_id)::text = ''::text))"
     assert where_of(db_url, "uq_cluster_team_name") == "((team_id IS NOT NULL) AND ((team_id)::text <> ''::text))"
+    # 드리프트 0 — 모델(표·열·제약)만 고치고 리비전을 안 만들면 Postgres 에서도 여기서 빨개진다
+    engine = create_engine(db_url)
+    with engine.connect() as con:
+        assert compare_metadata(MigrationContext.configure(con), Base.metadata) == []
+    engine.dispose()
 
 
 def test_다시_켜도_그대로다(db_url):
@@ -132,3 +143,31 @@ def test_이름이_겹치면_멈추고_Postgres는_카드도_남기지_않는다
     assert version(db_url) is None
     assert dict(query(db_url, "SELECT id, team_id FROM tbl_cluster")) == {"a": "", "b": None}
     assert where_of(db_url, "uq_cluster_personal_name") == "(team_id IS NULL)"
+
+
+def test_다른_세션이_잠금을_쥐고_있으면_기동이_기다린다(db_url):
+    """컨테이너 둘이 같이 뜰 때 한쪽만 upgrade 하게 — pg_advisory_xact_lock (PR #83 리뷰 1차·8차).
+    세션 잠금(pg_advisory_lock)과 트랜잭션 잠금은 같은 키 공간이라, 다른 세션이 쥐고 있으면 기동이 그 앞에서 기다린다."""
+    u = make_url(db_url)
+    holder = psycopg.connect(host=u.host, port=u.port, user=u.username, password=u.password, dbname=u.database, autocommit=True)
+    holder.execute(f"SELECT pg_advisory_lock({LOCK_KEY})")
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def boot() -> None:
+        try:
+            reset_store_for_tests(db_url)
+        except BaseException as exc:   # noqa: BLE001 — 스레드 밖으로 그대로 전달
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    threading.Thread(target=boot, daemon=True).start()
+    try:
+        assert not finished.wait(1.5), "잠금을 남이 쥐고 있는데 기동이 지나갔다"
+        assert version(db_url) is None
+    finally:
+        holder.execute(f"SELECT pg_advisory_unlock({LOCK_KEY})")
+    assert finished.wait(30) and not errors, errors
+    assert version(db_url) == HEAD
+    holder.close()

@@ -25,6 +25,7 @@ from kukie.store.chat_store import ChatStore
 DEFAULT_DB_PATH = Path.home() / ".kukie" / "kukie.db"
 MIGRATIONS_DIR = Path(__file__).with_name("migrations")
 BASELINE_REVISION = "0001"   # Alembic 이전 create_all 이 만들던 모양 그대로 얼려 둔 리비전
+LOCK_KEY = 7378616           # Postgres advisory lock 키 — 프로세스 여럿이 동시에 upgrade 에 들어오지 않게 (임의 상수)
 
 _engine: Engine | None = None
 _factory: sessionmaker[Session] | None = None
@@ -90,7 +91,7 @@ def _migrate(engine: Engine) -> None:
     """
     with engine.begin() as connection:
         if connection.dialect.name == "postgresql":
-            connection.execute(text("SELECT pg_advisory_xact_lock(7378616)"))   # 'kukie' 를 숫자로 — 임의 상수
+            connection.execute(text(f"SELECT pg_advisory_xact_lock({LOCK_KEY})"))   # 트랜잭션이 끝나면 풀린다
         config = _alembic_config(connection)
         if MigrationContext.configure(connection).get_current_revision() is None:
             expected = _baseline_shape()
@@ -171,7 +172,7 @@ def _connect(url: str) -> tuple[Engine, sessionmaker[Session]]:
 
 
 def get_store() -> ChatStore:
-    """프로세스당 하나. 처음 부를 때 연결한다 (import 시점에 홈 디렉터리를 만들지 않기 위해)."""
+    """프로세스당 하나. 서버는 기동 때(server.py lifespan) 먼저 불러 마이그레이션을 끝내 둔다 — import 시점엔 열지 않는다."""
     global _engine, _factory, _store
     if _store is None:
         with _init_lock:
