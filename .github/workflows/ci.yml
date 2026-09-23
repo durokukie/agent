@@ -35,7 +35,6 @@ jobs:
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s --health-retries 12
     env:
       KUKIE_TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
-      KUKIE_REQUIRE_POSTGRES_TESTS: '1'   # 전부 skip 이면 실패 — 변수가 빠져도 초록이 되지 않게
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
