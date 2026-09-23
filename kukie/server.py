@@ -30,10 +30,12 @@ KUKIE_DEV_AUTH=1 로 개발 모드를 켰을 때만 열리고, 그 밖(회원 �
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -49,6 +51,7 @@ from kukie.kubectl.config import KubeconfigError, read_kubeconfig
 from kukie.observability import setup as setup_observability
 from kukie.router import pick_skill
 from kukie.skills import DEFAULT_SKILL, SKILLS
+from kukie.store import get_store
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +162,19 @@ def _to_payload(session: Session, result) -> dict[str, Any]:
 
 # ── 엔드포인트 ──────────────────────────────────────────────
 
-app = FastAPI(title="Kukie local server")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """켜질 때 DB 를 열어 마이그레이션을 먼저 돌린다 — 첫 요청 때가 아니라.
+
+    get_store 는 처음 부를 때 연결하는 구조라, 요청이 오기 전엔 표가 없었다. 컴포즈 실기에서 컨테이너는 healthy 인데
+    에이전트 DB 가 비어 있던 이유 (DURO-110). 여기서 부르면 마이그레이션 실패가 곧 기동 실패라 배포 직후에 드러난다.
+    스레드로 넘기는 건 동기 SQLAlchemy 라서 (kukie.store.db 머리말).
+    """
+    await asyncio.to_thread(get_store)
+    yield
+
+
+app = FastAPI(title="Kukie local server", lifespan=_lifespan)
 
 
 @app.get("/health")

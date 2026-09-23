@@ -1,6 +1,8 @@
 """GET /health — 배포 확인용 (DURO-107). 인증도 회원 서버도 필요 없다."""
 from __future__ import annotations
 
+import sqlite3
+
 from fastapi.testclient import TestClient
 
 from kukie.server import app
@@ -33,3 +35,16 @@ def test_flat_endpoints_are_closed_unless_dev_mode_is_opted_in(monkeypatch):
             assert r.status_code == 404, path
             assert "KUKIE_DEV_AUTH" in r.json()["detail"]["message"]   # 왜 닫혔는지 — 회원 서버 모드 문구와 다르다
         assert client.get("/health").status_code == 200
+
+
+def test_startup_runs_migrations_before_any_request(tmp_path, monkeypatch):
+    """켜지기만 해도(요청 없이) DB 표가 만들어져 있어야 한다 — 첫 요청 때 여는 구조면 healthy 인데 DB 는 빈 채였다 (DURO-110)."""
+    db = tmp_path / "boot.db"
+    monkeypatch.setenv("KUKIE_DATABASE_URL", f"sqlite:///{db}")
+
+    with TestClient(app):
+        pass
+
+    con = sqlite3.connect(db)
+    assert con.execute("SELECT version_num FROM alembic_version").fetchone() == ("0002",)
+    assert con.execute("SELECT count(*) FROM sqlite_master WHERE name = 'tbl_cluster'").fetchone() == (1,)
