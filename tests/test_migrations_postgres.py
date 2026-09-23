@@ -26,7 +26,8 @@ ADMIN_URL = os.environ.get("KUKIE_TEST_POSTGRES_URL")
 # CI 의 migrations-postgres 잡 — 전부 skip 이어도 pytest 는 0 으로 끝나 초록이 된다. 그 잡에서는 이 파일이 실제로 돌길 요구한다.
 # 표식은 잡의 env: 블록이 아니라 Actions 가 잡 이름으로 항상 넣는 GITHUB_JOB — env: 블록이 통째로 빠져도 잡힌다 (PR #83 리뷰 9차).
 # 로컬에서 같은 검사를 켜려면 KUKIE_REQUIRE_POSTGRES_TESTS=1.
-if (os.environ.get("GITHUB_JOB") == "migrations-postgres" or os.environ.get("KUKIE_REQUIRE_POSTGRES_TESTS")) and not ADMIN_URL:
+_REQUIRED = os.environ.get("KUKIE_REQUIRE_POSTGRES_TESTS", "").strip().lower() in ("1", "true", "yes")   # '0'·빈 값은 끔 (11차)
+if (os.environ.get("GITHUB_JOB") == "migrations-postgres" or _REQUIRED) and not ADMIN_URL:
     raise RuntimeError("Postgres 테스트를 요구하는 자리인데 KUKIE_TEST_POSTGRES_URL 이 없다 — ci.yml 의 migrations-postgres 잡 env 를 확인")
 pytestmark = pytest.mark.skipif(not ADMIN_URL, reason="KUKIE_TEST_POSTGRES_URL 이 없다 — Postgres 실기는 CI 의 postgres 잡에서")
 
