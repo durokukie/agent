@@ -111,7 +111,7 @@ jobs:
           if [ "$existing" = "None" ]; then
             DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -t "$REGISTRY/$REPOSITORY:$GITHUB_SHA" .
             docker push "$REGISTRY/$REPOSITORY:$GITHUB_SHA"
-            # ECR 은 push 직후 조회가 늦게 보일 수 있다 — 잠깐씩 늘려 가며 다시 본다 (0·2·4·8·16초 뒤)
+            # ECR 은 push 직후 조회가 늦게 보일 수 있다 — 간격을 늘려 가며 다시 본다 (push 뒤 0·2·6·14·30초, 최대 30초)
             for wait in 0 2 4 8 16; do
               sleep "$wait"
               existing=$(digest)
