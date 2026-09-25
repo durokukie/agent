@@ -111,11 +111,11 @@ jobs:
           if [ "$existing" = "None" ]; then
             DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -t "$REGISTRY/$REPOSITORY:$GITHUB_SHA" .
             docker push "$REGISTRY/$REPOSITORY:$GITHUB_SHA"
-            # ECR 은 push 직후 조회가 늦게 보일 수 있다 — 잠깐씩 늘려 가며 다시 본다
-            for wait in 2 4 8 16; do
+            # ECR 은 push 직후 조회가 늦게 보일 수 있다 — 잠깐씩 늘려 가며 다시 본다 (0·2·4·8·16초 뒤)
+            for wait in 0 2 4 8 16; do
+              sleep "$wait"
               existing=$(digest)
               [ "$existing" != "None" ] && break
-              sleep "$wait"
             done
           else
             echo "이미 있는 태그 — 굽지 않는다"
