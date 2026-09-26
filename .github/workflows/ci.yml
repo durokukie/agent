@@ -69,18 +69,53 @@ jobs:
       - if: always()
         run: kind delete cluster --name kukie-e2e
 
+  # 이번 push 에서 바뀐 파일이 문서뿐이면(docs/ · *.md) 이미지를 굽지 않는다 — README 만 고친 머지마다 이미지와 manifest PR 이 생기지 않게.
+  # 판단할 수 없으면(브랜치 첫 push · 비교 파일 300개 이상) 굽는 쪽으로 둔다
+  changes:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.scope.outputs.build }}
+    steps:
+      - name: Decide whether this push needs a new image
+        id: scope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "$BEFORE" =~ ^0+$ ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          compare=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA")
+          count=$(jq '.files | length' <<<"$compare")
+          files=$(jq -r '.files[].filename' <<<"$compare")
+          if [ "$count" -gt 0 ] && [ "$count" -lt 300 ] && ! grep -qvE '(^docs/|\.md$)' <<<"$files"; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::문서만 바뀌어 이미지를 굽지 않는다"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   # develop 에 머지되고 위 검사가 모두 통과하면 개발환경 이미지를 구워 ECR kukie-agent 에 올린다.
   # 출입증: kukie-infra 의 kukie-dev-github-agent 역할 — 이 레포 develop 에서만, kukie-agent 창고에만 push 할 수 있다.
   # 레포 Variables 의 AWS_ROLE_ARN 이 그 역할이다. 창고가 IMMUTABLE 이라 태그는 커밋 SHA 하나만 쓴다.
-  # 버전은 kukie-manifest envs/dev/kustomization.yaml 의 digest 로 올린다 — 아래 요약에 나오는 값.
+  # 버전은 kukie-manifest envs/dev/kustomization.yaml 의 digest 로 올린다 — 아래 manifest-pr 잡이 PR 을 연다.
+  # 건너뛰기: 머지 커밋 메시지(= PR 제목)에 [skip image] 가 있거나, 바뀐 파일이 docs/ · *.md 뿐이면 굽지 않는다 (changes 잡)
   image:
-    if: github.event_name == 'push'
-    needs: [test, migrations-postgres, e2e]
+    if: >-
+      github.event_name == 'push'
+      && needs.changes.outputs.build == 'true'
+      && !contains(github.event.head_commit.message, '[skip image]')
+    needs: [test, migrations-postgres, e2e, changes]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     env:
       AWS_REGION: ap-northeast-2
       REGISTRY: 320343233643.dkr.ecr.ap-northeast-2.amazonaws.com
@@ -99,6 +134,7 @@ jobs:
       # 역할에 ecr:DescribeImages 가 없어서 BatchGetImage 로 확인한다. 받는 매니페스트 종류를 명시해야
       # buildx · attestation 으로 OCI image index 가 올라가도 "태그 없음" 으로 오판하지 않는다.
       - name: Build and push unless this commit is already in ECR
+        id: push
         shell: bash
         run: |
           digest() {
@@ -128,3 +164,116 @@ jobs:
           echo "### $REPOSITORY 이미지" >> "$GITHUB_STEP_SUMMARY"
           echo "- 태그: \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- digest: \`$existing\` — kukie-manifest envs/dev 의 kukie-agent 줄에 넣는 값" >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=$existing" >> "$GITHUB_OUTPUT"
+
+  # ④ ⑤ — kukie-manifest 에 "kukie-agent 줄의 digest 만 바꾼" PR 을 연다. 머지는 사람이 한다 (비공개 · Free 라 자동 머지 불가).
+  # 신분: kukie-manifest 에만 설치된 GitHub App kukie-manifest-bot. 레포 Variables MANIFEST_APP_CLIENT_ID · Secrets MANIFEST_APP_PRIVATE_KEY 로
+  # 1시간짜리 토큰을 받는다. 기본 GITHUB_TOKEN 은 이 레포 밖에 못 쓰고, 그 토큰으로 연 PR 에서는 manifest 의 검사 · 렌더링 차이 댓글이 돌지 않는다.
+  # AWS 출입증이 필요 없어 image 잡과 나눴다 (id-token 없음). 같은 앱의 옛 봇 PR 은 닫아 열린 PR 을 하나로 유지한다.
+  manifest-pr:
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 연달아 머지하면 앞 실행이 끝난 뒤 다음이 돈다 — 늦게 끝난 옛 실행이 새 PR 을 닫지 않게
+    concurrency:
+      group: manifest-pr-kukie-agent
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      APP: kukie-agent
+      DIGEST: ${{ needs.image.outputs.digest }}
+      MANIFEST_REPO: durokukie/kukie-manifest
+    steps:
+      # 더 새 develop 커밋이 있으면 그 실행이 PR 을 연다 — 여기서 열면 옛 digest 가 새 PR 을 닫는다
+      - name: Skip if develop has moved on
+        id: fresh
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/develop" --jq .sha)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::develop 이 ${head:0:7} 로 앞서가 이 실행은 PR 을 열지 않는다"
+          fi
+      - name: Get kukie-manifest bot token
+        if: steps.fresh.outputs.stale != 'true'
+        id: bot
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MANIFEST_APP_CLIENT_ID }}
+          private-key: ${{ secrets.MANIFEST_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: kukie-manifest
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Check out kukie-manifest
+        if: steps.fresh.outputs.stale != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: durokukie/kukie-manifest
+          ref: main
+          path: manifest
+          token: ${{ steps.bot.outputs.token }}
+      - name: Open digest PR
+        if: steps.fresh.outputs.stale != 'true'
+        shell: bash
+        working-directory: manifest
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          BOT_SLUG: ${{ steps.bot.outputs.app-slug }}
+        run: |
+          case "$DIGEST" in sha256:*) ;; *) echo "digest 가 비었다: '$DIGEST'" >&2; exit 1 ;; esac
+          # images 의 "- name: kukie-agent" 한 덩어리에서 newTag · digest 줄만 digest 한 줄로 바꾼다. 주석 · 다른 앱 줄은 그대로
+          python3 - "$APP" "$DIGEST" envs/dev/kustomization.yaml <<'PY'
+          import re, sys
+          app, digest, path = sys.argv[1:]
+          lines = open(path, encoding="utf-8").read().split("\n")
+          hits = [i for i, l in enumerate(lines) if re.fullmatch(r"\s*- name: " + re.escape(app), l)]
+          if len(hits) != 1:
+              sys.exit(f"{path} 에서 '- name: {app}' 를 한 번 찾아야 하는데 {len(hits)} 번 찾았다")
+          start = hits[0]
+          field = " " * (len(lines[start]) - len(lines[start].lstrip()) + 2)
+          end = start + 1
+          while end < len(lines) and lines[end].startswith(field) and not lines[end].lstrip().startswith("-"):
+              end += 1
+          block = [l for l in lines[start + 1:end] if not re.match(r"\s*(newTag|digest):", l)]
+          lines[start + 1:end] = block + [f"{field}digest: {digest}"]
+          open(path, "w", encoding="utf-8").write("\n".join(lines))
+          PY
+          if git diff --quiet; then
+            echo "::notice::manifest 에 이미 같은 digest 가 있다 — PR 을 열지 않는다"
+            exit 0
+          fi
+          # 렌더 결과에 새 이미지가 들어가는지 — 이름이 어긋나면 치환이 조용히 안 된다
+          kubectl kustomize envs/dev | grep -qF "/$APP@$DIGEST" || { echo "렌더 결과에 $APP@$DIGEST 가 없다" >&2; exit 1; }
+          short=${GITHUB_SHA:0:7}
+          branch="bot/$APP-$short"
+          uid=$(gh api "users/${BOT_SLUG}[bot]" --jq .id)
+          git config user.name "${BOT_SLUG}[bot]"
+          git config user.email "${uid}+${BOT_SLUG}[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -qam "chore(dev): $APP 이미지를 $GITHUB_REPOSITORY@$short 로"
+          # 같은 커밋으로 다시 돌린 경우 봇 브랜치를 새로 쓴다
+          git push -qf origin "$branch"
+          url=$(gh pr list --repo "$MANIFEST_REPO" --head "$branch" --state open --json url --jq '.[0].url // empty')
+          if [ -z "$url" ]; then
+            url=$(gh pr create --repo "$MANIFEST_REPO" --base main --head "$branch" \
+              --title "chore(dev): $APP 이미지를 $short 로" \
+              --body "$(printf '%s\n' \
+                "$GITHUB_REPOSITORY develop 의 [\`$short\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) 로 구운 이미지다." \
+                "" \
+                "- 바뀌는 줄: \`envs/dev/kustomization.yaml\` 의 \`$APP\` digest → \`$DIGEST\`" \
+                "- 만든 실행: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+                "- 렌더링 차이 댓글에 이미지 줄 말고 다른 줄이 보이면 머지하지 않는다" \
+                "- 이 버전을 반영하지 않으려면 이 PR 을 닫는다. 같은 앱의 새 버전 PR 이 열리면 이 PR 은 자동으로 닫힌다")")
+          fi
+          echo "### kukie-manifest PR" >> "$GITHUB_STEP_SUMMARY"
+          echo "- $url" >> "$GITHUB_STEP_SUMMARY"
+          # 같은 앱의 옛 봇 PR 은 닫는다 — 열린 버전 PR 을 앱마다 하나로
+          gh pr list --repo "$MANIFEST_REPO" --state open --json number,headRefName \
+            --jq ".[] | select((.headRefName | startswith(\"bot/$APP-\")) and .headRefName != \"$branch\") | .number" |
+          while read -r n; do
+            gh pr close "$n" --repo "$MANIFEST_REPO" --delete-branch --comment "새 버전 PR $url 로 대체한다."
+          done
