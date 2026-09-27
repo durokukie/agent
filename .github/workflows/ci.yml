@@ -68,3 +68,63 @@ jobs:
       - run: python -m pytest -q -m e2e
       - if: always()
         run: kind delete cluster --name kukie-e2e
+
+  # develop 에 머지되고 위 검사가 모두 통과하면 개발환경 이미지를 구워 ECR kukie-agent 에 올린다.
+  # 출입증: kukie-infra 의 kukie-dev-github-agent 역할 — 이 레포 develop 에서만, kukie-agent 창고에만 push 할 수 있다.
+  # 레포 Variables 의 AWS_ROLE_ARN 이 그 역할이다. 창고가 IMMUTABLE 이라 태그는 커밋 SHA 하나만 쓴다.
+  # 버전은 kukie-manifest envs/dev/kustomization.yaml 의 digest 로 올린다 — 아래 요약에 나오는 값.
+  image:
+    if: github.event_name == 'push'
+    needs: [test, migrations-postgres, e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ap-northeast-2
+      REGISTRY: 320343233643.dkr.ecr.ap-northeast-2.amazonaws.com
+      REPOSITORY: kukie-agent
+    steps:
+      - uses: actions/checkout@v6
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-northeast-2
+          allowed-account-ids: "320343233643"
+      - name: Log in to ECR
+        shell: bash
+        run: aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+      # 같은 커밋으로 다시 돌리면 이미 있는 태그라 push 가 거부된다(IMMUTABLE). 있으면 굽지 않고 그 digest 를 쓴다.
+      # 역할에 ecr:DescribeImages 가 없어서 BatchGetImage 로 확인한다. 받는 매니페스트 종류를 명시해야
+      # buildx · attestation 으로 OCI image index 가 올라가도 "태그 없음" 으로 오판하지 않는다.
+      - name: Build and push unless this commit is already in ECR
+        shell: bash
+        run: |
+          digest() {
+            aws ecr batch-get-image --repository-name "$REPOSITORY" --image-ids imageTag="$GITHUB_SHA" \
+              --accepted-media-types application/vnd.oci.image.index.v1+json application/vnd.oci.image.manifest.v1+json \
+                application/vnd.docker.distribution.manifest.list.v2+json application/vnd.docker.distribution.manifest.v2+json \
+              --query 'images[0].imageId.imageDigest' --output text
+          }
+          existing=$(digest)
+          if [ "$existing" = "None" ]; then
+            DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -t "$REGISTRY/$REPOSITORY:$GITHUB_SHA" .
+            docker push "$REGISTRY/$REPOSITORY:$GITHUB_SHA"
+            # ECR 은 push 직후 조회가 늦게 보일 수 있다 — 간격을 늘려 가며 다시 본다 (push 뒤 0·2·6·14·30초, 최대 30초)
+            for wait in 0 2 4 8 16; do
+              sleep "$wait"
+              existing=$(digest)
+              [ "$existing" != "None" ] && break
+            done
+          else
+            echo "이미 있는 태그 — 굽지 않는다"
+          fi
+          # 요약의 digest 는 사람이 manifest 에 옮겨 적는 값이다 — 모양이 아니면 잡을 실패시킨다
+          case "$existing" in
+            sha256:*) ;;
+            *) echo "digest 를 읽지 못했다: $existing" >&2; exit 1 ;;
+          esac
+          echo "### $REPOSITORY 이미지" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 태그: \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: \`$existing\` — kukie-manifest envs/dev 의 kukie-agent 줄에 넣는 값" >> "$GITHUB_STEP_SUMMARY"
