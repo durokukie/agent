@@ -12,13 +12,13 @@ from fastapi.testclient import TestClient
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 from pydantic_ai.models.test import TestModel
 
-from kukie import conversations, server
-from kukie.agent import agent
-from kukie.guardrail import action_plan
-from kukie.kubectl import KubectlResult
-from kukie.skills.base import KukieResponse
-from kukie.store import reset_store_for_tests
-from kukie.tools import read as read_tools
+from kukie_agent import conversations, server
+from kukie_agent.agent import agent
+from kukie_agent.guardrail import action_plan
+from kukie_agent.kubectl import KubectlResult
+from kukie_agent.skills.base import KukieResponse
+from kukie_agent.store import reset_store_for_tests
+from kukie_agent.tools import read as read_tools
 from test_server import FAKE_COMMAND, _model, _pending_ticket_for_server
 
 USER = {"X-User": "u-1"}
@@ -63,7 +63,7 @@ def test_context를_직접_주면_kubeconfig를_읽지_않는다(client, monkeyp
 
 
 def test_kubeconfig를_못_읽으면_503_KUBECONFIG(client, monkeypatch):
-    from kukie.kubectl.config import KubeconfigError
+    from kukie_agent.kubectl.config import KubeconfigError
     monkeypatch.setattr(server, "read_kubeconfig", lambda: (_ for _ in ()).throw(KubeconfigError("없음")))
     r = client.post("/conversations", json={}, headers=USER)
     assert r.status_code == 503 and r.json()["detail"]["code"] == "KUBECONFIG"
@@ -125,7 +125,7 @@ def test_빈_context는_kubeconfig의_실제_이름으로_확정한다(client):
 
 def test_private_방은_DB에_실습_모드가_남아_있어도_변경_모드로_복원하지_않는다(client):
     """자동 리뷰 5차: 게이트 전 커밋으로 남은 current_mode=실습 private 행을 그대로 열면 카드는 뜨고 승인은 403 이라 방이 막힌다."""
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
     cid = _new(client)
     get_store().update_session(cid, current_mode="실습")
     conversations.registry.clear()
@@ -159,7 +159,7 @@ def test_재개_뒤_새_카드가_나와도_그_사이_메시지가_run에_쌓�
 
 def test_결과_저장이_실패해도_방이_영구_BUSY로_남지_않는다(client, monkeypatch):
     """팀원 리뷰 3: 실행 뒤 저장이 실패하면 DB 의 run 이 running 으로 남아 다음 요청이 계속 409 였다."""
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
     store = get_store()
     original = store.update_run
     calls = {"failed": 0}
@@ -184,7 +184,7 @@ def test_결과_저장이_실패해도_방이_영구_BUSY로_남지_않는다(cl
 
 def test_저장_실패한_run을_같은_request_id로_재전송해도_영원히_BUSY가_아니다(client):
     """자동 리뷰 6차: 재전송 판정이 밀린 run 정리보다 앞이라, 같은 request_id 재시도가 저장된 실패·BUSY 를 영원히 재생했다."""
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
     cid = _new(client)
     # 대체 쓰기까지 실패해 running 으로 남은 run 을 흉내낸다
     get_store().start_run(cid, request_id="r-stuck", kind="chat", mode="학습", input_text="파드")
@@ -198,7 +198,7 @@ def test_저장_실패한_run을_같은_request_id로_재전송해도_영원히_
 def test_승인_뒤_저장이_죽으면_recovery_required와_plan_ids로_남고_다음_chat이_방을_풀어준다(client, monkeypatch):
     """자동 리뷰 6차: kubectl 이 이미 돈 run 을 failed 로 적고 "다시 보내라" 하면 같은 변경을 또 시킬 수 있다.
     저장이 두 번 다 죽어 awaiting_approval 이 남아도 다음 chat 이 닫아야 한다."""
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
     store = get_store()
     original = store.update_run
     dead = {"on": False}
@@ -232,7 +232,7 @@ def test_승인_뒤_저장이_죽으면_recovery_required와_plan_ids로_남고_
 
 def test_남은_카드_재전송에서_저장이_죽어도_확인_필요가_아니라_카드_대기_그대로다(client, monkeypatch):
     """자동 리뷰 7차: 아무것도 실행하지 않은 경로(result 없음)에 recovery_required + "변경 적용됐을 수 있다" 를 적으면 사실 칸 오염."""
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
     from pydantic_ai.tools import DeferredToolRequests
     store = get_store()
     original = store.update_run
@@ -272,7 +272,7 @@ def test_남은_카드_재전송에서_저장이_죽어도_확인_필요가_아�
 
 def test_거절한_카드의_Plan은_확인_목록에_들어가지_않는다(client, monkeypatch):
     """자동 리뷰 8차: 티켓 전체에서 뽑으면 거절해서 실행된 적 없는 Plan 까지 "적용됐을 수 있다" 목록에 섞인다."""
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
     from pydantic_ai.tools import DeferredToolRequests
     store = get_store()
     original = store.update_run
@@ -303,7 +303,7 @@ def test_거절한_카드의_Plan은_확인_목록에_들어가지_않는다(cli
 
 def test_재개_재시도_경로에서도_저장_실패_안내에_plan_ids가_실린다(client, monkeypatch):
     """자동 리뷰 7차: 앞선 RESUME_RETRYABLE 이 카드 payload 를 error 로 덮은 뒤라 payload 에서 뽑으면 빈 배열이었다."""
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
     store = get_store()
     original = store.update_run
     dead = {"on": False}
@@ -332,7 +332,7 @@ def test_재개_재시도_경로에서도_저장_실패_안내에_plan_ids가_�
 
 def test_실패_표시도_저장_못_한_running_run은_다음_chat이_닫고_진행한다(client):
     """저장이 완전히 죽었다 살아난 경우: 잠금을 쥔 chat 이 DB 의 running 을 중단으로 닫는다."""
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
     cid = _new(client)
     get_store().start_run(cid, request_id="orphan", kind="chat", mode="학습", input_text="저장 실패")   # running 으로 방치
     with agent.override(model=_model("살아남")):
@@ -357,7 +357,7 @@ def test_복원_한도는_UTF8_바이트_기준이고_최신_run_하나가_넘�
     client.get(f"/conversations/{cid}", headers=USER)
     messages = conversations.registry.get(cid).session.history
     assert len(messages) == 1
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
     raw = get_store().list_runs(cid)[0].agent_messages
     chars, size = len(json.dumps(raw, ensure_ascii=False)), len(json.dumps(raw, ensure_ascii=False).encode("utf-8"))
     assert size > chars                                                   # 한글은 바이트가 더 크다
@@ -371,7 +371,7 @@ def test_복원_한도는_UTF8_바이트_기준이고_최신_run_하나가_넘�
 def test_첫_요청_여럿이_동시에_와도_DB_초기화가_충돌하지_않는다(tmp_path, monkeypatch):
     """팀원 리뷰 4: 동기 dependency 는 스레드풀에서 돌아 create_all 이 동시에 들어올 수 있다."""
     import threading
-    from kukie.store import db as store_db
+    from kukie_agent.store import db as store_db
     monkeypatch.setenv("KUKIE_DATABASE_URL", f"sqlite:///{tmp_path / 'race.db'}")
     monkeypatch.setattr(store_db, "_engine", None)
     monkeypatch.setattr(store_db, "_factory", None)
@@ -448,7 +448,7 @@ def test_같은_request_id_재전송은_실행_없이_저장된_응답을_준다
         return SimpleNamespace(output=KukieResponse(narration="한 번만"), all_messages=lambda: [],
                                new_messages=lambda: [])
 
-    import kukie.server as srv
+    import kukie_agent.server as srv
     original = srv._run_agent
     srv._run_agent = fake_run
     try:
@@ -484,7 +484,7 @@ def test_모델_예외는_run을_failed로_남기고_500_RUN_FAILED(client):
     async def boom(session, **kwargs):
         raise RuntimeError("모델 죽음")
 
-    import kukie.server as srv
+    import kukie_agent.server as srv
     original = srv._run_agent
     srv._run_agent = boom
     try:
@@ -536,7 +536,7 @@ def test_실패한_요청을_같은_request_id로_다시_보내면_저장된_실
         calls += 1
         raise RuntimeError("모델 죽음")
 
-    import kukie.server as srv
+    import kukie_agent.server as srv
     original = srv._run_agent
     srv._run_agent = boom
     try:
@@ -562,7 +562,7 @@ def _fake(output, new_messages=()):
 
 def _swap_run_agent(outputs):
     """_run_agent 를 outputs 순서대로 돌려주는 가짜로. 반환은 원복 함수."""
-    import kukie.server as srv
+    import kukie_agent.server as srv
     original = srv._run_agent
     queue = list(outputs)
 
@@ -682,7 +682,7 @@ def test_카드가_여러_장이면_마지막_결정까지_run은_열려_있고_
 
 def test_실행_중_죽은_run은_처음_열_때_interrupted가_되고_running도_같이_꺼진다(client):
     """리뷰 🟡: 복원 전에 읽은 row 의 running 이 낡은 값으로 나가던 문제."""
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
     cid = _new(client)
     get_store().start_run(cid, request_id="crash", kind="chat", mode="학습", input_text="죽기 직전")  # 끝내지 않음
     conversations.registry.clear()
@@ -776,7 +776,7 @@ def test_최초_승인_요청_저장만_실패해도_방을_계속_쓸_수_있�
     카드가 기록에 안 남았으므로 그 승인은 이어갈 수 없다. 티켓을 버려 DB 와 맞추고, 안내대로
     새 요청을 받는다.
     """
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
 
     store = get_store()
     original = store.update_run
@@ -811,7 +811,7 @@ def test_최초_승인_요청_저장만_실패해도_방을_계속_쓸_수_있�
 
 def test_저장_실패로_닫힌_카드는_approve_도_resume_도_받지_않는다(client, monkeypatch):
     """티켓을 버렸으니 둘 다 "대기 중인 승인이 없다" 가 나와야 한다 — 서로 다른 409 로 엇갈리면 안 된다."""
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
 
     store = get_store()
     original = store.update_run
@@ -847,7 +847,7 @@ def test_저장_실패로_버린_카드의_기록도_history에서_뺀다(client
     history 가 그대로라 무한 반복이다 — registry.clear() 전에는 그 방을 못 쓴다. 재시작 복원이
     지키는 규칙(conversations.py 머리말 "결과 없는 tool call 은 버린다")과 같아야 한다.
     """
-    from kukie.store import get_store
+    from kukie_agent.store import get_store
 
     store = get_store()
     original = store.update_run

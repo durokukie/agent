@@ -8,11 +8,11 @@ from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
-from kukie.guardrail import action_plan
-from kukie.guardrail.approval import _manifest_preview
-from kukie.guardrail import decision_guidance
-from kukie.guardrail.action_plan import ActionPlan
-from kukie.guardrail.decision_guidance import (
+from kukie_agent.guardrail import action_plan
+from kukie_agent.guardrail.approval import _manifest_preview
+from kukie_agent.guardrail import decision_guidance
+from kukie_agent.guardrail.action_plan import ActionPlan
+from kukie_agent.guardrail.decision_guidance import (
     generate_decision_guidance,
     guidance_agent,
 )

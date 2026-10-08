@@ -10,10 +10,10 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from kukie import conversations, membership, server
-from kukie.auth import User
-from kukie.clusters import crypto
-from kukie.store import get_store, reset_store_for_tests
+from kukie_agent import conversations, membership, server
+from kukie_agent.auth import User
+from kukie_agent.clusters import crypto
+from kukie_agent.store import get_store, reset_store_for_tests
 
 MEMBER_URL = "http://member.test"
 
@@ -502,7 +502,7 @@ async def test_잠금_검사와_획득_사이에_await_가_없다():
     import inspect
     import re
 
-    from kukie import conversations_api
+    from kukie_agent import conversations_api
 
     source = inspect.getsource(conversations_api)
     blocks = re.findall(
@@ -594,7 +594,7 @@ def test_계획_목록은_팀을_안_넘기면_부를_수_없다():
     """team_ids=None 은 "shared 전부" 라 기본값으로 두면 나중에 붙는 호출자가 조용히 샌다."""
     import inspect
 
-    from kukie.guardrail import action_plan
+    from kukie_agent.guardrail import action_plan
 
     param = inspect.signature(action_plan.list_plans).parameters["team_ids"]
     assert param.default is inspect.Parameter.empty
@@ -625,7 +625,7 @@ def test_목록_쿼리를_만드는_층도_팀을_안_넘기면_못_부른다():
     """윗층에서만 막으면 아랫층을 직접 부르는 새 호출자가 조용히 샌다 (None = shared 전부)."""
     import inspect
 
-    from kukie.store.chat_store import ChatStore
+    from kukie_agent.store.chat_store import ChatStore
 
     for name in ("list_sessions", "list_plan_summaries", "list_clusters"):
         param = inspect.signature(getattr(ChatStore, name)).parameters["team_ids"]
@@ -634,7 +634,7 @@ def test_목록_쿼리를_만드는_층도_팀을_안_넘기면_못_부른다():
 
 def test_team_id_필터는_좁히기만_한다(client, spring, monkeypatch):
     """쿼리가 소유·소속 조건을 대신하면, 회원 서버가 없는 개발 모드에서 남의 팀 목록이 나간다."""
-    from kukie import clusters_api
+    from kukie_agent import clusters_api
 
     남의것 = _cluster("t-9", owner="다른사람")
     _dev_mode(monkeypatch)                                  # require_member 를 안 탄다
@@ -762,10 +762,10 @@ def test_클러스터_없는_옛_방에_걸린_승인_카드는_불러올_때_�
     from pydantic_ai.messages import ToolCallPart
     from pydantic_ai.models.function import FunctionModel
 
-    from kukie.agent import agent
-    from kukie.guardrail import action_plan, hook
-    from kukie.kubectl import KubectlResult
-    from kukie.tools import mutate
+    from kukie_agent.agent import agent
+    from kukie_agent.guardrail import action_plan, hook
+    from kukie_agent.kubectl import KubectlResult
+    from kukie_agent.tools import mutate
 
     ok = KubectlResult(command="kubectl …", stdout="ok\n", stderr="", success=True, exit_code=0)
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
@@ -809,7 +809,7 @@ def test_클러스터_없는_옛_방에_걸린_승인_카드는_불러올_때_�
 async def test_실행_중인_클러스터_없는_방은_불러와도_닫지_않는다(client, spring):
     """잠금을 쥔 run 을 밖에서 닫으면 끝난 뒤 결과를 닫힌 run 에 쓴다. 회원 서버 모드에서는 이 방이
     잠금을 잡기 전에 CLUSTER_REQUIRED 로 끊겨 실제로는 닿지 않는다 — 방어용 갈래를 직접 부른다."""
-    from kukie import conversations_api
+    from kukie_agent import conversations_api
 
     store = get_store()
     room = store.create_session(

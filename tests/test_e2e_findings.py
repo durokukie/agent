@@ -12,14 +12,14 @@ from pydantic_ai.messages import ToolCallPart
 import pytest
 from fastapi.testclient import TestClient
 
-from kukie import agent as agent_module
-from kukie import conversations, server
-from kukie.kubectl import KubectlResult
-from kukie.agent import agent
-from kukie.skills import SKILLS
-from kukie.store import get_store, reset_store_for_tests
-from kukie.store.models import DEFAULT_TITLE
-from kukie.tools import read as read_tools
+from kukie_agent import agent as agent_module
+from kukie_agent import conversations, server
+from kukie_agent.kubectl import KubectlResult
+from kukie_agent.agent import agent
+from kukie_agent.skills import SKILLS
+from kukie_agent.store import get_store, reset_store_for_tests
+from kukie_agent.store.models import DEFAULT_TITLE
+from kukie_agent.tools import read as read_tools
 
 USER = {"X-User": "u-1"}
 
@@ -46,7 +46,7 @@ def _room(client) -> str:
 
 def _say(client, room: str, text: str):
     from pydantic_ai.models.test import TestModel
-    from kukie.agent import agent
+    from kukie_agent.agent import agent
 
     with agent.override(model=TestModel(call_tools=[], custom_output_args={
         "narration": "답변입니다.", "suggested_next_action": None

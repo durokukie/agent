@@ -26,7 +26,7 @@ def _own_database(tmp_path, monkeypatch):
     서버가 기동 때(lifespan) DB 를 열어 마이그레이션을 돌리므로, `with TestClient(app)` 만 해도 DB 가 열린다.
     기본 주소를 임시 파일로 돌리고 전역 store 를 비워 둔다 — 각 파일의 reset_store_for_tests 는 그대로 동작한다.
     """
-    from kukie.store import db
+    from kukie_agent.store import db
 
     monkeypatch.setenv("KUKIE_DATABASE_URL", f"sqlite:///{tmp_path / 'kukie.db'}")
     monkeypatch.setattr(db, "_engine", None)

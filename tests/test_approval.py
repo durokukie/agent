@@ -3,9 +3,9 @@ import hashlib
 import pytest
 from pydantic_ai.messages import ToolCallPart
 
-from kukie.guardrail import action_plan
-from kukie.guardrail.action_plan import ActionPlan
-from kukie.guardrail.approval import ApprovalRequest, build_approval_request
+from kukie_agent.guardrail import action_plan
+from kukie_agent.guardrail.action_plan import ActionPlan
+from kukie_agent.guardrail.approval import ApprovalRequest, build_approval_request
 
 
 CALL_ARGS = {

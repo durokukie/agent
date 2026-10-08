@@ -7,12 +7,12 @@ from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
-from kukie import server
-from kukie.agent import agent
-from kukie.guardrail import action_plan, hook
-from kukie.guardrail.action_plan import ActionPlan
-from kukie.kubectl import KubectlResult
-from kukie.tools import mutate
+from kukie_agent import server
+from kukie_agent.agent import agent
+from kukie_agent.guardrail import action_plan, hook
+from kukie_agent.guardrail.action_plan import ActionPlan
+from kukie_agent.kubectl import KubectlResult
+from kukie_agent.tools import mutate
 
 
 SCALE_ARGS = {
