@@ -7,9 +7,10 @@ from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
+from helpers import answer_model
 from kukie import server
 from kukie.agent import agent
-from kukie.guardrail import action_plan, hook
+from kukie.guardrail import hook
 from kukie.guardrail.action_plan import ActionPlan
 from kukie.guardrail.decision_guidance import guidance_agent
 from kukie.kubectl.runner import run_kubectl as real_run_kubectl
@@ -92,18 +93,13 @@ def test_kind_context는_관리_cluster와_API_identity가_같아야한다(
 
 
 @pytest.fixture
-def client(monkeypatch, tmp_path, e2e_context, e2e_session_namespace):
-    monkeypatch.setenv("KUKIE_DEV_AUTH", "1")
-    server._session = None
+def client(monkeypatch, dev_auth, fresh_session, plan_dir, e2e_context, e2e_session_namespace):
     monkeypatch.setattr(
         server,
         "read_kubeconfig",
         lambda: (e2e_context, e2e_session_namespace),
     )
-    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
-    test_client = TestClient(server.app)
-    yield test_client
-    server._session = None
+    return TestClient(server.app)
 
 
 def _tool_model(tool_name, args, call_id):
@@ -115,13 +111,6 @@ def _tool_model(tool_name, args, call_id):
         )])
 
     return FunctionModel(model_call)
-
-
-def _answer_model():
-    return TestModel(
-        call_tools=[],
-        custom_output_args={"narration": "결정을 반영했습니다."},
-    )
 
 
 def _decide(client, tool_name, args, call_id, approved):
@@ -150,7 +139,7 @@ def _decide(client, tool_name, args, call_id, approved):
         assert card["dry_run_result"]["status"] == "succeeded"
         assert card["decision_guidance"] == "대상과 복구 기준을 확인한다."
 
-    with agent.override(model=_answer_model()):
+    with agent.override(model=answer_model()):
         decided = client.post(
             "/approve",
             json={"call_id": call_id, "approved": approved},

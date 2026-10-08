@@ -5,11 +5,11 @@ from fastapi.testclient import TestClient
 from pydantic_ai import ModelResponse
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.function import FunctionModel
-from pydantic_ai.models.test import TestModel
 
+from helpers import answer_model
 from kukie import server
 from kukie.agent import agent
-from kukie.guardrail import action_plan, hook
+from kukie.guardrail import hook
 from kukie.guardrail.action_plan import ActionPlan
 from kukie.kubectl import KubectlResult
 from kukie.tools import mutate
@@ -35,16 +35,11 @@ DELETE_ARGS = {
 
 
 @pytest.fixture
-def client(monkeypatch, tmp_path):
-    monkeypatch.setenv("KUKIE_DEV_AUTH", "1")   # flat 엔드포인트는 개발 모드를 켰을 때만 열린다 (#82)
-    server._session = None
-    monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
-    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+def client(dev_auth, fresh_session, fake_kubeconfig, plan_dir):
     test_client = TestClient(server.app)
     assert test_client.post("/session").status_code == 200
     assert test_client.post("/chat", json={"text": "/mode 실습"}).status_code == 200
-    yield test_client
-    server._session = None
+    return test_client
 
 
 @pytest.fixture
@@ -101,13 +96,6 @@ def _tool_model(tool_name, args, call_id):
     return FunctionModel(model_call)
 
 
-def _answer_model():
-    return TestModel(
-        call_tools=[],
-        custom_output_args={"narration": "결정을 반영했습니다."},
-    )
-
-
 @pytest.mark.parametrize("approved", [False, True])
 def test_Electron결정은_Hook과_Plan까지_한번만_반영한다(
     client,
@@ -130,7 +118,7 @@ def test_Electron결정은_Hook과_Plan까지_한번만_반영한다(
     assert guarded_runtime == []
     assert ActionPlan.find_by_call_id(call_id).status == "WAITING_APPROVAL"
 
-    with agent.override(model=_answer_model()):
+    with agent.override(model=answer_model()):
         decided = client.post(
             "/approve",
             json={"call_id": call_id, "approved": approved},
@@ -221,7 +209,7 @@ def test_판단보조실패는_승인DTO에_표시하고_사용자결정을_기�
     if failure == "unsupported":
         assert card["dry_run_result"]["stderr"] == "unknown flag: --dry-run"
     assert guarded_runtime == []
-    with agent.override(model=_answer_model()):
+    with agent.override(model=answer_model()):
         approved = client.post("/approve", json={"call_id": "fallback", "approved": True})
     assert approved.status_code == 200
     assert len(guarded_runtime) == 1
@@ -264,7 +252,7 @@ def test_실행후_응답실패를_resume해도_변경은_한번이고_저장결
     assert len(executions) == 1
     recorded = plan.path.read_text()
 
-    with agent.override(model=_answer_model()):
+    with agent.override(model=answer_model()):
         resumed = client.post("/resume")
     assert resumed.status_code == 200
     assert resumed.json()["kind"] == "answer"

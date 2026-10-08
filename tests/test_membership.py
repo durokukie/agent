@@ -10,13 +10,10 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from helpers import MEMBER_URL
 from kukie import conversations, membership, server
 from kukie.auth import User
-from kukie.clusters import crypto
-from kukie.store import get_store, reset_store_for_tests
-
-MEMBER_URL = "http://member.test"
-
+from kukie.store import get_store
 
 def _user(token: str = "tok-1", user_id: str = "u-1") -> User:
     return User(id=user_id, token=token)
@@ -30,30 +27,18 @@ def clean():
 
 
 @pytest.fixture
-def spring(monkeypatch):
+def spring(member_server):
     """Spring 의 GET /teams 를 가짜로. calls 로 몇 번 불렀는지 센다."""
-    monkeypatch.setenv("KUKIE_MEMBER_URL", MEMBER_URL)
-    state: dict = {"teams": [], "status": 200, "calls": [], "boom": None}
+    state: dict = {"teams": [], "status": 200, "boom": None}
 
-    class FakeClient:
-        def __init__(self, *a, **k):
-            pass
+    def respond(url, headers):
+        if state["boom"]:
+            raise state["boom"]
+        if url.endswith("/users/me"):
+            return httpx.Response(200, json={"id": "u-1", "name": "나", "email": "a@b.c"})
+        return httpx.Response(state["status"], json=state["teams"])
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-        async def get(self, url, headers=None):
-            state["calls"].append({"url": url, "headers": headers or {}})
-            if state["boom"]:
-                raise state["boom"]
-            if url.endswith("/users/me"):
-                return httpx.Response(200, json={"id": "u-1", "name": "나", "email": "a@b.c"})
-            return httpx.Response(state["status"], json=state["teams"])
-
-    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    state["calls"] = member_server(respond)
     return state
 
 
@@ -127,11 +112,7 @@ def test_개발_모드에서는_팀_판단을_하지_않는다(monkeypatch):
 # ── 클러스터에 적용 ────────────────────────────────────────
 
 @pytest.fixture
-def client(monkeypatch, tmp_path, spring):
-    monkeypatch.setenv(crypto.KEY_ENV, crypto.generate_key())
-    reset_store_for_tests(f"sqlite:///{tmp_path / 'test.db'}")
-    conversations.registry.clear()
-    monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
+def client(spring, secret_key, empty_store, fake_kubeconfig):
     return TestClient(server.app)
 
 
@@ -206,14 +187,18 @@ def test_팀_클러스터_등록은_Admin_만(client, spring):
 
 # ── 승인 권한 ──────────────────────────────────────────────
 
-def test_팀_Admin_은_남의_shared_방도_승인할_수_있다(client, spring):
-    """기획 06 §3 — Admin 이면 승인할 수 있다. 예전에는 만든 사람만이었다."""
-    spring["teams"] = [{"id": "t-1", "role": "ADMIN"}]
+@pytest.mark.parametrize(("role", "room_owner"), [
+    pytest.param("ADMIN", "다른사람", id="admin-others-room"),
+    pytest.param("MEMBER", "u-1", id="member-own-room"),
+])
+def test_팀_Admin_이나_요청한_본인은_승인할_수_있다(client, spring, role, room_owner):
+    """기획 06 §3 — 예전에는 만든 사람만이었다."""
+    spring["teams"] = [{"id": "t-1", "role": role}]
     room = get_store().create_session(
-        user_id="다른사람", context_name="ctx", namespace="default", mode="실습",
+        user_id=room_owner, context_name="ctx", namespace="default", mode="실습",
         team_id="t-1", cluster_id=_cluster("t-1", owner="다른사람"), shared=True,
     ).id
-    # 대기 중인 승인이 없으니 NOT_PENDING 이어야 한다 — 403(권한)에서 막히지 않았다는 뜻
+    # 권한에서 막히면 403, 통과하면 대기 카드가 없어 409 NOT_PENDING
     r = client.post(f"/conversations/{room}/approve", json={"call_id": "c1", "approved": True},
                     headers=BEARER)
     assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
@@ -266,7 +251,6 @@ def test_회원_서버가_죽으면_팀_클러스터에_닿지_못한다(client,
 
 def test_개인_클러스터는_회원_서버와_무관하게_보인다(client, spring):
     """팀이 없는 클러스터까지 막으면 혼자 쓰는 사람이 못 쓴다."""
-    import httpx
 
     personal = _cluster(None, owner="u-1")
     spring["teams"] = []
@@ -371,19 +355,6 @@ def test_회원_서버가_죽으면_옛_방도_못_쓴다(client, spring):
     membership.clear_cache()
     spring["boom"] = httpx.ConnectError("연결 실패")
     assert client.get(f"/conversations/{room}", headers=BEARER).status_code == 503
-
-
-def test_팀원이면_자기가_만든_방은_승인할_수_있다(client, spring):
-    """기획 06 §3 — 요청한 사용자 본인도 자신의 Plan 을 승인할 수 있다."""
-    spring["teams"] = [{"id": "t-1", "role": "MEMBER"}]
-    room = get_store().create_session(
-        user_id="u-1", context_name="ctx", namespace="default", mode="실습",
-        team_id="t-1", cluster_id=_cluster("t-1", owner="다른사람"), shared=True,
-    ).id
-    # 권한에서 막히면 403, 통과하면 대기 카드가 없어 409 NOT_PENDING
-    r = client.post(f"/conversations/{room}/approve", json={"call_id": "c1", "approved": True},
-                    headers=BEARER)
-    assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
 
 
 def test_클러스터_없이_남의_팀에_방을_심을_수_없다(client, spring):
