@@ -98,7 +98,9 @@ def test_개발자_env_에_계측_설정이_있어도_테스트는_계측을_켜
     테스트 프롬프트가 개발자의 계측 서버로 나가지 않는다. .env 가 있는 폴더에서 conftest 를 불러 확인한다."""
     (tmp_path / ".env").write_text("OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:9\n")
     env = {k: v for k, v in os.environ.items() if k not in ("LOGFIRE_TOKEN", "OTEL_EXPORTER_OTLP_ENDPOINT")}
-    env["PYTHONPATH"] = str(Path(__file__).parent)
+    tests_dir = Path(__file__).resolve().parent
+    # 설치 안 된 채 PYTHONPATH 로 돌리는 경우도 같은 코드를 보게 — 레포 루트와 받은 값을 이어 붙인다
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(tests_dir), str(tests_dir.parent), os.environ.get("PYTHONPATH", "")) if p)
     probe = "import conftest, kukie.server; from pydantic_ai import Agent; print(Agent._instrument_default is False)"
     r = subprocess.run([sys.executable, "-c", probe], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
     assert r.stdout.strip() == "True", r.stderr
