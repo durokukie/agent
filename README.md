@@ -84,11 +84,14 @@ kukie-electron (데스크톱 앱)  ──HTTP──▶  kukie agent (이 레포)
 
 ```bash
 git clone https://github.com/durokukie/agent.git && cd agent
-python -m pip install -e '.[dev]'
+uv sync                     # .python-version 의 Python 과 uv.lock 의 버전 그대로 .venv 에 깐다 (uv: https://docs.astral.sh/uv/)
+source .venv/bin/activate   # 아래 명령은 이 가상환경에서
 cp .env.example .env        # 모델·API 키 설정. 미설정 시 TestModel 로 키 없이 동작
 python -m pytest -q         # 단위 테스트
 uvicorn kukie.server:app --port 8000   # 로컬 서버 (Spring 없이 쓰려면 .env 에 KUKIE_DEV_AUTH=1)
 ```
+
+의존성은 `uv add <패키지>`(개발용은 `uv add --dev`)로 더한다 — `pyproject.toml` 과 `uv.lock` 이 같이 바뀌니 둘 다 커밋한다. CI 는 `uv sync --locked` 라 둘이 어긋나면 멈춘다.
 
 kind 클러스터 E2E: `KUKIE_E2E_CONTEXT=kind-<name> python -m pytest -m e2e`
 

@@ -2,8 +2,10 @@
 # Kukie 에이전트 컨테이너 (DURO-107 4단계). 리버스 프록시 뒤에서 /api/* 가 /api 를 떼고 여기 8000 으로 온다.
 # 띄우는 법은 kukie-electron/deploy/README.md — 도커 컴포즈가 이 파일을 빌드한다.
 FROM python:3.14-slim
+# uv 는 CI 의 SETUP_UV_VERSION 과 같은 버전. 태그는 옮겨질 수 있어 digest 로 고정한다
+COPY --from=ghcr.io/astral-sh/uv:0.12.23@sha256:61d393e44e249f2e4b526b6c7ddcecce245946826e608e11c93ad4f5bba55b21 /uv /usr/local/bin/uv
 
-# CI 와 같은 3.14. kubectl 은 등록된 클러스터에 대고 실행하는 도구라 이미지 안에 있어야 한다 (kukie/kubectl/runner.py).
+# .python-version 과 같은 3.14 — 어긋나면 아래 uv sync 가 멈춘다. kubectl 은 등록된 클러스터에 대고 실행하는 도구라 이미지 안에 있어야 한다 (kukie/kubectl/runner.py).
 # 버전을 고정하고 sha256 을 대조한다 — 빌드마다 다른 바이너리가 들어오지 않게.
 ARG KUBECTL_VERSION=v1.37.0
 ARG TARGETARCH
@@ -17,11 +19,16 @@ RUN : "${TARGETARCH:?BuildKit 이 필요하다 — DOCKER_BUILDKIT=1 로 빌드}
  && apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
+# uv.lock 에 적힌 버전 그대로 깐다 — 빌드할 때마다 새로 고르지 않는다. 이미지 안의 Python 을 쓰고 받아 오지 않는다
+ENV UV_PYTHON_DOWNLOADS=never UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+# 의존성 먼저, 소스는 나중에 — 소스만 바뀌면 의존성 레이어를 다시 쓴다.
+# postgres extra(psycopg)는 KUKIE_DATABASE_URL 을 Postgres 로 줄 때 쓴다 (.env.example). 기본 SQLite 면 있어도 무해
+COPY pyproject.toml uv.lock .python-version ./
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --extra postgres --no-install-project
+COPY README.md ./
 COPY kukie ./kukie
-# psycopg 는 KUKIE_DATABASE_URL 을 Postgres 로 줄 때 쓴다 (.env.example). 기본 SQLite 면 있어도 무해
-# 캐시 마운트: 소스가 바뀌어 이 레이어가 다시 돌아도 휠은 다시 안 내려받는다 (PR #82 리뷰)
-RUN --mount=type=cache,target=/root/.cache/pip pip install . 'psycopg[binary]>=3.1'
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --extra postgres --no-editable
+ENV PATH="/app/.venv/bin:$PATH"
 
 # 상태 파일 — 기본 SQLite(~/.kukie/kukie.db)와 승인 계획(~/.kukie/plans) — 이 HOME 아래로 모인다.
 # 컴포즈는 /data 를 볼륨으로 잡아 컨테이너를 갈아도 남긴다
