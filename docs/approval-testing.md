@@ -25,7 +25,7 @@ apply·scale·delete는 dry-run 성공과 guidance를, rollout restart는 dry-ru
 ## 실행
 
 ```sh
-uv run --extra dev pytest -q
+uv run pytest -q
 ```
 
 `KUKIE_E2E_CONTEXT`가 없으면 실제 클러스터 테스트만 건너뛴다.
@@ -41,7 +41,7 @@ kind와 Docker가 준비된 환경에서는 별도 kubeconfig로 일회용 클�
   export KUKIE_MODEL=test
   trap 'kind delete cluster --name "$cluster_name"; rm -rf "$e2e_dir"' EXIT
   kind create cluster --name "$cluster_name" --wait 120s &&
-    uv run --extra dev pytest -q -m e2e
+    uv run pytest -q -m e2e
 )
 ```
 
