@@ -9,7 +9,8 @@ on:
 permissions:
   contents: read
 
-# Python 버전은 .python-version 하나에서 온다 (uv 가 읽어 없으면 받아 온다). uv 자체 버전은 여기와 Dockerfile 두 곳
+# Python 버전은 .python-version 하나에서 온다 (uv 가 읽어 없으면 받아 온다). uv 자체 버전은 여기와 Dockerfile 두 곳.
+# setup-uv 는 v10 같은 큰 버전 태그를 내지 않아 릴리스 커밋으로 고정한다
 env:
   SETUP_UV_VERSION: "0.12.23"
 
@@ -18,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - run: uv sync --locked
@@ -43,7 +44,7 @@ jobs:
       KUKIE_REQUIRE_POSTGRES_TESTS: '1'
     steps:
       - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - run: uv sync --locked
@@ -58,7 +59,7 @@ jobs:
       KUKIE_MODEL: test
     steps:
       - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - run: uv sync --locked
