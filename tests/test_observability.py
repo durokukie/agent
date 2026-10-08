@@ -3,6 +3,11 @@
 계측은 본업의 곁가지다. 조건이 없으면 조용히 꺼져 있어야 하고(테스트·평상시 실행이
 바깥으로 데이터를 보내면 안 된다), 설정이 실패해도 예외가 새어 나오면 안 된다.
 """
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 from kukie import observability
@@ -86,3 +91,14 @@ def test_계측_설정이_실패해도_예외가_새지_않는다(monkeypatch, c
 
     assert observability.setup() is False
     assert any("observability setup failed" in r.message for r in caplog.records)
+
+
+def test_개발자_env_에_계측_설정이_있어도_테스트는_계측을_켜지_않는다(tmp_path):
+    """server 는 import 때 계측을 켜고, kukie 는 import 때 .env 를 올린다. conftest 가 그보다 먼저 막아야
+    테스트 프롬프트가 개발자의 계측 서버로 나가지 않는다. .env 가 있는 폴더에서 conftest 를 불러 확인한다."""
+    (tmp_path / ".env").write_text("OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:9\n")
+    env = {k: v for k, v in os.environ.items() if k not in ("LOGFIRE_TOKEN", "OTEL_EXPORTER_OTLP_ENDPOINT")}
+    env["PYTHONPATH"] = str(Path(__file__).parent)
+    probe = "import conftest, kukie.server; from pydantic_ai import Agent; print(Agent._instrument_default is False)"
+    r = subprocess.run([sys.executable, "-c", probe], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    assert r.stdout.strip() == "True", r.stderr

@@ -1,3 +1,10 @@
+import os
+
+# kukie 를 import 하면 .env 가 환경에 올라오고 server 는 그때 계측을 켠다. 테스트가 개발자의 계측 서버로
+# 프롬프트를 보내지 않게 그보다 먼저 빈 값으로 막는다 — load_dotenv 는 이미 있는 값을 덮지 않는다.
+os.environ["LOGFIRE_TOKEN"] = ""
+os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = ""
+
 import httpx
 import pytest
 from pydantic_ai import models
