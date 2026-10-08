@@ -1,3 +1,10 @@
+"""진짜 kind 클러스터에서 승인 흐름을 끝까지 돌린다 — 가짜 kubectl 로는 못 보는 "결정과 클러스터 상태가 맞는가".
+
+모델만 가짜(어떤 툴을 부를지 정해 둠)이고 kubectl 은 진짜로 클러스터에 간다. 변경 툴 넷을 승인·거절로 한 번씩 돌려
+승인하면 바뀌고 거절하면 그대로인지, Action Plan 상태(APPLIED / REJECTED)가 그와 맞는지 본다.
+
+돌리는 법: `KUKIE_E2E_CONTEXT=kind-<이름> python -m pytest -m e2e`. kind 가 아닌 context 는 conftest 가 거부한다.
+"""
 import subprocess
 
 import pytest
@@ -20,6 +27,8 @@ from kukie.tools import mutate
 pytestmark = pytest.mark.e2e
 
 
+# ── 안전장치: 운영 클러스터에 붙지 않는다 ─────────────────────
+
 def test_E2E_context는_명시적인_kind_cluster다(e2e_context):
     assert e2e_context.startswith("kind-")
 
@@ -27,6 +36,7 @@ def test_E2E_context는_명시적인_kind_cluster다(e2e_context):
 def test_kind_prefix_alias는_실제_kind_cluster가_아니면_거부한다(
     monkeypatch, request
 ):
+    """이름만 kind- 로 붙인 context(운영 클러스터 별칭 등)는 kind 가 관리하는 목록에 없으니 거부한다."""
     calls = []
 
     def fake_run(command, **kwargs):
@@ -46,6 +56,7 @@ def test_kind_prefix_alias는_실제_kind_cluster가_아니면_거부한다(
 def test_kind_context는_관리_cluster와_API_identity가_같아야한다(
     monkeypatch, request
 ):
+    """이름이 kind 목록에 있어도 kubeconfig 의 API 주소·CA 가 kind 것과 다르면 거부한다 — 이름만 같은 다른 클러스터일 수 있다."""
     calls = []
     selected = """clusters:
 - cluster:
@@ -92,6 +103,8 @@ def test_kind_context는_관리_cluster와_API_identity가_같아야한다(
     ]
 
 
+# ── 승인 흐름 ────────────────────────────────────────────────
+
 @pytest.fixture
 def client(monkeypatch, dev_auth, fresh_session, plan_dir, e2e_context, e2e_session_namespace):
     monkeypatch.setattr(
@@ -114,6 +127,10 @@ def _tool_model(tool_name, args, call_id):
 
 
 def _decide(client, tool_name, args, call_id, approved):
+    """한 번의 승인 흐름: 실습 모드 → 모델이 변경 툴을 부름 → 훅이 dry-run·판단 가이드로 카드를 만듦 → 승인/거절.
+
+    카드 내용까지 확인하고, 결정 뒤의 카드와 Action Plan 을 돌려준다.
+    """
     assert client.post("/session").status_code == 200
     assert client.post("/chat", json={"text": "/mode 실습"}).status_code == 200
 
@@ -132,6 +149,7 @@ def _decide(client, tool_name, args, call_id, approved):
         "destructive" if tool_name == "delete_resource" else "caution"
     )
     if tool_name == "rollout_restart":
+        # 서버 dry-run 이 안 되는 명령 — 카드에 unsupported 로 남고 판단 가이드는 만들지 않는다
         assert card["dry_run_result"]["status"] == "unsupported"
         assert card["dry_run_result"]["stderr"].strip()
         assert card["decision_guidance"] == "guidance unavailable"
@@ -206,6 +224,10 @@ def test_apply_manifest_결정과_cluster상태가_일치한다(
     e2e_session_namespace,
     approved,
 ):
+    """ConfigMap 적용. 승인하면 툴 인자의 namespace 에만 생기고(세션 기본 namespace 에는 없음), 거절하면 어디에도 없다.
+
+    kubectl 은 dry-run 한 번, 승인했을 때만 실행 한 번 — 둘 다 같은 명령·같은 본문이어야 한다.
+    """
     assert e2e_namespace != e2e_session_namespace
     calls = []
 
@@ -263,6 +285,7 @@ def test_scale_resource_결정과_cluster상태가_일치한다(
     e2e_namespace,
     approved,
 ):
+    """replicas 1 → 2. 승인하면 2, 거절하면 1 그대로."""
     _seed_deployment(kubectl_cli, e2e_context, e2e_namespace)
     args = {
         "kind": "deployment",
@@ -296,6 +319,7 @@ def test_rollout_restart_결정과_cluster상태가_일치한다(
     e2e_namespace,
     approved,
 ):
+    """승인하면 Deployment 에 restartedAt 표시가 생기고, 거절하면 없다."""
     _seed_deployment(kubectl_cli, e2e_context, e2e_namespace)
     args = {
         "kind": "deployment",
@@ -328,6 +352,7 @@ def test_delete_resource_결정과_cluster상태가_일치한다(
     e2e_namespace,
     approved,
 ):
+    """승인하면 Deployment 가 사라지고, 거절하면 남는다."""
     _seed_deployment(kubectl_cli, e2e_context, e2e_namespace)
     args = {
         "kind": "deployment",
