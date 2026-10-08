@@ -97,7 +97,8 @@ kind 클러스터 E2E: `KUKIE_E2E_CONTEXT=kind-<name> python -m pytest -m e2e`
 ```bash
 KUKIE_DATABASE_URL=sqlite:////tmp/fresh.db alembic upgrade head            # 지금 리비전까지 만든 빈 DB
 KUKIE_DATABASE_URL=sqlite:////tmp/fresh.db alembic revision --autogenerate -m "무엇을 바꿨나"   # 모델과의 차이를 리비전으로
+KUKIE_DATABASE_URL=sqlite:////tmp/fresh.db alembic upgrade head && alembic check   # 빠진 차이가 없는지 — "No new upgrade operations detected"
 ```
 
-만들어진 파일을 읽고 다듬은 뒤(자동 생성은 초안이다) 커밋한다. 데이터를 옮기는 리비전은 손으로 쓴다 — `0002` 가 예.
+**리비전 파일은 손으로 쓰지 않는다 — 사람도, AI 도.** 위 명령으로 Alembic 이 만든 파일을 읽고, 맨 위의 `왜:` · `데이터:` 를 채운 뒤 커밋한다. 표 모양 바뀜은 생성된 그대로 두고, 자동 생성이 못 보는 것(기존 데이터 옮기기, 부분 인덱스 조건)만 손으로 더하고 그 줄에 이유를 적는다 — `0002` 가 예. 이미 머지된 리비전은 고치지 않는다.
 
