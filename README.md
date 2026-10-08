@@ -95,6 +95,7 @@ kind 클러스터 E2E: `KUKIE_E2E_CONTEXT=kind-<name> python -m pytest -m e2e`
 **DB 표 모양을 바꿀 때** — 서버는 켜질 때 `kukie/store/migrations/versions` 의 리비전을 순서대로 적용한다 (Alembic). 모델(`kukie/store/models.py`)을 고쳤으면 리비전을 **같이** 만든다. 안 만들면 새 DB 에서만 맞고 이미 있는 DB 에는 안 나가며, `tests/test_migrations.py` 가 그 어긋남을 잡는다.
 
 ```bash
+rm -f /tmp/fresh.db                                  # 지난번에 버린 리비전 기록이 남아 있으면 upgrade 가 멈춘다
 export KUKIE_DATABASE_URL=sqlite:////tmp/fresh.db   # 아래 명령 모두 이 빈 DB 로 — 안 주면 ~/.kukie/kukie.db 를 연다
 alembic upgrade head                                 # 지금 리비전까지
 alembic revision --autogenerate -m "무엇을 바꿨나"     # 모델과의 차이를 리비전으로
