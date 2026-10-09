@@ -5,7 +5,7 @@
 """
 import pytest
 
-from kukie import observability
+from kukie_agent import observability
 
 
 @pytest.fixture(autouse=True)

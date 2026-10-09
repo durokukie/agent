@@ -830,7 +830,7 @@ wheels = [
 ]
 
 [[package]]
-name = "kukie"
+name = "kukie-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -853,7 +853,7 @@ postgres = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "kukie", extra = ["postgres"] },
+    { name = "kukie-agent", extra = ["postgres"] },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -876,7 +876,7 @@ provides-extras = ["postgres"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "kukie", extras = ["postgres"] },
+    { name = "kukie-agent", extras = ["postgres"] },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio" },
 ]

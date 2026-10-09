@@ -8,15 +8,15 @@ import logging
 import pytest
 from pydantic_ai.models.test import TestModel
 
-from kukie import response as response_mod
-from kukie.agent import agent
-from kukie.deps import Deps
-from kukie.glossary import explain_command
-from kukie.kubectl import KubectlResult
-from kukie.response import build_response_for
-from kukie.skills import SKILLS
-from kukie.skills.diagnosis import DiagnosisResponse
-from kukie.tools import read as read_tools
+from kukie_agent import response as response_mod
+from kukie_agent.agent import agent
+from kukie_agent.deps import Deps
+from kukie_agent.glossary import explain_command
+from kukie_agent.kubectl import KubectlResult
+from kukie_agent.response import build_response_for
+from kukie_agent.skills import SKILLS
+from kukie_agent.skills.diagnosis import DiagnosisResponse
+from kukie_agent.tools import read as read_tools
 
 FAKE_COMMAND = "kubectl --context kind-dev get pods -n study -o wide"
 
@@ -107,7 +107,7 @@ def test_사전_미등록_플래그는_로그만_남기고_응답은_그대로_�
                              stdout="ok", stderr="", success=True)
     monkeypatch.setattr(read_tools, "run_kubectl", fake)
     m = TestModel(call_tools=["list_resources"], custom_output_args={"narration": "x"})
-    with caplog.at_level(logging.WARNING, logger="kukie.validators"):
+    with caplog.at_level(logging.WARNING, logger="kukie_agent.validators"):
         result = _run(m)
     assert len(result.output.steps) == 1                      # 반려 안 함
     assert any("미등록" in r.message and "--weird-flag" in r.message for r in caplog.records)

@@ -10,9 +10,9 @@ import yaml
 from pydantic_ai import ApprovalRequired, ModelRetry, ToolFailed
 from pydantic_ai.messages import ToolCallPart
 
-from kukie.guardrail import action_plan, hook
-from kukie.kubectl import KubectlResult
-from kukie.kubectl import runner as kubectl_runner
+from kukie_agent.guardrail import action_plan, hook
+from kukie_agent.kubectl import KubectlResult
+from kukie_agent.kubectl import runner as kubectl_runner
 
 
 BASE_ARGS = {

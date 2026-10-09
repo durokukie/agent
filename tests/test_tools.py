@@ -5,10 +5,10 @@
 - 모든 변경 툴에 위험도 스티커가 등록돼 있는지 (미등록 = fail-closed 대상)
 - LLM이 kubectl args를 직접 조립하는 경로가 없는지 (탈출구 제거 확인)
 """
-from kukie.skills import SKILLS
-from kukie.skills.base import COMMON_TOOLS
-from kukie.tools.mutate import MUTATE_TOOLS, MUTATING_TOOLS, RISK_STICKERS, Risk
-from kukie.tools.read import READ_TOOLS
+from kukie_agent.skills import SKILLS
+from kukie_agent.skills.base import COMMON_TOOLS
+from kukie_agent.tools.mutate import MUTATE_TOOLS, MUTATING_TOOLS, RISK_STICKERS, Risk
+from kukie_agent.tools.read import READ_TOOLS
 
 
 def test_훅_대상은_변경_함수_목록에서_자동_파생된다():

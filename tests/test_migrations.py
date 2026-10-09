@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 from sqlalchemy import create_engine, text
 
-from kukie.store import reset_store_for_tests
-from kukie.store.models import Base
+from kukie_agent.store import reset_store_for_tests
+from kukie_agent.store.models import Base
 
 HEAD = "0002"
 BASELINE = "0001"
@@ -139,7 +139,7 @@ def test_0001은_실제_옛_DB의_모양과_같다(tmp_path):
     """도장(stamp)이 거짓말이 아니려면 0001 이 만드는 표·인덱스가 옛 create_all 의 결과와 같아야 한다.
     노트북 옛 DB 에서 뜬 스냅샷과, 빈 DB 에 0001 만 적용한 결과를 대조한다."""
     from alembic import command
-    from kukie.store.db import _alembic_config
+    from kukie_agent.store.db import _alembic_config
 
     legacy = tmp_path / "legacy.db"
     make_old_db(legacy, [])
@@ -200,7 +200,7 @@ def test_남의_표만_있는_DB는_옛_DB가_아니라_새_DB다(tmp_path):
 def test_SQLite에서도_DDL이_트랜잭션과_함께_되돌아간다(tmp_path):
     """pysqlite 기본값은 DDL 을 트랜잭션 밖에 둔다 — 리비전이 중간에 멈추면 표만 남아 다음 기동이 'already exists'
     로 죽는다. 엔진이 BEGIN 을 직접 쳐서 DDL 까지 되돌린다 (PR #83 리뷰 2차)."""
-    from kukie.store.db import _migration_engine
+    from kukie_agent.store.db import _migration_engine
 
     db = tmp_path / "ddl.db"
     engine = _migration_engine(f"sqlite:///{db}")
@@ -218,8 +218,8 @@ def test_서비스_엔진에는_BEGIN_레시피를_걸지_않는다(tmp_path):
     """레시피는 마이그레이션 엔진에만. 서비스 엔진에 걸면 세션의 첫 SELECT 가 SHARED 잠금을 쥐어 같은 세션의
     이어 쓰기가 잠금 승격에서 기다리지 못하고 바로 'database is locked' 를 맞는다 (PR #83 리뷰 3차).
     리스너 유무가 아니라 드라이버 커넥션의 in_transaction 으로 본다 — isolation_level 만 바뀌는 회귀도 잡게 (4차)."""
-    from kukie.store import db as db_module
-    from kukie.store.db import _migration_engine
+    from kukie_agent.store import db as db_module
+    from kukie_agent.store.db import _migration_engine
 
     url = f"sqlite:///{tmp_path / 'svc.db'}"
     reset_store_for_tests(url)
@@ -252,7 +252,7 @@ def test_메모리_SQLite_주소는_막는다(tmp_path):
 def test_메모리_SQLite_주소는_CLI_경로에서도_막는다(monkeypatch):
     """alembic.ini → env.py 는 database_url() 로 주소를 얻는다 — 거기서도 같은 문에 걸려야 버려질 메모리 DB 에
     리비전을 적용하고 조용히 성공을 찍는 일이 없다 (PR #83 리뷰 5차)."""
-    from kukie.store.db import database_url
+    from kukie_agent.store.db import database_url
 
     monkeypatch.setenv("KUKIE_DATABASE_URL", "sqlite+pysqlite://")
     with pytest.raises(ValueError, match="메모리 SQLite"):

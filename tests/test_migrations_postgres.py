@@ -18,9 +18,9 @@ from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
-from kukie.store import reset_store_for_tests
-from kukie.store.db import BASELINE_REVISION, LOCK_KEY, _alembic_config
-from kukie.store.models import Base
+from kukie_agent.store import reset_store_for_tests
+from kukie_agent.store.db import BASELINE_REVISION, LOCK_KEY, _alembic_config
+from kukie_agent.store.models import Base
 
 ADMIN_URL = os.environ.get("KUKIE_TEST_POSTGRES_URL")
 # CI 의 migrations-postgres 잡 — 전부 skip 이어도 pytest 는 0 으로 끝나 초록이 된다. 그 잡에서는 이 파일이 실제로 돌길 요구한다.

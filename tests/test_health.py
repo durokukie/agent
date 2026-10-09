@@ -5,7 +5,7 @@ import sqlite3
 
 from fastapi.testclient import TestClient
 
-from kukie.server import app
+from kukie_agent.server import app
 
 
 def test_health_is_open_without_auth():
