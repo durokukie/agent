@@ -12,13 +12,13 @@ from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 
 from helpers import GUIDANCE, OTHER, USER, answer_model, new_room
-from kukie import conversations, server
-from kukie.clusters import crypto
-from kukie.agent import agent
-from kukie.guardrail import action_plan, hook
-from kukie.kubectl import KubectlResult
-from kukie.store import get_store
-from kukie.tools import mutate
+from kukie_agent import conversations, server
+from kukie_agent.clusters import crypto
+from kukie_agent.agent import agent
+from kukie_agent.guardrail import action_plan, hook
+from kukie_agent.kubectl import KubectlResult
+from kukie_agent.store import get_store
+from kukie_agent.tools import mutate
 
 SCALE_ARGS = {
     "kind": "deployment",
@@ -353,7 +353,7 @@ def test_한_장을_거절한_뒤_재시작하면_되살리지_않는다(client)
 
 def test_없는_계획을_고치려_하면_조용히_넘어가지_않는다(client):
     """계획은 표가 원본이라 "없으면 그만" 이 아니다 — 조용히 성공하면 .md 와 표가 갈린다."""
-    from kukie.store.chat_store import PlanMissing
+    from kukie_agent.store.chat_store import PlanMissing
 
     with pytest.raises(PlanMissing):
         get_store().update_plan("없는-계획", status="EXPIRED")

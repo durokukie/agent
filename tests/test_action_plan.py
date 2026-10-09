@@ -7,8 +7,8 @@ from threading import Barrier
 import pytest
 import yaml
 
-from kukie.guardrail import action_plan
-from kukie.guardrail.action_plan import ActionPlan
+from kukie_agent.guardrail import action_plan
+from kukie_agent.guardrail.action_plan import ActionPlan
 
 
 def _read_plan(path: Path) -> tuple[dict, str]:

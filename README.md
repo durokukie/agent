@@ -69,14 +69,14 @@ kukie-electron (데스크톱 앱)  ──HTTP──▶  kukie agent (이 레포)
 
 | 영역 | 파일 |
 |---|---|
-| 에이전트 정의, 스킬별 툴 필터 | `kukie/agent.py`, `kukie/skills/` |
-| 가드레일 훅, Action Plan, 판단 가이드 | `kukie/guardrail/` |
-| 읽기 툴 4종, 변경 툴 4종 | `kukie/tools/` |
-| kubectl 명령 조립·실행 (`shell=False`) | `kukie/kubectl/` |
-| FastAPI 서버, 대화·계획·클러스터 API | `kukie/server.py`, `kukie/*_api.py` |
-| 클러스터 등록·암호화·임시 kubeconfig | `kukie/clusters/` |
-| 인증·팀 권한 (Spring 연동, fail-closed) | `kukie/auth.py`, `kukie/membership.py` |
-| 저장소 (SQLAlchemy) | `kukie/store/` |
+| 에이전트 정의, 스킬별 툴 필터 | `kukie_agent/agent.py`, `kukie_agent/skills/` |
+| 가드레일 훅, Action Plan, 판단 가이드 | `kukie_agent/guardrail/` |
+| 읽기 툴 4종, 변경 툴 4종 | `kukie_agent/tools/` |
+| kubectl 명령 조립·실행 (`shell=False`) | `kukie_agent/kubectl/` |
+| FastAPI 서버, 대화·계획·클러스터 API | `kukie_agent/server.py`, `kukie_agent/*_api.py` |
+| 클러스터 등록·암호화·임시 kubeconfig | `kukie_agent/clusters/` |
+| 인증·팀 권한 (Spring 연동, fail-closed) | `kukie_agent/auth.py`, `kukie_agent/membership.py` |
+| 저장소 (SQLAlchemy) | `kukie_agent/store/` |
 
 **스택**: Python 3.14+ · [pydantic-ai](https://ai.pydantic.dev/) (에이전트 루프, 승인 훅 `ApprovalRequired`/`DeferredToolRequests`) · FastAPI · SQLAlchemy · cryptography · pytest · kind (E2E)
 
@@ -88,14 +88,14 @@ uv sync                     # .python-version 의 Python 과 uv.lock 의 버전 
 source .venv/bin/activate   # 아래 명령은 이 가상환경에서
 cp .env.example .env        # 모델·API 키 설정. 미설정 시 TestModel 로 키 없이 동작
 python -m pytest -q         # 단위 테스트
-uvicorn kukie.server:app --port 8000   # 로컬 서버 (Spring 없이 쓰려면 .env 에 KUKIE_DEV_AUTH=1)
+uvicorn kukie_agent.server:app --port 8000   # 로컬 서버 (Spring 없이 쓰려면 .env 에 KUKIE_DEV_AUTH=1)
 ```
 
 의존성은 `uv add <패키지>`(개발용은 `uv add --dev`)로 더한다 — `pyproject.toml` 과 `uv.lock` 이 같이 바뀌니 둘 다 커밋한다. CI 는 `uv sync --locked` 라 둘이 어긋나면 멈춘다.
 
 kind 클러스터 E2E: `KUKIE_E2E_CONTEXT=kind-<name> python -m pytest -m e2e`
 
-**DB 표 모양을 바꿀 때** — 서버는 켜질 때 `kukie/store/migrations/versions` 의 리비전을 순서대로 적용한다 (Alembic). 모델(`kukie/store/models.py`)을 고쳤으면 리비전을 **같이** 만든다. 안 만들면 새 DB 에서만 맞고 이미 있는 DB 에는 안 나가며, `tests/test_migrations.py` 가 그 어긋남을 잡는다.
+**DB 표 모양을 바꿀 때** — 서버는 켜질 때 `kukie_agent/store/migrations/versions` 의 리비전을 순서대로 적용한다 (Alembic). 모델(`kukie_agent/store/models.py`)을 고쳤으면 리비전을 **같이** 만든다. 안 만들면 새 DB 에서만 맞고 이미 있는 DB 에는 안 나가며, `tests/test_migrations.py` 가 그 어긋남을 잡는다.
 
 ```bash
 rm -f /tmp/fresh.db                                  # 지난번에 버린 리비전 기록이 남아 있으면 upgrade 가 멈춘다

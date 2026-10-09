@@ -10,8 +10,8 @@ from unittest.mock import patch
 
 import pytest
 
-from kukie.kubectl import KubectlResult, assemble
-from kukie.tools import mutate
+from kukie_agent.kubectl import KubectlResult, assemble
+from kukie_agent.tools import mutate
 
 INTENT = dict(intent="테스트 의도", expected_effects=["영향"], side_effects=["부작용"])
 

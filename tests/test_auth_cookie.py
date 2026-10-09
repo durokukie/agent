@@ -10,7 +10,7 @@ import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from kukie.auth import User, current_user
+from kukie_agent.auth import User, current_user
 
 @pytest.fixture
 def spring(member_server):

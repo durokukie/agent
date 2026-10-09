@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from kukie.kubectl import runner
+from kukie_agent.kubectl import runner
 
 
 def test_kubectl_결과는_실제_exit_code를_보존한다(monkeypatch):

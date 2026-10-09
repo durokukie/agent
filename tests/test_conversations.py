@@ -13,11 +13,11 @@ from pydantic_ai.messages import ModelRequest, ToolCallPart, UserPromptPart
 from pydantic_ai.models.function import FunctionModel
 
 from helpers import OTHER, USER, answer_model, chat_model, new_room, pending_ticket
-from kukie import conversations, server
-from kukie.agent import agent
-from kukie.skills.base import KukieResponse
-from kukie.store import get_store, reset_store_for_tests
-from kukie.store.models import DEFAULT_TITLE
+from kukie_agent import conversations, server
+from kukie_agent.agent import agent
+from kukie_agent.skills.base import KukieResponse
+from kukie_agent.store import get_store, reset_store_for_tests
+from kukie_agent.store.models import DEFAULT_TITLE
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ def test_context를_직접_주면_kubeconfig를_읽지_않는다(client, monkeyp
 
 
 def test_kubeconfig를_못_읽으면_503_KUBECONFIG(client, monkeypatch):
-    from kukie.kubectl.config import KubeconfigError
+    from kukie_agent.kubectl.config import KubeconfigError
     monkeypatch.setattr(server, "read_kubeconfig", lambda: (_ for _ in ()).throw(KubeconfigError("없음")))
     r = client.post("/conversations", json={}, headers=USER)
     assert r.status_code == 503 and r.json()["detail"]["code"] == "KUBECONFIG"
@@ -341,7 +341,7 @@ def test_복원_한도는_UTF8_바이트_기준이고_최신_run_하나가_넘�
 def test_첫_요청_여럿이_동시에_와도_DB_초기화가_충돌하지_않는다(tmp_path, monkeypatch):
     """팀원 리뷰 4: 동기 dependency 는 스레드풀에서 돌아 create_all 이 동시에 들어올 수 있다."""
     import threading
-    from kukie.store import db as store_db
+    from kukie_agent.store import db as store_db
     monkeypatch.setenv("KUKIE_DATABASE_URL", f"sqlite:///{tmp_path / 'race.db'}")
     monkeypatch.setattr(store_db, "_engine", None)
     monkeypatch.setattr(store_db, "_factory", None)
@@ -418,7 +418,7 @@ def test_같은_request_id_재전송은_실행_없이_저장된_응답을_준다
         return SimpleNamespace(output=KukieResponse(narration="한 번만"), all_messages=lambda: [],
                                new_messages=lambda: [])
 
-    import kukie.server as srv
+    import kukie_agent.server as srv
     original = srv._run_agent
     srv._run_agent = fake_run
     try:
@@ -454,7 +454,7 @@ def test_모델_예외는_run을_failed로_남기고_500_RUN_FAILED(client):
     async def boom(session, **kwargs):
         raise RuntimeError("모델 죽음")
 
-    import kukie.server as srv
+    import kukie_agent.server as srv
     original = srv._run_agent
     srv._run_agent = boom
     try:
@@ -506,7 +506,7 @@ def test_실패한_요청을_같은_request_id로_다시_보내면_저장된_실
         calls += 1
         raise RuntimeError("모델 죽음")
 
-    import kukie.server as srv
+    import kukie_agent.server as srv
     original = srv._run_agent
     srv._run_agent = boom
     try:
@@ -532,7 +532,7 @@ def _fake(output, new_messages=()):
 
 def _swap_run_agent(outputs):
     """_run_agent 를 outputs 순서대로 돌려주는 가짜로. 반환은 원복 함수."""
-    import kukie.server as srv
+    import kukie_agent.server as srv
     original = srv._run_agent
     queue = list(outputs)
 

@@ -22,7 +22,7 @@
 
 ## 🔴 머지 전에 반드시 — DB 마이그레이션
 
-- **머지된 리비전 수정**: `kukie/store/migrations/versions/` 에서 이미 develop 에 있는 리비전 파일을 고쳤나. 이미 올라간 DB 에는 다시 돌지 않는다 — 바꿀 게 있으면 새 리비전이어야 한다.
+- **머지된 리비전 수정**: `kukie_agent/store/migrations/versions/` 에서 이미 develop 에 있는 리비전 파일을 고쳤나. 이미 올라간 DB 에는 다시 돌지 않는다 — 바꿀 게 있으면 새 리비전이어야 한다.
 
 ## 🟡 고치면 좋음
 

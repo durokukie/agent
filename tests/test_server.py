@@ -16,12 +16,12 @@ from pydantic_ai.tools import (
 )
 
 from helpers import FAKE_COMMAND, chat_model, pending_ticket, ready_plan
-from kukie import server
-from kukie.agent import agent
-from kukie.guardrail import hook
-from kukie.guardrail.action_plan import ActionPlan
-from kukie.kubectl import KubectlResult
-from kukie.tools import mutate
+from kukie_agent import server
+from kukie_agent.agent import agent
+from kukie_agent.guardrail import hook
+from kukie_agent.guardrail.action_plan import ActionPlan
+from kukie_agent.kubectl import KubectlResult
+from kukie_agent.tools import mutate
 
 
 @pytest.fixture
@@ -56,7 +56,7 @@ def test_kubeconfig를_못_읽으면_503(client, monkeypatch):
 ])
 def test_kubectl_실행_자체가_실패해도_KubeconfigError로_잡힌다(monkeypatch, raised):
     """returncode 검사를 못 가보는 예외(미설치·타임아웃)도 503 경로에 태운다 — 500 으로 새지 않게."""
-    from kukie.kubectl import config as kubeconfig
+    from kukie_agent.kubectl import config as kubeconfig
 
     def boom(*a, **kw):
         raise raised
@@ -167,7 +167,7 @@ def test_티켓은_Plan_DTO와_원본_Deferred요청을_보관한다(client):
 
 
 def test_새_Deferred_batch와_answer는_이전_결정을_초기화한다(client):
-    from kukie.skills.base import KukieResponse
+    from kukie_agent.skills.base import KukieResponse
 
     client.post("/session")
     server._session.decisions = {"old": ToolApproved()}
@@ -291,7 +291,7 @@ def test_승인은_원본_history와_ToolApproved로_재개한다(client, monkey
         assert session.pending is ticket
         seen["history"] = list(session.history)
         seen["results"] = kwargs["deferred_tool_results"]
-        from kukie.skills.base import KukieResponse
+        from kukie_agent.skills.base import KukieResponse
         return _fake_result(KukieResponse(narration="실행했습니다."))
 
     monkeypatch.setattr(server, "_run_agent", fake_run)
@@ -319,7 +319,7 @@ def test_승인_call_id는_재개_시작_전에_예약된다(client, monkeypatch
             "/approve", json={"call_id": "c1", "approved": True}
         ).status_code == 409
         assert client.post("/chat", json={"text": "딴 얘기"}).status_code == 409
-        from kukie.skills.base import KukieResponse
+        from kukie_agent.skills.base import KukieResponse
         return _fake_result(KukieResponse(narration="ok"))
 
     monkeypatch.setattr(server, "_run_agent", fake_run)
@@ -338,7 +338,7 @@ def test_거절은_Plan을_한번만_기록하고_ToolDenied로_재개한다(
 
     async def fake_run(session, **kwargs):
         seen["results"] = kwargs["deferred_tool_results"]
-        from kukie.skills.base import KukieResponse
+        from kukie_agent.skills.base import KukieResponse
         return _fake_result(KukieResponse(narration="요청을 취소했습니다."))
 
     monkeypatch.setattr(server, "_run_agent", fake_run)
@@ -496,7 +496,7 @@ def test_재개실패는_세션과_티켓을_유지하고_resume으로_다시_�
         raise RuntimeError("resume failed")
 
     monkeypatch.setattr(server, "_run_agent", boom)
-    with caplog.at_level(logging.ERROR, logger="kukie.server"):
+    with caplog.at_level(logging.ERROR, logger="kukie_agent.server"):
         response = client.post(
             "/approve",
             json={"call_id": "c1", "approved": approved},
@@ -519,7 +519,7 @@ def test_재개실패는_세션과_티켓을_유지하고_resume으로_다시_�
     assert client.post("/approve", json={"call_id": "c1", "approved": approved}).status_code == 409
     [record] = [
         record for record in caplog.records
-        if record.name == "kukie.server" and record.levelno == logging.ERROR
+        if record.name == "kukie_agent.server" and record.levelno == logging.ERROR
     ]
     assert "call_ids=['c1']" in record.getMessage()
     assert plan.id in record.getMessage()
@@ -613,7 +613,7 @@ def test_거절_기록_실패는_결정을_남기지_않고_티켓을_유지한�
         raise OSError("disk full")
 
     monkeypatch.setattr(ActionPlan, "reject", disk_full)
-    with caplog.at_level(logging.ERROR, logger="kukie.server"):
+    with caplog.at_level(logging.ERROR, logger="kukie_agent.server"):
         response = client.post("/approve", json={"call_id": "c1", "approved": False})
 
     assert response.status_code == 503
@@ -640,7 +640,7 @@ async def _async_ok():
 # ── 6. 실행 잠금 — run 이 도는 동안 새 요청은 409 ─────────────
 
 def _ok_result():
-    from kukie.skills.base import KukieResponse
+    from kukie_agent.skills.base import KukieResponse
     return _fake_result(KukieResponse(narration="ok"))
 
 

@@ -5,7 +5,7 @@ from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import DeferredToolRequests
 
-from kukie.guardrail.action_plan import ActionPlan
+from kukie_agent.guardrail.action_plan import ActionPlan
 
 MEMBER_URL = "http://member.test"
 USER = {"X-User": "u-1"}
