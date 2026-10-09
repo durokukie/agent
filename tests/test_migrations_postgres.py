@@ -15,11 +15,12 @@ import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 from kukie.store import reset_store_for_tests
-from kukie.store.db import BASELINE_REVISION, LOCK_KEY, _alembic_config
+from kukie.store.db import BASELINE_REVISION, LOCK_KEY, MIGRATIONS_DIR, _alembic_config
 from kukie.store.models import Base
 
 ADMIN_URL = os.environ.get("KUKIE_TEST_POSTGRES_URL")
@@ -31,7 +32,7 @@ if (os.environ.get("GITHUB_JOB") == "migrations-postgres" or _REQUIRED) and not 
     raise RuntimeError("Postgres 테스트를 요구하는 자리인데 KUKIE_TEST_POSTGRES_URL 이 없다 — ci.yml 의 migrations-postgres 잡 env 를 확인")
 pytestmark = pytest.mark.skipif(not ADMIN_URL, reason="KUKIE_TEST_POSTGRES_URL 이 없다 — Postgres 실기는 CI 의 postgres 잡에서")
 
-HEAD = "0002"
+HEAD = ScriptDirectory(str(MIGRATIONS_DIR)).get_current_head()
 INSERT = ("INSERT INTO tbl_cluster (id, team_id, registered_by, name, provider, api_server, insecure, credential_encrypted, "
           "context_name, default_namespace, fingerprint, status, created_at, updated_at) VALUES "
           "(:id, :team_id, :by, :name, 'GENERIC', 'https://x', false, 'enc', 'ctx', 'default', :id, 'disconnected', now(), now())")

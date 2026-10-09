@@ -9,12 +9,14 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, text
 
 from kukie.store import reset_store_for_tests
+from kukie.store.db import MIGRATIONS_DIR
 from kukie.store.models import Base
 
-HEAD = "0002"
+HEAD = ScriptDirectory(str(MIGRATIONS_DIR)).get_current_head()   # 리비전을 새로 만들어도 여기를 고치지 않는다
 BASELINE = "0001"
 # Alembic 이전 create_all 이 만든 실제 DB 의 모양 — 노트북의 옛 ~/.kukie/kukie.db 에서 그대로 뜬 sqlite_master
 LEGACY_SCHEMA = Path(__file__).with_name("data") / "legacy_schema_2026-09-22.sql"
