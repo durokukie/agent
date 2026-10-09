@@ -9,16 +9,21 @@ on:
 permissions:
   contents: read
 
+# Python 버전은 .python-version 하나에서 온다 (uv 가 읽어 없으면 받아 온다). uv 자체 버전은 여기와 Dockerfile 두 곳.
+# setup-uv 는 v10 같은 큰 버전 태그를 내지 않아 릴리스 커밋으로 고정한다
+env:
+  SETUP_UV_VERSION: "0.12.23"
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
-          python-version: "3.14"
-      - run: python -m pip install -e '.[dev]'
-      - run: python -m pytest
+          version: ${{ env.SETUP_UV_VERSION }}
+      - run: uv sync --locked
+      - run: uv run python -m pytest
 
   # 배포 DB 는 Postgres 다 (kukie-electron deploy/ 컴포즈 · 팀 Aurora). 마이그레이션이 Postgres 에서도 같은 결과인지 —
   # SQLite 에서만 맞는 리비전을 못 넣게 (agent #67, DURO-110)
@@ -39,11 +44,11 @@ jobs:
       KUKIE_REQUIRE_POSTGRES_TESTS: '1'
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
-          python-version: "3.14"
-      - run: python -m pip install -e '.[dev]'
-      - run: python -m pytest -q -ra tests/test_migrations_postgres.py
+          version: ${{ env.SETUP_UV_VERSION }}
+      - run: uv sync --locked
+      - run: uv run python -m pytest -q -ra tests/test_migrations_postgres.py
 
   e2e:
     runs-on: ubuntu-latest
@@ -54,10 +59,10 @@ jobs:
       KUKIE_MODEL: test
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
-          python-version: "3.14"
-      - run: python -m pip install -e '.[dev]'
+          version: ${{ env.SETUP_UV_VERSION }}
+      - run: uv sync --locked
       - name: Install kind
         run: |
           curl -fsSLO "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
@@ -65,7 +70,7 @@ jobs:
           sha256sum -c kind-linux-amd64.sha256sum
           sudo install -m 0755 kind-linux-amd64 /usr/local/bin/kind
       - run: kind create cluster --name kukie-e2e --wait 120s
-      - run: python -m pytest -q -m e2e
+      - run: uv run python -m pytest -q -m e2e
       - if: always()
         run: kind delete cluster --name kukie-e2e
 
