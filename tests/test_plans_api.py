@@ -10,21 +10,15 @@ from fastapi.testclient import TestClient
 from pydantic_ai import ModelResponse
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.function import FunctionModel
-from pydantic_ai.models.test import TestModel
 
+from helpers import GUIDANCE, OTHER, USER, answer_model, new_room
 from kukie import conversations, server
 from kukie.clusters import crypto
 from kukie.agent import agent
 from kukie.guardrail import action_plan, hook
 from kukie.kubectl import KubectlResult
-from kukie.store import get_store, reset_store_for_tests
+from kukie.store import get_store
 from kukie.tools import mutate
-from kukie.tools import read as read_tools
-
-USER = {"X-User": "u-1"}
-OTHER = {"X-User": "u-2"}
-
-GOOD_RESPONSE = {"narration": "적용했습니다.", "suggested_next_action": None}
 
 SCALE_ARGS = {
     "kind": "deployment",
@@ -43,24 +37,8 @@ def _ok(stdout="ok\n", success=True, exit_code=0, stderr=""):
 
 
 @pytest.fixture
-def client(monkeypatch, tmp_path):
-    monkeypatch.delenv("KUKIE_MEMBER_URL", raising=False)
-    monkeypatch.delenv("KUKIE_DEV_USER", raising=False)
-    monkeypatch.setenv("KUKIE_DEV_AUTH", "1")
-    monkeypatch.setenv(crypto.KEY_ENV, crypto.generate_key())   # 클러스터 자격증명 암호화 (기획 04 §8)
-    reset_store_for_tests(f"sqlite:///{tmp_path / 'test.db'}")
-    conversations.registry.clear()
-    monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
-    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
-    monkeypatch.setattr(read_tools, "run_kubectl",
-                        lambda *a, **k: _ok(stdout="nginx Running"))
-    monkeypatch.setattr(hook, "run_kubectl", lambda *a, **k: _ok())          # dry-run 성공
-    monkeypatch.setattr(mutate, "run_kubectl", lambda *a, **k: _ok("scaled\n"))  # 실제 실행
-
-    async def guidance(plan, manifest_preview=None):
-        return "현재 replica 와 가용 자원을 확인한다."
-
-    monkeypatch.setattr(hook, "generate_decision_guidance", guidance)
+def client(monkeypatch, dev_auth, secret_key, empty_store, fake_kubeconfig, kubectl_ok, hook_passes):
+    monkeypatch.setattr(mutate, "run_kubectl", lambda *a, **k: _ok("scaled\n"))
     return TestClient(server.app)
 
 
@@ -73,16 +51,9 @@ def _mutation_model(call_id="call-1", args=None, tool="scale_resource"):
     return FunctionModel(model_call)
 
 
-def _answer_model():
-    """재개용 — 툴을 더 부르지 않고 답만 낸다."""
-    return TestModel(call_tools=[], custom_output_args=GOOD_RESPONSE)
-
-
 def _room(client, headers=USER, **body) -> str:
     body.setdefault("shared", True)          # 변경 작업은 shared 방에서만 (기획 05 §3)
-    r = client.post("/conversations", json=body, headers=headers)
-    assert r.status_code == 200, r.text
-    return r.json()["conversation"]["id"]
+    return new_room(client, headers, **body)
 
 
 
@@ -136,13 +107,13 @@ def test_승인_카드가_뜨면_계획이_표에_WAITING_APPROVAL로_남는다(
     assert plan.id == card["approvals"][0]["plan_id"]        # 카드의 plan_id 와 같은 행이다
     # 대역이 훅의 인자를 못 받으면 TypeError 가 훅의 except 에 먹혀 "guidance unavailable" 이 된다.
     # 그 조용한 실패를 여기서 잡는다 (#50 리뷰).
-    assert card["approvals"][0]["decision_guidance"] == "현재 replica 와 가용 자원을 확인한다."
+    assert card["approvals"][0]["decision_guidance"] == GUIDANCE
 
 
 def test_승인하면_APPLIED와_적용시각_결정자가_남는다(client):
     room = _room(client)
     _card(client, room)
-    with agent.override(model=_answer_model()):
+    with agent.override(model=answer_model()):
         r = client.post(f"/conversations/{room}/approve",
                         json={"call_id": "call-1", "approved": True}, headers=USER)
     assert r.status_code == 200 and r.json()["kind"] == "answer"
@@ -158,7 +129,7 @@ def test_승인하면_APPLIED와_적용시각_결정자가_남는다(client):
 def test_거절하면_REJECTED로_남고_실행_기록은_없다(client):
     room = _room(client)
     _card(client, room)
-    with agent.override(model=_answer_model()):
+    with agent.override(model=answer_model()):
         r = client.post(f"/conversations/{room}/approve",
                         json={"call_id": "call-1", "approved": False}, headers=USER)
     assert r.status_code == 200
@@ -174,7 +145,7 @@ def test_kubectl이_실패하면_FAILED와_EXECUTION_FAILED가_남는다(client,
     _card(client, room)
     monkeypatch.setattr(mutate, "run_kubectl",
                         lambda *a, **k: _ok("", success=False, exit_code=1, stderr="not found"))
-    with agent.override(model=_answer_model()):
+    with agent.override(model=answer_model()):
         client.post(f"/conversations/{room}/approve",
                     json={"call_id": "call-1", "approved": True}, headers=USER)
 
@@ -263,7 +234,7 @@ def test_상세는_결정과_실행_결과와_본문을_함께_준다(client):
     room = _room(client)
     card = _card(client, room)
     plan_id = card["approvals"][0]["plan_id"]
-    with agent.override(model=_answer_model()):
+    with agent.override(model=answer_model()):
         client.post(f"/conversations/{room}/approve",
                     json={"call_id": "call-1", "approved": True}, headers=USER)
 
@@ -293,7 +264,7 @@ def test_재시작해도_결정_전_카드는_살아남아_이어서_승인할_�
     assert body["turns"][-1]["status"] == "awaiting_approval"
     assert _plans(room)[0].status == "WAITING_APPROVAL"
 
-    with agent.override(model=_answer_model()):
+    with agent.override(model=answer_model()):
         r = client.post(f"/conversations/{room}/approve",
                         json={"call_id": "call-1", "approved": True}, headers=USER)
     assert r.status_code == 200 and r.json()["kind"] == "answer"
@@ -366,7 +337,7 @@ def test_한_장을_거절한_뒤_재시작하면_되살리지_않는다(client)
     assert r.status_code == 200 and len(r.json()["approvals"]) == 2
 
     # 한 장만 거절 — 남은 카드가 있으니 run 은 계속 열려 있다
-    with agent.override(model=_answer_model()):
+    with agent.override(model=answer_model()):
         r = client.post(f"/conversations/{room}/approve",
                         json={"call_id": "call-1", "approved": False}, headers=USER)
     assert r.json()["kind"] == "approval"
@@ -467,7 +438,7 @@ def test_실행_기록_저장이_실패해도_계획이_열린_채_남지_않는
         return real(plan_id, **fields)
 
     monkeypatch.setattr(get_store(), "update_plan", flaky)
-    with agent.override(model=_answer_model()):
+    with agent.override(model=answer_model()):
         r = client.post(f"/conversations/{room}/approve",
                         json={"call_id": "call-1", "approved": True}, headers=USER)
 

@@ -15,31 +15,18 @@ from pydantic_ai.tools import (
     ToolDenied,
 )
 
+from helpers import FAKE_COMMAND, chat_model, pending_ticket, ready_plan
 from kukie import server
 from kukie.agent import agent
-from kukie.guardrail import action_plan, hook
+from kukie.guardrail import hook
 from kukie.guardrail.action_plan import ActionPlan
 from kukie.kubectl import KubectlResult
 from kukie.tools import mutate
-from kukie.tools import read as read_tools
-
-FAKE_COMMAND = "kubectl --context kind-dev get pods -n study -o wide"
 
 
 @pytest.fixture
-def client(monkeypatch, tmp_path):
-    monkeypatch.setenv("KUKIE_DEV_AUTH", "1")   # flat 엔드포인트는 개발 모드를 켰을 때만 열린다 (#82) — README 의 로컬 실행과 같은 설정
-    server._session = None
-    monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
-    monkeypatch.setattr(read_tools, "run_kubectl",
-                        lambda args, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None:
-                        KubectlResult(command=FAKE_COMMAND, stdout="nginx Running", stderr="", success=True))
-    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)   # 홈의 실제 계획서를 읽지 않게
+def client(dev_auth, fresh_session, fake_kubeconfig, kubectl_ok, plan_dir):
     return TestClient(server.app)
-
-
-def _model(narration="답", call_tools=("list_resources",)):
-    return TestModel(call_tools=list(call_tools), custom_output_args={"narration": narration})
 
 
 # ── 세션 ─────────────────────────────────────────────────────
@@ -82,7 +69,7 @@ def test_kubectl_실행_자체가_실패해도_KubeconfigError로_잡힌다(monk
 
 def test_채팅은_answer와_조립된_KukieResponse를_돌려준다(client):
     client.post("/session")
-    with agent.override(model=_model("파드 하나 떠 있어요")):
+    with agent.override(model=chat_model("파드 하나 떠 있어요")):
         r = client.post("/chat", json={"text": "파드 보여줘"})
     assert r.status_code == 200
     body = r.json()
@@ -113,7 +100,7 @@ def test_다음_행동은_HTTP로_전달되고_모드를_바꾸지_않는다(cli
 
 def test_대화_기록은_턴_사이에_이어진다(client):
     client.post("/session")
-    with agent.override(model=_model()):
+    with agent.override(model=chat_model()):
         client.post("/chat", json={"text": "첫 질문"})
         n_after_first = len(server._session.history)
         client.post("/chat", json={"text": "둘째 질문"})
@@ -143,58 +130,6 @@ def _fake_result(output):
     return SimpleNamespace(output=output, all_messages=lambda: ["기록"])
 
 
-def _ready_plan_for_server(call_id: str) -> ActionPlan:
-    plan = ActionPlan.create_draft(
-        call_id=call_id,
-        tool="scale_resource",
-        args={
-            "kind": "deployment",
-            "name": "nginx",
-            "replicas": 3,
-            "namespace": "study",
-        },
-        command=["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
-        risk="caution",
-        skill="실습",
-        target={
-            "context": "kind-dev",
-            "namespace": "study",
-            "kind": "deployment",
-            "name": "nginx",
-        },
-        intent="nginx 레플리카를 늘린다.",
-        expected_effects=["레플리카가 3개가 된다."],
-        side_effects=["추가 노드 자원을 사용한다."],
-    )
-    plan.record_dry_run("succeeded", "deployment.apps/nginx configured\n", "")
-    plan.record_decision_guidance("현재 replica와 가용 자원을 확인한다.")
-    plan.offer_for_approval()
-    return plan
-
-
-def _pending_ticket_for_server(
-    call_id: str,
-) -> tuple[ActionPlan, DeferredToolRequests]:
-    plan = _ready_plan_for_server(call_id)
-    call = ToolCallPart(
-        tool_name="scale_resource",
-        args={
-            "kind": "deployment",
-            "name": "nginx",
-            "replicas": 3,
-            "namespace": "study",
-            "intent": plan.intent,
-            "expected_effects": plan.expected_effects,
-            "side_effects": plan.side_effects,
-        },
-        tool_call_id=call_id,
-    )
-    return plan, DeferredToolRequests(
-        approvals=[call],
-        metadata={call_id: {"plan_id": plan.id}},
-    )
-
-
 @pytest.mark.asyncio
 async def test_서버_run은_스킬응답과_Deferred출력을_모두_유지한다(client, monkeypatch):
     client.post("/session")
@@ -216,7 +151,7 @@ async def test_서버_run은_스킬응답과_Deferred출력을_모두_유지한�
 
 def test_티켓은_Plan_DTO와_원본_Deferred요청을_보관한다(client):
     client.post("/session")
-    plan, ticket = _pending_ticket_for_server("c1")
+    plan, ticket = pending_ticket("c1")
 
     payload = server._to_payload(server._session, _fake_result(ticket))
 
@@ -236,7 +171,7 @@ def test_새_Deferred_batch와_answer는_이전_결정을_초기화한다(client
 
     client.post("/session")
     server._session.decisions = {"old": ToolApproved()}
-    _, ticket = _pending_ticket_for_server("c1")
+    _, ticket = pending_ticket("c1")
 
     server._to_payload(server._session, _fake_result(ticket))
 
@@ -267,7 +202,7 @@ def test_renderer는_call_id와_결정외_필드를_제출할수없다(client):
 
 def test_Plan과_다른_pending_args는_승인카드로_내보내지않는다(client):
     client.post("/session")
-    plan = _ready_plan_for_server("c1")
+    plan = ready_plan("c1")
     call = ToolCallPart(
         tool_name="scale_resource",
         args={
@@ -292,15 +227,15 @@ def test_Plan과_다른_pending_args는_승인카드로_내보내지않는다(cl
 
 def test_여러_승인카드중_나중_검증이_실패해도_기존_세션상태를_유지한다(client):
     client.post("/session")
-    _, existing = _pending_ticket_for_server("existing")
+    _, existing = pending_ticket("existing")
     server._session.history = ["기존 기록"]
     server._session.pending = existing
     server._session.decisions = {"existing": ToolApproved()}
     original_history = server._session.history
     original_decisions = server._session.decisions
 
-    _, first = _pending_ticket_for_server("c1")
-    second_plan, second = _pending_ticket_for_server("c2")
+    _, first = pending_ticket("c1")
+    second_plan, second = pending_ticket("c2")
     invalid_second = ToolCallPart(
         tool_name="scale_resource",
         args={
@@ -329,7 +264,7 @@ def test_여러_승인카드중_나중_검증이_실패해도_기존_세션상�
 
 def test_승인_대기_중에는_채팅이_409로_막힌다(client):
     client.post("/session")
-    _, server._session.pending = _pending_ticket_for_server("c1")
+    _, server._session.pending = pending_ticket("c1")
     assert client.post("/chat", json={"text": "딴 얘기"}).status_code == 409
 
 
@@ -346,7 +281,7 @@ def test_대기_중이_아닌_call_id로_승인하면_409(client):
 
 def test_승인은_원본_history와_ToolApproved로_재개한다(client, monkeypatch):
     client.post("/session")
-    plan, ticket = _pending_ticket_for_server("c1")
+    plan, ticket = pending_ticket("c1")
     server._to_payload(server._session, _fake_result(ticket))
     original_history = list(server._session.history)
     seen = {}
@@ -374,7 +309,7 @@ def test_승인_call_id는_재개_시작_전에_예약된다(client, monkeypatch
     """run 이 도는 동안 같은 call_id 의 두 번째 /approve 가 검사를 통과하면 같은 승인이
     두 번 재개된다 (CodeRabbit 지적). 원본 티켓은 유지하되 처리 표시를 run 전에 예약한다."""
     client.post("/session")
-    _, ticket = _pending_ticket_for_server("c1")
+    _, ticket = pending_ticket("c1")
     server._session.pending = ticket
 
     async def fake_run(session, **kwargs):
@@ -397,7 +332,7 @@ def test_거절은_Plan을_한번만_기록하고_ToolDenied로_재개한다(
     client, monkeypatch
 ):
     client.post("/session")
-    plan, ticket = _pending_ticket_for_server("c1")
+    plan, ticket = pending_ticket("c1")
     server._to_payload(server._session, _fake_result(ticket))
     seen = {}
 
@@ -421,7 +356,7 @@ def test_거절은_Plan을_한번만_기록하고_ToolDenied로_재개한다(
 
 
 def test_여러_승인을_모은뒤_승인과_거절을_한번만_재개한다(
-    client, monkeypatch
+    client, monkeypatch, hook_passes
 ):
     client.post("/session")
     client.post("/chat", json={"text": "/mode 실습"})
@@ -438,9 +373,6 @@ def test_여러_승인을_모은뒤_승인과_거절을_한번만_재개한다(
             success=True,
         )
 
-    async def fixed_guidance(plan, manifest_preview=None):
-        return "대상과 롤백 기준을 확인한다."
-
     def handler_run(command, **kwargs):
         if not execution_allowed:
             pytest.fail("모든 승인 결정 전 mutation handler를 실행하면 안 된다")
@@ -454,7 +386,6 @@ def test_여러_승인을_모은뒤_승인과_거절을_한번만_재개한다(
         )
 
     monkeypatch.setattr(hook, "run_kubectl", dry_run)
-    monkeypatch.setattr(hook, "generate_decision_guidance", fixed_guidance)
     monkeypatch.setattr(mutate, "run_kubectl", handler_run)
 
     def model_call(messages, info):
@@ -556,7 +487,7 @@ def test_재개실패는_세션과_티켓을_유지하고_resume으로_다시_�
     client, monkeypatch, caplog, approved
 ):
     client.post("/session")
-    plan, ticket = _pending_ticket_for_server("c1")
+    plan, ticket = pending_ticket("c1")
     server._to_payload(server._session, _fake_result(ticket))
     session = server._session
     original_history = list(session.history)
@@ -621,8 +552,8 @@ def test_resume은_티켓이_없으면_409(client):
 def test_resume은_미결정_카드가_남아_있으면_409(client, monkeypatch):
     """/resume 은 재시도 문이지 결정을 대신 내리는 문이 아니다."""
     client.post("/session")
-    _, first = _pending_ticket_for_server("c1")
-    _, second = _pending_ticket_for_server("c2")
+    _, first = pending_ticket("c1")
+    _, second = pending_ticket("c2")
     server._session.pending = DeferredToolRequests(
         approvals=[first.approvals[0], second.approvals[0]],
         metadata={**first.metadata, **second.metadata},
@@ -643,7 +574,7 @@ def test_resume_실행_중에는_다른_진입이_409(client, monkeypatch):
     from fastapi import HTTPException
 
     client.post("/session")
-    _, ticket = _pending_ticket_for_server("c1")
+    _, ticket = pending_ticket("c1")
     server._session.pending = ticket
     server._session.decisions = {"c1": ToolApproved()}
     seen = {}
@@ -668,7 +599,7 @@ def test_거절_기록_실패는_결정을_남기지_않고_티켓을_유지한�
     """거절은 로컬 파일 쓰기뿐 — 실패해도 LLM·클러스터는 건드리지 않았으니 같은 카드를 다시 누르면 된다
     (DURO-66 결정 불필요 1: try 범위를 run 으로 좁힘)."""
     client.post("/session")
-    plan, ticket = _pending_ticket_for_server("c1")
+    plan, ticket = pending_ticket("c1")
     server._to_payload(server._session, _fake_result(ticket))
     session = server._session
 
@@ -718,7 +649,7 @@ def test_승인_재개_중에는_채팅이_409로_막힌다(client, monkeypatch)
     from fastapi import HTTPException
 
     client.post("/session")
-    _, ticket = _pending_ticket_for_server("c1")
+    _, ticket = pending_ticket("c1")
     server._session.pending = ticket
     seen = {}
 

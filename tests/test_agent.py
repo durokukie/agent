@@ -4,6 +4,8 @@ TestModel로 결정론적으로 돌린다 (실제 LLM 호출·API 키 없음).
 
 응답 조립(steps를 코드가 채우는 것)은 tests/test_response.py 에서 검증한다 (DURO-44).
 """
+from types import SimpleNamespace
+
 import pytest
 from pydantic_ai import ModelResponse
 from pydantic_ai.messages import ToolCallPart
@@ -16,9 +18,10 @@ from pydantic_ai.tools import (
     ToolDenied,
 )
 
+from kukie import agent as agent_module
 from kukie.agent import agent
 from kukie.deps import Deps
-from kukie.guardrail import action_plan, hook
+from kukie.guardrail import hook
 from kukie.guardrail.action_plan import ActionPlan
 from kukie.kubectl import KubectlResult
 from kukie.response import build_response
@@ -105,25 +108,8 @@ MUTATION_CASES = [
 
 @pytest.mark.parametrize(("tool_name", "args"), MUTATION_CASES)
 def test_등록된_mutation은_모두_Hook을_거쳐_Deferred요청이된다(
-    monkeypatch, tmp_path, tool_name, args
+    monkeypatch, hook_passes, tool_name, args
 ):
-    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
-    monkeypatch.setattr(
-        hook,
-        "run_kubectl",
-        lambda *call_args, **call_kwargs: KubectlResult(
-            command="kubectl dry-run",
-            stdout="ok\n",
-            stderr="",
-            success=True,
-        ),
-    )
-
-    async def fixed_guidance(plan, manifest_preview=None):
-        return "대상과 롤백 기준을 확인한다."
-
-    monkeypatch.setattr(hook, "generate_decision_guidance", fixed_guidance)
-
     def forbidden_handler(*args, **kwargs):
         pytest.fail("승인 전에 mutation handler를 실행하면 안 된다")
 
@@ -145,24 +131,8 @@ def test_등록된_mutation은_모두_Hook을_거쳐_Deferred요청이된다(
 
 
 def test_ToolApproved_재개는_기존_history와_handler를_한번_사용한다(
-    monkeypatch, tmp_path
+    monkeypatch, hook_passes
 ):
-    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
-    monkeypatch.setattr(
-        hook,
-        "run_kubectl",
-        lambda *args, **kwargs: KubectlResult(
-            command="kubectl dry-run",
-            stdout="ok\n",
-            stderr="",
-            success=True,
-        ),
-    )
-
-    async def fixed_guidance(plan, manifest_preview=None):
-        return "대상과 롤백 기준을 확인한다."
-
-    monkeypatch.setattr(hook, "generate_decision_guidance", fixed_guidance)
     executions = []
 
     def actual_run(command, **kwargs):
@@ -204,25 +174,8 @@ def test_ToolApproved_재개는_기존_history와_handler를_한번_사용한다
 
 
 def test_ToolDenied_재개는_2차Hook과_handler를_호출하지않는다(
-    monkeypatch, tmp_path
+    monkeypatch, hook_passes
 ):
-    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
-    monkeypatch.setattr(
-        hook,
-        "run_kubectl",
-        lambda *args, **kwargs: KubectlResult(
-            command="kubectl dry-run",
-            stdout="ok\n",
-            stderr="",
-            success=True,
-        ),
-    )
-
-    async def fixed_guidance(plan, manifest_preview=None):
-        return "대상과 롤백 기준을 확인한다."
-
-    monkeypatch.setattr(hook, "generate_decision_guidance", fixed_guidance)
-
     def forbidden_handler(*args, **kwargs):
         pytest.fail("거절 전·후에 mutation handler나 2차 Hook을 실행하면 안 된다")
 
@@ -264,6 +217,46 @@ def test_응답은_KukieResponse_형식으로_강제된다():
 
 def test_Agent는_일반응답과_Deferred요청을_output으로_허용한다():
     assert agent.output_type == [build_response, DeferredToolRequests]
+
+
+# ── 현재 모드 못 박기 (#60) ─────────────────────────────────
+
+def _instruction(skill_name: str) -> str:
+    ctx = SimpleNamespace(deps=SimpleNamespace(skill=SKILLS[skill_name]))
+    return agent_module.add_current_mode(ctx)
+
+
+@pytest.mark.parametrize("mode", ["학습", "진단", "실습"])
+def test_매_턴_현재_모드를_이름으로_말한다(mode):
+    assert f"[현재 모드: {mode}]" in _instruction(mode)
+
+
+def test_지금_쓸_수_있는_툴을_함께_말한다():
+    """모델이 문맥에서 추론하지 않게 한다 — 노출된 툴이 곧 가능한 일이다."""
+    실습 = _instruction("실습")
+    assert "scale_resource" in 실습 and "apply_manifest" in 실습
+    학습 = _instruction("학습")
+    assert "scale_resource" not in 학습
+
+
+def test_과거_모드의_거절을_따르지_말라고_못_박되_다른_모드로_한정한다():
+    """대화 기록에 남은 **이전 모드의** 거절 답변이 모델을 끌던 것이 #60 의 원인이었다.
+
+    한정을 빼면 반대 방향으로 아프다 — 학습 모드에서 변경을 요청받았을 때의 **정당한 거절**까지
+    눌러 버린다. 앱의 [실습 모드로] 버튼이 그 안내에서 나온다 (자동 리뷰 지적).
+    """
+    text = _instruction("실습")
+    assert "다른 모드에서" in text and "지나간 상태" in text
+    assert "**다른 모드의 과거 답변을** 근거로 거절하지 마라" in text
+    assert "그건 올바른 답변이다" in text          # 지금 모드에 없는 일은 거절해도 된다
+
+
+def test_출력_툴은_금지_목록에_걸리지_않는다():
+    """allowed_tools 에는 응답을 마무리하는 출력 툴이 없다. "이것뿐" 이라고만 하면 모델이
+    필수 출력 툴을 안 부를 수 있다 (자동 리뷰 P1)."""
+    text = _instruction("학습")
+    assert "클러스터에 쓸 수 있는 툴" in text
+    assert "출력 툴은 여기 해당하지 않는다" in text
 
 
 # ── 재시도 (DURO-66 ③·④) ────────────────────────────────────

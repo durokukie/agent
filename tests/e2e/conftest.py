@@ -56,6 +56,11 @@ def _cluster_identity(kubeconfig: str) -> tuple[str, str]:
 
 @pytest.fixture
 def e2e_context() -> str:
+    """E2E 가 붙을 클러스터. 지워도 되는 kind 클러스터인지 세 번 확인한다.
+
+    이름이 kind- 로 시작하는가 → kind 가 관리하는 목록에 있는가 → kubeconfig 의 API 주소·CA 가 kind 가 준 것과 같은가.
+    KUKIE_E2E_CONTEXT 가 없으면 건너뛴다.
+    """
     context = os.environ.get("KUKIE_E2E_CONTEXT")
     if not context:
         pytest.skip("KUKIE_E2E_CONTEXT가 없어 kind E2E를 건너뜁니다.")
@@ -92,6 +97,7 @@ def e2e_context() -> str:
 
 
 def _namespace(e2e_context: str):
+    """테스트마다 새 namespace 를 만들고 끝나면 지운다 — 클러스터에 흔적을 남기지 않고 테스트끼리 섞이지 않게."""
     namespace = f"kukie-e2e-{uuid.uuid4().hex[:8]}"
     kubectl(e2e_context, "create", "namespace", namespace)
     try:
@@ -119,4 +125,5 @@ def e2e_namespace(e2e_context: str):
 
 @pytest.fixture
 def e2e_session_namespace(e2e_context: str):
+    """세션의 기본 namespace. 변경 대상(e2e_namespace)과 일부러 다르게 둬서, 변경이 툴 인자의 namespace 로 가는지 본다."""
     yield from _namespace(e2e_context)

@@ -1,6 +1,5 @@
 """대화(채팅방) 단위 엔드포인트 — DB 기록·멱등성·잠금·복원·권한.
 
-flat 엔드포인트 테스트(test_server.py)의 헬퍼를 그대로 빌려 승인 티켓을 만든다.
 LLM 은 TestModel / _run_agent 바꿔치기, kubectl 은 가짜, DB 는 임시 SQLite.
 """
 from __future__ import annotations
@@ -9,41 +8,21 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic_ai.messages import ModelRequest, UserPromptPart
-from pydantic_ai.models.test import TestModel
+from pydantic_ai import ModelResponse
+from pydantic_ai.messages import ModelRequest, ToolCallPart, UserPromptPart
+from pydantic_ai.models.function import FunctionModel
 
+from helpers import OTHER, USER, answer_model, chat_model, new_room, pending_ticket
 from kukie import conversations, server
 from kukie.agent import agent
-from kukie.guardrail import action_plan
-from kukie.kubectl import KubectlResult
 from kukie.skills.base import KukieResponse
-from kukie.store import reset_store_for_tests
-from kukie.tools import read as read_tools
-from test_server import FAKE_COMMAND, _model, _pending_ticket_for_server
-
-USER = {"X-User": "u-1"}
-OTHER = {"X-User": "u-2"}
+from kukie.store import get_store, reset_store_for_tests
+from kukie.store.models import DEFAULT_TITLE
 
 
 @pytest.fixture
-def client(monkeypatch, tmp_path):
-    monkeypatch.delenv("KUKIE_MEMBER_URL", raising=False)
-    monkeypatch.delenv("KUKIE_DEV_USER", raising=False)
-    monkeypatch.setenv("KUKIE_DEV_AUTH", "1")            # Spring 없이 X-User 헤더로 사용자 구분
-    reset_store_for_tests(f"sqlite:///{tmp_path / 'test.db'}")
-    conversations.registry.clear()
-    monkeypatch.setattr(server, "read_kubeconfig", lambda: ("kind-dev", "study"))
-    monkeypatch.setattr(read_tools, "run_kubectl",
-                        lambda args, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None:
-                        KubectlResult(command=FAKE_COMMAND, stdout="nginx Running", stderr="", success=True))
-    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+def client(dev_auth, empty_store, fake_kubeconfig, kubectl_ok, plan_dir):
     return TestClient(server.app)
-
-
-def _new(client, **body) -> str:
-    r = client.post("/conversations", json=body, headers=USER)
-    assert r.status_code == 200, r.text
-    return r.json()["conversation"]["id"]
 
 
 # ── 만들기 · 목록 · 권한 ───────────────────────────────────
@@ -70,15 +49,15 @@ def test_kubeconfig를_못_읽으면_503_KUBECONFIG(client, monkeypatch):
 
 
 def test_목록은_내_채팅방만_최신순(client):
-    a = _new(client, title="첫째")
-    b = _new(client, title="둘째")
+    a = new_room(client, title="첫째")
+    b = new_room(client, title="둘째")
     client.post("/conversations", json={"title": "남의 것"}, headers=OTHER)
     ids = [c["id"] for c in client.get("/conversations", headers=USER).json()]
     assert ids == [b, a]
 
 
 def test_남의_채팅방은_404_공유면_보인다(client):
-    mine = _new(client)
+    mine = new_room(client)
     shared = client.post("/conversations", json={"shared": True}, headers=OTHER).json()["conversation"]["id"]
     assert client.get(f"/conversations/{mine}", headers=OTHER).status_code == 404
     assert client.get(f"/conversations/{shared}", headers=USER).status_code == 200
@@ -93,7 +72,7 @@ def test_shared_방은_남도_읽고_입력하지만_승인은_아직_주인만�
     """기획 05 §4 는 팀원 공동 승인인데, 팀·Operator 정보가 오기 전까지는 만든 사람만 승인한다 (팀원 리뷰 6)."""
     shared = client.post("/conversations", json={"shared": True}, headers=OTHER).json()["conversation"]["id"]
     assert client.get(f"/conversations/{shared}", headers=USER).json()["conversation"]["user_id"] == "u-2"
-    _, ticket = _pending_ticket_for_server("call-s")
+    _, ticket = pending_ticket("call-s")
     restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="주인이 승인해서 적용"))])
     try:
         r = client.post(f"/conversations/{shared}/chat", json={"text": "늘려"}, headers=USER)     # 주인 아님 — 입력은 된다
@@ -109,7 +88,7 @@ def test_shared_방은_남도_읽고_입력하지만_승인은_아직_주인만�
 
 def test_목록에_남이_만든_shared_방이_나온다(client):
     """팀원 리뷰 7: 읽고 입력할 수 있는 방을 목록에서 찾을 수 있어야 참여할 수 있다."""
-    mine = _new(client)
+    mine = new_room(client)
     shared = client.post("/conversations", json={"shared": True}, headers=OTHER).json()["conversation"]["id"]
     private = client.post("/conversations", json={}, headers=OTHER).json()["conversation"]["id"]
     ids = {c["id"] for c in client.get("/conversations", headers=USER).json()}
@@ -125,8 +104,7 @@ def test_빈_context는_kubeconfig의_실제_이름으로_확정한다(client):
 
 def test_private_방은_DB에_실습_모드가_남아_있어도_변경_모드로_복원하지_않는다(client):
     """자동 리뷰 5차: 게이트 전 커밋으로 남은 current_mode=실습 private 행을 그대로 열면 카드는 뜨고 승인은 403 이라 방이 막힌다."""
-    from kukie.store import get_store
-    cid = _new(client)
+    cid = new_room(client)
     get_store().update_session(cid, current_mode="실습")
     conversations.registry.clear()
     assert client.get(f"/conversations/{cid}", headers=USER).json()["session"]["skill"] == "학습"
@@ -134,9 +112,9 @@ def test_private_방은_DB에_실습_모드가_남아_있어도_변경_모드로
 
 def test_재개_뒤_새_카드가_나와도_그_사이_메시지가_run에_쌓인다(client):
     """팀원 리뷰 2: 첫 승인 → 실행 → 둘째 카드 → 승인 → 완료. 복원하면 첫 작업 결과와 둘째 호출이 빠지면 안 된다."""
-    cid = _new(client, shared=True)
-    _, first = _pending_ticket_for_server("c1")
-    _, second = _pending_ticket_for_server("c2")
+    cid = new_room(client, shared=True)
+    _, first = pending_ticket("c1")
+    _, second = pending_ticket("c2")
     m = lambda text: [ModelRequest(parts=[UserPromptPart(content=text)])]   # noqa: E731
     restore = _swap_run_agent([_fake(first, m("카드1")), _fake(second, m("결과1+호출2")),
                                _fake(KukieResponse(narration="끝"), m("결과2+답"))])
@@ -159,7 +137,6 @@ def test_재개_뒤_새_카드가_나와도_그_사이_메시지가_run에_쌓�
 
 def test_결과_저장이_실패해도_방이_영구_BUSY로_남지_않는다(client, monkeypatch):
     """팀원 리뷰 3: 실행 뒤 저장이 실패하면 DB 의 run 이 running 으로 남아 다음 요청이 계속 409 였다."""
-    from kukie.store import get_store
     store = get_store()
     original = store.update_run
     calls = {"failed": 0}
@@ -171,34 +148,32 @@ def test_결과_저장이_실패해도_방이_영구_BUSY로_남지_않는다(cl
         return original(run_id, **fields)
 
     monkeypatch.setattr(store, "update_run", flaky)
-    cid = _new(client)
-    with agent.override(model=_model("첫 답")):
+    cid = new_room(client)
+    with agent.override(model=chat_model("첫 답")):
         r = client.post(f"/conversations/{cid}/chat", json={"text": "파드"}, headers=USER)
     assert r.status_code == 503 and r.json()["detail"]["code"] == "STORE_FAILED"
     assert "새 요청" in r.json()["detail"]["message"]                             # 같은 request_id 로는 같은 실패가 재생된다
     assert client.get(f"/conversations/{cid}", headers=USER).json()["turns"][0]["status"] == "failed"
-    with agent.override(model=_model("둘째 답")):
+    with agent.override(model=chat_model("둘째 답")):
         r = client.post(f"/conversations/{cid}/chat", json={"text": "파드"}, headers=USER)
     assert r.status_code == 200 and r.json()["response"]["narration"] == "둘째 답"
 
 
 def test_저장_실패한_run을_같은_request_id로_재전송해도_영원히_BUSY가_아니다(client):
     """자동 리뷰 6차: 재전송 판정이 밀린 run 정리보다 앞이라, 같은 request_id 재시도가 저장된 실패·BUSY 를 영원히 재생했다."""
-    from kukie.store import get_store
-    cid = _new(client)
+    cid = new_room(client)
     # 대체 쓰기까지 실패해 running 으로 남은 run 을 흉내낸다
     get_store().start_run(cid, request_id="r-stuck", kind="chat", mode="학습", input_text="파드")
     r = client.post(f"/conversations/{cid}/chat", json={"text": "파드", "request_id": "r-stuck"}, headers=USER)
     assert r.status_code == 409 and r.json()["detail"]["code"] == "INTERRUPTED"      # BUSY 가 아니라 "새 요청으로"
     assert "새 요청" in r.json()["detail"]["message"]
-    with agent.override(model=_model("살아남")):
+    with agent.override(model=chat_model("살아남")):
         assert client.post(f"/conversations/{cid}/chat", json={"text": "파드"}, headers=USER).status_code == 200
 
 
 def test_승인_뒤_저장이_죽으면_recovery_required와_plan_ids로_남고_다음_chat이_방을_풀어준다(client, monkeypatch):
     """자동 리뷰 6차: kubectl 이 이미 돈 run 을 failed 로 적고 "다시 보내라" 하면 같은 변경을 또 시킬 수 있다.
     저장이 두 번 다 죽어 awaiting_approval 이 남아도 다음 chat 이 닫아야 한다."""
-    from kukie.store import get_store
     store = get_store()
     original = store.update_run
     dead = {"on": False}
@@ -209,8 +184,8 @@ def test_승인_뒤_저장이_죽으면_recovery_required와_plan_ids로_남고_
         return original(run_id, **fields)
 
     monkeypatch.setattr(store, "update_run", flaky)
-    cid = _new(client, shared=True)
-    plan, ticket = _pending_ticket_for_server("call-st")
+    cid = new_room(client, shared=True)
+    plan, ticket = pending_ticket("call-st")
     restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="적용됨"))])
     try:
         assert client.post(f"/conversations/{cid}/chat", json={"text": "늘려"}, headers=USER).json()["kind"] == "approval"
@@ -223,7 +198,7 @@ def test_승인_뒤_저장이_죽으면_recovery_required와_plan_ids로_남고_
         assert store.active_run(cid).status == "awaiting_approval"
     finally:
         restore()
-    with agent.override(model=_model("풀렸다")):
+    with agent.override(model=chat_model("풀렸다")):
         r = client.post(f"/conversations/{cid}/chat", json={"text": "다음"}, headers=USER)
     assert r.status_code == 200 and r.json()["response"]["narration"] == "풀렸다"
     statuses = [t["status"] for t in client.get(f"/conversations/{cid}", headers=USER).json()["turns"]]
@@ -232,7 +207,6 @@ def test_승인_뒤_저장이_죽으면_recovery_required와_plan_ids로_남고_
 
 def test_남은_카드_재전송에서_저장이_죽어도_확인_필요가_아니라_카드_대기_그대로다(client, monkeypatch):
     """자동 리뷰 7차: 아무것도 실행하지 않은 경로(result 없음)에 recovery_required + "변경 적용됐을 수 있다" 를 적으면 사실 칸 오염."""
-    from kukie.store import get_store
     from pydantic_ai.tools import DeferredToolRequests
     store = get_store()
     original = store.update_run
@@ -245,9 +219,9 @@ def test_남은_카드_재전송에서_저장이_죽어도_확인_필요가_아�
         return original(run_id, **fields)
 
     monkeypatch.setattr(store, "update_run", flaky)
-    cid = _new(client, shared=True)
-    pa, first = _pending_ticket_for_server("d1")
-    pb, second = _pending_ticket_for_server("d2")
+    cid = new_room(client, shared=True)
+    pa, first = pending_ticket("d1")
+    pb, second = pending_ticket("d2")
     batch = DeferredToolRequests(approvals=[first.approvals[0], second.approvals[0]],
                                  metadata={**first.metadata, **second.metadata})
     restore = _swap_run_agent([_fake(batch), _fake(KukieResponse(narration="둘 다 적용"))])
@@ -272,7 +246,6 @@ def test_남은_카드_재전송에서_저장이_죽어도_확인_필요가_아�
 
 def test_거절한_카드의_Plan은_확인_목록에_들어가지_않는다(client, monkeypatch):
     """자동 리뷰 8차: 티켓 전체에서 뽑으면 거절해서 실행된 적 없는 Plan 까지 "적용됐을 수 있다" 목록에 섞인다."""
-    from kukie.store import get_store
     from pydantic_ai.tools import DeferredToolRequests
     store = get_store()
     original = store.update_run
@@ -285,9 +258,9 @@ def test_거절한_카드의_Plan은_확인_목록에_들어가지_않는다(cli
         return original(run_id, **fields)
 
     monkeypatch.setattr(store, "update_run", flaky)
-    cid = _new(client, shared=True)
-    pa, first = _pending_ticket_for_server("k1")
-    pb, second = _pending_ticket_for_server("k2")
+    cid = new_room(client, shared=True)
+    pa, first = pending_ticket("k1")
+    pb, second = pending_ticket("k2")
     batch = DeferredToolRequests(approvals=[first.approvals[0], second.approvals[0]],
                                  metadata={**first.metadata, **second.metadata})
     restore = _swap_run_agent([_fake(batch), _fake(KukieResponse(narration="하나만 적용"))])
@@ -303,7 +276,6 @@ def test_거절한_카드의_Plan은_확인_목록에_들어가지_않는다(cli
 
 def test_재개_재시도_경로에서도_저장_실패_안내에_plan_ids가_실린다(client, monkeypatch):
     """자동 리뷰 7차: 앞선 RESUME_RETRYABLE 이 카드 payload 를 error 로 덮은 뒤라 payload 에서 뽑으면 빈 배열이었다."""
-    from kukie.store import get_store
     store = get_store()
     original = store.update_run
     dead = {"on": False}
@@ -314,8 +286,8 @@ def test_재개_재시도_경로에서도_저장_실패_안내에_plan_ids가_�
         return original(run_id, **fields)
 
     monkeypatch.setattr(store, "update_run", flaky)
-    cid = _new(client, shared=True)
-    plan, ticket = _pending_ticket_for_server("rr")
+    cid = new_room(client, shared=True)
+    plan, ticket = pending_ticket("rr")
     restore = _swap_run_agent([_fake(ticket), RuntimeError("네트워크"), _fake(KukieResponse(narration="이번엔 됨"))])
     try:
         client.post(f"/conversations/{cid}/chat", json={"text": "늘려"}, headers=USER)
@@ -332,10 +304,9 @@ def test_재개_재시도_경로에서도_저장_실패_안내에_plan_ids가_�
 
 def test_실패_표시도_저장_못_한_running_run은_다음_chat이_닫고_진행한다(client):
     """저장이 완전히 죽었다 살아난 경우: 잠금을 쥔 chat 이 DB 의 running 을 중단으로 닫는다."""
-    from kukie.store import get_store
-    cid = _new(client)
+    cid = new_room(client)
     get_store().start_run(cid, request_id="orphan", kind="chat", mode="학습", input_text="저장 실패")   # running 으로 방치
-    with agent.override(model=_model("살아남")):
+    with agent.override(model=chat_model("살아남")):
         r = client.post(f"/conversations/{cid}/chat", json={"text": "다시"}, headers=USER)
     assert r.status_code == 200
     statuses = [t["status"] for t in client.get(f"/conversations/{cid}", headers=USER).json()["turns"]]
@@ -345,7 +316,7 @@ def test_실패_표시도_저장_못_한_running_run은_다음_chat이_닫고_�
 def test_복원_한도는_UTF8_바이트_기준이고_최신_run_하나가_넘어도_복원하지_않는다(client, monkeypatch):
     """팀원 리뷰 5: 문자 수로 재면 한글이 작게 잡히고, 첫 run 은 검사를 건너뛰었다."""
     import json
-    cid = _new(client)
+    cid = new_room(client)
     text = "한글" * 50
     restore = _swap_run_agent([_fake(KukieResponse(narration="ok"), [ModelRequest(parts=[UserPromptPart(content=text)])])])
     try:
@@ -357,7 +328,6 @@ def test_복원_한도는_UTF8_바이트_기준이고_최신_run_하나가_넘�
     client.get(f"/conversations/{cid}", headers=USER)
     messages = conversations.registry.get(cid).session.history
     assert len(messages) == 1
-    from kukie.store import get_store
     raw = get_store().list_runs(cid)[0].agent_messages
     chars, size = len(json.dumps(raw, ensure_ascii=False)), len(json.dumps(raw, ensure_ascii=False).encode("utf-8"))
     assert size > chars                                                   # 한글은 바이트가 더 크다
@@ -395,7 +365,7 @@ def test_첫_요청_여럿이_동시에_와도_DB_초기화가_충돌하지_않�
 
 def test_private_방은_실습_모드와_승인이_막힌다(client):
     """기획 05 §3: Private 는 조회·진단만, 실제 변경은 불가. 변경이 필요하면 Shared 를 새로 만든다."""
-    cid = _new(client)                                                   # shared=False
+    cid = new_room(client)                                                   # shared=False
     r = client.post(f"/conversations/{cid}/chat", json={"text": "/mode 실습"}, headers=USER)
     assert r.status_code == 403 and r.json()["detail"]["code"] == "PRIVATE_SESSION"
     assert client.get(f"/conversations/{cid}", headers=USER).json()["session"]["skill"] == "학습"   # 안 바뀜
@@ -404,7 +374,7 @@ def test_private_방은_실습_모드와_승인이_막힌다(client):
     r = client.post(f"/conversations/{cid}/approve", json={"call_id": "c", "approved": True}, headers=USER)
     assert r.status_code == 403 and r.json()["detail"]["code"] == "PRIVATE_SESSION"
     assert client.post(f"/conversations/{cid}/resume", headers=USER).status_code == 403
-    assert client.post(f"/conversations/{_new(client, shared=True)}/chat", json={"text": "/mode 실습"},
+    assert client.post(f"/conversations/{new_room(client, shared=True)}/chat", json={"text": "/mode 실습"},
                        headers=USER).json() == {"kind": "mode", "skill": "실습", "known": True}
 
 
@@ -424,8 +394,8 @@ def test_회원_서버도_개발_모드도_없으면_503_AUTH_NOT_CONFIGURED(cli
 # ── 채팅 · run 기록 ────────────────────────────────────────
 
 def test_채팅은_answer를_주고_turn으로_남는다(client):
-    cid = _new(client)
-    with agent.override(model=_model("파드 하나")):
+    cid = new_room(client)
+    with agent.override(model=chat_model("파드 하나")):
         r = client.post(f"/conversations/{cid}/chat", json={"text": "파드 보여줘"}, headers=USER)
     assert r.status_code == 200 and r.json()["kind"] == "answer"
 
@@ -439,7 +409,7 @@ def test_채팅은_answer를_주고_turn으로_남는다(client):
 
 
 def test_같은_request_id_재전송은_실행_없이_저장된_응답을_준다(client):
-    cid = _new(client)
+    cid = new_room(client)
     calls = 0
 
     async def fake_run(session, **kwargs):
@@ -462,15 +432,15 @@ def test_같은_request_id_재전송은_실행_없이_저장된_응답을_준다
 
 
 def test_같은_request_id에_다른_입력은_409_REQUEST_MISMATCH(client):
-    cid = _new(client)
-    with agent.override(model=_model()):
+    cid = new_room(client)
+    with agent.override(model=chat_model()):
         client.post(f"/conversations/{cid}/chat", json={"text": "하나", "request_id": "r"}, headers=USER)
         r = client.post(f"/conversations/{cid}/chat", json={"text": "둘", "request_id": "r"}, headers=USER)
     assert r.status_code == 409 and r.json()["detail"]["code"] == "REQUEST_MISMATCH"
 
 
 def test_모드_전환은_LLM_없이_run으로_남고_채팅방_모드가_바뀐다(client):
-    cid = _new(client)
+    cid = new_room(client)
     r = client.post(f"/conversations/{cid}/chat", json={"text": "/mode 진단"}, headers=USER)
     assert r.json() == {"kind": "mode", "skill": "진단", "known": True}
     detail = client.get(f"/conversations/{cid}", headers=USER).json()
@@ -479,7 +449,7 @@ def test_모드_전환은_LLM_없이_run으로_남고_채팅방_모드가_바뀐
 
 
 def test_모델_예외는_run을_failed로_남기고_500_RUN_FAILED(client):
-    cid = _new(client)
+    cid = new_room(client)
 
     async def boom(session, **kwargs):
         raise RuntimeError("모델 죽음")
@@ -495,16 +465,16 @@ def test_모델_예외는_run을_failed로_남기고_500_RUN_FAILED(client):
     turn = client.get(f"/conversations/{cid}", headers=USER).json()["turns"][0]
     assert turn["status"] == "failed" and turn["error"]["code"] == "RUN_FAILED"
     # 세션은 살아 있다 — 다음 채팅이 된다
-    with agent.override(model=_model("다시")):
+    with agent.override(model=chat_model("다시")):
         assert client.post(f"/conversations/{cid}/chat", json={"text": "다시"}, headers=USER).status_code == 200
 
 
 # ── 채팅방 독립성 · 복원 ───────────────────────────────────
 
 def test_채팅방끼리_기록과_모드가_섞이지_않는다(client):
-    a, b = _new(client), _new(client)
+    a, b = new_room(client), new_room(client)
     client.post(f"/conversations/{a}/chat", json={"text": "/mode 진단"}, headers=USER)
-    with agent.override(model=_model()):
+    with agent.override(model=chat_model()):
         client.post(f"/conversations/{b}/chat", json={"text": "파드"}, headers=USER)
     assert client.get(f"/conversations/{a}", headers=USER).json()["session"]["skill"] == "진단"
     assert client.get(f"/conversations/{b}", headers=USER).json()["session"]["skill"] == "학습"
@@ -513,8 +483,8 @@ def test_채팅방끼리_기록과_모드가_섞이지_않는다(client):
 
 
 def test_서버가_다시_떠도_기록과_history가_복원된다(client):
-    cid = _new(client)
-    with agent.override(model=_model("첫 답")):
+    cid = new_room(client)
+    with agent.override(model=chat_model("첫 답")):
         client.post(f"/conversations/{cid}/chat", json={"text": "첫 질문"}, headers=USER)
     live_history = len(conversations.registry.get(cid).session.history)
     assert live_history > 0
@@ -528,7 +498,7 @@ def test_서버가_다시_떠도_기록과_history가_복원된다(client):
 
 
 def test_실패한_요청을_같은_request_id로_다시_보내면_저장된_실패를_준다(client):
-    cid = _new(client)
+    cid = new_room(client)
     calls = 0
 
     async def boom(session, **kw):
@@ -549,7 +519,7 @@ def test_실패한_요청을_같은_request_id로_다시_보내면_저장된_실
     assert second.json()["detail"]["code"] == "RUN_FAILED" and calls == 1
     assert "모델 죽음" not in first.json()["detail"]["message"]         # 예외 문자열은 응답에 안 싣는다
     # 새 request_id 면 다시 실행한다
-    with agent.override(model=_model("살아남")):
+    with agent.override(model=chat_model("살아남")):
         assert client.post(f"/conversations/{cid}/chat", json={"text": "파드"}, headers=USER).status_code == 200
 
 
@@ -578,8 +548,8 @@ def _swap_run_agent(outputs):
 
 def test_chat이_승인_카드를_주면_approve가_같은_run을_이어서_끝내고_다음_chat이_된다(client):
     """DB 문서 7절: 승인만으로 새 run 을 만들지 않는다 — 카드 run(awaiting_approval)을 이어서 completed 로."""
-    cid = _new(client, shared=True)
-    _, ticket = _pending_ticket_for_server("call-f")
+    cid = new_room(client, shared=True)
+    _, ticket = pending_ticket("call-f")
     card_msgs = [ModelRequest(parts=[UserPromptPart(content="nginx 3개로")])]
     resume_msgs = [ModelRequest(parts=[UserPromptPart(content="(tool 결과)")])]
     restore = _swap_run_agent([_fake(ticket, card_msgs), _fake(KukieResponse(narration="적용됨"), resume_msgs),
@@ -614,8 +584,8 @@ def test_chat이_승인_카드를_주면_approve가_같은_run을_이어서_끝�
 
 def test_승인_대기_중_재시작하면_카드는_만료되고_그_턴의_기록은_history에서_뺀다(client):
     """리뷰 P1/🟡: 재시작 뒤 활성 run 이 남아 영구 BUSY, 결과 없는 tool call 이 history 에 남는 문제."""
-    cid = _new(client, shared=True)
-    _, ticket = _pending_ticket_for_server("call-x")
+    cid = new_room(client, shared=True)
+    _, ticket = pending_ticket("call-x")
     dangling = [ModelRequest(parts=[UserPromptPart(content="nginx 3개로")])]
     restore = _swap_run_agent([_fake(ticket, dangling), _fake(KukieResponse(narration="재시작 뒤"))])
     try:
@@ -635,8 +605,8 @@ def test_승인_대기_중_재시작하면_카드는_만료되고_그_턴의_기
 
 
 def test_승인_대기는_그_방만_막고_다른_방은_자유다(client):
-    a, b = _new(client, shared=True), _new(client)
-    _, ticket = _pending_ticket_for_server("call-a")
+    a, b = new_room(client, shared=True), new_room(client)
+    _, ticket = pending_ticket("call-a")
     restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="b 답")),
                                _fake(KukieResponse(narration="적용됨"))])
     try:
@@ -659,9 +629,9 @@ def test_승인_대기는_그_방만_막고_다른_방은_자유다(client):
 def test_카드가_여러_장이면_마지막_결정까지_run은_열려_있고_payload는_남은_카드다(client):
     """문서 7절: 계획이 여러 개면 결정이 모일 때까지 기다린다."""
     from pydantic_ai.tools import DeferredToolRequests
-    cid = _new(client, shared=True)
-    _, first = _pending_ticket_for_server("c1")
-    _, second = _pending_ticket_for_server("c2")
+    cid = new_room(client, shared=True)
+    _, first = pending_ticket("c1")
+    _, second = pending_ticket("c2")
     batch = DeferredToolRequests(approvals=[first.approvals[0], second.approvals[0]],
                                  metadata={**first.metadata, **second.metadata})
     restore = _swap_run_agent([_fake(batch), _fake(KukieResponse(narration="둘 다 적용"))])
@@ -682,28 +652,27 @@ def test_카드가_여러_장이면_마지막_결정까지_run은_열려_있고_
 
 def test_실행_중_죽은_run은_처음_열_때_interrupted가_되고_running도_같이_꺼진다(client):
     """리뷰 🟡: 복원 전에 읽은 row 의 running 이 낡은 값으로 나가던 문제."""
-    from kukie.store import get_store
-    cid = _new(client)
+    cid = new_room(client)
     get_store().start_run(cid, request_id="crash", kind="chat", mode="학습", input_text="죽기 직전")  # 끝내지 않음
     conversations.registry.clear()
     detail = client.get(f"/conversations/{cid}", headers=USER).json()
     assert detail["conversation"]["running"] is False
     assert detail["turns"][0]["status"] == "interrupted"
     assert client.get("/conversations", headers=USER).json()[0]["running"] is False
-    with agent.override(model=_model("살아남")):
+    with agent.override(model=chat_model("살아남")):
         assert client.post(f"/conversations/{cid}/chat", json={"text": "다시"}, headers=USER).status_code == 200
 
 
 def test_모르는_call_id는_409_NOT_PENDING(client):
-    cid = _new(client, shared=True)
+    cid = new_room(client, shared=True)
     r = client.post(f"/conversations/{cid}/approve", json={"call_id": "없음", "approved": True}, headers=USER)
     assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
 
 
 def test_재개_실패는_run을_recovery_required로_남기고_resume이_같은_run을_끝낸다(client):
     """문서 4절: recovery_required = 실제 변경 결과가 불명확해 확인 필요. DURO-66 의 RESUME_RETRYABLE 과 같다."""
-    cid = _new(client, shared=True)
-    _, ticket = _pending_ticket_for_server("call-r")
+    cid = new_room(client, shared=True)
+    _, ticket = pending_ticket("call-r")
     restore = _swap_run_agent([_fake(ticket), RuntimeError("네트워크"), _fake(KukieResponse(narration="이번엔 됨"))])
     try:
         assert client.post(f"/conversations/{cid}/chat", json={"text": "늘려"}, headers=USER).json()["kind"] == "approval"
@@ -726,8 +695,8 @@ def test_재개_실패는_run을_recovery_required로_남기고_resume이_같은
 
 
 def test_recovery_required_중_재시작하면_interrupted지만_확인_필요_코드는_남는다(client):
-    cid = _new(client, shared=True)
-    _, ticket = _pending_ticket_for_server("call-k")
+    cid = new_room(client, shared=True)
+    _, ticket = pending_ticket("call-k")
     restore = _swap_run_agent([_fake(ticket), RuntimeError("네트워크")])
     try:
         client.post(f"/conversations/{cid}/chat", json={"text": "늘려"}, headers=USER)
@@ -741,8 +710,8 @@ def test_recovery_required_중_재시작하면_interrupted지만_확인_필요_�
 
 
 def test_응답이_유실된_뒤_같은_request_id로_재전송하면_승인_대기_중이라도_카드를_다시_준다(client):
-    cid = _new(client, shared=True)
-    _, ticket = _pending_ticket_for_server("call-l")
+    cid = new_room(client, shared=True)
+    _, ticket = pending_ticket("call-l")
     restore = _swap_run_agent([_fake(ticket)])
     try:
         body = {"text": "늘려", "request_id": "lost"}
@@ -757,7 +726,7 @@ def test_응답이_유실된_뒤_같은_request_id로_재전송하면_승인_대
 
 
 def test_재개할_티켓이_없으면_409_NOT_PENDING(client):
-    cid = _new(client, shared=True)
+    cid = new_room(client, shared=True)
     r = client.post(f"/conversations/{cid}/resume", headers=USER)
     assert r.status_code == 409 and r.json()["detail"]["code"] == "NOT_PENDING"
 
@@ -776,7 +745,6 @@ def test_최초_승인_요청_저장만_실패해도_방을_계속_쓸_수_있�
     카드가 기록에 안 남았으므로 그 승인은 이어갈 수 없다. 티켓을 버려 DB 와 맞추고, 안내대로
     새 요청을 받는다.
     """
-    from kukie.store import get_store
 
     store = get_store()
     original = store.update_run
@@ -788,8 +756,8 @@ def test_최초_승인_요청_저장만_실패해도_방을_계속_쓸_수_있�
         return original(run_id, **fields)
 
     monkeypatch.setattr(store, "update_run", flaky)
-    cid = _new(client, shared=True)
-    _, ticket = _pending_ticket_for_server("first")
+    cid = new_room(client, shared=True)
+    _, ticket = pending_ticket("first")
     restore = _swap_run_agent([_fake(ticket), _fake(KukieResponse(narration="다시 됨"))])
     try:
         dead["on"] = True
@@ -811,7 +779,6 @@ def test_최초_승인_요청_저장만_실패해도_방을_계속_쓸_수_있�
 
 def test_저장_실패로_닫힌_카드는_approve_도_resume_도_받지_않는다(client, monkeypatch):
     """티켓을 버렸으니 둘 다 "대기 중인 승인이 없다" 가 나와야 한다 — 서로 다른 409 로 엇갈리면 안 된다."""
-    from kukie.store import get_store
 
     store = get_store()
     original = store.update_run
@@ -823,8 +790,8 @@ def test_저장_실패로_닫힌_카드는_approve_도_resume_도_받지_않는�
         return original(run_id, **fields)
 
     monkeypatch.setattr(store, "update_run", flaky)
-    cid = _new(client, shared=True)
-    _, ticket = _pending_ticket_for_server("gone")
+    cid = new_room(client, shared=True)
+    _, ticket = pending_ticket("gone")
     restore = _swap_run_agent([_fake(ticket)])
     try:
         dead["on"] = True
@@ -847,7 +814,6 @@ def test_저장_실패로_버린_카드의_기록도_history에서_뺀다(client
     history 가 그대로라 무한 반복이다 — registry.clear() 전에는 그 방을 못 쓴다. 재시작 복원이
     지키는 규칙(conversations.py 머리말 "결과 없는 tool call 은 버린다")과 같아야 한다.
     """
-    from kukie.store import get_store
 
     store = get_store()
     original = store.update_run
@@ -859,8 +825,8 @@ def test_저장_실패로_버린_카드의_기록도_history에서_뺀다(client
         return original(run_id, **fields)
 
     monkeypatch.setattr(store, "update_run", flaky)
-    cid = _new(client, shared=True)
-    _, ticket = _pending_ticket_for_server("hist")
+    cid = new_room(client, shared=True)
+    _, ticket = pending_ticket("hist")
     첫마디 = [ModelRequest(parts=[UserPromptPart(content="nginx 3개로")])]
     restore = _swap_run_agent([_fake(ticket, 첫마디), _fake(KukieResponse(narration="다시 됨"), 첫마디)])
     try:
@@ -873,3 +839,163 @@ def test_저장_실패로_버린_카드의_기록도_history에서_뺀다(client
         assert r.status_code == 200 and r.json()["response"]["narration"] == "다시 됨"
     finally:
         restore()
+
+
+# ── 제목 (#59) · 모드 전환 (#60) ─────────────────────────────
+# 첫 로컬 E2E(DURO-85)에서 실제로 돌려 보고 찾은 것들. 가짜 모델로는 재현되지 않아 원인을 막는 장치만 확인한다.
+
+def _say(client, room: str, text: str):
+    with agent.override(model=answer_model("답변입니다.")):
+        return client.post(f"/conversations/{room}/chat", json={"text": text}, headers=USER)
+
+
+def test_첫_마디가_방_제목이_된다(client):
+    room = new_room(client)
+    assert get_store().get_session(room).title == "새 대화"
+
+    _say(client, room, "운영 클러스터의 파드 상태를 보여줘")
+
+    assert get_store().get_session(room).title == "운영 클러스터의 파드 상태를 보여줘"
+
+
+@pytest.mark.parametrize("first", [
+    pytest.param("첫 번째 질문", id="plain"),
+    # 제목 글자만 보고 "아직 기본 제목" 으로 판단하면 이 경우에 덮어쓴다
+    pytest.param("새 대화", id="same-as-default-title"),
+])
+def test_제목은_한_번만_정해진다(client, first):
+    """두 번째 마디로 제목이 바뀌면 사이드바가 대화 도중에 계속 흔들린다."""
+    room = new_room(client)
+    _say(client, room, first)
+    _say(client, room, "두 번째 질문")
+
+    assert get_store().get_session(room).title == first
+
+
+def test_긴_첫_마디는_앞_30자까지만(client):
+    room = new_room(client)
+    _say(client, room, "가" * 100)
+    assert get_store().get_session(room).title == "가" * 30
+
+
+def test_모드_전환은_제목을_정하지_않는다(client):
+    """`/mode 진단` 이 방 이름이 되면 안 된다."""
+    room = new_room(client)
+    client.post(f"/conversations/{room}/chat", json={"text": "/mode 진단"}, headers=USER)
+    assert get_store().get_session(room).title == "새 대화"
+
+
+def test_공백만_보내면_제목을_바꾸지_않고_자리도_안_먹는다(client):
+    room = new_room(client)
+    _say(client, room, "   ")
+    assert get_store().get_session(room).title == "새 대화"
+
+    _say(client, room, "파드 보여줘")
+    assert get_store().get_session(room).title == "파드 보여줘"
+
+
+def test_인자_없는_mode_도_제목이_되지_않고_자리도_안_먹는다(client):
+    """`/mode` 만 보내면 kind 는 chat 이라 라우팅은 일반 대화지만, 방 이름이 되면 안 된다.
+
+    1턴만 보면 구멍이 있는 채로 통과한다 — 그 run 이 "첫 턴" 자리를 먹고 사라지면 다음 마디도
+    제목이 못 된다 (자동 리뷰 4차). 그래서 두 번째 마디까지 본다.
+    """
+    room = new_room(client)
+    _say(client, room, "/mode")
+    assert get_store().get_session(room).title == "새 대화"
+
+    _say(client, room, "파드 보여줘")
+    assert get_store().get_session(room).title == "파드 보여줘"
+
+
+def test_제목_쓰기가_version_을_올린다(client):
+    """세션 행을 고치는 다른 경로와 같아야 앱이 "바뀌었다" 를 알아챈다.
+
+    매 chat 턴이 current_mode 갱신으로 이미 version 을 한 번 올리므로(자동 리뷰 지적), 단순히
+    "올랐나" 만 보면 제목 쓰기를 지워도 통과한다. 제목이 바뀌는 첫 턴의 증가분과 안 바뀌는
+    둘째 턴의 증가분을 비교한다.
+    """
+    room = new_room(client)
+    before = get_store().get_session(room).version
+
+    _say(client, room, "첫 번째 질문")
+    after_first = get_store().get_session(room).version
+
+    _say(client, room, "두 번째 질문")            # 제목은 그대로다
+    after_second = get_store().get_session(room).version
+
+    assert after_first - before == 2              # 모드 갱신 + 제목
+    assert after_second - after_first == 1        # 모드 갱신만
+
+
+def test_모드를_먼저_바꿔도_첫_마디가_제목이_된다(client):
+    """turn_no 로 판단하면 `/mode` 가 1번을 먹어 그 방은 제목을 영영 못 받는다 (자동 리뷰 지적).
+
+    E2E 에서 실제로 나온 순서다 — 모드 바꾸고 나서 변경을 요청한다.
+    """
+    room = client.post("/conversations", json={"shared": True}, headers=USER).json()["conversation"]["id"]
+    client.post(f"/conversations/{room}/chat", json={"text": "/mode 실습"}, headers=USER)
+
+    _say(client, room, "nginx 를 4개로 늘려줘")
+
+    assert get_store().get_session(room).title == "nginx 를 4개로 늘려줘"
+
+
+def test_제목_저장이_실패해도_대화는_성공으로_끝난다(client, monkeypatch):
+    """제목은 부가 정보다. 여기서 터지면 이미 completed 로 저장한 run 이 500 으로 뒤집힌다."""
+    def boom(*a, **k):
+        raise RuntimeError("DB 넘어짐")
+
+    monkeypatch.setattr(get_store(), "name_from_first_message", boom)
+    room = new_room(client)
+    assert _say(client, room, "안녕").status_code == 200
+
+
+def test_모드를_바꾸면_다음_턴의_지시문이_실제로_바뀐다(client):
+    """#60 은 문구가 아니라 **전환이 ctx.deps.skill 까지 오느냐** 의 문제였다.
+
+    `/mode` 를 실제로 보낸 뒤, 다음 chat 턴이 도는 시점의 deps 를 잡아 지시문을 확인한다.
+    """
+    seen: list[str] = []
+
+    def capture(messages, info):
+        # @agent.instructions 의 결과는 ModelRequest.instructions 로 온다 (parts 가 아니다)
+        for message in messages:
+            text = getattr(message, "instructions", None)
+            if isinstance(text, str) and "[현재 모드:" in text:
+                seen.append(text[text.index("[현재 모드:"):][:20])
+        out = info.output_tools[0]
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name=out.name,
+            args={"narration": "답변입니다.", "suggested_next_action": None},
+        )])
+
+    # 실습 모드는 shared 방에서만 된다 (기획 05 §3)
+    room = client.post("/conversations", json={"shared": True}, headers=USER).json()["conversation"]["id"]
+    with agent.override(model=FunctionModel(capture)):
+        client.post(f"/conversations/{room}/chat", json={"text": "안녕"}, headers=USER)
+    assert seen and "학습" in seen[-1]
+
+    # 모드를 바꾼다 — 이 요청은 LLM 을 부르지 않는다
+    r = client.post(f"/conversations/{room}/chat", json={"text": "/mode 실습"}, headers=USER)
+    assert r.json()["skill"] == "실습"
+
+    with agent.override(model=FunctionModel(capture)):
+        client.post(f"/conversations/{room}/chat", json={"text": "nginx 를 늘려줘"}, headers=USER)
+    assert "실습" in seen[-1]          # 전환이 다음 턴의 deps 까지 왔다
+
+
+def test_빈_제목으로_만든_방도_첫_마디로_제목을_받는다(client):
+    """title: "" 는 DEFAULT_TITLE 과 달라서 "아직 기본 제목" 검사를 영영 통과 못 한다."""
+    room = client.post("/conversations", json={"title": "  ", "shared": True},
+                       headers=USER).json()["conversation"]["id"]
+    assert get_store().get_session(room).title == DEFAULT_TITLE
+
+    _say(client, room, "파드 상태 알려줘")
+    assert get_store().get_session(room).title == "파드 상태 알려줘"
+
+
+def test_제목이_문자열이_아니면_422(client):
+    """빈 제목을 접느라 바로 .strip() 을 부르면 숫자 제목이 500 으로 샌다."""
+    r = client.post("/conversations", json={"title": 123}, headers=USER)
+    assert r.status_code == 422
