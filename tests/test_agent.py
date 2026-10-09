@@ -18,16 +18,16 @@ from pydantic_ai.tools import (
     ToolDenied,
 )
 
-from kukie import agent as agent_module
-from kukie.agent import agent
-from kukie.deps import Deps
-from kukie.guardrail import hook
-from kukie.guardrail.action_plan import ActionPlan
-from kukie.kubectl import KubectlResult
-from kukie.response import build_response
-from kukie.skills import SKILLS
-from kukie.tools import mutate
-from kukie.tools.mutate import MUTATING_TOOLS
+from kukie_agent import agent as agent_module
+from kukie_agent.agent import agent
+from kukie_agent.deps import Deps
+from kukie_agent.guardrail import hook
+from kukie_agent.guardrail.action_plan import ActionPlan
+from kukie_agent.kubectl import KubectlResult
+from kukie_agent.response import build_response
+from kukie_agent.skills import SKILLS
+from kukie_agent.tools import mutate
+from kukie_agent.tools.mutate import MUTATING_TOOLS
 
 
 def _deps(skill_name: str = "학습") -> Deps:
@@ -268,7 +268,7 @@ def test_응답_형식_실패는_run_안에서_두번까지_흡수한다():
 
 
 def test_build_model은_test와_접두어_없는_이름을_그대로_둔다():
-    from kukie.agent import _build_model
+    from kukie_agent.agent import _build_model
 
     assert _build_model("test") == "test"
     assert _build_model("gpt-4o") == "gpt-4o"    # 공급자 미지정 → pydantic-ai 가 해석
@@ -277,7 +277,7 @@ def test_build_model은_test와_접두어_없는_이름을_그대로_둔다():
 def _http_libs():
     """공급자 SDK 가 예외를 던질 수 있는 HTTP 라이브러리 — pydantic-ai 2.3x 는 httpx, 2.4x 는 httpx2 도.
     (httpx2 가 깔려 있어도 2.3x 의 SDK 는 httpx 로 통신하므로 agent 가 고른 목록을 그대로 쓴다.)"""
-    from kukie import agent as agent_module
+    from kukie_agent import agent as agent_module
 
     return list(agent_module._HTTP_LIBS)
 
@@ -285,7 +285,7 @@ def _http_libs():
 def test_build_model은_실제_공급자에_HTTP_재시도_전송층을_끼운다(monkeypatch, caplog):
     import pydantic_ai.retries as retries
 
-    from kukie.agent import _build_model
+    from kukie_agent.agent import _build_model
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
     model = _build_model("anthropic:claude-sonnet-4-6")
@@ -307,7 +307,7 @@ def test_build_model은_실제_공급자에_HTTP_재시도_전송층을_끼운�
     (400, False), (401, False), (404, False),       # 잘못된 요청·키 → 다시 보내도 같은 답
 ])
 def test_HTTP_재시도는_429와_5xx만(lib, status, expected):
-    from kukie.agent import _retryable
+    from kukie_agent.agent import _retryable
 
     request = lib.Request("POST", "https://api.example")
     error = lib.HTTPStatusError("x", request=request, response=lib.Response(status, request=request))
@@ -316,7 +316,7 @@ def test_HTTP_재시도는_429와_5xx만(lib, status, expected):
 
 @pytest.mark.parametrize("lib", _http_libs(), ids=lambda lib: lib.__name__)
 def test_HTTP_재시도는_네트워크와_타임아웃도_포함한다(lib):
-    from kukie.agent import _retryable
+    from kukie_agent.agent import _retryable
 
     assert _retryable(lib.ReadTimeout("t")) is True
     assert _retryable(lib.ConnectError("c")) is True

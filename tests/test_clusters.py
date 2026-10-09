@@ -12,13 +12,13 @@ import yaml
 from fastapi.testclient import TestClient
 
 from helpers import OTHER, USER
-from kukie import conversations, server
-from kukie.clusters import crypto, runtime
-from kukie.clusters import kubeconfig as kubeconfig_module
-from kukie.clusters.kubeconfig import KubeconfigRejected, parse_kubeconfig
-from kukie.kubectl import KubectlResult
-from kukie.store import get_store
-from kukie.tools import read as read_tools
+from kukie_agent import conversations, server
+from kukie_agent.clusters import crypto, runtime
+from kukie_agent.clusters import kubeconfig as kubeconfig_module
+from kukie_agent.clusters.kubeconfig import KubeconfigRejected, parse_kubeconfig
+from kukie_agent.kubectl import KubectlResult
+from kukie_agent.store import get_store
+from kukie_agent.tools import read as read_tools
 
 CA = base64.b64encode(b"fake-ca").decode()
 
@@ -194,7 +194,7 @@ def test_연결_확인은_상태를_갱신한다(client, monkeypatch):
         return KubectlResult(command="kubectl …", stdout="yes" if not ok else "{}", stderr="",
                              success=True, exit_code=0)
 
-    monkeypatch.setattr("kukie.clusters_api.run_kubectl", fake)
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
     r = client.post(f"/clusters/{registered['id']}/test", headers=USER)
 
     assert r.status_code == 200
@@ -207,7 +207,7 @@ def test_연결_확인은_상태를_갱신한다(client, monkeypatch):
 def test_연결_실패는_이유에_따라_상태가_갈린다(client, monkeypatch):
     registered = _register(client)
     monkeypatch.setattr(
-        "kukie.clusters_api.run_kubectl",
+        "kukie_agent.clusters_api.run_kubectl",
         lambda *a, **k: KubectlResult(command="kubectl …", stdout="", stderr="error: Unauthorized",
                                       success=False, exit_code=1),
     )
@@ -275,7 +275,7 @@ def test_등록된_클러스터로_대화하면_임시_kubeconfig로_실행한�
 
     monkeypatch.setattr(read_tools, "run_kubectl", fake)
     from pydantic_ai.models.test import TestModel
-    from kukie.agent import agent
+    from kukie_agent.agent import agent
 
     with agent.override(model=TestModel(call_tools=["list_resources"],
                                         custom_output_args={"narration": "봤습니다.",
@@ -354,7 +354,7 @@ def test_CA_와_insecure_를_함께_쓰면_거부한다():
 
 def test_사설_주소로_풀리는_이름도_거부한다(monkeypatch):
     """P1: 이름만 보면 127.0.0.1 로 풀리는 이름을 등록해 서버가 대신 접속하게 만들 수 있다."""
-    from kukie.clusters import kubeconfig as module
+    from kukie_agent.clusters import kubeconfig as module
 
     monkeypatch.setattr(module, "_resolved", lambda host: ["127.0.0.1"])
     with pytest.raises(KubeconfigRejected, match="풀리는 이름"):
@@ -413,7 +413,7 @@ def test_빈_team_id_는_개인_클러스터로_들어간다(client):
 
 def test_연결_확인도_공용_스레드풀을_다_물지_않는다(client, monkeypatch):
     """probe 는 kubectl 두 번 × 30초라 DNS 보다 오래 잡는다 — 리미터가 붙어 있어야 한다."""
-    from kukie import clusters_api
+    from kukie_agent import clusters_api
 
     registered = _register(client)
     seen: list[object] = []
@@ -488,7 +488,7 @@ def test_context_의_앞뒤_공백도_뗀다(client):
 
 def test_namespace_를_안_보내면_kubeconfig_가_정한다(client):
     """등록에서 빈 값·안 보냄은 둘 다 "안 정했다" 다 — kubeconfig 의 namespace 를 쓴다."""
-    from kukie.clusters.kubeconfig import parse_kubeconfig
+    from kukie_agent.clusters.kubeconfig import parse_kubeconfig
 
     kubeconfig_ns = parse_kubeconfig(kubeconfig()).namespace
     assert _register(client)["namespace"] == kubeconfig_ns

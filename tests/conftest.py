@@ -1,6 +1,6 @@
 import os
 
-# kukie 를 import 하면 .env 가 환경에 올라오고 server 는 그때 계측을 켠다. 테스트가 개발자의 계측 서버로
+# kukie_agent 를 import 하면 .env 가 환경에 올라오고 server 는 그때 계측을 켠다. 테스트가 개발자의 계측 서버로
 # 프롬프트를 보내지 않게 그보다 먼저 빈 값으로 막는다 — load_dotenv 는 이미 있는 값을 덮지 않는다.
 os.environ["LOGFIRE_TOKEN"] = ""
 os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = ""
@@ -10,12 +10,12 @@ import pytest
 from pydantic_ai import models
 
 from helpers import FAKE_COMMAND, GUIDANCE, MEMBER_URL
-from kukie import conversations, server
-from kukie.clusters import crypto
-from kukie.guardrail import action_plan, hook
-from kukie.kubectl import KubectlResult
-from kukie.store import db, reset_store_for_tests
-from kukie.tools import read as read_tools
+from kukie_agent import conversations, server
+from kukie_agent.clusters import crypto
+from kukie_agent.guardrail import action_plan, hook
+from kukie_agent.kubectl import KubectlResult
+from kukie_agent.store import db, reset_store_for_tests
+from kukie_agent.tools import read as read_tools
 
 
 models.ALLOW_MODEL_REQUESTS = False
@@ -23,7 +23,7 @@ models.ALLOW_MODEL_REQUESTS = False
 
 @pytest.fixture(autouse=True)
 def _member_server_off_by_default(monkeypatch):
-    """kukie 를 import 하면 load_dotenv(".env") 가 개발자 .env 의 KUKIE_MEMBER_URL 을 환경에 올린다.
+    """kukie_agent 를 import 하면 load_dotenv(".env") 가 개발자 .env 의 KUKIE_MEMBER_URL 을 환경에 올린다.
 
     그대로 두면 같은 테스트가 .env 가 있는 컴퓨터에서만 회원 서버 모드로 돈다 (CI 에는 .env 가 없다).
     flat 엔드포인트가 회원 서버 모드에서 닫히면서(#75) 실제로 갈렸다. 회원 서버 모드가 필요한 테스트는
