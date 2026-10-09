@@ -78,7 +78,7 @@ kukie-electron (데스크톱 앱)  ──HTTP──▶  kukie agent (이 레포)
 | 인증·팀 권한 (Spring 연동, fail-closed) | `kukie/auth.py`, `kukie/membership.py` |
 | 저장소 (SQLAlchemy) | `kukie/store/` |
 
-**스택**: Python 3.10+ · [pydantic-ai](https://ai.pydantic.dev/) (에이전트 루프, 승인 훅 `ApprovalRequired`/`DeferredToolRequests`) · FastAPI · SQLAlchemy · cryptography · pytest · kind (E2E)
+**스택**: Python 3.14+ · [pydantic-ai](https://ai.pydantic.dev/) (에이전트 루프, 승인 훅 `ApprovalRequired`/`DeferredToolRequests`) · FastAPI · SQLAlchemy · cryptography · pytest · kind (E2E)
 
 ## 실행
 

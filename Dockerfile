@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 # Kukie 에이전트 컨테이너 (DURO-107 4단계). 리버스 프록시 뒤에서 /api/* 가 /api 를 떼고 여기 8000 으로 온다.
 # 띄우는 법은 kukie-electron/deploy/README.md — 도커 컴포즈가 이 파일을 빌드한다.
-FROM python:3.10-slim
+FROM python:3.14-slim
 
-# CI 와 같은 3.10. kubectl 은 등록된 클러스터에 대고 실행하는 도구라 이미지 안에 있어야 한다 (kukie/kubectl/runner.py).
+# CI 와 같은 3.14. kubectl 은 등록된 클러스터에 대고 실행하는 도구라 이미지 안에 있어야 한다 (kukie/kubectl/runner.py).
 # 버전을 고정하고 sha256 을 대조한다 — 빌드마다 다른 바이너리가 들어오지 않게.
 ARG KUBECTL_VERSION=v1.37.0
 ARG TARGETARCH
