@@ -12,11 +12,12 @@ LLM은 발동 여부에 관여할 수 없다. wrap 훅 하나가 전 단계를 �
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import shlex
+from functools import partial
 
 import yaml
+from anyio import to_thread
 from pydantic_ai import ApprovalRequired, ModelRetry, ToolFailed
 from pydantic_ai.capabilities.hooks import Hooks
 
@@ -24,11 +25,15 @@ from kukie_agent.guardrail.action_plan import ActionPlan, PlanTarget
 from kukie_agent.guardrail.approval import _manifest_preview
 from kukie_agent.guardrail.decision_guidance import generate_decision_guidance
 from kukie_agent.guardrail.mutation_request import canonicalize_mutation_args
-from kukie_agent.kubectl import KubectlResult, assemble, run_kubectl
+from kukie_agent.kubectl import KubectlResult, assemble, run_kubectl, thread_limiter
 from kukie_agent.tools.mutate import MUTATING_TOOLS, RISK_STICKERS
 
 logger = logging.getLogger(__name__)
 hooks = Hooks()
+
+#: 동시에 도는 dry-run 상한. 넘치면 다음 dry-run 은 기다린다 — 다른 채팅방의 툴·DNS 는 영향 없다.
+#: probe(4)보다 큰 건 채팅 중에 일어나 여러 방에서 몰리기 때문이다.
+DRY_RUN_WORKERS = 8
 
 
 def _recorded_result(plan: ActionPlan) -> KubectlResult:
@@ -245,13 +250,16 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
     )
     # 스레드로 넘긴다 — 여기는 async 훅이라 그냥 부르면 dry-run(최대 30초) 동안 이벤트 루프가 멈춰
     # 다른 채팅방의 run 까지 같이 선다. 툴 본체의 run_kubectl 은 pydantic-ai 가 이미 스레드로 돌린다.
-    rehearsal = await asyncio.to_thread(
-        run_kubectl,
-        command,
-        context=ctx.deps.context,
-        dry_run=True,
-        stdin=stdin,
-        kubeconfig=ctx.deps.kubeconfig,
+    rehearsal = await to_thread.run_sync(
+        partial(
+            run_kubectl,
+            command,
+            context=ctx.deps.context,
+            dry_run=True,
+            stdin=stdin,
+            kubeconfig=ctx.deps.kubeconfig,
+        ),
+        limiter=thread_limiter("dry_run", DRY_RUN_WORKERS),
     )
 
     if rehearsal.success:

@@ -1273,10 +1273,19 @@ async def test_dry_run_동안_이벤트_루프가_다른_요청을_처리한다(
 
     가짜 kubectl 은 루프 위의 다른 코루틴이 신호를 줄 때까지 기다린다. 루프가 막혀 있으면 신호가
     오지 않아 시간 초과(False)로 끝난다.
+
+    루프 기본 풀은 쓰지 않는다 — DNS 조회(loop.getaddrinfo)와 나눠 쓰는 풀이라, 30초짜리 dry-run 이 차면
+    새 바깥 연결이 줄 선다 (PR #97 리뷰). 기본 풀을 쓰면 실패하는 풀로 바꿔 끼워 확인한다.
     """
     import asyncio
     import threading
+    from concurrent.futures import ThreadPoolExecutor
 
+    class 쓰면안되는풀(ThreadPoolExecutor):
+        def submit(self, *args, **kwargs):
+            pytest.fail("dry-run 이 루프 기본 풀(DNS 와 공유)로 갔다 — thread_limiter 를 거쳐야 한다")
+
+    asyncio.get_running_loop().set_default_executor(쓰면안되는풀())
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     다른_요청 = threading.Event()
     신호를_받았나 = []

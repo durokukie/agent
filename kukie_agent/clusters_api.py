@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from anyio import CapacityLimiter, to_thread
+from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -34,7 +34,7 @@ from kukie_agent.clusters.kubeconfig import KubeconfigRejected, parse_kubeconfig
 from kukie_agent.clusters.settings import allow_local_clusters
 from kukie_agent.fields import blank_is_none, none_if_blank, stripped
 from kukie_agent import membership
-from kukie_agent.kubectl import run_kubectl
+from kukie_agent.kubectl import run_kubectl, thread_limiter
 from kukie_agent.store import ChatStore, get_store
 from kukie_agent.store.chat_store import ClusterInUse, ClusterRow
 
@@ -42,21 +42,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/clusters", tags=["clusters"])
 
-#: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적).
-#: AnyIO 공용 풀은 기본 40개인데, getaddrinfo 는 타임아웃을 줄 수 없고 kubectl 은 30초씩 잡는다.
-#: 여기서 다 물면 채팅의 동기 툴(pydantic-ai 가 같은 풀로 돌린다)까지 함께 멈춘다.
+#: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적, 이유는 thread_limiter).
+#: getaddrinfo 는 타임아웃을 줄 수 없고 kubectl 은 30초씩 잡는다.
 RESOLVE_WORKERS = 4          # kubeconfig 검사 (이름 해석)
 PROBE_WORKERS = 4            # 연결 확인 (kubectl × 2, 최대 60초)
-
-_limiters: dict[str, CapacityLimiter] = {}
-
-
-def _limiter(name: str, workers: int) -> CapacityLimiter:
-    """처음 쓸 때 만든다. anyio 3.x 는 이벤트 루프 밖에서 만들면 터지므로 import 시점에 두지 않는다."""
-    found = _limiters.get(name)
-    if found is None:
-        found = _limiters[name] = CapacityLimiter(workers)
-    return found
 
 
 # ── 요청 본문 ──────────────────────────────────────────────
@@ -156,7 +145,7 @@ async def _parse(body_text: str, context: str | None):
         return parse_kubeconfig(body_text, context_name=context, allow_local=allow_local_clusters())
 
     try:
-        return await to_thread.run_sync(run, limiter=_limiter("resolve", RESOLVE_WORKERS))
+        return await to_thread.run_sync(run, limiter=thread_limiter("resolve", RESOLVE_WORKERS))
     except KubeconfigRejected as exc:
         raise _error(400, "KUBECONFIG_REJECTED", str(exc)) from None
 
@@ -244,7 +233,7 @@ async def test_cluster(
     try:
         # run_kubectl 은 subprocess.run 을 그대로 부른다. 여기서 직접 부르면 닿지 않는 주소일 때
         # 최대 60초(version + can-i) 동안 서버 전체가 멈춘다 (자동 리뷰 지적). 스레드로 넘긴다.
-        version, can_edit = await to_thread.run_sync(probe, limiter=_limiter("probe", PROBE_WORKERS))
+        version, can_edit = await to_thread.run_sync(probe, limiter=thread_limiter("probe", PROBE_WORKERS))
     except ClusterGone:
         raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}") from None
     except crypto.CredentialUnreadable as exc:

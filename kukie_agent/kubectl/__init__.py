@@ -5,8 +5,8 @@
 - 조립 함수는 툴별 1벌만 존재한다 (assemble.py). 재조립 금지.
 - 실행은 shell=False + args 리스트 (인젝션 차단).
 """
-from kukie_agent.kubectl.runner import KubectlResult, run_kubectl
+from kukie_agent.kubectl.runner import KubectlResult, run_kubectl, thread_limiter
 from kukie_agent.kubectl.assemble import assemble
 from kukie_agent.kubectl.config import KubeconfigError, read_kubeconfig
 
-__all__ = ["KubectlResult", "run_kubectl", "assemble", "read_kubeconfig", "KubeconfigError"]
+__all__ = ["KubectlResult", "run_kubectl", "thread_limiter", "assemble", "read_kubeconfig", "KubeconfigError"]
