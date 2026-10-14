@@ -12,6 +12,7 @@ LLM은 발동 여부에 관여할 수 없다. wrap 훅 하나가 전 단계를 �
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import shlex
 
@@ -242,7 +243,10 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
         if tool_name == "apply_manifest"
         else None
     )
-    rehearsal = run_kubectl(
+    # 스레드로 넘긴다 — 여기는 async 훅이라 그냥 부르면 dry-run(최대 30초) 동안 이벤트 루프가 멈춰
+    # 다른 채팅방의 run 까지 같이 선다. 툴 본체의 run_kubectl 은 pydantic-ai 가 이미 스레드로 돌린다.
+    rehearsal = await asyncio.to_thread(
+        run_kubectl,
         command,
         context=ctx.deps.context,
         dry_run=True,
