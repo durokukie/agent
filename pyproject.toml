@@ -14,6 +14,7 @@ dependencies = [
     "alembic>=1.13",        # 표 모양 변경 이력 — 켜질 때 적용 (kukie_agent/store/migrations, issue #67)
     "httpx>=0.27",          # Spring 회원 서버 /users/me 호출 (kukie_agent/auth)
     "cryptography>=42",     # 클러스터 자격증명 대칭 암호화 (kukie_agent/clusters, 기획 04 §8)
+    "anyio>=4.0",           # 블로킹 kubectl 을 스레드로 + 쓰임새별 상한 (kukie_agent/kubectl/runner.thread_limiter). 원래 FastAPI·httpx 가 끌어오지만 직접 import 한다
 ]
 
 [project.optional-dependencies]

@@ -1263,3 +1263,42 @@ async def test_미리보기가_실패하면_가이드_모델을_아예_안_부�
 
     plan = action_plan.ActionPlan.find_by_call_id("call-123")
     assert plan.decision_guidance == "guidance unavailable"
+
+
+@pytest.mark.asyncio
+async def test_dry_run_동안_이벤트_루프가_다른_요청을_처리한다(
+    monkeypatch, tmp_path, successful_guidance
+):
+    """dry-run 은 스레드로 간다 — 루프를 붙잡으면 다른 채팅방의 run 이 kubectl 이 끝날 때까지 같이 선다.
+
+    가짜 kubectl 은 루프 위의 다른 코루틴이 신호를 줄 때까지 기다린다. 루프가 막혀 있으면 신호가
+    오지 않아 시간 초과(False)로 끝난다.
+
+    루프 기본 풀은 쓰지 않는다 — DNS 조회(loop.getaddrinfo)와 나눠 쓰는 풀이라, 30초짜리 dry-run 이 차면
+    새 바깥 연결이 줄 선다 (PR #97 리뷰). 기본 풀을 쓰면 실패하는 풀로 바꿔 끼워 확인한다.
+    """
+    import asyncio
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    class 쓰면안되는풀(ThreadPoolExecutor):
+        def submit(self, *args, **kwargs):
+            pytest.fail("dry-run 이 루프 기본 풀(DNS 와 공유)로 갔다 — thread_limiter 를 거쳐야 한다")
+
+    asyncio.get_running_loop().set_default_executor(쓰면안되는풀())
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    다른_요청 = threading.Event()
+    신호를_받았나 = []
+
+    def 느린_kubectl(args, **kwargs):
+        신호를_받았나.append(다른_요청.wait(timeout=2))
+        return KubectlResult(command="kubectl dry-run", stdout="ok\n", stderr="", success=True)
+
+    monkeypatch.setattr(hook, "run_kubectl", 느린_kubectl)
+
+    async def 다른_채팅방():
+        다른_요청.set()
+
+    await asyncio.gather(_create_pending_plan(), 다른_채팅방())   # 승인 카드(ApprovalRequired)까지는 헬퍼가 확인한다
+
+    assert 신호를_받았나 == [True]

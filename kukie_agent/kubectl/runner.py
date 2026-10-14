@@ -5,7 +5,24 @@ import shlex
 import subprocess
 from pathlib import Path
 
+from anyio import CapacityLimiter
 from pydantic import BaseModel
+
+_limiters: dict[str, CapacityLimiter] = {}
+
+
+def thread_limiter(name: str, workers: int) -> CapacityLimiter:
+    """블로킹 일(kubectl·이름 해석)을 스레드로 넘길 때 쓰는 이름별 스레드 상한.
+
+    AnyIO 공용 풀(기본 40)을 통째로 물지 않게 쓰임새마다 따로 묶는다 — kubectl 은 30초씩 잡고, 여기서 다 물면
+    채팅의 동기 툴(pydantic-ai 가 같은 풀로 돌린다)까지 함께 멈춘다. asyncio.to_thread 를 쓰지 않는 이유는
+    그 기본 풀을 DNS 조회(loop.getaddrinfo)와 나눠 써서, 풀이 차면 새 바깥 연결의 이름 풀이가 줄 서기 때문이다 (PR #97 리뷰).
+    처음 쓸 때 만든다. anyio 3.x 는 이벤트 루프 밖에서 만들면 터지므로 import 시점에 두지 않는다.
+    """
+    found = _limiters.get(name)
+    if found is None:
+        found = _limiters[name] = CapacityLimiter(workers)
+    return found
 
 
 class KubectlResult(BaseModel):
