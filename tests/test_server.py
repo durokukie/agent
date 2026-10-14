@@ -617,7 +617,8 @@ def test_거절_기록_실패는_결정을_남기지_않고_티켓을_유지한�
         response = client.post("/approve", json={"call_id": "c1", "approved": False})
 
     assert response.status_code == 503
-    assert "disk full" in response.json()["detail"]
+    assert response.json()["detail"]["code"] == "REJECT_FAILED"
+    assert "disk full" in response.json()["detail"]["message"]
     assert server._session is session
     assert session.pending is ticket
     assert session.decisions == {}                            # 결정을 남기지 않았다

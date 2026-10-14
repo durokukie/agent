@@ -496,10 +496,9 @@ async def chat(
             store.update_run(run.id, status="failed", response_payload=_error_record(wrapped))
             raise wrapped from None
         except HTTPException as exc:
-            wrapped = _wrap(exc)
-            store.update_run(run.id, status="failed", response_payload=_error_record(wrapped))
+            store.update_run(run.id, status="failed", response_payload=_error_record(exc))
             _close_plans(store, run)   # failed 는 종료 상태다 — 안 닫으면 계획이 영원히 열린 채 남는다
-            raise wrapped
+            raise
         except Exception as exc:                 # 모델·툴 예외 — run 은 실패로 남기고 세션은 유지
             logger.exception("run 실패 (conversation=%s, run=%s)", conversation_id, run.id)
             failed = _error(500, "RUN_FAILED", f"요청 처리에 실패했다 ({type(exc).__name__}) — 서버 로그 참고")
@@ -675,14 +674,14 @@ async def approve(
         _bind_run(session, run, user)
         # 재개가 돌면 _to_payload 가 티켓을 지우므로, 저장 실패 안내에 실을 Plan id(승인한 카드만)는 여기서 미리 뽑는다
         plan_ids = _approved_plan_ids(session, body.call_id if body.approved else None)
-        # 결정 검사·기록은 server._approve 가 한다 (문자열 detail). 여기서는 코드 객체로 감싼다.
+        # 결정 검사·기록은 server._approve 가 한다. 오류는 거기서 이미 {code, message} 로 나온다.
         try:
             with _with_cluster(store, session, row):
                 outcome, result = await _server._approve(session, body.call_id, body.approved)
         except CLUSTER_FAILURES as exc:
             raise _record_failure(store, run, _cluster_error(exc, row.cluster_id)) from None
         except HTTPException as exc:
-            raise _record_failure(store, run, _wrap(exc))
+            raise _record_failure(store, run, exc)
         return _continue_run(store, conversation, run, outcome, result, plan_ids)
 
 
@@ -712,7 +711,7 @@ async def resume(
         except CLUSTER_FAILURES as exc:
             raise _record_failure(store, run, _cluster_error(exc, row.cluster_id)) from None
         except HTTPException as exc:
-            raise _record_failure(store, run, _wrap(exc))
+            raise _record_failure(store, run, exc)
         return _continue_run(store, conversation, run, outcome, result, plan_ids)
 
 
@@ -765,32 +764,6 @@ def _record_failure(store: ChatStore, run: RunRow, exc: HTTPException) -> HTTPEx
 def _error_record(exc: HTTPException) -> dict[str, Any]:
     detail = dict(exc.detail)
     return error_payload(detail.pop("code", "ERROR"), detail.pop("message", ""), exc.status_code, **detail)
-
-
-# ── server.py 의 문자열 detail 을 {code, message} 로 ─────────
-
-_CODES: list[tuple[str, str]] = [
-    ("세션이 없다", "NO_SESSION"),
-    ("이전 요청 처리 중", "BUSY"),
-    ("요청 처리 중", "BUSY"),
-    ("승인 대기 중", "PENDING_APPROVAL"),
-    ("이미 결정한", "ALREADY_DECIDED"),
-    ("대기 중인 승인 건이 아니다", "NOT_PENDING"),
-    ("재개할 승인 건이 없다", "NOT_PENDING"),
-    ("아직 결정하지 않은", "PENDING_APPROVAL"),
-    ("거절을 기록하지 못했다", "REJECT_FAILED"),
-    ("kubeconfig", "KUBECONFIG"),
-    ("pending approval mismatch", "APPROVAL_MISMATCH"),
-]
-
-
-def _wrap(exc: HTTPException) -> HTTPException:
-    """server.py 가 던진 문자열 detail 을 코드 객체로. 이미 객체면(RESUME_RETRYABLE) 그대로."""
-    if isinstance(exc.detail, dict):
-        return exc
-    text = str(exc.detail)
-    code = next((c for prefix, c in _CODES if text.startswith(prefix) or prefix in text), "ERROR")
-    return HTTPException(exc.status_code, {"code": code, "message": text})
 
 
 _server.app.include_router(router)   # server.py 맨 아래의 plain import 가 이 줄을 실행시킨다
