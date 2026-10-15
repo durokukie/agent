@@ -1,4 +1,4 @@
-"""요청이 누구 것인지 — Spring 회원 서버(kukie-server) 에 토큰을 확인한다.
+"""요청이 누구 것인지 — Kukie API 서버(kukie-server) 에 토큰을 확인한다.
 
 토큰은 두 길로 온다. 앱(Electron)은 `Authorization: Bearer` 헤더로 (api-spec 5절), 웹 브라우저는 Spring 이 구워 준
 httpOnly 쿠키 `kukie_access` 로 (kukie-server #26 — 브라우저는 헤더를 못 붙이고 쿠키만 자동으로 붙인다).
@@ -9,12 +9,13 @@ cross-site/same-site 면 403 CROSS_SITE_COOKIE. 브라우저는 이 헤더를 **
 기본 true)면 애초에 안 실려 **401**, Secure 를 끈 채면 쿠키는 오지만 헤더가 없어 **403** — 어느 쪽이든 HTTPS 로 올리라는
 신호다. 로컬 개발은 kukie-server 를 `auth.cookie.secure=false` 로 띄워 평문 http://localhost 에서 돈다 — 헤더는 localhost 면
 어느 브라우저나 붙이고, Secure 쿠키를 http://localhost 에 보내는 예외는 Chrome·Firefox 에서만 확인했다.
-agent 는 그 토큰으로 Spring `GET /users/me` 를 불러 회원 id 를 얻는다. 팀·권한 판단도 Spring 몫이라
-같은 토큰으로 `GET /teams` 를 물어 역할을 받는다 (kukie_agent/membership.py).
+agent 는 그 토큰으로 kukie-server `GET /users/me` 를 불러 회원 id 를 얻는다. 팀·권한 판단도 server 몫이라
+같은 토큰을 내부 API 의 입구 호출에 실어 server 가 판단하게 한다 (kukie_agent/server_api.py, DURO-113).
 
 fail-closed: 설정이 빠지면 거부한다.
-  - KUKIE_MEMBER_URL 이 있으면 토큰(헤더 또는 쿠키)만 받는다. 개발용 헤더·변수는 무시.
+  - KUKIE_SERVER_URL 이 있으면 토큰(헤더 또는 쿠키)만 받는다. 개발용 헤더·변수는 무시.
   - 없으면 KUKIE_DEV_AUTH=1 일 때만 개발 모드 — `X-User: <id>` 헤더나 KUKIE_DEV_USER 를 회원 id 로 쓴다.
+    개발 모드에는 server 가 없으므로 대화 경로(/conversations/{id}/...)는 쓸 수 없고 flat 엔드포인트만 연다 (server.py).
   - 둘 다 없으면 503 AUTH_NOT_CONFIGURED. (변수 하나 빠뜨렸다고 무인증 서버가 되지 않게.)
 """
 from __future__ import annotations
@@ -25,7 +26,7 @@ from dataclasses import dataclass
 import httpx
 from fastapi import Header, HTTPException, Request
 
-MEMBER_TIMEOUT = 5.0
+SERVER_TIMEOUT = 5.0
 # Spring 이 굽는 access 쿠키 이름 (kukie-server `auth.cookie.access-name`). 바꾸면 양쪽을 같이 바꾼다.
 DEFAULT_ACCESS_COOKIE = "kukie_access"
 
@@ -35,13 +36,14 @@ class User:
     id: str
     email: str | None = None
     name: str | None = None
-    # 이 요청의 Bearer 토큰. 팀 소속을 물을 때 같은 토큰을 그대로 쓴다 (kukie_agent/membership.py).
-    # 요청 처리 동안 메모리에만 있고 저장·기록되지 않는다. 개발 모드면 None.
+    # 이 요청의 Bearer 토큰. 내부 API 의 입구 호출(대화 컨텍스트·run 시작·클러스터 연결 정보)에 그대로 싣는다
+    # (kukie_agent/server_api.py). 요청 처리 동안 메모리에만 있고 저장·기록되지 않는다. 개발 모드면 None.
     token: str | None = None
 
 
-def _member_url() -> str | None:
-    return os.environ.get("KUKIE_MEMBER_URL", "").rstrip("/") or None
+def server_url() -> str | None:
+    """Kukie API 서버 주소 (끝 `/` 는 뗀다). 인증(/users/me)과 내부 API(server_api)가 같은 주소를 쓴다."""
+    return os.environ.get("KUKIE_SERVER_URL", "").strip().rstrip("/") or None
 
 
 def _dev_auth() -> bool:
@@ -83,16 +85,16 @@ def _from_same_origin(request: Request) -> bool:
     return request.headers.get("sec-fetch-site", "").strip().lower() in SAME_ORIGIN_VALUES
 
 
-async def _lookup(token: str, member_url: str) -> User:
+async def _lookup(token: str, base_url: str) -> User:
     try:
-        async with httpx.AsyncClient(timeout=MEMBER_TIMEOUT) as http:
-            response = await http.get(f"{member_url}/users/me", headers={"Authorization": f"Bearer {token}"})
+        async with httpx.AsyncClient(timeout=SERVER_TIMEOUT) as http:
+            response = await http.get(f"{base_url}/users/me", headers={"Authorization": f"Bearer {token}"})
     except httpx.HTTPError as exc:
-        raise HTTPException(503, {"code": "MEMBER_UNAVAILABLE", "message": f"회원 서버에 연결할 수 없다: {exc}"}) from exc
+        raise HTTPException(503, {"code": "SERVER_UNAVAILABLE", "message": f"Kukie API 서버에 연결할 수 없다: {exc}"}) from exc
     if response.status_code in (401, 403):
         raise HTTPException(401, {"code": "UNAUTHORIZED", "message": "토큰이 유효하지 않다"})
     if response.status_code != 200:
-        raise HTTPException(503, {"code": "MEMBER_UNAVAILABLE", "message": f"회원 서버 응답 {response.status_code}"})
+        raise HTTPException(503, {"code": "SERVER_UNAVAILABLE", "message": f"Kukie API 서버 응답 {response.status_code}"})
     body = response.json()
     return User(id=str(body["id"]), email=body.get("email"), name=body.get("name"), token=token)
 
@@ -103,8 +105,8 @@ async def current_user(
     x_user: str | None = Header(default=None),
 ) -> User:
     """FastAPI 의존성. 라우트 인자에 `user: User = Depends(current_user)`."""
-    member_url = _member_url()
-    if member_url:
+    base_url = server_url()
+    if base_url:
         # 헤더가 **있으면** 헤더만 본다 — 모양이 틀려도 쿠키로 넘어가지 않는다. 헤더는 부르는 쪽이 이번 요청에
         # 일부러 붙인 값이라 그 뜻을 존중한다 (Basic 을 보낸 클라이언트가 조용히 남의 쿠키 세션으로 도는 일이 없게).
         # 값이 빈 헤더(`Authorization:`)는 존중할 뜻이 없으니 없는 것으로 친다. 헤더가 **없을 때만** 쿠키.
@@ -113,7 +115,7 @@ async def current_user(
             token = _bearer(authorization)
             if token is None:
                 raise HTTPException(401, {"code": "UNAUTHORIZED", "message": "Authorization 헤더는 Bearer <토큰> 모양이어야 한다"})
-            return await _lookup(token, member_url)
+            return await _lookup(token, base_url)
 
         token = _cookie_token(request)
         if token is None:
@@ -130,12 +132,12 @@ async def current_user(
                 "message": "다른 오리진에서 시작됐거나 출처(Sec-Fetch-Site)를 알 수 없는 요청은 쿠키로 인증하지 않는다 "
                            "(브라우저는 HTTPS·localhost 에서만 이 헤더를 보낸다)",
             })
-        return await _lookup(token, member_url)
+        return await _lookup(token, base_url)
 
     if not _dev_auth():
         raise HTTPException(503, {
             "code": "AUTH_NOT_CONFIGURED",
-            "message": "KUKIE_MEMBER_URL(회원 서버) 또는 KUKIE_DEV_AUTH=1(개발 모드) 중 하나가 필요하다",
+            "message": "KUKIE_SERVER_URL(Kukie API 서버) 또는 KUKIE_DEV_AUTH=1(개발 모드) 중 하나가 필요하다",
         })
     if x_user and x_user.strip():
         return User(id=x_user.strip())
