@@ -639,6 +639,8 @@ def test_카드가_여러_장이면_마지막_결정까지_run은_열려_있고_
         assert client.post(f"/conversations/{cid}/chat", json={"text": "두 개"}, headers=USER).json()["kind"] == "approval"
         r = client.post(f"/conversations/{cid}/approve", json={"call_id": "c1", "approved": True}, headers=USER)
         assert r.json()["kind"] == "approval"                            # 카드 한 장 남음
+        r = client.post(f"/conversations/{cid}/approve", json={"call_id": "c1", "approved": True}, headers=USER)
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "ALREADY_DECIDED"   # server.py 가 붙인 이름표 그대로
         turns = client.get(f"/conversations/{cid}", headers=USER).json()["turns"]
         assert [t["status"] for t in turns] == ["awaiting_approval"]
         assert [c["tool_call_id"] for c in turns[0]["payload"]["approvals"]] == ["c2"]

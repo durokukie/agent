@@ -286,10 +286,12 @@ async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict
     반환 (payload, run 결과). 남은 카드가 있어 재전송만 하면 결과가 None 이다.
     """
     requests = session.pending
+    # 오류는 {code, message} 로 던진다 — 앱은 code 로 가른다. 문장만 던지면 conversations_api 가 문장 앞부분으로
+    # code 를 짐작해야 했고, 문구를 다듬기만 해도 code 가 조용히 ERROR 로 바뀌었다.
     if requests is None:
-        raise HTTPException(409, f"대기 중인 승인 건이 아니다: {call_id}")
+        raise HTTPException(409, {"code": "NOT_PENDING", "message": f"대기 중인 승인 건이 아니다: {call_id}"})
     if call_id in session.decisions:
-        raise HTTPException(409, f"이미 결정한 승인 건이다: {call_id}")
+        raise HTTPException(409, {"code": "ALREADY_DECIDED", "message": f"이미 결정한 승인 건이다: {call_id}"})
 
     call = next(
         (
@@ -300,7 +302,7 @@ async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict
         None,
     )
     if call is None:
-        raise HTTPException(409, f"대기 중인 승인 건이 아니다: {call_id}")
+        raise HTTPException(409, {"code": "NOT_PENDING", "message": f"대기 중인 승인 건이 아니다: {call_id}"})
 
     try:
         approval_request = build_approval_request(
@@ -310,7 +312,10 @@ async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict
             run_id=session.deps.run_id,
         )
     except (FileNotFoundError, ValueError) as exc:
-        raise HTTPException(409, str(exc)) from None
+        # 카드와 Plan 이 어긋난 경우(approval.py 의 "pending approval mismatch…")만 APPROVAL_MISMATCH.
+        # Plan 을 못 찾는 등 나머지는 예전 짐작표처럼 ERROR 로 둔다 — 앱이 받는 code 를 바꾸지 않으려고
+        code = "APPROVAL_MISMATCH" if str(exc).startswith("pending approval mismatch") else "ERROR"
+        raise HTTPException(409, {"code": code, "message": str(exc)}) from None
 
     # 거절 기록은 run 밖에서 — 로컬 파일 쓰기일 뿐이라 실패해도 LLM 도 클러스터도 건드리지 않았다.
     # 결정을 남기지 않고 티켓을 그대로 두면 사용자가 같은 카드를 다시 누를 수 있다 (DURO-66 결정 불필요 1).
@@ -324,7 +329,8 @@ async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict
             # DB 장애일 때만 안내가 사라지고 코드 없는 500 이 나간다 — 자동 리뷰 지적)
             logger.exception("거절 기록 실패 — 티켓 유지 (call_id=%s, plan_id=%s)",
                              call_id, approval_request.plan_id)
-            raise HTTPException(503, f"거절을 기록하지 못했다. 같은 카드를 다시 결정하라: {exc}") from exc
+            raise HTTPException(503, {"code": "REJECT_FAILED",
+                                      "message": f"거절을 기록하지 못했다. 같은 카드를 다시 결정하라: {exc}"}) from exc
     session.decisions[call_id] = (
         ToolApproved()
         if approved
