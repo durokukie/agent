@@ -6,7 +6,7 @@ from pydantic_ai import ModelResponse
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 
-from helpers import answer_model
+from helpers import answer_model, sync
 from kukie_agent import server
 from kukie_agent.agent import agent
 from kukie_agent.guardrail import hook
@@ -116,7 +116,7 @@ def test_Electron결정은_Hook과_Plan까지_한번만_반영한다(
     assert card["command"] == expected_command
     assert card["dry_run_result"]["status"] == "succeeded"
     assert guarded_runtime == []
-    assert ActionPlan.find_by_call_id(call_id).status == "WAITING_APPROVAL"
+    assert sync(ActionPlan.find_by_call_id(call_id)).status == "WAITING_APPROVAL"
 
     with agent.override(model=answer_model()):
         decided = client.post(
@@ -126,7 +126,7 @@ def test_Electron결정은_Hook과_Plan까지_한번만_반영한다(
 
     assert decided.status_code == 200
     assert decided.json()["kind"] == "answer"
-    plan = ActionPlan.find_by_call_id(call_id)
+    plan = sync(ActionPlan.find_by_call_id(call_id))
     if approved:
         assert guarded_runtime == [(expected_command, "kind-dev", None)]
         assert plan.status == "APPLIED"
@@ -169,7 +169,7 @@ def test_검토실패는_HTTP승인없이_종료하고_mutation을_실행하지�
     assert client.post("/approve", json={"call_id": "blocked", "approved": True}).status_code == 409
     assert guarded_runtime == []
     if failure == "dry_run":
-        plan = ActionPlan.find_by_call_id("blocked")
+        plan = sync(ActionPlan.find_by_call_id("blocked"))
         assert plan.status == "FAILED"
         assert plan.dry_run_result["stderr"] == "Forbidden"
         assert plan.decision is None and plan.execution_result is None
@@ -213,7 +213,7 @@ def test_판단보조실패는_승인DTO에_표시하고_사용자결정을_기�
         approved = client.post("/approve", json={"call_id": "fallback", "approved": True})
     assert approved.status_code == 200
     assert len(guarded_runtime) == 1
-    assert ActionPlan.find_by_call_id("fallback").status == "APPLIED"
+    assert sync(ActionPlan.find_by_call_id("fallback")).status == "APPLIED"
 
 
 @pytest.mark.parametrize("success", [True, False])
@@ -244,7 +244,7 @@ def test_실행후_응답실패를_resume해도_변경은_한번이고_저장결
         failed = client.post("/approve", json={"call_id": "resume", "approved": True})
     assert failed.status_code == 503
     assert failed.json()["detail"]["code"] == "RESUME_RETRYABLE"
-    plan = ActionPlan.find_by_call_id("resume")
+    plan = sync(ActionPlan.find_by_call_id("resume"))
     assert plan.status == ("APPLIED" if success else "FAILED")
     assert plan.execution_result["stdout"] == stdout
     assert plan.execution_result["stderr"] == stderr

@@ -15,7 +15,7 @@ from pydantic_ai.tools import (
     ToolDenied,
 )
 
-from helpers import FAKE_COMMAND, chat_model, pending_ticket, ready_plan
+from helpers import FAKE_COMMAND, chat_model, pending_ticket, ready_plan, sync
 from kukie_agent import server
 from kukie_agent.agent import agent
 from kukie_agent.guardrail import hook
@@ -153,7 +153,7 @@ def test_티켓은_Plan_DTO와_원본_Deferred요청을_보관한다(client):
     client.post("/session")
     plan, ticket = pending_ticket("c1")
 
-    payload = server._to_payload(server._session, _fake_result(ticket))
+    payload = sync(server._to_payload(server._session, _fake_result(ticket)))
 
     assert payload["kind"] == "approval"
     approval = payload["approvals"][0]
@@ -173,15 +173,15 @@ def test_새_Deferred_batch와_answer는_이전_결정을_초기화한다(client
     server._session.decisions = {"old": ToolApproved()}
     _, ticket = pending_ticket("c1")
 
-    server._to_payload(server._session, _fake_result(ticket))
+    sync(server._to_payload(server._session, _fake_result(ticket)))
 
     assert server._session.decisions == {}
     server._session.decisions["c1"] = ToolApproved()
 
-    server._to_payload(
+    sync(server._to_payload(
         server._session,
         _fake_result(KukieResponse(narration="완료")),
-    )
+    ))
 
     assert server._session.decisions == {}
 
@@ -222,7 +222,7 @@ def test_Plan과_다른_pending_args는_승인카드로_내보내지않는다(cl
     )
 
     with pytest.raises(ValueError, match="pending approval mismatch"):
-        server._to_payload(server._session, _fake_result(ticket))
+        sync(server._to_payload(server._session, _fake_result(ticket)))
 
 
 def test_여러_승인카드중_나중_검증이_실패해도_기존_세션상태를_유지한다(client):
@@ -255,7 +255,7 @@ def test_여러_승인카드중_나중_검증이_실패해도_기존_세션상�
     )
 
     with pytest.raises(ValueError, match="pending approval mismatch"):
-        server._to_payload(server._session, _fake_result(batch))
+        sync(server._to_payload(server._session, _fake_result(batch)))
 
     assert server._session.history is original_history
     assert server._session.pending is existing
@@ -282,7 +282,7 @@ def test_대기_중이_아닌_call_id로_승인하면_409(client):
 def test_승인은_원본_history와_ToolApproved로_재개한다(client, monkeypatch):
     client.post("/session")
     plan, ticket = pending_ticket("c1")
-    server._to_payload(server._session, _fake_result(ticket))
+    sync(server._to_payload(server._session, _fake_result(ticket)))
     original_history = list(server._session.history)
     seen = {}
 
@@ -333,7 +333,7 @@ def test_거절은_Plan을_한번만_기록하고_ToolDenied로_재개한다(
 ):
     client.post("/session")
     plan, ticket = pending_ticket("c1")
-    server._to_payload(server._session, _fake_result(ticket))
+    sync(server._to_payload(server._session, _fake_result(ticket)))
     seen = {}
 
     async def fake_run(session, **kwargs):
@@ -453,7 +453,7 @@ def test_여러_승인을_모은뒤_승인과_거절을_한번만_재개한다(
             "/approve", json={"call_id": "c-denied", "approved": False}
         ).status_code == 409
         assert isinstance(server._session.decisions["c-denied"], ToolDenied)
-        assert ActionPlan.find_by_call_id("c-denied").status == "REJECTED"
+        assert sync(ActionPlan.find_by_call_id("c-denied")).status == "REJECTED"
         assert model_calls == 1
         assert executions == []
 
@@ -469,8 +469,8 @@ def test_여러_승인을_모은뒤_승인과_거절을_한번만_재개한다(
     assert executions[0][0] == [
         "scale", "deployment", "nginx", "--replicas=3", "-n", "study"
     ]
-    assert ActionPlan.find_by_call_id("c-approved").status == "APPLIED"
-    assert ActionPlan.find_by_call_id("c-denied").status == "REJECTED"
+    assert sync(ActionPlan.find_by_call_id("c-approved")).status == "APPLIED"
+    assert sync(ActionPlan.find_by_call_id("c-denied")).status == "REJECTED"
     assert server._session.pending is None
     assert server._session.processing is False
     assert server._session.decisions == {}
@@ -488,7 +488,7 @@ def test_재개실패는_세션과_티켓을_유지하고_resume으로_다시_�
 ):
     client.post("/session")
     plan, ticket = pending_ticket("c1")
-    server._to_payload(server._session, _fake_result(ticket))
+    sync(server._to_payload(server._session, _fake_result(ticket)))
     session = server._session
     original_history = list(session.history)
 
@@ -600,7 +600,7 @@ def test_거절_기록_실패는_결정을_남기지_않고_티켓을_유지한�
     (DURO-66 결정 불필요 1: try 범위를 run 으로 좁힘)."""
     client.post("/session")
     plan, ticket = pending_ticket("c1")
-    server._to_payload(server._session, _fake_result(ticket))
+    sync(server._to_payload(server._session, _fake_result(ticket)))
     session = server._session
 
     async def unexpected_run(session, **kwargs):
