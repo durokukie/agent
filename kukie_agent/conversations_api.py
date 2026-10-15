@@ -119,9 +119,15 @@ async def _runnable_connection(
             raise
         if conversation.lock.locked():
             raise
-        async with conversation.lock:
-            await _interrupt(conversation.id, UNRUNNABLE_MESSAGE)
-        registry.forget(conversation.id)
+        try:
+            async with conversation.lock:
+                await _interrupt(conversation.id, UNRUNNABLE_MESSAGE)
+        except Exception:
+            # 닫기 실패가 원래 오류를 덮지 않는다 — 앱은 그 코드로 "새 대화" 안내를 고른다
+            logger.exception("실행할 수 없는 방의 활성 run 을 닫지 못했다 (conversation=%s)", conversation.id)
+        else:
+            if registry.get(conversation.id) is conversation:   # 그 사이 다른 요청이 새로 등록한 세션은 두고 간다
+                registry.forget(conversation.id)
         raise
 
 

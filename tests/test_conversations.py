@@ -192,6 +192,24 @@ def test_승인_대기_중_클러스터가_바뀌면_승인_요청이_남은_카
         restore()
 
 
+def test_남은_카드를_닫지_못해도_원래_오류_코드를_돌려준다(client, fake_server, monkeypatch):
+    """앱은 CLUSTER_CHANGED 로 "새 대화" 안내를 고른다 — 닫기 실패의 503 이 그 코드를 덮으면 안 된다."""
+    room = new_room(fake_server, shared=True)
+    restore = _swap_run_agent([_card(fake_server, "call-y")])
+    try:
+        assert _say(client, room, "nginx 3개로").json()["kind"] == "approval"
+        fake_server.clusters[fake_server.conversation(room)["clusterId"]]["fingerprint"] = "다른-지문"
+
+        async def down(conversation_id, message):
+            raise server_api.ServerError(503, "SERVER_UNAVAILABLE", "kukie-server 에 닿지 못했다")
+
+        monkeypatch.setattr(server_api, "interrupt", down)
+        r = client.post(f"/conversations/{room}/approve", json={"call_id": "call-y", "approved": False}, headers=USER)
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "CLUSTER_CHANGED"
+    finally:
+        restore()
+
+
 def test_등록된_클러스터로_대화하면_임시_kubeconfig로_실행하고_끝나면_지운다(client, fake_server, monkeypatch):
     from kukie_agent.tools import read as read_tools
     seen = {}
