@@ -51,6 +51,8 @@ router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 #: 결과를 저장하지 못하고 활성으로 남은 run 을 닫을 때 남기는 안내
 STALE_MESSAGE = "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라"
+UNRUNNABLE_MESSAGE = "클러스터가 바뀌었거나 없어져 이 대화로는 실행할 수 없어 닫았다 — 새 대화를 시작해 주세요"
+UNRUNNABLE_CODES = ("CLUSTER_CHANGED", "NOT_FOUND")
 
 
 # ── 요청 본문 ──────────────────────────────────────────────
@@ -99,6 +101,28 @@ async def _connection(room: server_api.ConversationInfo, user: User) -> server_a
     방이 만들 때 복사한 지문을 함께 보내 "승인한 대상 = 실행 대상" 을 server 가 대조한다 (409 CLUSTER_CHANGED).
     """
     return await access.connection(room.cluster_id, user, expected_fingerprint=room.cluster_fingerprint)
+
+
+async def _runnable_connection(
+    conversation: Conversation, context: server_api.ConversationContext, user: User,
+) -> server_api.ClusterConnection:
+    """_connection 과 같다. 다만 이 방을 다시는 실행할 수 없다고 server 가 답하면(지문이 바뀌었거나 클러스터가
+    없어졌거나 볼 수 없다) 남은 활성 run 을 닫고 그 오류를 그대로 돌려준다.
+
+    chat · approve · resume 이 모두 이 자리에서 끊기므로, 닫지 않으면 승인 대기 카드를 거절조차 못 하고 방이 영원히
+    "승인 대기" 로 남는다. 메모리 세션도 버린다 — 다음 요청은 닫힌 run 으로 다시 복원한다.
+    `lock.locked()` 검사와 `async with lock` 사이에 await 가 없다 (체크리스트 "잠금 틈")."""
+    try:
+        return await _connection(context.conversation, user)
+    except server_api.ServerError as exc:
+        if exc.code not in UNRUNNABLE_CODES or context.active_run is None:
+            raise
+        if conversation.lock.locked():
+            raise
+        async with conversation.lock:
+            await _interrupt(conversation.id, UNRUNNABLE_MESSAGE)
+        registry.forget(conversation.id)
+        raise
 
 
 def _mutating_mode(name: str) -> bool:
@@ -219,7 +243,7 @@ async def chat(
     #     재시도하면 403 대신 409 INTERRUPTED 라는 엉뚱한 안내가 나간다
     #   - `lock.locked()` 검사와 `async with lock` 사이에 await 가 있으면 안 된다. 그 창에서 루프를
     #     놓으면 두 요청이 나란히 통과해 같은 방에 run 이 둘 생긴다 (체크리스트 "잠금 틈")
-    conn = await _connection(room, user)
+    conn = await _runnable_connection(conversation, context, user)
     if conversation.lock.locked():
         raise _busy()
     if session.pending is not None:
@@ -384,7 +408,7 @@ async def approve(
 ) -> dict[str, Any]:
     context, conversation = await _open(conversation_id, user, "approve")   # 승인 권한은 server 가 본다
     session = conversation.session
-    conn = await _connection(context.conversation, user)   # 잠금 검사보다 먼저 — 그 사이에 await 가 있으면 안 된다
+    conn = await _runnable_connection(conversation, context, user)   # 잠금 검사보다 먼저 — 그 사이에 await 가 있으면 안 된다
     if conversation.lock.locked():
         raise _busy()
     run = _open_run(context)
@@ -408,7 +432,7 @@ async def resume(
 ) -> dict[str, Any]:
     context, conversation = await _open(conversation_id, user, "approve")   # 재개도 승인과 같은 권한
     session = conversation.session
-    conn = await _connection(context.conversation, user)   # 잠금 검사보다 먼저 — 그 사이에 await 가 있으면 안 된다
+    conn = await _runnable_connection(conversation, context, user)   # 잠금 검사보다 먼저 — 그 사이에 await 가 있으면 안 된다
     if conversation.lock.locked():
         raise _busy()
     if session.pending is None:
