@@ -9,6 +9,10 @@
 
 트리거: 변경 툴 4종의 호출 (LLM이 쓰려는 시도 자체).
 LLM은 발동 여부에 관여할 수 없다. wrap 훅 하나가 전 단계를 감싼다.
+
+대화 경로의 Plan 은 Kukie API 서버가 원본이다 (DURO-113, guardrail/action_plan.py). 각 단계는 server 의
+상태 전이(dry-run·offer·decision·start·result …)가 기록된 뒤에야 다음으로 넘어간다. 특히 kubectl 직전의
+decision·start 가 server 에 닿지 못하면 실행하지 않는다 — 기록 없이 돈 변경은 재시도에서 두 번 적용될 수 있다.
 """
 from __future__ import annotations
 
@@ -40,7 +44,7 @@ def _recorded_result(plan: ActionPlan) -> KubectlResult:
     """이미 실행된 Plan 의 저장 결과를 툴 반환값 모양으로 되돌린다 (DURO-66 재시도).
 
     승인 재개(run)가 kubectl 실행 뒤에 실패하면 서버는 같은 승인으로 run 을 다시 부른다.
-    그때 kubectl 을 또 돌리면 안 되므로 Plan 파일에 기록된 결과를 그대로 돌려준다 —
+    그때 kubectl 을 또 돌리면 안 되므로 Plan 에 기록된 결과를 그대로 돌려준다 —
     LLM 은 첫 실행과 똑같은 결과를 보고, 화면 블록(collect_steps)도 KubectlResult 로 그려진다.
     command 는 run_kubectl 이 만드는 것과 같은 모양(kubectl --context … + 조립 args)으로 복원한다.
     """
@@ -163,19 +167,21 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
     risk = RISK_STICKERS[tool_name].name.lower()
 
     if ctx.tool_call_approved:
+        # 여기서 server 에 못 닿으면(ServerError 503) 그대로 올라간다 — kubectl 전이라 아무것도 안 돌았고,
+        # 재개 쪽이 RESUME_RETRYABLE 로 받아 같은 결정으로 다시 시도하게 한다.
         try:
-            plan = ActionPlan.find_by_call_id(call.tool_call_id, run_id=ctx.deps.run_id)
+            plan = await ActionPlan.find_by_call_id(call.tool_call_id, run_id=ctx.deps.run_id)
         except (FileNotFoundError, ValueError) as exc:
             raise ToolFailed(str(exc)) from None
         # 재시도 분기 (DURO-66): 같은 승인으로 run 이 다시 왔을 때 kubectl 이 돌았는지는
-        # 서버가 아니라 Plan 파일이 안다. 실행 기록이 있으면 그걸 돌려주고, 승인 기록만 있고
+        # 이 프로세스가 아니라 Plan 이 안다. 실행 기록이 있으면 그걸 돌려주고, 승인 기록만 있고
         # 실행 기록이 없으면(기록 도중 죽음·기록 실패) 실행 여부를 모르므로 다시 돌리지 않는다.
         if plan.execution_result is not None:
             return _recorded_result(plan)
         if plan.decision is not None:
             # 승인은 남았는데 결과가 없다 = kubectl 이 돌았는지 모른다. 다시 돌리지 않고 UNKNOWN 으로 남긴다 (DURO-83)
             try:
-                plan.mark_unknown()
+                await plan.mark_unknown()
             except Exception:
                 logger.exception("UNKNOWN 표시 실패: plan_id=%s", plan.id)
             raise ToolFailed(
@@ -183,7 +189,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
                 f"클러스터 상태를 직접 확인하라 (plan_id={plan.id})"
             )
         try:
-            plan.approve_for_execution(
+            await plan.approve_for_execution(
                 tool=tool_name,
                 args=plan_args,
                 command=command,
@@ -191,14 +197,14 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
                 target=target,
                 user_id=ctx.deps.user_id,
             )
-            plan.mark_executing()
+            await plan.mark_executing()
         except ValueError as exc:
             raise ToolFailed(str(exc)) from None
         try:
             result = await handler(args)
         except Exception as exc:
             try:
-                plan.record_execution(
+                await plan.record_execution(
                     success=False,
                     stdout="",
                     stderr=str(exc),
@@ -208,7 +214,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
                 logger.exception("failed to record execution error: plan_id=%s", plan.id)
             raise
         try:
-            plan.record_execution(
+            await plan.record_execution(
                 success=result.success,
                 stdout=result.stdout,
                 stderr=result.stderr,
@@ -229,7 +235,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
             return result.model_copy(update={"stderr": stderr})
         return result
 
-    plan = ActionPlan.create_draft(
+    plan = await ActionPlan.create_draft(
         run_id=ctx.deps.run_id,
         call_id=call.tool_call_id,
         tool=tool_name,
@@ -269,13 +275,13 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
     else:
         dry_run_status = "failed"
 
-    plan.record_dry_run(
+    # 떨어진 예행은 기록하는 자리에서 FAILED + DRY_RUN_FAILED 로 닫힌다 (server 계획은 server 가 닫는다)
+    await plan.record_dry_run(
         dry_run_status,
         rehearsal.stdout,
         rehearsal.stderr,
     )
     if dry_run_status == "failed":
-        plan.mark_failed("DRY_RUN_FAILED")
         raise ToolFailed(f"dry-run failed: {rehearsal.stderr.strip()}")
 
     guidance = "guidance unavailable"
@@ -287,6 +293,5 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
         except Exception:
             logger.exception("decision guidance unavailable: plan_id=%s", plan.id)
 
-    plan.record_decision_guidance(guidance)
-    plan.offer_for_approval()          # DRAFT → WAITING_APPROVAL: 이제 카드가 사용자에게 나간다
+    await plan.offer(guidance)         # DRAFT → WAITING_APPROVAL: 이제 카드가 사용자에게 나간다
     raise ApprovalRequired({"plan_id": plan.id})

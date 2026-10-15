@@ -17,20 +17,21 @@ run 이 끝나는 방식은 둘뿐이다 — 답변(KukieResponse) 또는 승인
 
 재개 실패 정책 (DURO-66): 어떤 실패에도 세션을 버리지 않는다. 실패 시점에 history·pending·
 decisions 는 온전하므로(전부 run 성공 후에만 갱신) 503 RESUME_RETRYABLE 을 돌려주고 /resume 으로
-같은 결정을 다시 보낸다. kubectl 이 이미 돌았는지는 서버가 아니라 Plan 파일이 알고, 훅이 그걸 보고
-저장된 결과를 돌려주므로(guardrail/hook.py) 재시도해도 변경이 두 번 적용되지 않는다.
+같은 결정을 다시 보낸다. kubectl 이 이미 돌았는지는 이 프로세스가 아니라 Plan(flat 은 파일, 대화 경로는
+Kukie API 서버)이 알고, 훅이 그걸 보고 저장된 결과를 돌려주므로(guardrail/hook.py) 재시도해도 변경이 두 번
+적용되지 않는다.
 계속 실패하면 사용자가 POST /session 으로 새로 여는 것이 탈출구다 — 버리는 결정은 코드가 아니라
 사용자가 한다.
 
 세션 상태(대화 기록·대기 티켓)는 메모리에만 있다. 서버가 꺼지면 대기 중인 승인은 만료된다 (MVP 결정).
 
-이 4개는 **회원 서버가 없는 로컬 개발 전용**이다 (#75). 인증도 팀 검사도 없이 서버의 kubeconfig 로
-돌기 때문에, 회원 서버 모드에서 열어 두면 /conversations 의 검사를 통째로 건너뛰는 옆문이 된다.
-KUKIE_DEV_AUTH=1 로 개발 모드를 켰을 때만 열리고, 그 밖(회원 서버 모드, 아무 설정 없음)에는 404 — 앱은 /conversations 를 쓴다.
+이 4개는 **Kukie API 서버가 없는 로컬 개발 전용**이다 (#75). 인증도 팀 검사도 없이 서버의 kubeconfig 로
+돌기 때문에, server 모드에서 열어 두면 /conversations 의 검사를 통째로 건너뛰는 옆문이 된다.
+KUKIE_DEV_AUTH=1 로 개발 모드를 켰을 때만 열리고, 그 밖(server 모드, 아무 설정 없음)에는 404 — 앱은 /conversations 를 쓴다.
+반대로 대화 경로(/conversations/{id}/...)는 server 가 있어야 돈다 — agent 는 DB 를 갖지 않는다 (DURO-113).
 """
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import logging
 from contextlib import asynccontextmanager
@@ -42,8 +43,9 @@ from pydantic import BaseModel, ConfigDict
 from pydantic_ai.messages import ModelMessage, ToolCallPart
 from pydantic_ai.tools import DeferredToolRequests, ToolApproved, ToolDenied
 
-from kukie_agent import auth, membership
+from kukie_agent import auth, server_api
 from kukie_agent.agent import agent
+from kukie_agent.clusters import runtime
 from kukie_agent.deps import Deps
 from kukie_agent.guardrail.action_plan import ActionPlan
 from kukie_agent.guardrail.approval import ApprovalRequest, build_approval_request
@@ -51,7 +53,6 @@ from kukie_agent.kubectl.config import KubeconfigError, read_kubeconfig
 from kukie_agent.observability import setup as setup_observability
 from kukie_agent.router import pick_skill
 from kukie_agent.skills import DEFAULT_SKILL, SKILLS
-from kukie_agent.store import get_store
 
 logger = logging.getLogger(__name__)
 
@@ -121,14 +122,14 @@ async def _run_agent(session: Session, **kwargs: Any):
     )
 
 
-def _approval_payload(
+async def _approval_payload(
     session: Session,
     requests: DeferredToolRequests,
     calls: list[ToolCallPart] | None = None,
 ) -> dict[str, Any]:
     calls = requests.approvals if calls is None else calls
     approvals: list[ApprovalRequest] = [
-        build_approval_request(
+        await build_approval_request(
             call,
             requests.metadata.get(call.tool_call_id, {}),
             default_namespace=session.deps.namespace,
@@ -143,12 +144,12 @@ def _approval_payload(
     }
 
 
-def _to_payload(session: Session, result) -> dict[str, Any]:
+async def _to_payload(session: Session, result) -> dict[str, Any]:
     """run 결과를 앱이 그릴 형태로. 기록 보관과 대기 티켓 갱신도 여기서."""
     output = result.output
 
     if isinstance(output, DeferredToolRequests):
-        payload = _approval_payload(session, output)
+        payload = await _approval_payload(session, output)
         session.history = result.all_messages()
         session.pending = output
         session.decisions.clear()
@@ -162,16 +163,42 @@ def _to_payload(session: Session, result) -> dict[str, Any]:
 
 # ── 엔드포인트 ──────────────────────────────────────────────
 
+#: 기동 때 닫는 run 에 남기는 안내 — 앱이 그 턴의 오류로 보여준다.
+ORPHANED_MESSAGE = "서버가 다시 떠서 실행 중이던 요청이 중단됐다 — 새 요청으로 보내라"
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """켜질 때 DB 를 열어 마이그레이션을 먼저 돌린다 — 첫 요청 때가 아니라.
+    """Kukie API 서버와의 연결 풀을 열고, 전 프로세스가 돌리다 죽은 run 과 그 임시 kubeconfig 를 치운다 (DURO-113).
 
-    get_store 는 처음 부를 때 연결하는 구조라, 요청이 오기 전엔 표가 없었다. 컴포즈 실기에서 컨테이너는 healthy 인데
-    에이전트 DB 가 비어 있던 이유 (DURO-110). 여기서 부르면 마이그레이션 실패가 곧 기동 실패라 배포 직후에 드러난다.
-    스레드로 넘기는 건 동기 SQLAlchemy 라서 (kukie_agent.store.db 머리말).
+    agent 는 DB 가 없다 — 켜질 때 마이그레이션도 없다. 대신 replica 가 하나뿐이라 `running` 인 run 은 전부
+    이 프로세스 이전의 것이므로 server 에 interrupt-orphaned 를 부른다. 승인 대기(awaiting_approval)는 그대로
+    둔다 — 방을 열 때 카드를 되살린다 (conversations.py). 실패해도 기동은 막지 않는다: 요청이 들어올 때
+    "잠금이 비어 있는데 running" 인 run 을 닫는 기존 복구가 남아 있다 (conversations_api.py).
+    개발 모드(server 설정 없음)면 부르지 않는다.
+
+    전 프로세스가 kubectl 을 돌리다 강제 종료(SIGKILL)됐으면 평문 자격증명이 든 임시 kubeconfig 가 /tmp 에 남는다 —
+    재시작은 컨테이너 파일시스템을 그대로 쓴다. 요청을 받기 전에 지운다 (clusters/runtime.py remove_orphaned).
+    이건 개발 모드에서도 한다.
     """
-    await asyncio.to_thread(get_store)
-    yield
+    try:
+        removed = runtime.remove_orphaned()
+        if removed:
+            logger.warning("전 프로세스가 지우지 못한 임시 kubeconfig %d 개를 지웠다", removed)
+    except Exception:
+        logger.exception("기동 시 임시 kubeconfig 정리 실패")
+    server_api.start()
+    if server_api.configured():
+        try:
+            closed = await server_api.interrupt_orphaned(ORPHANED_MESSAGE)
+            if closed:
+                logger.warning("기동 전에 실행 중이던 run %d 개를 중단으로 닫았다", closed)
+        except Exception:
+            logger.exception("기동 시 run 정리(interrupt-orphaned) 실패 — 요청이 들어올 때 방마다 복구한다")
+    try:
+        yield
+    finally:
+        await server_api.close()
 
 
 app = FastAPI(title="Kukie local server", lifespan=_lifespan)
@@ -179,25 +206,25 @@ app = FastAPI(title="Kukie local server", lifespan=_lifespan)
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    """배포 확인용 (DURO-107). 인증 없음, 상태를 바꾸지 않는다 — 회원 서버 모드에서도 열려 있다 (아래 dev 전용 4개와 다르다).
+    """배포 확인용 (DURO-107). 인증 없음, 상태를 바꾸지 않는다 — server 모드에서도 열려 있다 (아래 dev 전용 4개와 다르다).
 
     리버스 프록시 뒤에서는 /api/health. 컨테이너 HEALTHCHECK 와 `curl https://<도메인>/api/health` 가 이걸 본다.
-    async def: 동기 def 면 kubectl·DB 와 같은 스레드풀에 줄 서서, 가장 바쁠 때 헬스체크가 늦어 unhealthy 로 찍힌다 (PR #82 리뷰)."""
+    async def: 동기 def 면 kubectl 과 같은 스레드풀에 줄 서서, 가장 바쁠 때 헬스체크가 늦어 unhealthy 로 찍힌다 (PR #82 리뷰)."""
     return {"status": "ok"}
 
 
 def _dev_only() -> None:
-    """flat 엔드포인트의 문. **개발 모드(KUKIE_DEV_AUTH=1)이고 회원 서버가 없을 때만** 열린다 — 그 밖에는 없는 주소처럼 닫는다 (#75).
+    """flat 엔드포인트의 문. **개발 모드(KUKIE_DEV_AUTH=1)이고 Kukie API 서버가 없을 때만** 열린다 — 그 밖에는 없는 주소처럼 닫는다 (#75).
 
-    "회원 서버가 없으면 열림" 이 아니라 "개발 모드를 켰을 때만 열림" 인 이유: 컴포즈에서 KUKIE_MEMBER_URL 이 빠지거나
+    "server 가 없으면 열림" 이 아니라 "개발 모드를 켰을 때만 열림" 인 이유: 컴포즈에서 KUKIE_SERVER_URL 이 빠지거나
     오타 나면 /conversations 는 503 으로 닫히는데(auth.py, fail-closed) 여기만 인증 없이 열려 있었다 (PR #82 리뷰).
     같은 방향으로 맞춘다 — 설정 한 줄 실수가 무인증 에이전트 실행이 되지 않게."""
-    if membership.available():
+    if auth.server_url() is not None:
         raise HTTPException(404, {"code": "NOT_FOUND",
-                                  "message": "회원 서버 모드에서는 쓰지 않는 개발용 엔드포인트다 — /conversations 를 쓴다"})
+                                  "message": "Kukie API 서버 모드에서는 쓰지 않는 개발용 엔드포인트다 — /conversations 를 쓴다"})
     if not auth.dev_auth_enabled():
         raise HTTPException(404, {"code": "NOT_FOUND",
-                                  "message": "개발용 엔드포인트는 KUKIE_DEV_AUTH=1 일 때만 열린다 — 회원 서버 없이 로컬에서 쓰려면 .env 에 넣는다"})
+                                  "message": "개발용 엔드포인트는 KUKIE_DEV_AUTH=1 일 때만 열린다 — server 없이 로컬에서 쓰려면 .env 에 넣는다"})
 
 
 DEV_ONLY = [Depends(_dev_only)]
@@ -266,7 +293,7 @@ async def _chat_turn(session: Session, text: str) -> tuple[dict[str, Any], Any]:
     session.processing = True
     try:
         result = await _run_agent(session, user_prompt=text)
-        return _to_payload(session, result), result
+        return await _to_payload(session, result), result
     finally:
         session.processing = False
 
@@ -303,7 +330,7 @@ async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict
         raise HTTPException(409, f"대기 중인 승인 건이 아니다: {call_id}")
 
     try:
-        approval_request = build_approval_request(
+        approval_request = await build_approval_request(
             call,
             requests.metadata.get(call_id, {}),
             default_namespace=session.deps.namespace,
@@ -312,16 +339,17 @@ async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(409, str(exc)) from None
 
-    # 거절 기록은 run 밖에서 — 로컬 파일 쓰기일 뿐이라 실패해도 LLM 도 클러스터도 건드리지 않았다.
+    # 거절 기록은 run 밖에서 — 기록 실패는 LLM 도 클러스터도 건드리지 않았다.
     # 결정을 남기지 않고 티켓을 그대로 두면 사용자가 같은 카드를 다시 누를 수 있다 (DURO-66 결정 불필요 1).
     if not approved:
         try:
-            ActionPlan.find_by_call_id(
+            plan = await ActionPlan.find_by_call_id(
                 approval_request.tool_call_id, run_id=session.deps.run_id,
-            ).reject(session.deps.user_id)
+            )
+            await plan.reject(session.deps.user_id)
         except Exception as exc:
-            # DB 가 원본이 된 뒤로는 SQLAlchemyError 도 온다 (OSError·ValueError 만 잡으면
-            # DB 장애일 때만 안내가 사라지고 코드 없는 500 이 나간다 — 자동 리뷰 지적)
+            # 대화 경로는 Kukie API 서버에 기록한다 — server 오류(ServerError)도 온다. OSError·ValueError 만 잡으면
+            # server 장애일 때만 안내가 사라지고 코드 없는 오류가 나간다 (자동 리뷰 지적)
             logger.exception("거절 기록 실패 — 티켓 유지 (call_id=%s, plan_id=%s)",
                              call_id, approval_request.plan_id)
             raise HTTPException(503, f"거절을 기록하지 못했다. 같은 카드를 다시 결정하라: {exc}") from exc
@@ -337,7 +365,7 @@ async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict
         if call.tool_call_id not in session.decisions
     ]
     if remaining:
-        return _approval_payload(session, requests, remaining), None
+        return await _approval_payload(session, requests, remaining), None
     return await _resume(session)
 
 
@@ -380,7 +408,7 @@ async def _resume(session: Session) -> tuple[dict[str, Any], Any]:
     try:
         results = session.pending.build_results(approvals=session.decisions)
         result = await _run_agent(session, deferred_tool_results=results)
-        return _to_payload(session, result), result
+        return await _to_payload(session, result), result
     except Exception as exc:
         logger.exception(
             "승인 재개 실패 — 세션·티켓 유지, /resume 으로 재시도 가능 (call_ids=%s, plan_ids=%s)",
@@ -402,10 +430,9 @@ async def _resume(session: Session) -> tuple[dict[str, Any], Any]:
         session.processing = False
 
 
-# ── 대화(채팅방) 단위 엔드포인트 — kukie_agent/conversations_api.py, Action Plan 조회 — kukie_agent/plans_api.py ──
+# ── 대화(채팅방) 단위 엔드포인트 — kukie_agent/conversations_api.py, 클러스터 연결 확인 — kukie_agent/clusters_api.py ──
 # flat 엔드포인트와 같은 _chat_turn / _approve / _resume 을 쓴다. 그 모듈이 이 모듈을 참조하므로
 # 맨 아래에서 plain import 만 한다 (from-import 는 순환 시 이름이 아직 없어 깨진다).
-# 라우터 등록은 conversations_api 가 자기 맨 아래에서 app.include_router 로 한다.
+# 라우터 등록은 각 모듈이 자기 맨 아래에서 app.include_router 로 한다.
 import kukie_agent.conversations_api  # noqa: E402, F401
-import kukie_agent.plans_api  # noqa: E402, F401
 import kukie_agent.clusters_api  # noqa: E402, F401
