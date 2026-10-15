@@ -18,7 +18,12 @@ ENV UV_PYTHON_DOWNLOADS=never UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 COPY pyproject.toml uv.lock .python-version ./
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --no-install-project
 COPY kukie_agent ./kukie_agent
-RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --no-editable
+# --reinstall-package: 앱 휠은 매번 새로 굽는다. uv 는 pyproject.toml 이 그대로면 캐시 마운트에 남은 예전 휠을 다시 깐다 —
+# 소스만 바뀐 걸 모르므로, 코드를 받아 `docker compose up -d --build` 해도 옛 코드가 돈다. 의존성은 여전히 캐시에서 온다
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --no-editable --reinstall-package kukie-agent
+# 깔린 앱이 방금 복사한 소스와 같은지 — 다르면 옛 코드를 실은 이미지를 내보내지 않고 빌드에서 멈춘다.
+# 바이트코드와 숨김 파일(맥의 .DS_Store 등)은 휠에 들어가지 않으므로 견주지 않는다
+RUN diff -r -x __pycache__ -x '.*' kukie_agent .venv/lib/python3.*/site-packages/kukie_agent
 
 # ── 2단계: 실행 이미지 — .venv 와 kubectl 만. 소스 폴더는 두지 않는다(두면 설치본 대신 그쪽이 import 된다)
 FROM ${PYTHON_IMAGE}
