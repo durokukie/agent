@@ -29,6 +29,8 @@ from kukie_agent.skills import SKILLS
 from kukie_agent.tools import mutate
 from kukie_agent.tools.mutate import MUTATING_TOOLS
 
+from helpers import sync
+
 
 def _deps(skill_name: str = "학습") -> Deps:
     return Deps(context="kind-dev", namespace="study", skill=SKILLS[skill_name])
@@ -127,7 +129,7 @@ def test_등록된_mutation은_모두_Hook을_거쳐_Deferred요청이된다(
 
     assert isinstance(result.output, DeferredToolRequests)
     assert result.output.approvals[0].tool_name == tool_name
-    assert ActionPlan.find_by_call_id(f"call-{tool_name}").status == "WAITING_APPROVAL"
+    assert sync(ActionPlan.find_by_call_id(f"call-{tool_name}")).status == "WAITING_APPROVAL"
 
 
 def test_ToolApproved_재개는_기존_history와_handler를_한번_사용한다(
@@ -170,7 +172,7 @@ def test_ToolApproved_재개는_기존_history와_handler를_한번_사용한다
 
     assert resumed.output.narration
     assert len(executions) == 1
-    assert ActionPlan.find_by_call_id("call-123").status == "APPLIED"
+    assert sync(ActionPlan.find_by_call_id("call-123")).status == "APPLIED"
 
 
 def test_ToolDenied_재개는_2차Hook과_handler를_호출하지않는다(

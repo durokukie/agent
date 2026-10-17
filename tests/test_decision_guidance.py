@@ -18,9 +18,10 @@ from kukie_agent.guardrail.decision_guidance import (
 )
 
 
-def _ready_plan(monkeypatch, tmp_path: Path) -> ActionPlan:
+
+async def _ready_plan(monkeypatch, tmp_path: Path) -> ActionPlan:
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
-    plan = ActionPlan.create_draft(
+    plan = await ActionPlan.create_draft(
         call_id="call-123",
         tool="scale_resource",
         args={
@@ -42,7 +43,7 @@ def _ready_plan(monkeypatch, tmp_path: Path) -> ActionPlan:
         expected_effects=["레플리카가 3개가 된다."],
         side_effects=["추가 Pod가 자원을 사용한다."],
     )
-    plan.record_dry_run("succeeded", "dry-run ok", "")
+    await plan.record_dry_run("succeeded", "dry-run ok", "")
     return plan
 
 
@@ -57,7 +58,7 @@ def test_guidance_agent는_설정된_모델과_reasoning_설정을_쓴다():
 
 @pytest.mark.asyncio
 async def test_generate_decision_guidance_returns_stripped_text(monkeypatch, tmp_path):
-    plan = _ready_plan(monkeypatch, tmp_path)
+    plan = await _ready_plan(monkeypatch, tmp_path)
 
     with guidance_agent.override(
         model=TestModel(custom_output_text="  실행 시간과 롤백 기준을 확인한다.  ")
@@ -73,7 +74,7 @@ async def test_generate_decision_guidance_returns_stripped_text(monkeypatch, tmp
 async def test_판단_보조_모델은_동적으로_조합한_Markdown을_받는다(
     monkeypatch, tmp_path
 ):
-    plan = _ready_plan(monkeypatch, tmp_path)
+    plan = await _ready_plan(monkeypatch, tmp_path)
     received_context = ""
 
     def capture_context(messages, info):
@@ -100,7 +101,7 @@ async def test_generate_decision_guidance_loads_openai_key_from_dotenv(
         "OPENAI_API_KEY=test-openai-key\n",
         encoding="utf-8",
     )
-    plan = _ready_plan(monkeypatch, tmp_path)
+    plan = await _ready_plan(monkeypatch, tmp_path)
 
     with guidance_agent.override(model=TestModel(custom_output_text="추가 판단 없음")):
         await generate_decision_guidance(plan)
@@ -113,7 +114,7 @@ async def test_generate_decision_guidance_validates_before_model_call(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
-    plan = ActionPlan.create_draft(
+    plan = await ActionPlan.create_draft(
         call_id="call-123",
         tool="scale_resource",
         args={"kind": "deployment", "name": "nginx", "replicas": 3},
@@ -136,7 +137,7 @@ async def test_generate_decision_guidance_validates_before_model_call(
 
 @pytest.mark.asyncio
 async def test_generate_decision_guidance_rejects_empty_output(monkeypatch, tmp_path):
-    plan = _ready_plan(monkeypatch, tmp_path)
+    plan = await _ready_plan(monkeypatch, tmp_path)
 
     with guidance_agent.override(model=TestModel(custom_output_text="   ")):
         with pytest.raises(ValueError, match="LLM returned empty decision guidance"):
@@ -188,7 +189,7 @@ def _capture_prompt() -> tuple[list[str], FunctionModel]:
 async def test_매니페스트_본문이_모델_프롬프트에_실제로_들어간다(monkeypatch, tmp_path):
     """훅과의 경계만 보던 테스트(test_guardrail_hook.py)로는 _with_manifest 호출을
     지워도 초록이었다 — #50 이 되살아나도 아무도 모른다 (PR #74 리뷰)."""
-    plan = _ready_plan(monkeypatch, tmp_path)
+    plan = await _ready_plan(monkeypatch, tmp_path)
     received, model = _capture_prompt()
 
     with decision_guidance.guidance_agent.override(model=model):
@@ -202,7 +203,7 @@ async def test_매니페스트_본문이_모델_프롬프트에_실제로_들어
 
 @pytest.mark.asyncio
 async def test_미리보기가_없으면_그_절도_없다(monkeypatch, tmp_path):
-    plan = _ready_plan(monkeypatch, tmp_path)
+    plan = await _ready_plan(monkeypatch, tmp_path)
     received, model = _capture_prompt()
 
     with decision_guidance.guidance_agent.override(model=model):
@@ -226,7 +227,7 @@ async def test_YAML이_만든_날짜_집합도_프롬프트에_남는다(monkeyp
     )
     assert isinstance(preview[0]["metadata"]["annotations"]["deployed-on"], date)
 
-    plan = _ready_plan(monkeypatch, tmp_path)
+    plan = await _ready_plan(monkeypatch, tmp_path)
     received, model = _capture_prompt()
 
     with decision_guidance.guidance_agent.override(model=model):

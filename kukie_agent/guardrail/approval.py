@@ -244,17 +244,18 @@ class ApprovalRequest(BaseModel):
     )
 
 
-def build_approval_request(
+async def build_approval_request(
     call: ToolCallPart,
     metadata: dict[str, Any],
     *,
     default_namespace: str,
     run_id: str | None = None,
 ) -> ApprovalRequest:
+    """대기 중인 tool call 하나를 승인 카드로. plan_id 는 원본 Plan 의 id — 대화 경로면 server 의 UUID 다."""
     call_id = call.tool_call_id
     if not call_id:
         raise ValueError("pending approval mismatch: missing call_id")
-    plan = ActionPlan.find_by_call_id(call_id, run_id=run_id)
+    plan = await ActionPlan.find_by_call_id(call_id, run_id=run_id)
     canonical = canonicalize_mutation_args(
         call.tool_name,
         call.args_as_dict(raise_if_invalid=True),

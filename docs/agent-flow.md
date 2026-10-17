@@ -57,10 +57,10 @@ flowchart TD
         direction TB
         H1["① 실행 args 정규화·보관<br/>apply_manifest는 원문 대신 manifest_sha256"]
         H1 --> H2["② RISK_STICKERS[tool_name]<br/>→ DESTRUCTIVE (미등록이면 fail-closed)"]
-        H2 --> H3["③ ActionPlan.create_draft(tool, args, command, risk,<br/>skill, target, intent, effects, side_effects)<br/>→ tbl_action_plan 행 + ~/.kukie/plans/ap-YYMMDD-HHMM-tool.md (DRAFT)"]
+        H2 --> H3["③ ActionPlan.create_draft(tool, args, command, risk,<br/>skill, target, intent, effects, side_effects)<br/>→ 대화 경로: kukie-server POST /internal/runs/{runId}/plans (DRAFT, id=UUID·code=ap-YYMMDD-HHMM-tool)<br/>→ flat 개발 엔드포인트: ~/.kukie/plans/ap-YYMMDD-HHMM-tool.md"]
         H3 --> H4["④ run_kubectl(command, context, dry_run=True)<br/>plan.record_dry_run(status, stdout, stderr)"]
-        H4 -->|"실패"| H4F["plan.mark_failed('DRY_RUN_FAILED')<br/>raise ToolFailed"]
-        H4 -->|"성공·미지원"| H5["⑤ decision guidance 기록<br/>plan.offer_for_approval() → WAITING_APPROVAL<br/>raise ApprovalRequired(plan_id)"]
+        H4 -->|"실패"| H4F["기록하는 자리에서 FAILED + DRY_RUN_FAILED<br/>raise ToolFailed"]
+        H4 -->|"성공·미지원"| H5["⑤ plan.offer(decision guidance) → WAITING_APPROVAL<br/>raise ApprovalRequired(plan_id)"]
         H5 --> P["DeferredToolRequests<br/>metadata(plan_id)"]
         P --> E["Electron 승인 화면<br/>apply_manifest: 민감값을 가린 구조적 preview + SHA-256"]
         E --> A["POST /approve<br/>{call_id, approved}"]
@@ -112,9 +112,9 @@ flowchart LR
 | 명령 조립 | `assemble()` | `kubectl/assemble.py` | 부분 (apply TODO) |
 | 실행 | `run_kubectl()` | `kubectl/runner.py` | ✅ |
 | 훅 파이프라인 | `guardrail()` | `guardrail/hook.py` | ✅ 2-pass 승인·실행·기록 |
-| Action Plan | `create_draft()`, `offer_for_approval()`, `approve_for_execution()`, `record_execution()` | `guardrail/action_plan.py` + `tbl_action_plan` | ✅ |
-| 클러스터 | `parse_kubeconfig()` → 암호화 저장 → 실행 직전 임시 kubeconfig | `clusters/` + `tbl_cluster` | ✅ |
-| 팀 권한 | 사용자 토큰으로 Spring `GET /teams` → 역할 판단 (15초 기억, fail-closed) | `membership.py` | ✅ |
+| Action Plan | `create_draft()`, `offer()`, `approve_for_execution()`, `mark_executing()`, `record_execution()` — 대화 경로는 kukie-server 의 plan 동작, 다음 상태는 server 가 정한다 | `guardrail/action_plan.py` → `server_api.py` | ✅ DURO-113 |
+| 저장·권한 판단 | 대화 컨텍스트·run·plan·클러스터 연결 정보 — kukie-server `/internal/**` (agent 는 DB 없음) | `server_api.py` | ✅ DURO-113 |
+| 클러스터 | 실행 직전 `GET /internal/clusters/{id}/connection` → 임시 kubeconfig (등록·암호화는 kukie-server) | `clusters/` | ✅ |
 | 승인 | `DeferredToolRequests → Electron → /approve → DeferredToolResults` | `server.py`, `guardrail/approval.py` | ✅ #27 |
 | 응답 조립 (steps·설명) | `build_response_for()`, `collect_steps()` + `FLAG_GLOSSARY` | `response.py`, `glossary.py` | ✅ DURO-44 |
 | 사전 미등록 플래그 로그 | `log_unregistered_flags()` | `validators.py` | ✅ DURO-44 |

@@ -1,18 +1,20 @@
-"""Action Plan — 변경 1건당 1장씩 생기는 구조화된 계획 객체와 .md 기록.
+"""Action Plan — 변경 1건당 1장씩 생기는 구조화된 계획 객체.
 
 팀 결정 (가드레일 v2):
 - Action Plan은 훅이 내부적으로 생성·기록한다. LLM이 호출하는 Plan 툴(조회/평가)은
   MVP 제외 — 필요해지면 히스토리 기능과 함께 추가.
-- 실행 중에는 ActionPlan 객체가 기준이고, 변경할 때마다 .md 스냅샷을 갱신한다.
-- frontmatter(기계용) = 모든 필드의 단일 저장 원본
+- 실행 중에는 ActionPlan 객체가 기준이고, 상태가 바뀔 때마다 원본에 먼저 기록한다.
 - Markdown(사람용) = 객체 필드를 표시할 때만 동적으로 조합
 - decision_guidance = 승인 전 별도 LLM 검토가 작성하는 판단 보조 필드
 
-원본은 DB 표 tbl_action_plan 이다 (#58, DB 문서 5절). .md 는 사람이 읽는 사본으로 계속 쓴다 —
-DB 를 먼저 쓰고 파일은 뒤이어 갱신하며, 파일 쓰기 실패는 로그만 남기고 넘어간다.
-
-run 에 속하지 않는 계획(flat /chat, /approve)은 DB 에 넣을 자리가 없으므로 파일로만 남는다.
-run_id 를 받은 계획만 표에 들어간다 — issue #58 댓글 4번.
+원본은 계획이 어디서 생겼는지에 따라 둘 중 하나다.
+- **대화 경로 (run_id 있음)**: Kukie API 서버(kukie-server)의 tbl_action_plan (DURO-113). agent 는 DB 가 없으므로
+  상태가 바뀔 때마다 내부 API 의 plan 동작(create·dry-run·offer·decision·start·result·fail·unknown)을 부르고,
+  **다음 상태는 server 가 정한다** — 허용되지 않는 전이·승인한 호출과 다른 실행은 server 가 409 로 거절한다.
+  메모리의 객체는 그 응답으로 맞춘다. id 는 server 가 만든 UUID(승인 카드의 plan_id)이고,
+  화면에 보이는 id 는 code(`ap-YYMMDD-HHMM-<tool>[-N]`)다. .md 사본은 만들지 않는다 — 상세 Markdown 은 server 가 그린다.
+- **flat 엔드포인트 (run_id 없음, 개발용)**: ~/.kukie/plans 의 .md 파일. frontmatter 가 원본이고,
+  전이 규칙도 여기서 server 와 같은 규칙으로 본다 (issue #58 댓글 4번).
 
 상태 (DURO-83 결정, 기획 10 이름):
   DRAFT → WAITING_APPROVAL → APPROVED → EXECUTING → APPLIED → (EFFECT_VERIFIED)
@@ -21,42 +23,45 @@ EFFECT_VERIFIED 로 가는 경로는 아직 없다 (검증 = 기획 09, 다음 �
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from re import compile as _compile, sub
+from re import sub
 from tempfile import NamedTemporaryFile
 from typing import Any
 
 import yaml
 
-from sqlalchemy.exc import IntegrityError
-
-from kukie_agent.store.models import PLAN_CLOSED, PLAN_FAILURE_REASONS, PLAN_STATUSES
+from kukie_agent import server_api
 
 logger = logging.getLogger(__name__)
 
 PLAN_DIR = Path.home() / ".kukie" / "plans"
 ID_ATTEMPTS = 20        # 이름 충돌을 물러나며 재시도할 횟수
+
+# plan 상태 — server 의 wire 값 그대로 (DURO-83, 기획 10 이름 + REJECTED).
+PLAN_OPEN = ("DRAFT", "WAITING_APPROVAL", "APPROVED", "EXECUTING")   # 아직 끝나지 않은 계획
+PLAN_CLOSED = ("APPLIED", "EFFECT_VERIFIED", "REJECTED", "EXPIRED", "STALE", "FAILED", "UNKNOWN")
+PLAN_STATUSES = PLAN_OPEN + PLAN_CLOSED
+# EXPIRED = 중단·재시작으로 승인 카드가 못 쓰게 됐다 (클러스터는 그대로). STALE = 클러스터 상태가 바뀌어 전제가 깨졌다 (기획 08).
+PLAN_FAILURE_REASONS = (
+    "PERMISSION_DENIED",           # RBAC 거부
+    "CONCURRENT_MODIFICATION",     # 다른 사람이 먼저 바꿨다 (기획 08, 아직 판정하지 않는다)
+    "DRY_RUN_FAILED",              # 승인 전 예행에서 떨어졌다
+    "EXECUTION_FAILED",            # kubectl 이 실패했다
+    "VERIFICATION_FAILED",         # 적용은 됐지만 효과 확인이 실패했다 (기획 09)
+    "VERIFICATION_TIMEOUT",
+)
 FINAL_STATUSES = frozenset(PLAN_CLOSED)
 DRY_RUN_STATUSES = frozenset({"succeeded", "failed", "unsupported"})
 PlanTarget = dict[str, str | list[dict[str, str]]]
 
-# .md frontmatter 중 DB 컬럼이 아닌 것들 — 통째로 plan_payload JSON 에 들어간다 (DB 문서 5절)
-_PAYLOAD_FIELDS = (
-    "created_at", "args", "skill", "target", "command", "intent",
-    "expected_effects", "side_effects", "dry_run_result", "decision_guidance",
-)
-
-
-def _store():
-    """DB 저장소. import 시점에 홈 디렉터리를 만들지 않도록 부를 때 가져온다."""
-    from kukie_agent.store import get_store
-
-    return get_store()
+#: server 가 "지금 상태에서는 그 동작을 받을 수 없다" 고 답하는 코드. 훅은 이걸 실행 거절(ToolFailed)로 읽는다.
+PLAN_CONFLICTS = frozenset({"PLAN_STATE_CONFLICT", "PLAN_CALL_MISMATCH"})
 
 
 def compute_request_hash(*, tool: str, args: dict[str, object], command: list[str], risk: str, target: PlanTarget) -> str:
@@ -78,8 +83,8 @@ def _bullets(items: list[str]) -> str:
 
 @dataclass
 class ActionPlan:
-    id: str
-    path: Path
+    id: str                 # server 계획은 UUID (승인 카드의 plan_id), 파일 계획은 파일 이름과 같은 표시용 id
+    path: Path | None       # 파일 계획의 .md. server 계획은 None — 사본을 두지 않는다
     created_at: str
     call_id: str
     tool: str
@@ -98,10 +103,16 @@ class ActionPlan:
     execution_result: dict[str, object] | None = None
     failure_reason: str | None = None                  # PLAN_FAILURE_REASONS. FAILED 일 때만
     applied_at: str | None = None                      # kubectl 이 실제로 적용된 시각 — 검증이 실패해도 남는다 (DURO-83)
-    run_id: str | None = None                          # 어느 run 의 계획인가. None 이면 DB 에 넣지 않는다 (flat 엔드포인트)
+    run_id: str | None = None                          # 어느 run 의 계획인가. None 이면 server 에 넣지 않는다 (flat 엔드포인트)
+    code: str | None = None                            # server 계획의 표시용 id. 파일 계획은 id 가 곧 표시용이라 None
+
+    @property
+    def remote(self) -> bool:
+        """원본이 server 인가 (대화 경로). False 면 .md 파일이 원본이다."""
+        return self.run_id is not None
 
     @classmethod
-    def create_draft(
+    async def create_draft(
         cls,
         *,
         call_id: str,
@@ -119,14 +130,35 @@ class ActionPlan:
         if not isinstance(args, dict):
             raise TypeError("args must be a dict")
         created_at = _utc_now()
+        if run_id is not None:
+            # id·code 는 server 가 정한다 — 이름 예약을 agent 가 할 필요가 없다
+            created = await server_api.create_plan(
+                run_id,
+                tool_call_id=call_id,
+                tool_name=tool,
+                risk=risk,
+                request_hash=compute_request_hash(
+                    tool=tool, args=args, command=command, risk=risk, target=target,
+                ),
+                payload={
+                    "created_at": created_at,
+                    "args": dict(args),
+                    "skill": skill,
+                    "target": dict(target),
+                    "command": list(command),
+                    "intent": intent,
+                    "expected_effects": list(expected_effects),
+                    "side_effects": list(side_effects),
+                },
+            )
+            return cls.from_response(created)
+
         timestamp = datetime.fromisoformat(created_at).strftime("%y%m%d-%H%M")
         tool_name = sub(r"[^\w-]+", "-", tool).strip("-") or "tool"
         base_id = f"ap-{timestamp}-{tool_name}"
         # 파일명 원자적 예약: "있나 확인 → 쓰기"로 나누면 확인과 쓰기 사이에 다른 프로세스가
         # 같은 이름을 잡을 수 있다. 확인 없이 exclusive 쓰기를 시도하고, 이미 있으면(FileExistsError)
         # 다음 번호로 재시도한다 — 판단이 "쓰는 순간" OS에서 이뤄져 틈이 없다.
-        # 같은 이름이 있으면 -2, -3 … 으로 물러난다. 이름과 무관한 충돌(같은 run 에 같은 tool_call_id)이면
-        # 번호만 늘리며 영원히 돌게 되므로 몇 번만 시도하고 던진다.
         for suffix in range(1, ID_ATTEMPTS + 1):
             plan_id = base_id if suffix == 1 else f"{base_id}-{suffix}"
             plan = cls(
@@ -144,18 +176,10 @@ class ActionPlan:
                 intent=intent,
                 expected_effects=list(expected_effects),
                 side_effects=list(side_effects),
-                run_id=run_id,
             )
             try:
                 plan._write(exclusive=True)
             except FileExistsError:   # 누군가 먼저 이 이름을 썼음 → 다음 번호로
-                continue
-            try:
-                plan._insert()
-            except IntegrityError:
-                # 이름 예약은 파일이 하지만 원본은 표다 — 표에서 부딪히면 파일도 물리고 다음 번호로
-                # (자동 리뷰 지적: _insert 가 루프 밖이라 재시도되지 않았다)
-                plan.path.unlink(missing_ok=True)
                 continue
             return plan
         raise RuntimeError(f"Action Plan id 를 확보하지 못했다: {base_id}")
@@ -205,40 +229,44 @@ class ActionPlan:
             raise ValueError(f"invalid Action Plan frontmatter: {path}") from exc
 
     @classmethod
-    def from_row(cls, row: Any) -> "ActionPlan":
-        """DB 행(PlanRow)에서 되살린다 — 서버가 다시 떠서 .md 가 없거나 낡아도 이쪽이 원본이다."""
-        payload = dict(row.plan_payload or {})
+    def from_response(cls, plan: server_api.Plan) -> "ActionPlan":
+        """server 의 PlanResponse 에서 만든다. DB 컬럼이 아닌 필드는 payload 에 통째로 들어 있다."""
+        payload = dict(plan.payload or {})
         return cls(
-            id=row.id,
-            path=PLAN_DIR / f"{row.id}.md",
-            created_at=payload.get("created_at", row.created_at.isoformat()),
-            call_id=row.tool_call_id,
-            tool=row.tool_name,
+            id=plan.id,
+            path=None,
+            created_at=payload.get("created_at") or plan.created_at or "",
+            call_id=plan.tool_call_id,
+            tool=plan.tool_name,
             args=dict(payload.get("args") or {}),
             skill=payload.get("skill", ""),
             target=dict(payload.get("target") or {}),
             command=list(payload.get("command") or []),
-            risk_level=row.risk,
-            status=row.status,
+            risk_level=plan.risk,
+            status=plan.status,
             intent=payload.get("intent", ""),
             expected_effects=list(payload.get("expected_effects") or []),
             side_effects=list(payload.get("side_effects") or []),
             dry_run_result=payload.get("dry_run_result"),
             decision_guidance=payload.get("decision_guidance"),
-            decision=row.decision,
-            execution_result=row.execution_result,
-            failure_reason=row.failure_reason,
-            applied_at=row.applied_at.isoformat() if row.applied_at else None,
-            run_id=row.run_id,
+            decision=plan.decision,
+            execution_result=plan.execution_result,
+            failure_reason=plan.failure_reason,
+            applied_at=plan.applied_at,
+            run_id=plan.run_id,
+            code=plan.code,
         )
 
     @classmethod
-    def find_by_call_id(cls, call_id: str, *, run_id: str | None = None) -> "ActionPlan":
-        """카드 하나를 찾는다. run 을 알면 DB 에서(원본), 모르면 .md 를 훑는다 (flat 엔드포인트·테스트)."""
+    async def find_by_call_id(cls, call_id: str, *, run_id: str | None = None) -> "ActionPlan":
+        """카드 하나를 찾는다. run 을 알면 server 에서(원본), 모르면 .md 를 훑는다 (flat 엔드포인트·테스트)."""
         if run_id is not None:
-            row = _store().find_plan_by_call_id(call_id, run_id=run_id)
-            if row is not None:
-                return cls.from_row(row)
+            found = await server_api.run_plans(run_id, tool_call_id=call_id)
+            if not found:
+                raise FileNotFoundError(f"Action Plan not found for call_id={call_id}")
+            if len(found) > 1:
+                raise ValueError(f"multiple Action Plans found for call_id={call_id}")
+            return cls.from_response(found[0])
         # ponytail: 로컬 MVP에서는 선형 탐색이면 충분하다. 실제 병목일 때만 인덱스를 추가한다.
         matches = [
             path
@@ -253,7 +281,7 @@ class ActionPlan:
 
     def _metadata(self) -> dict[str, object]:
         return {
-            "id": self.id,
+            "id": self.code or self.id,      # 사람이 읽는 id — server 계획은 UUID 대신 code
             "created_at": self.created_at,
             "call_id": self.call_id,
             "tool": self.tool,
@@ -343,66 +371,44 @@ class ActionPlan:
     def _read(self) -> tuple[dict, str]:
         return self._read_path(self.path)
 
-    # ── DB (원본) ─────────────────────────────────────────
-
-    def _payload(self) -> dict[str, Any]:
-        """DB 컬럼이 아닌 필드는 통째로 plan_payload JSON 에 (DB 문서 5절)."""
-        return {field: getattr(self, field) for field in _PAYLOAD_FIELDS}
+    # ── 원본에 기록 ──────────────────────────────────────
 
     @property
     def request_hash(self) -> str:
-        """DB 문서 5절의 request_hash. 지금은 기록만 하고 비교에는 쓰지 않는다 —
-        승인 내용 대조는 approve_for_execution 의 필드별 비교가 한다 (어느 칸이 달라졌는지 알려주려고)."""
+        """승인한 내용과 실행 요청이 같은지 확인하는 해시 (DB 문서 5절 request_hash). 만들 때 server 에 함께 남긴다.
+        승인 내용 대조는 server 의 decision 동작이 필드별로 한다 (어느 칸이 달라졌는지 알려주려고)."""
         return compute_request_hash(
             tool=self.tool, args=self.args, command=self.command,
             risk=self.risk_level, target=self.target,
         )
 
-    def _insert(self) -> None:
-        if self.run_id is None:      # run 밖의 계획(flat 엔드포인트)은 파일이 원본이다
-            return
-        _store().create_plan(
-            plan_id=self.id, run_id=self.run_id, tool_call_id=self.call_id, tool_name=self.tool,
-            risk=self.risk_level, plan_payload=self._payload(), request_hash=self.request_hash,
-            status=self.status,
-        )
+    async def _act(self, action: str, body: dict[str, Any] | None = None) -> None:
+        """server 계획: 동작을 알리고 돌아온 plan 으로 이 객체를 맞춘다.
 
-    def _sync(self) -> None:
-        if self.run_id is None:
-            return
-        _store().update_plan(
-            self.id,
-            status=self.status,
-            plan_payload=self._payload(),
-            decision=self.decision,
-            execution_result=self.execution_result,
-            failure_reason=self.failure_reason,
-            applied_at=datetime.fromisoformat(self.applied_at) if self.applied_at else None,
-        )
+        상태 충돌(409)은 ValueError 로 바꾼다 — 파일 계획의 전이 검사와 같은 예외라 훅이 한 갈래로 받는다.
+        server 에 못 닿은 것(503 등)은 그대로 던진다. 어느 쪽이든 이 객체는 바뀌지 않는다.
+        """
+        try:
+            updated = await server_api.plan_action(self.id, action, body)
+        except server_api.ServerError as exc:
+            if exc.code in PLAN_CONFLICTS:
+                raise ValueError(f"ActionPlan {action} rejected ({exc.code}): {exc.message}") from None
+            raise
+        fresh = type(self).from_response(updated)
+        for item in dataclasses.fields(self):
+            setattr(self, item.name, getattr(fresh, item.name))
 
     def _update_fields(self, **changes: object) -> None:
-        """상태를 바꾼다. run 에 속한 계획은 DB 가 원본이라 그걸 먼저 쓰고, .md 는 뒤이어 갱신한다.
-
-        DB 를 쓰지 못하면 객체를 원래대로 되돌리고 던진다. .md 만 실패하면 로그만 남긴다 —
-        사람이 읽는 사본이 낡을 뿐이고 판단은 DB 로 한다. run 밖의 계획은 파일이 원본이라 그대로 던진다.
-        """
+        """파일 계획의 상태를 바꾼다. .md 가 원본이라 쓰지 못하면 객체를 원래대로 되돌리고 던진다."""
         previous = {key: getattr(self, key) for key in changes}
         for key, value in changes.items():
             setattr(self, key, value)
         try:
-            self._sync()
+            self._write()
         except Exception:
             for key, value in previous.items():
                 setattr(self, key, value)
             raise
-        try:
-            self._write()
-        except Exception:
-            if self.run_id is None:
-                for key, value in previous.items():
-                    setattr(self, key, value)
-                raise
-            logger.exception("Action Plan .md 갱신 실패 — DB 기록은 남았다 (plan_id=%s)", self.id)
 
     def validate_for_decision_guidance(self) -> None:
         if not isinstance(self.args, dict):
@@ -445,44 +451,53 @@ class ActionPlan:
                 "ActionPlan is not ready for guidance: decision guidance already exists"
             )
 
-    def record_decision_guidance(self, text: str) -> None:
-        guidance = text.strip()
-        if not guidance:
-            raise ValueError("decision guidance must not be empty")
-
-        if self.decision_guidance is not None:
-            raise ValueError("decision guidance already exists")
-        self._update_fields(decision_guidance=guidance)
-
-    def record_dry_run(self, status: str, stdout: str, stderr: str) -> None:
+    async def record_dry_run(self, status: str, stdout: str, stderr: str) -> None:
+        """승인 전 예행 결과. 떨어졌으면(failed) 그 자리에서 FAILED + DRY_RUN_FAILED 로 닫힌다."""
         if status not in DRY_RUN_STATUSES:
             raise ValueError(f"invalid dry-run status: {status}")
-        self._update_fields(
-            dry_run_result={
+        if self.remote:
+            await self._act("dry-run", {"status": status, "stdout": stdout, "stderr": stderr})
+            return
+        if self.status != "DRAFT" or self.dry_run_result is not None:
+            raise ValueError("ActionPlan is not ready for dry-run")
+        changes: dict[str, object] = {
+            "dry_run_result": {
                 "status": status,
                 "stdout": stdout,
                 "stderr": stderr,
                 "at": _utc_now(),
             }
-        )
+        }
+        if status == "failed":
+            changes.update(status="FAILED", failure_reason="DRY_RUN_FAILED")
+        self._update_fields(**changes)
 
-    def offer_for_approval(self) -> None:
-        """승인 카드로 사용자에게 나간다 — DRAFT → WAITING_APPROVAL (DURO-83)."""
-        if self.status != "DRAFT":
+    async def offer(self, guidance: str) -> None:
+        """판단 가이드를 남기고 승인 카드로 내보낸다 — DRAFT → WAITING_APPROVAL (DURO-83)."""
+        text = guidance.strip()
+        if not text:
+            raise ValueError("decision guidance must not be empty")
+        if self.remote:
+            await self._act("offer", {"decisionGuidance": text})
+            return
+        dry_run = self.dry_run_result
+        if self.decision_guidance is not None:
+            raise ValueError("decision guidance already exists")
+        if (
+            self.status != "DRAFT"
+            or not isinstance(dry_run, dict)
+            or dry_run.get("status") not in {"succeeded", "unsupported"}
+        ):
             raise ValueError("ActionPlan is not ready for approval")
-        self._update_fields(status="WAITING_APPROVAL")
+        self._update_fields(decision_guidance=text, status="WAITING_APPROVAL")
 
-    def record_decision(self, *, approved: bool, user_id: str | None = None) -> None:
-        """사용자의 결정을 남긴다 — 승인이면 APPROVED, 거절이면 REJECTED (DB 문서 5절 decision 칸).
-
-        검사는 부르는 쪽(approve_for_execution / reject)이 한다.
-        """
+    def _record_decision(self, *, approved: bool, user_id: str | None) -> None:
         self._update_fields(
             decision={"approved": approved, "user_id": user_id, "at": _utc_now()},
             status="APPROVED" if approved else "REJECTED",
         )
 
-    def approve_for_execution(
+    async def approve_for_execution(
         self,
         *,
         tool: str,
@@ -492,6 +507,18 @@ class ActionPlan:
         target: PlanTarget,
         user_id: str | None = None,
     ) -> None:
+        """승인을 남긴다. 승인한 카드와 지금 실행하려는 호출이 같아야 한다 — 다르면 ValueError (실행하지 않는다)."""
+        current = {
+            "tool": tool,
+            "args": args,
+            "command": command,
+            "risk": risk,
+            "target": target,
+        }
+        if self.remote:
+            # 비교는 server 가 한다 (다르면 409 PLAN_CALL_MISMATCH — 다른 칸 이름이 message 에 온다)
+            await self._act("decision", {"approved": True, "userId": user_id, "call": current})
+            return
         dry_run = self.dry_run_result
         if (
             self.status not in {"DRAFT", "WAITING_APPROVAL"}
@@ -502,14 +529,6 @@ class ActionPlan:
             or self.execution_result is not None
         ):
             raise ValueError("ActionPlan is not ready for execution")
-
-        current = {
-            "tool": tool,
-            "args": args,
-            "command": command,
-            "risk": risk,
-            "target": target,
-        }
         approved = {
             "tool": self.tool,
             "args": self.args,
@@ -520,16 +539,18 @@ class ActionPlan:
         for field, value in current.items():
             if value != approved[field]:
                 raise ValueError(f"approved request mismatch: {field}")
+        self._record_decision(approved=True, user_id=user_id)
 
-        self.record_decision(approved=True, user_id=user_id)
-
-    def mark_executing(self) -> None:
+    async def mark_executing(self) -> None:
         """kubectl 을 부르기 직전 — APPROVED → EXECUTING. 여기서 죽으면 실행 여부를 모른다 (UNKNOWN)."""
+        if self.remote:
+            await self._act("start")
+            return
         if self.status != "APPROVED":
             raise ValueError("ActionPlan is not ready to execute")
         self._update_fields(status="EXECUTING")
 
-    def record_execution(
+    async def record_execution(
         self,
         *,
         success: bool,
@@ -537,6 +558,15 @@ class ActionPlan:
         stderr: str,
         exit_code: int | None,
     ) -> None:
+        """실행 결과. 성공이고 exit 0 이면 APPLIED, 아니면 FAILED + EXECUTION_FAILED."""
+        if self.remote:
+            await self._act("result", {
+                "success": success,
+                "stdout": stdout,
+                "stderr": stderr,
+                "exitCode": exit_code,
+            })
+            return
         if (
             self.status not in {"APPROVED", "EXECUTING"}
             or self.decision is None
@@ -544,6 +574,7 @@ class ActionPlan:
         ):
             raise ValueError("ActionPlan is not ready to record execution")
         at = _utc_now()
+        applied = success and exit_code == 0
         self._update_fields(
             execution_result={
                 "success": success,
@@ -553,25 +584,22 @@ class ActionPlan:
                 "at": at,
             },
             # 적용 시각은 성공했을 때만 남긴다. 검증(기획 09)이 나중에 실패해 FAILED 로 가도 이 값은 지우지 않는다 (DURO-83)
-            applied_at=at if success else self.applied_at,
-            failure_reason=None if success else "EXECUTION_FAILED",
-            status="APPLIED" if success else "FAILED",
+            applied_at=at if applied else self.applied_at,
+            failure_reason=None if applied else "EXECUTION_FAILED",
+            status="APPLIED" if applied else "FAILED",
         )
 
-    def reject(self, user_id: str | None = None) -> None:
+    async def reject(self, user_id: str | None = None) -> None:
         """거절을 기록한다. **다시 불러도 성공한다** — 안내가 "같은 카드를 다시 결정하라" 이기 때문이다.
 
-        DB commit 은 성공했는데 응답이 끊겨 실패로 올라오는 경우가 있다. 그때 사용자가 시킨 대로
-        다시 거절하면 예전에는 상태 검사에 걸려 또 503 이 나고 그 카드는 영영 결정할 수 없었다.
-        이미 거절로 끝난 계획이면 조용히 성공으로 돌려준다 (자동 리뷰 지적).
+        기록은 성공했는데 응답이 끊겨 실패로 올라오는 경우가 있다. 그때 사용자가 시킨 대로 다시 거절하면
+        상태 검사에 걸려 또 실패하고 그 카드는 영영 결정할 수 없다. 이미 거절로 끝났으면 조용히 성공한다
+        (server 의 decision 동작도 같은 규칙이다 — 자동 리뷰 지적).
         """
+        if self.remote:
+            await self._act("decision", {"approved": False, "userId": user_id})
+            return
         if self.status == "REJECTED" and self.decision is not None and not self.decision.get("approved"):
-            # 이 경로가 생기는 상황은 "DB 는 됐는데 응답이 끊겼다" 이고, 그때 _write 는 한 번도 안 돌았다 —
-            # .md 가 결정 전 카드로 남아 있다. 사본을 따라오게 한다 (자동 리뷰 지적). 실패는 로그만.
-            try:
-                self._write()
-            except Exception:
-                logger.exception("거절 재시도에서 .md 갱신 실패 (plan_id=%s)", self.id)
             return
         if (
             self.status not in {"DRAFT", "WAITING_APPROVAL"}
@@ -579,68 +607,24 @@ class ActionPlan:
             or self.execution_result is not None
         ):
             raise ValueError("ActionPlan is not ready for rejection")
-        self.record_decision(approved=False, user_id=user_id)
+        self._record_decision(approved=False, user_id=user_id)
 
-    def mark_failed(self, reason: str) -> None:
-        """FAILED 는 이유를 함께 남긴다 (DURO-83: "세부 실패 사유를 분리")."""
+    async def mark_failed(self, reason: str) -> None:
+        """FAILED 는 이유를 함께 남긴다 (DURO-83: "세부 실패 사유를 분리"). 열린 계획만."""
         if reason not in PLAN_FAILURE_REASONS:
             raise ValueError(f"invalid Action Plan failure reason: {reason}")
+        if self.remote:
+            await self._act("fail", {"reason": reason})
+            return
+        if self.status not in PLAN_OPEN:
+            raise ValueError("ActionPlan is already closed")
         self._update_fields(status="FAILED", failure_reason=reason)
 
-    def mark_unknown(self) -> None:
+    async def mark_unknown(self) -> None:
         """실행 여부를 모른다 — 승인은 남았는데 결과가 없다 (run 의 recovery_required 와 같은 뜻)."""
+        if self.remote:
+            await self._act("unknown")
+            return
+        if self.status not in {"APPROVED", "EXECUTING"} or self.execution_result is not None:
+            raise ValueError("ActionPlan is not waiting for an execution result")
         self._update_fields(status="UNKNOWN")
-
-    def mark(self, status: str, *, failure_reason: str | None = None) -> None:
-        if status not in PLAN_STATUSES:
-            raise ValueError(f"invalid Action Plan status: {status}")
-        if status == "FAILED" and failure_reason is None:
-            raise ValueError("FAILED requires a failure_reason")
-        self._update_fields(status=status, failure_reason=failure_reason)
-
-_PLAN_ID = _compile(r"^[A-Za-z0-9._-]{1,64}$")
-
-
-def sync_markdown(rows: "list[Any]") -> None:
-    """DB 에서 직접 바꾼 계획들의 .md 사본을 따라오게 한다 (자동 리뷰 지적).
-
-    표를 원본으로 두고 DB 만 고치는 경로(계획 만료 — EXPIRED/UNKNOWN)가 있어서, 그대로 두면 사본이
-    옛 상태로 굳고 다시 지나가는 경로가 없다. 사본이므로 실패는 로그만 남긴다.
-    """
-    for row in rows:
-        try:
-            ActionPlan.from_row(row)._write()
-        except Exception:
-            logger.exception("만료된 계획의 .md 갱신 실패 (plan_id=%s)", getattr(row, "id", "?"))
-
-
-def list_plans(
-    user_id: str, *, team_ids: list[str] | None, cluster_id: str | None = None,
-    status: str | None = None,
-) -> list[Any]:
-    """GET /action-plans 와 히스토리 스킬이 같이 쓰는 목록 — 내 방 + 내가 볼 수 있는 shared 방의 요약.
-
-    team_ids 에 **기본값을 두지 않는다**. `None` 은 "shared 전부"(회원 서버가 없는 개발 모드)라
-    fail-open 이므로, 나중에 히스토리 툴이 붙을 때 안 넘겨서 조용히 새는 일이 없게 부르는 쪽이
-    매번 정하게 한다 (자동 리뷰 지적). 값은 회원 서버에서 받아 넘긴다.
-
-    본문(.md)은 읽지 않는다 — 한 줄에 필요한 값은 전부 DB 표에 있다.
-    """
-    if status is not None and status not in PLAN_STATUSES:
-        raise ValueError(f"invalid Action Plan status: {status}")
-    return _store().list_plan_summaries(
-        user_id, cluster_id=cluster_id, status=status, team_ids=team_ids
-    )
-
-
-def get_plan(plan_id: str) -> str:
-    """Plan 전문(사람이 읽는 Markdown). DB 행이 있으면 거기서 다시 그리고, 없으면 .md 파일을 읽는다."""
-    if not _PLAN_ID.match(plan_id):
-        raise ValueError(f"invalid Action Plan id: {plan_id}")
-    row = _store().get_plan(plan_id)
-    if row is not None:
-        return ActionPlan.from_row(row).render_markdown()
-    path = PLAN_DIR / f"{plan_id}.md"
-    if not path.is_file():
-        raise FileNotFoundError(f"Action Plan not found: {plan_id}")
-    return ActionPlan.load(path).render_markdown()

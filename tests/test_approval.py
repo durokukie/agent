@@ -7,6 +7,8 @@ from kukie_agent.guardrail import action_plan
 from kukie_agent.guardrail.action_plan import ActionPlan
 from kukie_agent.guardrail.approval import ApprovalRequest, build_approval_request
 
+from helpers import sync
+
 
 CALL_ARGS = {
     "kind": "deployment",
@@ -25,7 +27,7 @@ def _ready_plan(
     dry_run_status: str = "succeeded",
 ) -> ActionPlan:
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
-    plan = ActionPlan.create_draft(
+    plan = sync(ActionPlan.create_draft(
         call_id="call-123",
         tool="scale_resource",
         args={
@@ -46,18 +48,17 @@ def _ready_plan(
         intent=CALL_ARGS["intent"],
         expected_effects=CALL_ARGS["expected_effects"],
         side_effects=CALL_ARGS["side_effects"],
-    )
+    ))
     stdout = "deployment.apps/nginx configured\n" if dry_run_status == "succeeded" else ""
     stderr = "server does not support dry run\n" if dry_run_status == "unsupported" else ""
-    plan.record_dry_run(dry_run_status, stdout, stderr)
-    plan.record_decision_guidance("현재 replica와 가용 자원을 확인한다.")
-    plan.offer_for_approval()
+    sync(plan.record_dry_run(dry_run_status, stdout, stderr))
+    sync(plan.offer("현재 replica와 가용 자원을 확인한다."))
     return plan
 
 
 def _ready_manifest_plan(monkeypatch, plan_dir, call_id: str, manifest: str) -> ActionPlan:
     monkeypatch.setattr(action_plan, "PLAN_DIR", plan_dir)
-    plan = ActionPlan.create_draft(
+    plan = sync(ActionPlan.create_draft(
         call_id=call_id,
         tool="apply_manifest",
         args={
@@ -75,16 +76,15 @@ def _ready_manifest_plan(monkeypatch, plan_dir, call_id: str, manifest: str) -> 
         intent="Pod를 배포한다.",
         expected_effects=["Pod가 적용된다."],
         side_effects=["클러스터 구성이 변경된다."],
-    )
-    plan.record_dry_run("unsupported", "", "server does not support dry run")
-    plan.record_decision_guidance("대상과 권한을 확인한다.")
-    plan.offer_for_approval()
+    ))
+    sync(plan.record_dry_run("unsupported", "", "server does not support dry run"))
+    sync(plan.offer("대상과 권한을 확인한다."))
     return plan
 
 
 def _manifest_dto(monkeypatch, plan_dir, call_id: str, manifest: str) -> ApprovalRequest:
     plan = _ready_manifest_plan(monkeypatch, plan_dir, call_id, manifest)
-    return build_approval_request(
+    return sync(build_approval_request(
         ToolCallPart(
             tool_name="apply_manifest",
             args={
@@ -98,7 +98,7 @@ def _manifest_dto(monkeypatch, plan_dir, call_id: str, manifest: str) -> Approva
         ),
         {"plan_id": plan.id},
         default_namespace="study",
-    )
+    ))
 
 
 def test_apply_manifest_승인_DTO는_보안설정차이를_보존하고_원문을_노출하지않는다(
@@ -414,11 +414,11 @@ def test_Plan과_pending_call로_승인_DTO를_만든다(
         tool_call_id="call-123",
     )
 
-    dto = build_approval_request(
+    dto = sync(build_approval_request(
         call,
         {"plan_id": plan.id},
         default_namespace="study",
-    )
+    ))
 
     assert dto.tool_call_id == "call-123"
     assert dto.plan_id == plan.id
@@ -468,4 +468,4 @@ def test_pending_tool_args_plan_id가_다르면_DTO를_거부한다(
     call = ToolCallPart(tool_name=tool, args=args, tool_call_id="call-123")
 
     with pytest.raises(ValueError, match="pending approval mismatch"):
-        build_approval_request(call, metadata, default_namespace="study")
+        sync(build_approval_request(call, metadata, default_namespace="study"))

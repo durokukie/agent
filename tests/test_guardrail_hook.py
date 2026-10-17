@@ -41,7 +41,7 @@ def _ctx(*, namespace="study", approved=False, run_id=None, user_id=None):
             context="kind-dev",
             namespace=namespace,
             skill=SimpleNamespace(name="실습"),
-            run_id=run_id,      # None 이면 계획이 DB 표에 들어가지 않는다 (flat 경로와 같다, #58)
+            run_id=run_id,      # None 이면 계획이 Kukie API 서버에 들어가지 않는다 (flat 경로와 같다, #58)
             user_id=user_id,
             kubeconfig=None,    # 서버 컴퓨터의 기본 kubeconfig (기획 04 §8 등록 경로가 아님)
         ),
@@ -899,7 +899,7 @@ async def test_terminal_Plan은_handler를_실행하지_않는다(
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     await _create_pending_plan()
     plan = action_plan.ActionPlan.load(next(tmp_path.glob("*.md")))
-    plan.mark(status)
+    plan._update_fields(status=status)       # 상태 머신을 거치지 않고 닫힌 계획을 놓는다
     handler = AsyncMock()
 
     with pytest.raises(ToolFailed, match="not ready for execution"):
@@ -971,7 +971,7 @@ async def test_승인_기록만_있고_실행_기록이_없으면_실행_여부_
     monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
     await _create_pending_plan()
     plan = action_plan.ActionPlan.load(next(tmp_path.glob("*.md")))
-    plan.record_decision(approved=True)
+    plan._record_decision(approved=True, user_id=None)
     handler = AsyncMock()
 
     with pytest.raises(ToolFailed, match="실행 여부를 확인할 수 없다") as exc:
@@ -1261,7 +1261,7 @@ async def test_미리보기가_실패하면_가이드_모델을_아예_안_부�
             handler=AsyncMock(),
         )
 
-    plan = action_plan.ActionPlan.find_by_call_id("call-123")
+    plan = await action_plan.ActionPlan.find_by_call_id("call-123")
     assert plan.decision_guidance == "guidance unavailable"
 
 
@@ -1302,3 +1302,104 @@ async def test_dry_run_동안_이벤트_루프가_다른_요청을_처리한다(
     await asyncio.gather(_create_pending_plan(), 다른_채팅방())   # 승인 카드(ApprovalRequired)까지는 헬퍼가 확인한다
 
     assert 신호를_받았나 == [True]
+
+
+# ── server 계획 (대화 경로, run_id 있음 — DURO-113) ─────────────────
+
+def _server_run(fake) -> str:
+    room = fake.add_conversation(shared=True)
+    return fake.put_run(room, request_id="r-1")["id"]
+
+
+@pytest.mark.asyncio
+async def test_server_계획은_server_동작으로만_기록하고_파일을_남기지_않는다(
+    monkeypatch, tmp_path, fake_server, successful_dry_run, successful_guidance
+):
+    monkeypatch.setattr(action_plan, "PLAN_DIR", tmp_path)
+    run_id = _server_run(fake_server)
+
+    with pytest.raises(ApprovalRequired) as raised:
+        await hook.guardrail(_ctx(run_id=run_id, user_id="u-1"), call=_call(), tool_def=None,
+                             args=BASE_ARGS, handler=AsyncMock())
+
+    plan = fake_server.plan_by_call("call-123")
+    assert raised.value.metadata == {"plan_id": plan["id"]}         # 카드의 plan_id = server UUID
+    assert plan["status"] == "WAITING_APPROVAL"
+    assert plan["payload"]["decision_guidance"] == "배포 시간과 롤백 기준을 확인한다."
+    assert list(tmp_path.iterdir()) == []                            # .md 사본도 이름 예약도 없다
+
+    handler = AsyncMock(return_value=KubectlResult(command="kubectl scale", stdout="scaled\n", stderr="",
+                                                   success=True, exit_code=0))
+    result = await hook.guardrail(_ctx(approved=True, run_id=run_id, user_id="u-1"), call=_call(),
+                                  tool_def=None, args=BASE_ARGS, handler=handler)
+
+    assert result.stdout == "scaled\n"
+    handler.assert_awaited_once()
+    assert plan["status"] == "APPLIED" and plan["decision"]["user_id"] == "u-1"
+    actions = [c["action"] for name, c in fake_server.calls if name == "plan_action"]
+    assert actions == ["dry-run", "offer", "decision", "start", "result"]
+
+
+@pytest.mark.asyncio
+async def test_server가_승인한_호출과_다르다고_하면_실행하지_않는다(
+    fake_server, successful_dry_run, successful_guidance
+):
+    """승인 내용 대조는 server 가 한다 (409 PLAN_CALL_MISMATCH) — 훅은 ToolFailed 로 바꿔 kubectl 을 부르지 않는다."""
+    run_id = _server_run(fake_server)
+    with pytest.raises(ApprovalRequired):
+        await hook.guardrail(_ctx(run_id=run_id), call=_call(), tool_def=None, args=BASE_ARGS, handler=AsyncMock())
+    handler = AsyncMock()
+
+    with pytest.raises(ToolFailed, match="PLAN_CALL_MISMATCH"):
+        await hook.guardrail(_ctx(approved=True, run_id=run_id), call=_call(), tool_def=None,
+                             args={**BASE_ARGS, "replicas": 9}, handler=handler)
+
+    handler.assert_not_awaited()
+    assert fake_server.plan_by_call("call-123")["status"] == "WAITING_APPROVAL"
+
+
+@pytest.mark.asyncio
+async def test_kubectl_전에_server에_닿지_못하면_실행하지_않는다(
+    monkeypatch, fake_server, successful_dry_run, successful_guidance
+):
+    from kukie_agent import server_api
+    from kukie_agent.server_api import ServerError
+
+    run_id = _server_run(fake_server)
+    with pytest.raises(ApprovalRequired):
+        await hook.guardrail(_ctx(run_id=run_id), call=_call(), tool_def=None, args=BASE_ARGS, handler=AsyncMock())
+    original = server_api.plan_action
+
+    async def start_fails(plan_id, action, body=None):
+        if action == "start":
+            raise ServerError(503, "SERVER_UNAVAILABLE", "down")
+        return await original(plan_id, action, body)
+
+    monkeypatch.setattr(server_api, "plan_action", start_fails)
+    handler = AsyncMock()
+
+    with pytest.raises(ServerError):
+        await hook.guardrail(_ctx(approved=True, run_id=run_id), call=_call(), tool_def=None,
+                             args=BASE_ARGS, handler=handler)
+
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_server에_기록된_결과가_있으면_kubectl_대신_그_결과를_돌려준다(
+    fake_server, successful_dry_run, successful_guidance
+):
+    run_id = _server_run(fake_server)
+    with pytest.raises(ApprovalRequired):
+        await hook.guardrail(_ctx(run_id=run_id), call=_call(), tool_def=None, args=BASE_ARGS, handler=AsyncMock())
+    plan = fake_server.plan_by_call("call-123")
+    plan.update(status="APPLIED", decision={"approved": True, "user_id": "u-1", "at": "2026-10-14T00:00:00Z"},
+                executionResult={"success": True, "stdout": "scaled\n", "stderr": "", "exit_code": 0,
+                                 "at": "2026-10-14T00:00:01Z"})
+    handler = AsyncMock()
+
+    result = await hook.guardrail(_ctx(approved=True, run_id=run_id), call=_call(), tool_def=None,
+                                  args=BASE_ARGS, handler=handler)
+
+    handler.assert_not_awaited()
+    assert result.stdout == "scaled\n" and result.success is True

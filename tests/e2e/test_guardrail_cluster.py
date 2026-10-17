@@ -14,7 +14,7 @@ from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
-from helpers import answer_model
+from helpers import answer_model, sync
 from kukie_agent import server
 from kukie_agent.agent import agent
 from kukie_agent.guardrail import hook
@@ -165,7 +165,7 @@ def _decide(client, tool_name, args, call_id, approved):
 
     assert decided.status_code == 200
     assert decided.json()["kind"] == "answer"
-    return card, ActionPlan.find_by_call_id(call_id)
+    return card, sync(ActionPlan.find_by_call_id(call_id))
 
 
 CONFIG_MAP = """apiVersion: v1

@@ -14,11 +14,16 @@ WORKDIR /app
 # uv.lock 에 적힌 버전 그대로 깐다 — 빌드할 때마다 새로 고르지 않는다. 이미지 안의 Python 을 쓰고 받아 오지 않는다
 ENV UV_PYTHON_DOWNLOADS=never UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 # 의존성 먼저, 소스는 나중에 — 소스만 바뀌면 의존성 레이어를 다시 쓴다. 앱도 .venv 에 설치한다(--no-editable)
-# postgres extra(psycopg)는 KUKIE_DATABASE_URL 을 Postgres 로 줄 때 쓴다 (.env.example). 기본 SQLite 면 있어도 무해
+# DB 드라이버는 없다 — agent 는 DB 를 갖지 않고 저장은 Kukie API 서버(kukie-server) 내부 API 로 한다 (DURO-113)
 COPY pyproject.toml uv.lock .python-version ./
-RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --extra postgres --no-install-project
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --no-install-project
 COPY kukie_agent ./kukie_agent
-RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --extra postgres --no-editable
+# --reinstall-package: 앱 휠은 매번 새로 굽는다. uv 는 pyproject.toml 이 그대로면 캐시 마운트에 남은 예전 휠을 다시 깐다 —
+# 소스만 바뀐 걸 모르므로, 코드를 받아 `docker compose up -d --build` 해도 옛 코드가 돈다. 의존성은 여전히 캐시에서 온다
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --no-editable --reinstall-package kukie-agent
+# 깔린 앱이 방금 복사한 소스와 같은지 — 다르면 옛 코드를 실은 이미지를 내보내지 않고 빌드에서 멈춘다.
+# 바이트코드와 숨김 파일(맥의 .DS_Store 등)은 휠에 들어가지 않으므로 견주지 않는다
+RUN diff -r -x __pycache__ -x '.*' kukie_agent .venv/lib/python3.*/site-packages/kukie_agent
 
 # ── 2단계: 실행 이미지 — .venv 와 kubectl 만. 소스 폴더는 두지 않는다(두면 설치본 대신 그쪽이 import 된다)
 FROM ${PYTHON_IMAGE}
@@ -41,8 +46,8 @@ ENV PATH="/app/.venv/bin:$PATH"
 # 옮겨 온 .venv 가 이 베이스에서 도는지 — 어긋나면 띄울 때가 아니라 빌드에서 멈춘다
 RUN python -c "import kukie_agent.server"
 
-# 상태 파일 — 기본 SQLite(~/.kukie/kukie.db)와 승인 계획(~/.kukie/plans) — 이 HOME 아래로 모인다.
-# 컴포즈는 /data 를 볼륨으로 잡아 컨테이너를 갈아도 남긴다
+# 쓰기 가능한 HOME — 개발용 flat 엔드포인트(KUKIE_DEV_AUTH=1, server 없음)의 승인 계획 파일(~/.kukie/plans)이 여기 쌓인다.
+# 대화 경로는 저장을 전부 kukie-server 에 하므로 이 디렉터리에 지킬 상태가 없다 — 볼륨이 없어도 된다
 RUN useradd --create-home --home-dir /data --uid 1000 kukie
 USER kukie
 ENV HOME=/data PYTHONUNBUFFERED=1
