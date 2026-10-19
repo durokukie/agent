@@ -134,6 +134,8 @@ async def _run_agent(session: Session, **kwargs: Any):
             output_type=[session.skill.output_fn, DeferredToolRequests],
             message_history=session.history or None,
             capabilities=[progress.hub.capability(key)],
+            # 답 미리보기는 스위치로만 — 켜면 모델 요청이 스트리밍이 된다 (progress.answer_streaming_enabled)
+            **({"event_stream_handler": progress.hub.answer_handler(key)} if progress.answer_streaming_enabled() else {}),
             **kwargs,
         )
     finally:

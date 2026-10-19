@@ -14,15 +14,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterable, AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry
-from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.messages import AgentStreamEvent, PartDeltaEvent, PartStartEvent, ToolCallPart, ToolCallPartDelta
+from pydantic_core import from_json
 from pydantic_ai.tools import ToolDefinition
 
 #: 연결한 뒤 run 이 시작되기를 기다리는 시간. 화면은 POST 와 거의 동시에 연결하는데, 에이전트는 run 을 열기 전에
@@ -166,6 +169,40 @@ class ProgressHub:
             if not pending:
                 yield ": keep-alive\n\n"
 
+    def answer_handler(self, key: str):
+        """`agent.run(event_stream_handler=...)` — 모델이 쓰는 답 양식(JSON)에서 설명(narration)만 꺼내 흘린다.
+
+        답은 도구 호출 꼴의 JSON 으로 조금씩 온다 (`{"narr` → `ation": "nginx 를` …). 조각을 모아 미완성 JSON 을 그대로
+        읽고(`allow_partial`), narration 이 있으면 **지금까지의 글 전체**를 `{"type":"answer","text":…}` 로 보낸다.
+        조각만 보내지 않는 이유: 늦게 붙거나 다시 붙은 화면도, 모델이 양식을 다시 쓸 때(검증 재시도)도 마지막 것만
+        그리면 맞다. 미리보기일 뿐이고 진짜 답은 POST 응답이다.
+        """
+
+        async def handle(_: RunContext[Any], events: AsyncIterable[AgentStreamEvent]) -> None:
+            raw: dict[int, str] = {}          # 응답 조각 번호 → 지금까지 모인 args 문자열
+            sent = ""
+            last = 0.0
+            async for event in events:
+                if isinstance(event, PartStartEvent) and isinstance(event.part, ToolCallPart):
+                    args = event.part.args
+                    raw[event.index] = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
+                elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, ToolCallPartDelta):
+                    delta = event.delta.args_delta
+                    if isinstance(delta, str):
+                        raw[event.index] = raw.get(event.index, "") + delta
+                    elif isinstance(delta, dict):
+                        raw[event.index] = json.dumps(delta, ensure_ascii=False)
+                else:
+                    continue
+                text = _narration(raw.get(event.index, ""))
+                now = time.monotonic()
+                if text is None or text == sent or now - last < ANSWER_INTERVAL_SECONDS:
+                    continue
+                sent, last = text, now
+                await self.publish(key, {"type": "answer", "text": text})
+
+        return handle
+
     def capability(self, key: str) -> "_Progress":
         """`agent.run(capabilities=[...])` 에 넘길 것 — 이 run 의 도구 실행을 이 방의 단계로 올린다."""
         return _Progress(self, key)
@@ -218,6 +255,26 @@ class _Progress(AbstractCapability[Any]):
 
 #: 도구가 실제로 돌지 않았음을 뜻하는 흐름 제어 예외. kubectl 자체의 실패는 예외가 아니라 KubectlResult(success=False) 다
 _NOT_RUN = (ApprovalRequired, CallDeferred, ModelRetry)
+
+
+#: 답 미리보기를 이보다 자주 보내지 않는다 — 조각마다 미완성 JSON 을 다시 읽어 답이 길수록 일이 는다
+ANSWER_INTERVAL_SECONDS = 0.05
+
+
+def answer_streaming_enabled() -> bool:
+    """답 미리보기 스위치 (`KUKIE_STREAM_ANSWER=1`). 켜면 모델 요청이 스트리밍으로 바뀐다 — 답을 받는 방식이
+    달라지므로 끄면 예전 그대로다. 실행·승인·저장 규칙은 켜도 그대로다."""
+    return os.environ.get("KUKIE_STREAM_ANSWER", "").strip() in ("1", "true", "yes")
+
+
+def _narration(args: str) -> str | None:
+    """답 양식 JSON(미완성일 수 있음)에서 narration. 도구 인자처럼 narration 이 없는 JSON 이면 None."""
+    try:
+        value = from_json(args, allow_partial="trailing-strings")
+    except ValueError:
+        return None
+    text = value.get("narration") if isinstance(value, dict) else None
+    return text if isinstance(text, str) and text else None
 
 
 def _sse(event: dict[str, Any]) -> str:
