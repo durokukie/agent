@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shlex
 import time
@@ -25,8 +26,10 @@ from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry
 from pydantic_ai.messages import AgentStreamEvent, PartDeltaEvent, PartStartEvent, ToolCallPart, ToolCallPartDelta
-from pydantic_core import from_json
 from pydantic_ai.tools import ToolDefinition
+from pydantic_core import from_json
+
+logger = logging.getLogger(__name__)
 
 #: 연결한 뒤 run 이 시작되기를 기다리는 시간. 화면은 POST 와 거의 동시에 연결하는데, 에이전트는 run 을 열기 전에
 #: 권한·클러스터를 먼저 확인한다 — 그 사이에 연결이 먼저 닿는다.
@@ -87,6 +90,9 @@ def display_command(command: str) -> str:
 @dataclass
 class _Run:
     events: list[dict[str, Any]] = field(default_factory=list)
+    # 답 미리보기는 events 에 쌓지 않고 마지막 것 한 칸만 — "지금까지의 글 전체" 라 마지막 것만 그리면 맞고,
+    # 쌓으면 늦게 붙은 화면이 수백 개를 되받고 메모리가 답 길이의 제곱으로 는다 (리뷰)
+    answer: str = ""
     done: bool = False
     changed: asyncio.Condition = field(default_factory=asyncio.Condition)
 
@@ -112,6 +118,10 @@ class ProgressHub:
         if run is None or run.done:
             return
         async with run.changed:
+            if event["type"] == "answer":
+                run.answer = event["text"]
+                run.changed.notify_all()
+                return
             # 덧붙이기만 한다 — stream 은 "몇 번째까지 보냈나" 를 정수로 세서, 중간을 지우면 이미 본 화면이 step_drop 을
             # 못 받는다 (리뷰). 늦게 붙은 화면은 시작과 drop 을 둘 다 받아 앱에서 지운다
             run.events.append(event)
@@ -152,22 +162,26 @@ class ProgressHub:
             yield _sse({"type": "done", "run": False})
             return
         sent = 0
+        sent_answer = ""
         while True:
             async with run.changed:
-                if sent == len(run.events) and not run.done:
+                if sent == len(run.events) and run.answer == sent_answer and not run.done:
                     try:
                         await asyncio.wait_for(run.changed.wait(), HEARTBEAT_SECONDS)
                     except TimeoutError:
                         pass
-                pending, finished = run.events[sent:], run.done
+                pending, answer, finished = run.events[sent:], run.answer, run.done
             for event in pending:
                 yield _sse(event)
             sent += len(pending)
+            if answer != sent_answer:
+                yield _sse({"type": "answer", "text": answer})
+                sent_answer = answer
+            elif not pending and not finished:
+                yield ": keep-alive\n\n"
             if finished and sent == len(run.events):
                 yield _sse({"type": "done", "run": True})   # run:false(시작 안 됨)와 짝을 맞춰 늘 적는다
                 return
-            if not pending:
-                yield ": keep-alive\n\n"
 
     def answer_handler(self, key: str):
         """`agent.run(event_stream_handler=...)` — 모델이 쓰는 답 양식(JSON)에서 설명(narration)만 꺼내 흘린다.
@@ -179,27 +193,26 @@ class ProgressHub:
         """
 
         async def handle(_: RunContext[Any], events: AsyncIterable[AgentStreamEvent]) -> None:
-            raw: dict[int, str] = {}          # 응답 조각 번호 → 지금까지 모인 args 문자열
-            sent = ""
+            args: dict[int, str | dict[str, Any]] = {}   # 응답 조각 번호 → 지금까지 모인 args (문자열 조각 또는 dict)
+            latest = sent = ""
             last = 0.0
             async for event in events:
-                if isinstance(event, PartStartEvent) and isinstance(event.part, ToolCallPart):
-                    args = event.part.args
-                    raw[event.index] = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
-                elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, ToolCallPartDelta):
-                    delta = event.delta.args_delta
-                    if isinstance(delta, str):
-                        raw[event.index] = raw.get(event.index, "") + delta
-                    elif isinstance(delta, dict):
-                        raw[event.index] = json.dumps(delta, ensure_ascii=False)
-                else:
-                    continue
-                text = _narration(raw.get(event.index, ""))
-                now = time.monotonic()
-                if text is None or text == sent or now - last < ANSWER_INTERVAL_SECONDS:
-                    continue
-                sent, last = text, now
-                await self.publish(key, {"type": "answer", "text": text})
+                # 미리보기는 없어도 되는 덤이다 — 여기서 터져 진짜 답(run)이 죽으면 안 된다 (리뷰). 이벤트는 끝까지 소비한다
+                try:
+                    text = _collect(args, event)
+                    if text is None:
+                        continue
+                    latest = text
+                    now = time.monotonic()
+                    if latest == sent or now - last < ANSWER_INTERVAL_SECONDS:
+                        continue
+                    sent, last = latest, now
+                    await self.publish(key, {"type": "answer", "text": latest})
+                except Exception:
+                    logger.warning("답 미리보기를 만들지 못했다 (방=%s)", key, exc_info=True)
+            # 마지막 조각은 대개 앞 전송 50ms 안에 온다 — 간격에 걸려 버려지면 미리보기가 문장 중간에서 끊긴다 (리뷰)
+            if latest and latest != sent:
+                await self.publish(key, {"type": "answer", "text": latest})
 
         return handle
 
@@ -265,6 +278,26 @@ def answer_streaming_enabled() -> bool:
     """답 미리보기 스위치 (`KUKIE_STREAM_ANSWER=1`). 켜면 모델 요청이 스트리밍으로 바뀐다 — 답을 받는 방식이
     달라지므로 끄면 예전 그대로다. 실행·승인·저장 규칙은 켜도 그대로다."""
     return os.environ.get("KUKIE_STREAM_ANSWER", "").strip() in ("1", "true", "yes")
+
+
+def _collect(args: dict[int, "str | dict[str, Any]"], event: AgentStreamEvent) -> str | None:
+    """응답 조각 이벤트를 모으고, 그 조각이 답 양식이면 지금까지의 narration."""
+    if isinstance(event, PartStartEvent) and isinstance(event.part, ToolCallPart):
+        args[event.index] = event.part.args if event.part.args is not None else ""
+    elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, ToolCallPartDelta):
+        delta, before = event.delta.args_delta, args.get(event.index, "")
+        if isinstance(delta, str):
+            args[event.index] = (before if isinstance(before, str) else json.dumps(before)) + delta
+        elif isinstance(delta, dict):
+            # dict 조각은 pydantic-ai 처럼 합친다 — 덮어쓰면 narration 이 담긴 앞 조각이 사라진다 (리뷰)
+            args[event.index] = {**(before if isinstance(before, dict) else {}), **delta}
+    else:
+        return None
+    current = args.get(event.index, "")
+    if isinstance(current, dict):
+        text = current.get("narration")
+        return text if isinstance(text, str) and text else None
+    return _narration(current)
 
 
 def _narration(args: str) -> str | None:

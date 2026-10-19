@@ -221,13 +221,75 @@ def test_답_양식_조각에서_narration만_지금까지의_글로_흘린다(m
         for c in chunks[1:]:
             yield PartDeltaEvent(index=1, delta=ToolCallPartDelta(args_delta=c))
 
+    published: list[str] = []
+    publish = hub.publish
+
+    async def record(key, event):
+        published.append(event["text"])
+        await publish(key, event)
+
+    hub.publish = record
+
     async def go():
         await hub.begin("room")
         await hub.answer_handler("room")(None, events())
-        return list(hub._runs["room"].events)
+        return hub._runs["room"]
 
-    texts = [e["text"] for e in sync(go())]
-    assert texts == ["nginx 파드", "nginx 파드를 2개로 늘렸", "nginx 파드를 2개로 늘렸습니다."]   # 도구 인자는 안 섞인다
+    run = sync(go())
+    assert published == ["nginx 파드", "nginx 파드를 2개로 늘렸", "nginx 파드를 2개로 늘렸습니다."]   # 도구 인자는 안 섞인다
+    assert run.answer == published[-1] and run.events == []          # 미리보기는 events 에 안 쌓인다
+
+
+def test_간격에_걸린_마지막_조각도_끝에_보낸다(monkeypatch):
+    from pydantic_ai.messages import PartDeltaEvent, PartStartEvent, ToolCallPart, ToolCallPartDelta
+
+    monkeypatch.setattr(progress, "ANSWER_INTERVAL_SECONDS", 60)       # 첫 전송 뒤로는 전부 간격에 걸린다
+    hub = progress.ProgressHub()
+
+    async def events():
+        yield PartStartEvent(index=0, part=ToolCallPart(tool_name="build_KukieResponse", args='{"narration": "가'))
+        yield PartDeltaEvent(index=0, delta=ToolCallPartDelta(args_delta='나다"}'))
+
+    async def go():
+        await hub.begin("room")
+        await hub.answer_handler("room")(None, events())
+        return hub._runs["room"].answer
+
+    assert sync(go()) == "가나다"
+
+
+def test_dict_조각은_합치고_미리보기가_터져도_run_은_안_죽는다(monkeypatch):
+    from pydantic_ai.messages import PartDeltaEvent, PartStartEvent, ToolCallPart, ToolCallPartDelta
+
+    monkeypatch.setattr(progress, "ANSWER_INTERVAL_SECONDS", 0)
+    hub = progress.ProgressHub()
+
+    async def events():
+        yield PartStartEvent(index=0, part=ToolCallPart(tool_name="build_KukieResponse", args={"narration": "앞"}))
+        yield PartDeltaEvent(index=0, delta=ToolCallPartDelta(args_delta={"finding": None}))   # narration 이 남아야 한다
+        yield PartDeltaEvent(index=1, delta=ToolCallPartDelta(args_delta=object()))           # 이상한 조각 — 무시
+
+    async def go():
+        await hub.begin("room")
+        await hub.answer_handler("room")(None, events())                 # 예외 없이 끝나야 한다
+        return hub._runs["room"].answer
+
+    assert sync(go()) == "앞"
+
+
+def test_늦게_붙은_화면은_마지막_미리보기_하나만_받는다():
+    hub = progress.ProgressHub()
+
+    async def go():
+        await hub.begin("room")
+        for text in ("가", "가나", "가나다"):
+            await hub.publish("room", {"type": "answer", "text": text})
+        reader = asyncio.create_task(_collect(hub, "room"))
+        await asyncio.sleep(0.01)
+        await hub.end("room")
+        return await asyncio.wait_for(reader, 2)
+
+    assert _events(sync(go())) == [{"type": "answer", "text": "가나다"}, {"type": "done", "run": True}]
 
 
 def test_스위치를_켜면_실제_채팅에서_답_미리보기가_올라간다(client, fake_server, monkeypatch):
