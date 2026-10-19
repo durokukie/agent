@@ -5,7 +5,7 @@
 
 - 단계는 도구 실행 훅에서 만든다 (`agent.run(capabilities=[hub.capability(방)])`).
   도구가 돌기 직전 `step_start`(무엇을 하려는지), 끝나면 `step_end`(실제로 돈 kubectl 명령·성공 여부, 근거 없으면 None).
-  변경 도구는 승인으로 미뤄질 수 있어 실제로 돈 뒤에만 시작·끝을 같이 올린다.
+  돌지 않고 넘어가면(승인으로 미룸·모델 재시도) `step_drop` 으로 그 단계를 지운다 — 실패가 아니다.
 - 방마다 지금 run 의 단계를 모아 둔다. 늦게 연결한 화면도 앞 단계를 다시 받는다.
 - 메모리에만 둔다 — 에이전트는 한 대이고(세션도 메모리), 진행 상황은 run 이 끝나면 쓸모가 없다.
 """
@@ -20,11 +20,9 @@ from typing import Any
 
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.exceptions import ApprovalRequired, CallDeferred
+from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import ToolDefinition
-
-from kukie_agent.tools.mutate import MUTATING_TOOLS
 
 #: 연결한 뒤 run 이 시작되기를 기다리는 시간. 화면은 POST 와 거의 동시에 연결하는데, 에이전트는 run 을 열기 전에
 #: 권한·클러스터를 먼저 확인한다 — 그 사이에 연결이 먼저 닿는다.
@@ -39,10 +37,10 @@ _LABELS: dict[str, str] = {
     "get_events": "이벤트 보기",
     "get_logs": "{pod} 로그 보기",
     "explain_command": "{resource_or_field} 설명 찾기",
-    "apply_manifest": "매니페스트 적용 준비",
-    "scale_resource": "{kind}/{name} 개수 바꾸기 준비",
-    "rollout_restart": "{kind}/{name} 재시작 준비",
-    "delete_resource": "{kind}/{name} 삭제 준비",
+    "apply_manifest": "매니페스트 적용",
+    "scale_resource": "{kind}/{name} 개수 바꾸기",
+    "rollout_restart": "{kind}/{name} 재시작",
+    "delete_resource": "{kind}/{name} 삭제",
 }
 
 
@@ -110,6 +108,9 @@ class ProgressHub:
         if run is None or run.done:
             return
         async with run.changed:
+            if event["type"] == "step_drop":
+                # 아직 안 본 연결에는 그 단계가 처음부터 없던 것처럼 — 쌓인 시작을 지운다. 이미 본 화면은 drop 을 받아 지운다
+                run.events = [e for e in run.events if e.get("id") != event["id"]]
             run.events.append(event)
             run.changed.notify_all()
 
@@ -174,33 +175,25 @@ class _Progress(AbstractCapability[Any]):
     """도구 실행 앞뒤에서 단계를 올린다. 모델 요청은 건드리지 않는다.
 
     `agent.run(event_stream_handler=...)` 로도 같은 일을 할 수 있지만, 그러면 Pydantic AI 가 모델 요청을 스트리밍으로
-    바꾼다 — 답을 받는 방식이 바뀌는 셈이라 도구 훅만 쓴다. 가드레일이 승인으로 미룬 변경 도구는 실행되지 않으므로
-    단계도 남지 않는다(승인 카드가 대신 뜬다).
+    바꾼다 — 답을 받는 방식이 바뀌는 셈이라 도구 훅만 쓴다. 가드레일은 이 훅보다 먼저 변경 도구를 승인으로 미뤄서
+    카드 단계에는 아무것도 안 올라간다(승인 뒤 실제로 돌 때 뜬다). 순서가 달라 시작이 먼저 올라가도 step_drop 이 지운다.
     """
 
     hub: ProgressHub
     key: str
 
-    async def _start(self, call: ToolCallPart) -> None:
+    async def before_tool_execute(self, ctx: RunContext[Any], *, call: ToolCallPart, tool_def: ToolDefinition,
+                                  args: Any) -> Any:
         await self.hub.publish(self.key, {
             "type": "step_start",
             "id": call.tool_call_id,
             "label": label(call.tool_name, call.args_as_dict()),
         })
-
-    async def before_tool_execute(self, ctx: RunContext[Any], *, call: ToolCallPart, tool_def: ToolDefinition,
-                                  args: Any) -> Any:
-        # 변경 도구는 가드레일(tool_execute 를 감싸는 훅)이 승인으로 미룰 수 있다 — 여기서 시작을 올리면 끝나지 않는
-        # 단계가 남는다. 실제로 돌았을 때만 after 에서 시작·끝을 같이 올린다 (리뷰)
-        if call.tool_name not in MUTATING_TOOLS:
-            await self._start(call)
         return args
 
     async def after_tool_execute(self, ctx: RunContext[Any], *, call: ToolCallPart, tool_def: ToolDefinition,
                                  args: Any, result: Any) -> Any:
-        if call.tool_name in MUTATING_TOOLS:
-            await self._start(call)
-        command = getattr(result, "command", None)       # 읽기 도구는 KubectlResult 를 돌려준다
+        command = getattr(result, "command", None)       # kubectl 도구는 KubectlResult 를 돌려준다
         success = getattr(result, "success", None)
         await self.hub.publish(self.key, {
             "type": "step_end",
@@ -213,12 +206,17 @@ class _Progress(AbstractCapability[Any]):
 
     async def on_tool_execute_error(self, ctx: RunContext[Any], *, call: ToolCallPart, tool_def: ToolDefinition,
                                     args: Any, error: Exception) -> Any:
-        # 승인으로 미룸은 실패가 아니다 — 단계 없이 넘긴다 (승인 카드가 대신 뜬다)
-        if not isinstance(error, (ApprovalRequired, CallDeferred)):
-            if call.tool_name in MUTATING_TOOLS:
-                await self._start(call)
+        if isinstance(error, _NOT_RUN):
+            # 실행하지 않고 넘어간 것 — 승인으로 미룸(카드가 대신 뜬다), 모델에게 인자를 다시 내라고 함(정상 흐름).
+            # 실패가 아니므로 그 단계를 지운다. 승인 뒤 /approve 가 실제로 돌리면 그때 다시 시작부터 뜬다
+            await self.hub.publish(self.key, {"type": "step_drop", "id": call.tool_call_id})
+        else:
             await self.hub.publish(self.key, {"type": "step_end", "id": call.tool_call_id, "command": None, "ok": False})
         raise error
+
+
+#: 도구가 실제로 돌지 않았음을 뜻하는 흐름 제어 예외. kubectl 자체의 실패는 예외가 아니라 KubectlResult(success=False) 다
+_NOT_RUN = (ApprovalRequired, CallDeferred, ModelRetry)
 
 
 def _sse(event: dict[str, Any]) -> str:

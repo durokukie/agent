@@ -126,24 +126,86 @@ def test_진행_상황은_대화를_읽을_수_있는_사람만_연다(client, f
     assert client.get(f"/conversations/{room}/progress", headers=OTHER).status_code in (403, 404)
 
 
-def test_근거_없는_결과는_성공이_아니라_불명이고_승인_미룸은_단계를_남기지_않는다():
-    from pydantic_ai.exceptions import ApprovalRequired
+def test_근거_없는_결과는_성공이_아니라_불명이고_돌지_않은_도구는_지운다():
+    from pydantic_ai.exceptions import ApprovalRequired, ModelRetry
     from pydantic_ai.messages import ToolCallPart
 
     hub = progress.ProgressHub()
     cap = hub.capability("room")
     read = ToolCallPart(tool_name="list_resources", args={"kind": "pod"}, tool_call_id="r1")
     change = ToolCallPart(tool_name="scale_resource", args={"kind": "deployment", "name": "api"}, tool_call_id="m1")
+    retry = ToolCallPart(tool_name="scale_resource", args={}, tool_call_id="m2")
+    broken = ToolCallPart(tool_name="list_resources", args={"kind": "pod"}, tool_call_id="r2")
 
     async def go():
         await hub.begin("room")
-        await cap.before_tool_execute(None, call=read, tool_def=None, args={})
+        for call in (read, change, retry, broken):
+            await cap.before_tool_execute(None, call=call, tool_def=None, args={})
         await cap.after_tool_execute(None, call=read, tool_def=None, args={}, result="문자열 결과")
-        await cap.before_tool_execute(None, call=change, tool_def=None, args={})
-        with pytest.raises(ApprovalRequired):
-            await cap.on_tool_execute_error(None, call=change, tool_def=None, args={}, error=ApprovalRequired())
+        for call, error in ((change, ApprovalRequired()), (retry, ModelRetry("다시")), (broken, RuntimeError("x"))):
+            with pytest.raises(type(error)):
+                await cap.on_tool_execute_error(None, call=call, tool_def=None, args={}, error=error)
         return list(hub._runs["room"].events)
 
     events = sync(go())
-    assert [e["type"] for e in events] == ["step_start", "step_end"]      # 변경 도구는 아무것도 안 남는다
-    assert events[1]["ok"] is None
+    kept = [(e["type"], e["id"]) for e in events]
+    assert ("step_start", "m1") not in kept and ("step_start", "m2") not in kept     # 미룸·재시도는 지워진다
+    assert [e for e in events if e["type"] == "step_end" and e["id"] == "r1"][0]["ok"] is None
+    assert [e for e in events if e["type"] == "step_end" and e["id"] == "r2"][0]["ok"] is False   # 진짜 예외는 실패
+
+
+# ── 승인 카드 경로 (가드레일이 변경 도구를 미룸) ─────────────────
+
+def test_승인_카드_단계엔_단계가_없고_승인_뒤_실제로_돌_때_뜬다(
+    dev_auth, fake_server, kubectl_ok, hook_passes, monkeypatch
+):
+    from test_plan_flow import _approve, _card, _ok, _room
+    from kukie_agent.tools import mutate
+
+    monkeypatch.setattr(mutate, "run_kubectl", lambda args, **kw: _ok("scaled\n"))
+
+    progress.hub = progress.ProgressHub()
+    client = TestClient(server.app)
+    room = _room(fake_server)
+    seen: list[dict] = []
+    publish = progress.hub.publish
+
+    async def record(key, event):
+        if key == room:
+            seen.append(event)
+        await publish(key, event)
+
+    monkeypatch.setattr(progress.hub, "publish", record)
+
+    _card(client, room)
+    # 가드레일이 우리 훅보다 먼저 승인으로 미룬다 — 카드 단계에는 아무것도 안 올라간다 (끝나지 않는 단계 없음).
+    # 순서가 바뀌어 우리 시작이 먼저 올라가더라도 on_tool_execute_error 의 step_drop 이 지운다 (위 단위 테스트)
+    assert [e["type"] for e in seen if e["type"] != "step_drop"] == []
+
+    seen.clear()
+    assert _approve(client, room).status_code == 200
+    start, end = seen
+    assert start["type"] == "step_start" and start["label"] == "deployment/nginx 개수 바꾸기"
+    assert end["type"] == "step_end" and end["ok"] is True
+
+
+def test_drop_은_아직_안_본_연결에서도_그_단계를_지운다():
+    hub = progress.ProgressHub()
+
+    async def go():
+        await hub.begin("room")
+        await hub.publish("room", {"type": "step_start", "id": "m1", "label": "x"})
+        await hub.publish("room", {"type": "step_drop", "id": "m1"})
+        await hub.end("room")
+
+    async def late():
+        await hub.begin("room")
+        await hub.publish("room", {"type": "step_start", "id": "m1", "label": "x"})
+        await hub.publish("room", {"type": "step_drop", "id": "m1"})
+        reader = asyncio.create_task(_collect(hub, "room"))
+        await asyncio.sleep(0)
+        await hub.end("room")
+        return await asyncio.wait_for(reader, 2)
+
+    sync(go())
+    assert [e["type"] for e in _events(sync(late()))] == ["step_drop", "done"]
