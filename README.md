@@ -70,7 +70,7 @@ kukie-electron (앱·웹) ──/member/*──▶ kukie-server (Kukie API 서�
 이 레포는 에이전트 서버다. **agent 는 DB 를 갖지 않는다** — 대화·run·Action Plan·클러스터의 원본은 kukie-server 하나이고,
 agent 는 워크플로(LLM 루프·가드레일·kubectl)만 실행하며 저장은 kukie-server 의 내부 API(`/internal/**`)로 한다 (DURO-113).
 대화 만들기·목록·조회, 클러스터 등록·목록·수정·삭제, Action Plan 목록·상세는 클라이언트가 kukie-server 에 직접 부른다.
-agent 에 남은 공개 API 는 `POST /conversations/{id}/chat`·`/approve`·`/resume` 과 `POST /clusters/{id}/test` 뿐이다.
+agent 에 남은 공개 API 는 `POST /conversations/{id}/chat`·`/approve`·`/resume` 과 `POST /clusters/{id}/test`(연결 확인)·`GET /clusters/{id}/overview`(대시보드 개요) 뿐이다.
 "이 사용자가 이 대화·클러스터에 이 일을 해도 되나" 도 server 가 판단한다.
 
 세 레포 중 [kukie-server](https://github.com/durokukie/kukie-server) 는 공개, 앱은 비공개.
@@ -81,10 +81,10 @@ agent 에 남은 공개 API 는 `POST /conversations/{id}/chat`·`/approve`·`/r
 | 가드레일 훅, Action Plan, 판단 가이드 | `kukie_agent/guardrail/` |
 | 읽기 툴 4종, 변경 툴 4종 | `kukie_agent/tools/` |
 | kubectl 명령 조립·실행 (`shell=False`) | `kukie_agent/kubectl/` |
-| FastAPI 서버, 대화 실행(chat·approve·resume)·클러스터 연결 확인 | `kukie_agent/server.py`, `kukie_agent/conversations_api.py`, `kukie_agent/clusters_api.py` |
+| FastAPI 서버, 대화 실행(chat·approve·resume)·클러스터 연결 확인·개요 | `kukie_agent/server.py`, `kukie_agent/conversations_api.py`, `kukie_agent/clusters_api.py` |
 | 채팅방별 세션·잠금·재시작 복원 | `kukie_agent/conversations.py` |
 | Kukie API 서버 내부 API 클라이언트 (저장·권한 판단, fail-closed) | `kukie_agent/server_api.py` |
-| 실행 직전 임시 kubeconfig | `kukie_agent/clusters/` |
+| 실행 직전 임시 kubeconfig, 개요 응답 정리 | `kukie_agent/clusters/` |
 | 인증 (kukie-server `/users/me`, fail-closed) | `kukie_agent/auth.py` |
 
 **스택**: Python 3.14+ · [pydantic-ai](https://ai.pydantic.dev/) (에이전트 루프, 승인 훅 `ApprovalRequired`/`DeferredToolRequests`) · FastAPI · httpx · pytest · kind (E2E)
