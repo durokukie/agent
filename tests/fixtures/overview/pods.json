@@ -1,0 +1,36 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "metadata": {"name": "web-1", "creationTimestamp": "2026-10-19T09:00:00Z"},
+      "spec": {"nodeName": "ip-10-0-1-5"},
+      "status": {"phase": "Running", "containerStatuses": [
+        {"name": "app", "restartCount": 1, "state": {"running": {}}},
+        {"name": "sidecar", "restartCount": 2, "state": {"running": {}}}]}
+    },
+    {
+      "metadata": {"name": "api-1", "creationTimestamp": "2026-10-19T11:35:00Z"},
+      "spec": {"nodeName": "ip-10-0-1-6"},
+      "status": {"phase": "Running", "containerStatuses": [
+        {"name": "app", "restartCount": 7, "state": {"waiting": {"reason": "CrashLoopBackOff"}}}]}
+    },
+    {
+      "metadata": {"name": "api-2", "creationTimestamp": "2026-10-19T11:59:15Z"},
+      "spec": {},
+      "status": {"phase": "Pending", "containerStatuses": [
+        {"name": "app", "restartCount": 0, "state": {"waiting": {"reason": "ImagePullBackOff"}}}]}
+    },
+    {
+      "metadata": {"name": "worker-1", "creationTimestamp": "2026-10-19T11:58:00Z"},
+      "spec": {},
+      "status": {"phase": "Pending"}
+    },
+    {
+      "metadata": {"name": "job-1", "creationTimestamp": "2026-10-15T12:00:00Z"},
+      "spec": {"nodeName": "ip-10-0-1-5"},
+      "status": {"phase": "Succeeded", "containerStatuses": [
+        {"name": "job", "restartCount": 0, "state": {"terminated": {"reason": "Completed"}}}]}
+    }
+  ]
+}
