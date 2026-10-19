@@ -389,20 +389,14 @@ def test_빈_글로_지운_미리보기도_늦게_붙은_화면에_전해진다(
 
 
 def test_실패한_run_도_미리보기를_지운다(monkeypatch):
+    """publish 가 불렸는지가 아니라 화면(스트림)에 실제로 내려갔는지 본다 — 지우기가 hub.end 뒤로 밀리면
+    publish 는 run.done 으로 그냥 돌아 나와 아무 화면에도 안 간다 (리뷰)."""
     from types import SimpleNamespace
 
     from kukie_agent import server as srv
 
     monkeypatch.setenv("KUKIE_STREAM_ANSWER", "1")
     hub = progress.hub = progress.ProgressHub()
-    seen: list[dict] = []
-    publish = hub.publish
-
-    async def record(key, event):
-        seen.append(event)
-        await publish(key, event)
-
-    monkeypatch.setattr(hub, "publish", record)
 
     async def broken_run(**kwargs):
         await hub.publish("room", {"type": "answer", "text": "지웠어요"})
@@ -411,6 +405,13 @@ def test_실패한_run_도_미리보기를_지운다(monkeypatch):
     monkeypatch.setattr(srv.agent, "run", broken_run)
     session = SimpleNamespace(progress_key="room", deps=None, history=[],
                               skill=SimpleNamespace(output_fn=lambda **_: None))
-    with pytest.raises(RuntimeError):
-        sync(srv._run_agent(session, user_prompt="x"))
-    assert seen[-1] == {"type": "answer", "text": ""}
+
+    async def go():
+        reader = asyncio.create_task(_collect(hub, "room"))
+        await asyncio.sleep(0)                          # 스트림이 run 을 기다리게 둔다
+        with pytest.raises(RuntimeError):
+            await srv._run_agent(session, user_prompt="x")
+        return await asyncio.wait_for(reader, 2)
+
+    answers = [e for e in _events(sync(go())) if e["type"] == "answer"]
+    assert answers[-1] == {"type": "answer", "text": ""}
