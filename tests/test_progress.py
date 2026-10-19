@@ -68,7 +68,7 @@ def test_run이_시작되기_전에_연결하면_시작을_기다렸다가_받�
 
 def test_기다려도_run이_없으면_done만_보내고_닫는다(monkeypatch):
     monkeypatch.setattr(progress, "WAIT_FOR_RUN_SECONDS", 0.01)
-    assert _events(sync(_collect(progress.ProgressHub(), "room"))) == [{"type": "done"}]
+    assert _events(sync(_collect(progress.ProgressHub(), "room"))) == [{"type": "done", "run": False}]
 
 
 def test_조용하면_keep_alive_주석을_보낸다(monkeypatch):
@@ -121,7 +121,7 @@ def test_진행_상황은_대화를_읽을_수_있는_사람만_연다(client, f
 
     r = client.get(f"/conversations/{room}/progress", headers=USER)
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream")
-    assert _events(r.text.split("\n\n")) == [{"type": "done"}]
+    assert _events(r.text.split("\n\n")) == [{"type": "done", "run": False}]
 
     assert client.get(f"/conversations/{room}/progress", headers=OTHER).status_code in (403, 404)
 
@@ -149,7 +149,8 @@ def test_근거_없는_결과는_성공이_아니라_불명이고_돌지_않은_
 
     events = sync(go())
     kept = [(e["type"], e["id"]) for e in events]
-    assert ("step_start", "m1") not in kept and ("step_start", "m2") not in kept     # 미룸·재시도는 지워진다
+    assert ("step_drop", "m1") in kept and ("step_drop", "m2") in kept               # 미룸·재시도는 지우라고 알린다
+    assert ("step_end", "m1") not in kept and ("step_end", "m2") not in kept         # 실패(✗)로는 안 닫는다
     assert [e for e in events if e["type"] == "step_end" and e["id"] == "r1"][0]["ok"] is None
     assert [e for e in events if e["type"] == "step_end" and e["id"] == "r2"][0]["ok"] is False   # 진짜 예외는 실패
 
@@ -189,23 +190,17 @@ def test_승인_카드_단계엔_단계가_없고_승인_뒤_실제로_돌_때_�
     assert end["type"] == "step_end" and end["ok"] is True
 
 
-def test_drop_은_아직_안_본_연결에서도_그_단계를_지운다():
+def test_drop_은_덧붙이기만_해서_이미_본_연결도_받는다():
+    """중간을 지우면 stream 의 커서가 어긋나 이미 시작을 본 화면이 drop 을 못 받는다 (리뷰)."""
     hub = progress.ProgressHub()
 
     async def go():
         await hub.begin("room")
-        await hub.publish("room", {"type": "step_start", "id": "m1", "label": "x"})
-        await hub.publish("room", {"type": "step_drop", "id": "m1"})
-        await hub.end("room")
-
-    async def late():
-        await hub.begin("room")
-        await hub.publish("room", {"type": "step_start", "id": "m1", "label": "x"})
-        await hub.publish("room", {"type": "step_drop", "id": "m1"})
         reader = asyncio.create_task(_collect(hub, "room"))
-        await asyncio.sleep(0)
+        await hub.publish("room", {"type": "step_start", "id": "m1", "label": "x"})
+        await asyncio.sleep(0.01)                        # 화면이 시작을 받은 뒤
+        await hub.publish("room", {"type": "step_drop", "id": "m1"})
         await hub.end("room")
         return await asyncio.wait_for(reader, 2)
 
-    sync(go())
-    assert [e["type"] for e in _events(sync(late()))] == ["step_drop", "done"]
+    assert [e["type"] for e in _events(sync(go()))] == ["step_start", "step_drop", "done"]

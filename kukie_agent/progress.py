@@ -6,6 +6,7 @@
 - 단계는 도구 실행 훅에서 만든다 (`agent.run(capabilities=[hub.capability(방)])`).
   도구가 돌기 직전 `step_start`(무엇을 하려는지), 끝나면 `step_end`(실제로 돈 kubectl 명령·성공 여부, 근거 없으면 None).
   돌지 않고 넘어가면(승인으로 미룸·모델 재시도) `step_drop` 으로 그 단계를 지운다 — 실패가 아니다.
+- 연결했는데 run 이 시작되지 않으면 `{"type":"done","run":false}` — run 이 끝난 `done` 과 달리 앱이 다시 연결한다.
 - 방마다 지금 run 의 단계를 모아 둔다. 늦게 연결한 화면도 앞 단계를 다시 받는다.
 - 메모리에만 둔다 — 에이전트는 한 대이고(세션도 메모리), 진행 상황은 run 이 끝나면 쓸모가 없다.
 """
@@ -108,9 +109,8 @@ class ProgressHub:
         if run is None or run.done:
             return
         async with run.changed:
-            if event["type"] == "step_drop":
-                # 아직 안 본 연결에는 그 단계가 처음부터 없던 것처럼 — 쌓인 시작을 지운다. 이미 본 화면은 drop 을 받아 지운다
-                run.events = [e for e in run.events if e.get("id") != event["id"]]
+            # 덧붙이기만 한다 — stream 은 "몇 번째까지 보냈나" 를 정수로 세서, 중간을 지우면 이미 본 화면이 step_drop 을
+            # 못 받는다 (리뷰). 늦게 붙은 화면은 시작과 drop 을 둘 다 받아 앱에서 지운다
             run.events.append(event)
             run.changed.notify_all()
 
@@ -145,7 +145,8 @@ class ProgressHub:
         """SSE 본문. 지금 run 이 있으면 지난 단계부터, 없으면 시작을 잠깐 기다린다. run 이 끝나면 `done` 으로 닫는다."""
         run = await self._next_run(key)
         if run is None:
-            yield _sse({"type": "done"})
+            # run 이 끝난 done 과 가른다 — 앱은 아직 답을 기다리는 중이면 다시 연결한다 (리뷰)
+            yield _sse({"type": "done", "run": False})
             return
         sent = 0
         while True:
