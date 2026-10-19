@@ -161,7 +161,7 @@ class ProgressHub:
                 yield _sse(event)
             sent += len(pending)
             if finished and sent == len(run.events):
-                yield _sse({"type": "done"})
+                yield _sse({"type": "done", "run": True})   # run:false(시작 안 됨)와 짝을 맞춰 늘 적는다
                 return
             if not pending:
                 yield ": keep-alive\n\n"

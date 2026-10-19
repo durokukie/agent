@@ -83,7 +83,7 @@ def test_조용하면_keep_alive_주석을_보낸다(monkeypatch):
         return await asyncio.wait_for(reader, 2)
 
     chunks = sync(go())
-    assert ": keep-alive\n\n" in chunks and _events(chunks)[-1] == {"type": "done"}
+    assert ": keep-alive\n\n" in chunks and _events(chunks)[-1] == {"type": "done", "run": True}
 
 
 # ── 실제 run 과 엔드포인트 ─────────────────────────────────────
