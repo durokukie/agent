@@ -50,6 +50,7 @@ def test_늦게_연결해도_지난_단계부터_받고_끝나면_done으로_닫
 
     events = _events(sync(go()))
     assert [e["type"] for e in events] == ["step_start", "step_end", "done"]
+    assert events[-1] == {"type": "done", "run": True}                 # 끝난 done 에는 run 키가 늘 있다
 
 
 def test_run이_시작되기_전에_연결하면_시작을_기다렸다가_받는다():
@@ -63,7 +64,8 @@ def test_run이_시작되기_전에_연결하면_시작을_기다렸다가_받�
         await hub.end("room")
         return await asyncio.wait_for(reader, 2)
 
-    assert [e["type"] for e in _events(sync(go()))] == ["step_start", "done"]
+    got = _events(sync(go()))
+    assert [e["type"] for e in got] == ["step_start", "done"] and got[-1]["run"] is True
 
 
 def test_기다려도_run이_없으면_done만_보내고_닫는다(monkeypatch):
@@ -267,7 +269,7 @@ def test_dict_조각은_합치고_미리보기가_터져도_run_은_안_죽는�
     async def events():
         yield PartStartEvent(index=0, part=ToolCallPart(tool_name="build_KukieResponse", args={"narration": "앞"}))
         yield PartDeltaEvent(index=0, delta=ToolCallPartDelta(args_delta={"finding": None}))   # narration 이 남아야 한다
-        yield PartDeltaEvent(index=1, delta=ToolCallPartDelta(args_delta=object()))           # 이상한 조각 — 무시
+        yield PartStartEvent(index=1, part=ToolCallPart(tool_name="x", args=[1, 2]))    # from_json 이 TypeError — 가드가 잡아야 한다
 
     async def go():
         await hub.begin("room")
@@ -312,6 +314,66 @@ def test_스위치를_켜면_실제_채팅에서_답_미리보기가_올라간�
     assert answers and answers[-1] == "파드 하나가 떠 있어요"                       # 미리보기 끝 = 진짜 답
 
 
-def test_스위치가_꺼져_있으면_답_미리보기는_없다(client, fake_server, monkeypatch):
+def test_스위치가_꺼져_있으면_실제_채팅에서_답_미리보기가_없다(client, fake_server, monkeypatch):
     monkeypatch.delenv("KUKIE_STREAM_ANSWER", raising=False)
-    assert not progress.answer_streaming_enabled()
+    room = new_room(fake_server)
+    seen: list[dict] = []
+    publish = progress.hub.publish
+
+    async def record(key, event):
+        if key == room:
+            seen.append(event)
+        await publish(key, event)
+
+    monkeypatch.setattr(progress.hub, "publish", record)
+    with agent.override(model=chat_model("답")):
+        assert client.post(f"/conversations/{room}/chat", json={"text": "파드"}, headers=USER).status_code == 200
+    assert seen and not [e for e in seen if e["type"] == "answer"]      # 단계는 오고 미리보기는 없다
+
+
+def test_str_조각_뒤에_dict_조각이_와도_앞의_narration_을_잃지_않는다(monkeypatch):
+    from pydantic_ai.messages import PartDeltaEvent, PartStartEvent, ToolCallPart, ToolCallPartDelta
+
+    monkeypatch.setattr(progress, "ANSWER_INTERVAL_SECONDS", 0)
+    hub = progress.ProgressHub()
+
+    async def events():
+        yield PartStartEvent(index=0, part=ToolCallPart(tool_name="build_KukieResponse", args='{"narration": "nginx 파드를'))
+        yield PartDeltaEvent(index=0, delta=ToolCallPartDelta(args_delta={"finding": None}))
+
+    async def go():
+        await hub.begin("room")
+        await hub.answer_handler("room")(None, events())
+        return hub._runs["room"].answer
+
+    assert sync(go()) == "nginx 파드를"
+
+
+def test_승인_카드로_끝난_run_은_미리보기를_지운다(monkeypatch):
+    """같은 응답에 답 양식도 썼다면 미리보기에 '늘렸습니다' 가 남는다 — 실행 전이니 끝에 빈 글로 지운다."""
+    from types import SimpleNamespace
+
+    from pydantic_ai.tools import DeferredToolRequests
+
+    from kukie_agent import server as srv
+
+    monkeypatch.setenv("KUKIE_STREAM_ANSWER", "1")
+    hub = progress.hub = progress.ProgressHub()
+    seen: list[dict] = []
+    publish = hub.publish
+
+    async def record(key, event):
+        seen.append(event)
+        await publish(key, event)
+
+    monkeypatch.setattr(hub, "publish", record)
+
+    async def fake_run(**kwargs):
+        await hub.publish("room", {"type": "answer", "text": "늘렸습니다"})
+        return SimpleNamespace(output=DeferredToolRequests())
+
+    monkeypatch.setattr(srv.agent, "run", fake_run)
+    session = SimpleNamespace(progress_key="room", deps=None, history=[],
+                              skill=SimpleNamespace(output_fn=lambda **_: None))
+    sync(srv._run_agent(session, user_prompt="x"))
+    assert seen[-1] == {"type": "answer", "text": ""}

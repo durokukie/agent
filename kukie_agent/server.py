@@ -127,17 +127,22 @@ async def _run_agent(session: Session, **kwargs: Any):
             message_history=session.history or None,
             **kwargs,
         )
+    streaming = progress.answer_streaming_enabled()
     await progress.hub.begin(key)
     try:
-        return await agent.run(
+        result = await agent.run(
             deps=session.deps,
             output_type=[session.skill.output_fn, DeferredToolRequests],
             message_history=session.history or None,
             capabilities=[progress.hub.capability(key)],
             # 답 미리보기는 스위치로만 — 켜면 모델 요청이 스트리밍이 된다 (progress.answer_streaming_enabled)
-            **({"event_stream_handler": progress.hub.answer_handler(key)} if progress.answer_streaming_enabled() else {}),
+            **({"event_stream_handler": progress.hub.answer_handler(key)} if streaming else {}),
             **kwargs,
         )
+        if streaming and isinstance(result.output, DeferredToolRequests):
+            # 승인 카드로 끝났다 — 같은 응답에 답 양식도 썼다면 미리보기에 "늘렸습니다" 가 남아 있다. 실행 전이니 지운다 (리뷰)
+            await progress.hub.publish(key, {"type": "answer", "text": ""})
+        return result
     finally:
         await progress.hub.end(key)
 
