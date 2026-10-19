@@ -204,3 +204,52 @@ def test_drop_은_덧붙이기만_해서_이미_본_연결도_받는다():
         return await asyncio.wait_for(reader, 2)
 
     assert [e["type"] for e in _events(sync(go()))] == ["step_start", "step_drop", "done"]
+
+
+# ── 답 미리보기 (KUKIE_STREAM_ANSWER) ─────────────────────────
+
+def test_답_양식_조각에서_narration만_지금까지의_글로_흘린다(monkeypatch):
+    from pydantic_ai.messages import PartDeltaEvent, PartStartEvent, ToolCallPart, ToolCallPartDelta
+
+    monkeypatch.setattr(progress, "ANSWER_INTERVAL_SECONDS", 0)
+    hub = progress.ProgressHub()
+    chunks = ['{"narr', 'ation": "nginx 파드', '를 2개로 늘렸', '습니다.", "finding": null}']
+
+    async def events():
+        yield PartStartEvent(index=0, part=ToolCallPart(tool_name="list_resources", args='{"kind": "pod"}'))
+        yield PartStartEvent(index=1, part=ToolCallPart(tool_name="build_KukieResponse", args=chunks[0]))
+        for c in chunks[1:]:
+            yield PartDeltaEvent(index=1, delta=ToolCallPartDelta(args_delta=c))
+
+    async def go():
+        await hub.begin("room")
+        await hub.answer_handler("room")(None, events())
+        return list(hub._runs["room"].events)
+
+    texts = [e["text"] for e in sync(go())]
+    assert texts == ["nginx 파드", "nginx 파드를 2개로 늘렸", "nginx 파드를 2개로 늘렸습니다."]   # 도구 인자는 안 섞인다
+
+
+def test_스위치를_켜면_실제_채팅에서_답_미리보기가_올라간다(client, fake_server, monkeypatch):
+    monkeypatch.setenv("KUKIE_STREAM_ANSWER", "1")
+    monkeypatch.setattr(progress, "ANSWER_INTERVAL_SECONDS", 0)
+    room = new_room(fake_server)
+    seen: list[dict] = []
+    publish = progress.hub.publish
+
+    async def record(key, event):
+        if key == room:
+            seen.append(event)
+        await publish(key, event)
+
+    monkeypatch.setattr(progress.hub, "publish", record)
+    with agent.override(model=chat_model("파드 하나가 떠 있어요")):
+        r = client.post(f"/conversations/{room}/chat", json={"text": "파드"}, headers=USER)
+    assert r.status_code == 200 and r.json()["response"]["narration"] == "파드 하나가 떠 있어요"
+    answers = [e["text"] for e in seen if e["type"] == "answer"]
+    assert answers and answers[-1] == "파드 하나가 떠 있어요"                       # 미리보기 끝 = 진짜 답
+
+
+def test_스위치가_꺼져_있으면_답_미리보기는_없다(client, fake_server, monkeypatch):
+    monkeypatch.delenv("KUKIE_STREAM_ANSWER", raising=False)
+    assert not progress.answer_streaming_enabled()
