@@ -96,6 +96,9 @@ class _Run:
     # 답 미리보기는 events 에 쌓지 않고 마지막 것 한 칸만 — "지금까지의 글 전체" 라 마지막 것만 그리면 맞고,
     # 쌓으면 늦게 붙은 화면이 수백 개를 되받고 메모리가 답 길이의 제곱으로 는다 (리뷰)
     answer: str = ""
+    # 미리보기를 몇 번 바꿨나. 글이 아니라 이 번호로 "새 것" 을 가른다 — 빈 글로 지운 것(승인 카드·실패)도 늦게 붙거나
+    # 다시 붙은 화면에 전해져야 하는데, 글로 비교하면 빈 글은 "아직 없음" 과 같아 안 보내졌다 (리뷰)
+    answer_version: int = 0
     done: bool = False
     changed: asyncio.Condition = field(default_factory=asyncio.Condition)
 
@@ -123,6 +126,7 @@ class ProgressHub:
         async with run.changed:
             if event["type"] == "answer":
                 run.answer = event["text"]
+                run.answer_version += 1
                 run.changed.notify_all()
                 return
             # 덧붙이기만 한다 — stream 은 "몇 번째까지 보냈나" 를 정수로 세서, 중간을 지우면 이미 본 화면이 step_drop 을
@@ -165,21 +169,21 @@ class ProgressHub:
             yield _sse({"type": "done", "run": False})
             return
         sent = 0
-        sent_answer = ""
+        sent_version = 0
         while True:
             async with run.changed:
-                if sent == len(run.events) and run.answer == sent_answer and not run.done:
+                if sent == len(run.events) and run.answer_version == sent_version and not run.done:
                     try:
                         await asyncio.wait_for(run.changed.wait(), HEARTBEAT_SECONDS)
                     except TimeoutError:
                         pass
-                pending, answer, finished = run.events[sent:], run.answer, run.done
+                pending, answer, version, finished = run.events[sent:], run.answer, run.answer_version, run.done
             for event in pending:
                 yield _sse(event)
             sent += len(pending)
-            if answer != sent_answer:
+            if version != sent_version:
                 yield _sse({"type": "answer", "text": answer})
-                sent_answer = answer
+                sent_version = version
             elif not pending and not finished:
                 yield ": keep-alive\n\n"
             if finished and sent == len(run.events):

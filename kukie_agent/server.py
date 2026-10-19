@@ -143,6 +143,11 @@ async def _run_agent(session: Session, **kwargs: Any):
             # 승인 카드로 끝났다 — 같은 응답에 답 양식도 썼다면 미리보기에 "늘렸습니다" 가 남아 있다. 실행 전이니 지운다 (리뷰)
             await progress.hub.publish(key, {"type": "answer", "text": ""})
         return result
+    except BaseException:
+        # 실패한 턴도 지운다 — 미리보기를 덮을 답이 오지 않아 "지웠어요" 가 그대로 남는다 (리뷰)
+        if streaming:
+            await progress.hub.publish(key, {"type": "answer", "text": ""})
+        raise
     finally:
         await progress.hub.end(key)
 
