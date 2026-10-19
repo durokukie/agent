@@ -11,10 +11,15 @@ kubectl 은 clusters_api.py 가 돌리고, 여기는 그 출력(JSON 문자열)�
   - Progressing  ready < desired 이지만 롤아웃이 진행 중이다
                    공통: metadata.generation 을 컨트롤러가 아직 못 봤다(observedGeneration 이 작다) 또는 updated < desired
                    StatefulSet: currentRevision ≠ updateRevision 도 진행 중으로 본다
+                   StatefulSet 의 partition·OnDelete 는 옛 리비전이 남는 게 정상이라 그만큼은 진행 중으로 보지 않는다
   - Degraded     ready < desired 인데 진행 중인 롤아웃이 없다 (새 버전으로 다 바뀐 뒤 파드가 죽는다 등)
-                   Deployment 는 Progressing 조건이 False(ProgressDeadlineExceeded — 기본 600초 안에 못 끝냄)여도 Degraded
-  롤아웃 중에 파드가 계속 죽으면 Deployment 는 진행 기한(progressDeadlineSeconds)까지 Progressing 이다가 Degraded 가 되고,
-  StatefulSet·DaemonSet 은 기한 조건이 없어 updated 가 desired 에 닿을 때까지 Progressing 으로 남는다 — 단순하게 둔 것이다.
+  Deployment 는 숫자 대신 Progressing 조건을 먼저 본다 — updatedReplicas 는 Ready 와 무관하게 파드가 생기면 올라서
+  숫자만으로는 "막 뜨는 중" 과 "다 바뀐 뒤 죽음" 이 갈리지 않는다.
+    False(ProgressDeadlineExceeded — 기본 600초 안에 못 끝냄)       → Degraded
+    True/NewReplicaSetAvailable(롤아웃을 끝냈다) 인데 ready < desired → Degraded (끝난 뒤 파드가 죽었다)
+    그 밖의 True(NewReplicaSetCreated·ReplicaSetUpdated …)          → Progressing
+  롤아웃 중에 파드가 계속 죽으면 Deployment 는 진행 기한까지 Progressing 이다가 Degraded 가 되고,
+  StatefulSet·DaemonSet 은 기한 조건이 없어 updated 가 다 찰 때까지 Progressing 으로 남는다 — 단순하게 둔 것이다.
 
 파드 phase
   kubelet 이 주는 status.phase 를 그대로 쓰되, 컨테이너(init 포함) 하나라도 BROKEN_WAITING 의 대기 사유에 걸려 있으면
@@ -99,14 +104,31 @@ def workload_status(item: dict[str, Any]) -> tuple[int, int, str]:
         updated = _int(status.get("updatedReplicas"))
 
     stale = _int(status.get("observedGeneration")) < _int(meta.get("generation"))
-    rolling = stale or updated < desired
-    if kind == "StatefulSet" and status.get("updateRevision"):
+    expected_updated, check_revision = desired, True
+    if kind == "StatefulSet":
+        strategy = spec.get("updateStrategy") or {}
+        if strategy.get("type") == "OnDelete":
+            expected_updated, check_revision = 0, False       # 사람이 파드를 지울 때까지 옛 리비전이 정상이다
+        else:
+            partition = _int((strategy.get("rollingUpdate") or {}).get("partition"))
+            expected_updated = max(0, desired - partition)    # partition 아래 순번은 옛 리비전에 두는 게 정상이다
+            check_revision = partition == 0
+    rolling = stale or updated < expected_updated
+    if check_revision and kind == "StatefulSet" and status.get("updateRevision"):
         rolling = rolling or status.get("currentRevision") != status.get("updateRevision")
 
     if ready >= desired and not rolling:
         return ready, desired, "Available"
-    if kind == "Deployment" and _condition(status, "Progressing") == "False":
-        return ready, desired, "Degraded"
+    if kind == "Deployment":
+        progressing = _condition(status, "Progressing")
+        if progressing is not None:
+            if progressing.get("status") == "False":
+                return ready, desired, "Degraded"             # ProgressDeadlineExceeded
+            if ready < desired and progressing.get("reason") == "NewReplicaSetAvailable" and not rolling:
+                return ready, desired, "Degraded"             # 롤아웃을 끝낸 뒤에 파드가 죽었다
+            # 그 밖의 사유(NewReplicaSetCreated·FoundNewReplicaSet·ReplicaSetUpdated)는 진행 중이다.
+            # updatedReplicas 는 Ready 와 무관하게 파드가 생기면 오르므로 숫자만 보면 막 뜨는 중인 것도 Degraded 가 된다
+            return ready, desired, "Progressing"
     if ready >= desired:
         return ready, desired, "Progressing"       # 다 떠 있지만 새 버전으로 바꾸는 중
     return ready, desired, "Progressing" if rolling else "Degraded"
@@ -119,7 +141,8 @@ def parse_pods(items: list[dict[str, Any]], now: datetime) -> list[dict[str, Any
     for item in items:
         meta = item.get("metadata") or {}
         status = item.get("status") or {}
-        containers = status.get("containerStatuses") or []
+        # kubectl 의 RESTARTS 처럼 init(사이드카 포함) 컨테이너도 센다 — pod_phase 도 init 을 본다
+        containers = [*(status.get("initContainerStatuses") or []), *(status.get("containerStatuses") or [])]
         rows.append({
             "name": meta.get("name", ""),
             "phase": pod_phase(status),
@@ -215,10 +238,10 @@ def _items(stdout: str) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)]
 
 
-def _condition(status: dict[str, Any], kind: str) -> str | None:
+def _condition(status: dict[str, Any], kind: str) -> dict[str, Any] | None:
     for condition in status.get("conditions") or []:
-        if condition.get("type") == kind:
-            return condition.get("status")
+        if isinstance(condition, dict) and condition.get("type") == kind:
+            return condition
     return None
 
 

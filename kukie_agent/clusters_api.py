@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -26,12 +27,16 @@ from kukie_agent.auth import User, current_user
 from kukie_agent.clusters import access, overview
 from kukie_agent.kubectl import run_kubectl, thread_limiter
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/clusters", tags=["clusters"])
 
 #: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적, 이유는 thread_limiter).
 #: kubectl 은 30초씩 잡는다.
 PROBE_WORKERS = 4            # 연결 확인 (kubectl × 2, 최대 60초)
-OVERVIEW_WORKERS = 4         # 개요 (kubectl × 3, 최대 90초). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
+OVERVIEW_WORKERS = 4         # 개요 (kubectl × 3). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
+#: 개요의 kubectl 한 번 시간 제한(초). 기본 30초 × 3 이면 한 요청이 슬롯을 90초 잡는다 — 닿지 않으면 첫 번째에서 15초로 끝난다 (자동 리뷰 지적)
+OVERVIEW_TIMEOUT = 15
 
 
 @router.post("/{cluster_id}/test")
@@ -88,14 +93,18 @@ async def cluster_overview(
         outputs: dict[str, str] = {}
         with access.kubeconfig(conn) as path:
             for name, args in overview.READ_COMMANDS.items():
-                result = run_kubectl([*args, "-n", conn.namespace], context=conn.context_name, kubeconfig=path)
+                result = run_kubectl([*args, "-n", conn.namespace], context=conn.context_name,
+                                     kubeconfig=path, timeout=OVERVIEW_TIMEOUT)
                 if not result.success:
-                    _raise_kubectl_failure(result.stderr or result.stdout)   # 첫 실패에서 멈춘다 — 닿지 않으면 30초면 끝
+                    _raise_kubectl_failure(result.stderr or result.stdout)   # 첫 실패에서 멈춘다
                 outputs[name] = result.stdout
         try:
             return overview.build(context=conn.context_name, namespace=conn.namespace,
                                   now=datetime.now(timezone.utc), **outputs)
-        except (ValueError, AttributeError, TypeError) as exc:
+        except ValueError as exc:
+            # JSON 이 아니거나 items 가 목록이 아닐 때만 (json.JSONDecodeError 도 ValueError). 우리 코드의 버그는 500 으로 둔다.
+            # 원문은 클러스터 내용이라 남기지 않고 예외 종류·위치만 남긴다
+            logger.warning("개요의 kubectl 출력을 읽지 못했다: %s", type(exc).__name__, exc_info=True)
             raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
                                       "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
 

@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from helpers import OTHER, USER
-from kukie_agent import server
+from kukie_agent import clusters_api, server
 from kukie_agent.clusters import overview
 from kukie_agent.kubectl import KubectlResult
 
@@ -60,6 +60,33 @@ def test_컨트롤러가_새_세대를_아직_못_봤으면_진행_중이다():
     assert overview.workload_status(item) == (0, 1, "Progressing")
 
 
+def test_막_만든_Deployment는_파드가_다_생겼어도_뜨는_동안_진행_중이다():
+    """updatedReplicas 는 Ready 와 무관하게 파드가 생기면 오른다 — Progressing 조건의 사유로 가른다 (PR #103 리뷰)."""
+    item = {"kind": "Deployment", "metadata": {"name": "x", "generation": 1}, "spec": {"replicas": 2},
+            "status": {"observedGeneration": 1, "updatedReplicas": 2, "readyReplicas": 0, "conditions": [
+                {"type": "Available", "status": "False", "reason": "MinimumReplicasUnavailable"},
+                {"type": "Progressing", "status": "True", "reason": "ReplicaSetUpdated"}]}}
+    assert overview.workload_status(item) == (0, 2, "Progressing")
+
+
+@pytest.mark.parametrize(("strategy", "status", "expected"), [
+    # partition 2 — 순번 0·1 은 옛 리비전에 두는 게 정상이다
+    ({"type": "RollingUpdate", "rollingUpdate": {"partition": 2}},
+     {"updatedReplicas": 1, "readyReplicas": 3, "currentRevision": "a", "updateRevision": "b"}, "Available"),
+    ({"type": "RollingUpdate", "rollingUpdate": {"partition": 2}},
+     {"updatedReplicas": 0, "readyReplicas": 3, "currentRevision": "a", "updateRevision": "b"}, "Progressing"),
+    # OnDelete — 사람이 지울 때까지 옛 리비전이 정상이다
+    ({"type": "OnDelete"},
+     {"updatedReplicas": 0, "readyReplicas": 3, "currentRevision": "a", "updateRevision": "b"}, "Available"),
+    ({"type": "OnDelete"},
+     {"updatedReplicas": 0, "readyReplicas": 2, "currentRevision": "a", "updateRevision": "b"}, "Degraded"),
+])
+def test_StatefulSet_partition_과_OnDelete는_옛_리비전이_남아도_정상이다(strategy, status, expected):
+    item = {"kind": "StatefulSet", "metadata": {"name": "db", "generation": 1},
+            "spec": {"replicas": 3, "updateStrategy": strategy}, "status": {"observedGeneration": 1, **status}}
+    assert overview.workload_status(item)[2] == expected
+
+
 def test_replicas_를_생략하면_1이고_0이면_Available():
     # 막 만들어 아직 아무 파드도 새 버전이 아니다 (updated 0 < 1) — 진행 중
     assert overview.workload_status({"kind": "Deployment", "spec": {}, "status": {}}) == (0, 1, "Progressing")
@@ -79,6 +106,14 @@ def test_파드는_대기_사유가_고장이면_Failed로_센다():
     assert pods["web-1"]["node"] == "ip-10-0-1-5" and pods["api-2"]["node"] == ""
     assert (pods["web-1"]["age"], pods["api-2"]["age"], pods["job-1"]["age"]) == ("3h", "45s", "4d")
     assert [p["name"] for p in built()["pods"]] == sorted(pods)
+
+
+def test_restarts_는_init_컨테이너도_센다():
+    [pod] = overview.parse_pods([{"metadata": {"name": "p"}, "status": {
+        "phase": "Pending",
+        "initContainerStatuses": [{"restartCount": 4, "state": {"waiting": {"reason": "CrashLoopBackOff"}}}],
+        "containerStatuses": [{"restartCount": 1, "state": {"waiting": {"reason": "PodInitializing"}}}]}}], NOW)
+    assert (pod["phase"], pod["restarts"]) == ("Failed", 5)
 
 
 def test_init_컨테이너가_고장이어도_Failed_모르는_phase는_Unknown():
@@ -155,7 +190,7 @@ def test_팀_구성원은_개요를_읽고_namespace_범위로만_조회한다(c
     seen: list[dict] = []
 
     def fake(args, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None):
-        seen.append({"args": args, "context": context, "dry_run": dry_run, "kubeconfig": kubeconfig,
+        seen.append({"args": args, "context": context, "dry_run": dry_run, "kubeconfig": kubeconfig, "timeout": timeout,
                      "body": kubeconfig.read_text() if kubeconfig else None})
         return _by_resource(args)
 
@@ -176,6 +211,8 @@ def test_팀_구성원은_개요를_읽고_namespace_범위로만_조회한다(c
     # 클러스터 범위 조회는 하지 않는다 — EKS 고객 클러스터는 namespace Edit 만 준다
     assert not any(flag in call["args"] for call in seen for flag in ("-A", "--all-namespaces", "nodes"))
     assert {call["context"] for call in seen} == {"eks-shop"} and not any(call["dry_run"] for call in seen)
+    # 대시보드가 자주 부른다 — 기본 30초보다 짧게 끊는다
+    assert {call["timeout"] for call in seen} == {clusters_api.OVERVIEW_TIMEOUT} and clusters_api.OVERVIEW_TIMEOUT < 30
     # server 에서 받은 값으로 만든 임시 kubeconfig 하나로 세 번 돌리고, 끝나면 지운다
     assert all("secret-token" in call["body"] for call in seen)
     assert len({call["kubeconfig"] for call in seen}) == 1 and not seen[0]["kubeconfig"].exists()
@@ -211,8 +248,6 @@ def test_kubectl_출력이_JSON이_아니면_502_CLUSTER_BAD_RESPONSE(client, fa
 
 
 def test_개요도_스레드_상한을_쓴다(client, fake_server, monkeypatch):
-    from kukie_agent import clusters_api
-
     cluster = fake_server.add_cluster()
     seen: list[object] = []
     real = clusters_api.to_thread.run_sync
