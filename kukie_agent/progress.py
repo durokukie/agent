@@ -6,7 +6,10 @@
 - 단계는 도구 실행 훅에서 만든다 (`agent.run(capabilities=[hub.capability(방)])`).
   도구가 돌기 직전 `step_start`(무엇을 하려는지), 끝나면 `step_end`(실제로 돈 kubectl 명령·성공 여부, 근거 없으면 None).
   돌지 않고 넘어가면(승인으로 미룸·모델 재시도) `step_drop` 으로 그 단계를 지운다 — 실패가 아니다.
-- 연결했는데 run 이 시작되지 않으면 `{"type":"done","run":false}` — run 이 끝난 `done` 과 달리 앱이 다시 연결한다.
+- 답 미리보기(`KUKIE_STREAM_ANSWER=1` 일 때만): `{"type":"answer","text":지금까지 쓴 설명 전체}` — 조각이 아니라 전체라 마지막
+  것만 그리면 맞다. 승인 카드로 끝난 run 은 끝에 빈 글(`""`)을 보내 미리보기를 지운다 (실행 전인데 "늘렸습니다" 가 남지 않게).
+- run 이 끝나면 `{"type":"done","run":true}`, 연결했는데 run 이 시작되지 않으면 `{"type":"done","run":false}` — 앱은 false 일 때만
+  다시 연결한다.
 - 방마다 지금 run 의 단계를 모아 둔다. 늦게 연결한 화면도 앞 단계를 다시 받는다.
 - 메모리에만 둔다 — 에이전트는 한 대이고(세션도 메모리), 진행 상황은 run 이 끝나면 쓸모가 없다.
 """
@@ -225,8 +228,8 @@ class ProgressHub:
 class _Progress(AbstractCapability[Any]):
     """도구 실행 앞뒤에서 단계를 올린다. 모델 요청은 건드리지 않는다.
 
-    `agent.run(event_stream_handler=...)` 로도 같은 일을 할 수 있지만, 그러면 Pydantic AI 가 모델 요청을 스트리밍으로
-    바꾼다 — 답을 받는 방식이 바뀌는 셈이라 도구 훅만 쓴다. 가드레일은 이 훅보다 먼저 변경 도구를 승인으로 미뤄서
+    단계는 `event_stream_handler` 가 아니라 이 도구 훅에서 만든다 — 그 핸들러를 붙이면 모델 요청이 스트리밍으로 바뀌는데,
+    단계는 답 미리보기 스위치(`KUKIE_STREAM_ANSWER`)와 상관없이 늘 보여야 해서다. 가드레일은 이 훅보다 먼저 변경 도구를 승인으로 미뤄서
     카드 단계에는 아무것도 안 올라간다(승인 뒤 실제로 돌 때 뜬다). 순서가 달라 시작이 먼저 올라가도 step_drop 이 지운다.
     """
 
@@ -287,10 +290,17 @@ def _collect(args: dict[int, "str | dict[str, Any]"], event: AgentStreamEvent) -
     elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, ToolCallPartDelta):
         delta, before = event.delta.args_delta, args.get(event.index, "")
         if isinstance(delta, str):
-            args[event.index] = (before if isinstance(before, str) else json.dumps(before)) + delta
+            args[event.index] = (before if isinstance(before, str) else json.dumps(before, ensure_ascii=False)) + delta
         elif isinstance(delta, dict):
-            # dict 조각은 pydantic-ai 처럼 합친다 — 덮어쓰면 narration 이 담긴 앞 조각이 사라진다 (리뷰)
-            args[event.index] = {**(before if isinstance(before, dict) else {}), **delta}
+            # dict 조각은 pydantic-ai 처럼 합친다 — 덮어쓰면 narration 이 담긴 앞 조각이 사라진다 (리뷰).
+            # 앞이 미완성 JSON 문자열이면 지금까지 읽히는 만큼 dict 로 올려서 합친다 (str → dict 전이)
+            if isinstance(before, str):
+                try:
+                    parsed = from_json(before, allow_partial="trailing-strings") if before else {}
+                except ValueError:
+                    parsed = {}
+                before = parsed if isinstance(parsed, dict) else {}
+            args[event.index] = {**before, **delta}
     else:
         return None
     current = args.get(event.index, "")

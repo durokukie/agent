@@ -386,7 +386,8 @@ async def progress_stream(
     """지금 도는 run 의 단계(도구 호출·실행한 명령)를 SSE 로. 화면이 답을 기다리는 동안 연다.
 
     대화를 읽을 수 있는 사람만 (purpose=chat — 기록과 같은 권한). 답(`POST /chat` 등)과 별개라, 이 연결이 끊겨도
-    실행에는 영향이 없다. run 이 끝나면 `{"type": "done"}` 을 보내고 닫는다 (progress.py).
+    실행에는 영향이 없다. run 이 끝나면 `{"type": "done", "run": true}` 를 보내고 닫는다 — 연결했는데 run 이 시작되지 않으면
+    `run: false` (progress.py).
     """
     # 권한만 본다. _open 은 방을 메모리에 되살리며 되살릴 수 없는 활성 run 을 닫기도 한다 — 보기만 하는 GET 이
     # 그런 일을 하면 안 된다 (리뷰). 방이 메모리에 없으면 도는 run 도 없으니 기다리다 done 으로 닫힌다
