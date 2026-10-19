@@ -87,6 +87,13 @@ def test_StatefulSet_partition_과_OnDelete는_옛_리비전이_남아도_정상
     assert overview.workload_status(item)[2] == expected
 
 
+def test_DaemonSet_OnDelete도_옛_리비전이_남아도_정상이다():
+    item = {"kind": "DaemonSet", "metadata": {"name": "cni", "generation": 2},
+            "spec": {"updateStrategy": {"type": "OnDelete"}},
+            "status": {"observedGeneration": 2, "desiredNumberScheduled": 3, "numberReady": 3, "updatedNumberScheduled": 0}}
+    assert overview.workload_status(item) == (3, 3, "Available")
+
+
 def test_replicas_를_생략하면_1이고_0이면_Available():
     # 막 만들어 아직 아무 파드도 새 버전이 아니다 (updated 0 < 1) — 진행 중
     assert overview.workload_status({"kind": "Deployment", "spec": {}, "status": {}}) == (0, 1, "Progressing")

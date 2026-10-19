@@ -11,7 +11,7 @@ kubectl 은 clusters_api.py 가 돌리고, 여기는 그 출력(JSON 문자열)�
   - Progressing  ready < desired 이지만 롤아웃이 진행 중이다
                    공통: metadata.generation 을 컨트롤러가 아직 못 봤다(observedGeneration 이 작다) 또는 updated < desired
                    StatefulSet: currentRevision ≠ updateRevision 도 진행 중으로 본다
-                   StatefulSet 의 partition·OnDelete 는 옛 리비전이 남는 게 정상이라 그만큼은 진행 중으로 보지 않는다
+                   StatefulSet 의 partition, StatefulSet·DaemonSet 의 OnDelete 는 옛 리비전이 남는 게 정상이라 그만큼은 진행 중으로 보지 않는다
   - Degraded     ready < desired 인데 진행 중인 롤아웃이 없다 (새 버전으로 다 바뀐 뒤 파드가 죽는다 등)
   Deployment 는 숫자 대신 Progressing 조건을 먼저 본다 — updatedReplicas 는 Ready 와 무관하게 파드가 생기면 올라서
   숫자만으로는 "막 뜨는 중" 과 "다 바뀐 뒤 죽음" 이 갈리지 않는다.
@@ -20,6 +20,8 @@ kubectl 은 clusters_api.py 가 돌리고, 여기는 그 출력(JSON 문자열)�
     그 밖의 True(NewReplicaSetCreated·ReplicaSetUpdated …)          → Progressing
   롤아웃 중에 파드가 계속 죽으면 Deployment 는 진행 기한까지 Progressing 이다가 Degraded 가 되고,
   StatefulSet·DaemonSet 은 기한 조건이 없어 updated 가 다 찰 때까지 Progressing 으로 남는다 — 단순하게 둔 것이다.
+  진행 기한을 끈 Deployment(progressDeadlineSeconds 2147483647)도 조건이 False 로 뒤집히지 않아 롤아웃이 망가져도
+  Degraded 로 넘어가지 않고 Progressing 으로 남는다.
 
 파드 phase
   kubelet 이 주는 status.phase 를 그대로 쓰되, 컨테이너(init 포함) 하나라도 BROKEN_WAITING 의 대기 사유에 걸려 있으면
@@ -105,14 +107,13 @@ def workload_status(item: dict[str, Any]) -> tuple[int, int, str]:
 
     stale = _int(status.get("observedGeneration")) < _int(meta.get("generation"))
     expected_updated, check_revision = desired, True
-    if kind == "StatefulSet":
-        strategy = spec.get("updateStrategy") or {}
-        if strategy.get("type") == "OnDelete":
-            expected_updated, check_revision = 0, False       # 사람이 파드를 지울 때까지 옛 리비전이 정상이다
-        else:
-            partition = _int((strategy.get("rollingUpdate") or {}).get("partition"))
-            expected_updated = max(0, desired - partition)    # partition 아래 순번은 옛 리비전에 두는 게 정상이다
-            check_revision = partition == 0
+    strategy = spec.get("updateStrategy") or {}
+    if kind in ("StatefulSet", "DaemonSet") and strategy.get("type") == "OnDelete":
+        expected_updated, check_revision = 0, False           # 사람이 파드를 지울 때까지 옛 리비전이 정상이다
+    elif kind == "StatefulSet":
+        partition = _int((strategy.get("rollingUpdate") or {}).get("partition"))
+        expected_updated = max(0, desired - partition)        # partition 아래 순번은 옛 리비전에 두는 게 정상이다
+        check_revision = partition == 0
     rolling = stale or updated < expected_updated
     if check_revision and kind == "StatefulSet" and status.get("updateRevision"):
         rolling = rolling or status.get("currentRevision") != status.get("updateRevision")
