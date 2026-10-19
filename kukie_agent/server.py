@@ -43,7 +43,7 @@ from pydantic import BaseModel, ConfigDict
 from pydantic_ai.messages import ModelMessage, ToolCallPart
 from pydantic_ai.tools import DeferredToolRequests, ToolApproved, ToolDenied
 
-from kukie_agent import auth, server_api
+from kukie_agent import auth, progress, server_api
 from kukie_agent.agent import agent
 from kukie_agent.clusters import runtime
 from kukie_agent.deps import Deps
@@ -72,6 +72,8 @@ class Session:
     # 실행 잠금 — run 이 도는 동안(await) 두 번째 run 이 같은 history 를 쓰면 늦게 끝난
     # 쪽이 기록을 덮어쓴다. pending 은 승인 대기 상태만 표현하므로 실행 잠금을 겸할 수 없다.
     processing: bool = False
+    # 진행 상황을 올릴 방 (progress.hub 의 키). 대화 API 가 방을 열 때 채운다 — 없으면(예전 단일 세션 경로) 안 올린다
+    progress_key: str | None = None
 
     @property
     def skill(self):
@@ -113,13 +115,29 @@ class ApproveIn(BaseModel):
 # ── 에이전트 호출과 결과 분기 ─────────────────────────────
 
 async def _run_agent(session: Session, **kwargs: Any):
-    """agent.run 호출 자리. 세션의 deps·스킬·기록을 항상 같이 싣는다 (테스트에서 바꿔치기하는 이음매)."""
-    return await agent.run(
-        deps=session.deps,
-        output_type=[session.skill.output_fn, DeferredToolRequests],
-        message_history=session.history or None,
-        **kwargs,
-    )
+    """agent.run 호출 자리. 세션의 deps·스킬·기록을 항상 같이 싣는다 (테스트에서 바꿔치기하는 이음매).
+
+    방이 정해져 있으면 도는 동안의 도구 호출을 진행 상황으로 흘린다 (progress.py) — 답 자체는 그대로 끝난 뒤 돌려준다.
+    """
+    key = session.progress_key
+    if key is None:
+        return await agent.run(
+            deps=session.deps,
+            output_type=[session.skill.output_fn, DeferredToolRequests],
+            message_history=session.history or None,
+            **kwargs,
+        )
+    await progress.hub.begin(key)
+    try:
+        return await agent.run(
+            deps=session.deps,
+            output_type=[session.skill.output_fn, DeferredToolRequests],
+            message_history=session.history or None,
+            capabilities=[progress.hub.capability(key)],
+            **kwargs,
+        )
+    finally:
+        await progress.hub.end(key)
 
 
 async def _approval_payload(

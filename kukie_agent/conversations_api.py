@@ -33,12 +33,13 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.tools import ToolApproved
 
 import kukie_agent.server as _server  # 순환 import: 이름은 호출 시점에만 쓴다
-from kukie_agent import server_api
+from kukie_agent import progress, server_api
 from kukie_agent.auth import User, current_user
 from kukie_agent.clusters import access
 from kukie_agent.conversations import Conversation, registry
@@ -89,6 +90,7 @@ async def _open(
     """
     context = await server_api.conversation_context(conversation_id, user, purpose=purpose)
     conversation, context = await registry.get_or_restore(context)
+    conversation.session.progress_key = conversation_id   # 이 방의 run 이 진행 상황을 올릴 자리
     return context, conversation
 
 
@@ -374,6 +376,25 @@ def _replay(run: server_api.Run) -> dict[str, Any]:
                             {"code": error.get("code", "RUN_FAILED"), "message": error.get("message", "")})
     assert run.payload is not None
     return run.payload
+
+
+@router.get("/{conversation_id}/progress")
+async def progress_stream(
+    conversation_id: str,
+    user: User = Depends(current_user),
+) -> StreamingResponse:
+    """지금 도는 run 의 단계(도구 호출·실행한 명령)를 SSE 로. 화면이 답을 기다리는 동안 연다.
+
+    대화를 읽을 수 있는 사람만 (purpose=chat — 기록과 같은 권한). 답(`POST /chat` 등)과 별개라, 이 연결이 끊겨도
+    실행에는 영향이 없다. run 이 끝나면 `{"type": "done"}` 을 보내고 닫는다 (progress.py).
+    """
+    await _open(conversation_id, user, "chat")
+    return StreamingResponse(
+        progress.hub.stream(conversation_id),
+        media_type="text/event-stream",
+        # 프록시가 모았다가 한 번에 보내지 않게 (nginx 계열은 X-Accel-Buffering 을 본다)
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/{conversation_id}/approve")
