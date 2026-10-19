@@ -19,7 +19,7 @@ jobs:
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
-    runs-on: ubuntu-latest
+    runs-on: kukie-ci
     permissions:
       contents: write        # 요청받으면 브랜치에 커밋할 수 있게
       pull-requests: write
