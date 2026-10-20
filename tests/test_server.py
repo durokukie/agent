@@ -34,8 +34,9 @@ def client(dev_auth, fresh_session, fake_kubeconfig, kubectl_ok, plan_dir):
 def test_세션_시작은_kubeconfig의_대상을_돌려준다(client):
     r = client.post("/session")
     assert r.status_code == 200
-    assert r.json() == {"context": "kind-dev", "namespace": "study", "skill": "학습", "pending": []}
-    assert client.get("/session").json()["skill"] == "학습"
+    # 로컬 개발엔 방이 없어 변경까지 시험할 수 있는 Shared 로 연다 (DURO-100)
+    assert r.json() == {"context": "kind-dev", "namespace": "study", "skill": "Shared", "pending": []}
+    assert client.get("/session").json()["skill"] == "Shared"
 
 
 def test_세션_없이_채팅하면_409(client):
@@ -73,14 +74,14 @@ def test_채팅은_answer와_조립된_KukieResponse를_돌려준다(client):
         r = client.post("/chat", json={"text": "파드 보여줘"})
     assert r.status_code == 200
     body = r.json()
-    assert body["kind"] == "answer" and body["skill"] == "학습"
+    assert body["kind"] == "answer" and body["skill"] == "Shared"
     assert body["response"]["narration"] == "파드 하나 떠 있어요"
     assert body["response"]["steps"][0]["command"] == FAKE_COMMAND   # 사실 칸 = 실행 기록 (DURO-44)
 
 
-def test_다음_행동은_HTTP로_전달되고_모드를_바꾸지_않는다(client):
+def test_다음_행동은_HTTP로_전달되고_스킬을_바꾸지_않는다(client):
     client.post("/session")
-    suggestion = "컨테이너 로그를 분석하려면 진단 모드로 전환해 주세요."
+    suggestion = "컨테이너 로그를 확인해 보세요."
     model = TestModel(call_tools=[], custom_output_args={
         "narration": "추가 로그 확인이 필요합니다.",
         "suggested_next_action": suggestion,
@@ -94,7 +95,7 @@ def test_다음_행동은_HTTP로_전달되고_모드를_바꾸지_않는다(cli
     assert "suggested_transition" not in body["response"]
     assert body["response"]["steps"] == []
     session = client.get("/session").json()
-    assert session["skill"] == "학습"
+    assert session["skill"] == "Shared"
     assert session["pending"] == []
 
 
@@ -107,21 +108,20 @@ def test_대화_기록은_턴_사이에_이어진다(client):
     assert len(server._session.history) > n_after_first
 
 
-# ── 모드 전환 ────────────────────────────────────────────────
+# ── 옛 앱의 /mode (DURO-100) ─────────────────────────────────
 
-def test_mode_명령은_LLM_없이_스킬만_바꾼다(client):
+@pytest.mark.parametrize("text", ["/mode 실습", "/mode 학습", "/mode 없는모드"])
+def test_mode_입력은_LLM을_부르지_않고_아무것도_바꾸지_않는다(client, monkeypatch, text):
+    """모드는 없어졌다. 버튼이 남은 옛 앱이 보내도 known=False 로만 답한다."""
     client.post("/session")
-    with agent.override(model=TestModel()) as _:
-        r = client.post("/chat", json={"text": "/mode 진단"})
-    assert r.json() == {"kind": "mode", "skill": "진단", "known": True}
-    assert client.get("/session").json()["skill"] == "진단"
-    assert server._session.history == []            # 에이전트 호출 없음
 
-
-def test_모르는_모드는_현재_스킬_유지(client):
-    client.post("/session")
-    r = client.post("/chat", json={"text": "/mode 없는모드"})
-    assert r.json()["skill"] == "학습" and r.json()["known"] is False
+    async def no_llm(*args, **kwargs):
+        raise AssertionError("/mode 는 LLM 을 부르지 않는다")
+    monkeypatch.setattr(server, "_run_agent", no_llm)
+    r = client.post("/chat", json={"text": text})
+    assert r.json() == {"kind": "mode", "skill": "Shared", "known": False}
+    assert client.get("/session").json()["skill"] == "Shared"
+    assert server._session.history == []
 
 
 # ── 승인 대기: 잠금과 티켓 분기 ──────────────────────────────
@@ -359,7 +359,6 @@ def test_여러_승인을_모은뒤_승인과_거절을_한번만_재개한다(
     client, monkeypatch, hook_passes
 ):
     client.post("/session")
-    client.post("/chat", json={"text": "/mode 실습"})
     model_calls = 0
     execution_allowed = False
     executions = []

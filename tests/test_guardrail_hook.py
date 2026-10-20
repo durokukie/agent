@@ -40,7 +40,7 @@ def _ctx(*, namespace="study", approved=False, run_id=None, user_id=None):
         deps=SimpleNamespace(
             context="kind-dev",
             namespace=namespace,
-            skill=SimpleNamespace(name="실습"),
+            skill=SimpleNamespace(name="Shared"),
             run_id=run_id,      # None 이면 계획이 Kukie API 서버에 들어가지 않는다 (flat 경로와 같다, #58)
             user_id=user_id,
             kubeconfig=None,    # 서버 컴퓨터의 기본 kubeconfig (기획 04 §8 등록 경로가 아님)

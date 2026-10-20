@@ -25,15 +25,15 @@ from kukie_agent.guardrail import hook
 from kukie_agent.guardrail.action_plan import ActionPlan
 from kukie_agent.kubectl import KubectlResult
 from kukie_agent.response import build_response
-from kukie_agent.skills import SKILLS
+from kukie_agent.skills import PRIVATE, SHARED
 from kukie_agent.tools import mutate
 from kukie_agent.tools.mutate import MUTATING_TOOLS
 
 from helpers import sync
 
 
-def _deps(skill_name: str = "학습") -> Deps:
-    return Deps(context="kind-dev", namespace="study", skill=SKILLS[skill_name])
+def _deps(shared: bool = False) -> Deps:
+    return Deps(context="kind-dev", namespace="study", skill=SHARED if shared else PRIVATE)
 
 
 # LLM이 채우는 칸만 — steps 는 스키마에 없다 (코드가 채움)
@@ -45,17 +45,17 @@ GOOD_RESPONSE = {
 
 # ── 툴 등록 + 스킬 필터 ─────────────────────────────────────
 
-@pytest.mark.parametrize("skill,expected", [
-    ("학습", {"list_resources", "explain_command"}),
-    ("진단", {"list_resources", "explain_command",
-              "describe_resource", "get_events", "get_logs"}),
-    ("실습", {"list_resources", "explain_command", "describe_resource"}
-             | MUTATING_TOOLS),
+READ_ONLY = {"list_resources", "explain_command", "describe_resource", "get_events", "get_logs"}
+
+
+@pytest.mark.parametrize("shared,expected", [
+    (False, READ_ONLY),                     # Private — 읽기 5종만, 변경 툴은 아예 없다
+    (True, READ_ONLY | MUTATING_TOOLS),     # Shared — 읽기 + 변경 (변경은 가드레일 훅 → 승인 카드)
 ])
-def test_스킬별로_허용된_툴만_LLM에게_노출된다(skill, expected):
+def test_공개_범위별로_허용된_툴만_LLM에게_노출된다(shared, expected):
     m = TestModel(call_tools=[], custom_output_args=GOOD_RESPONSE)
     with agent.override(model=m):
-        agent.run_sync("파드 보여줘", deps=_deps(skill))
+        agent.run_sync("파드 보여줘", deps=_deps(shared))
     exposed = {t.name for t in m.last_model_request_parameters.function_tools}
     assert exposed == expected
 
@@ -125,7 +125,7 @@ def test_등록된_mutation은_모두_Hook을_거쳐_Deferred요청이된다(
         )])
 
     with agent.override(model=FunctionModel(model_call)):
-        result = agent.run_sync("변경해줘", deps=_deps("실습"))
+        result = agent.run_sync("변경해줘", deps=_deps(shared=True))
 
     assert isinstance(result.output, DeferredToolRequests)
     assert result.output.approvals[0].tool_name == tool_name
@@ -157,13 +157,13 @@ def test_ToolApproved_재개는_기존_history와_handler를_한번_사용한다
         )])
 
     with agent.override(model=FunctionModel(model_call)):
-        pending_result = agent.run_sync("변경해줘", deps=_deps("실습"))
+        pending_result = agent.run_sync("변경해줘", deps=_deps(shared=True))
     history = pending_result.all_messages()
 
     with agent.override(model=TestModel(call_tools=[], custom_output_args=GOOD_RESPONSE)):
         resumed = agent.run_sync(
-            deps=_deps("실습"),
-            output_type=[SKILLS["실습"].output_fn, DeferredToolRequests],
+            deps=_deps(shared=True),
+            output_type=[SHARED.output_fn, DeferredToolRequests],
             message_history=history,
             deferred_tool_results=DeferredToolResults(
                 approvals={"call-123": ToolApproved()}
@@ -191,15 +191,15 @@ def test_ToolDenied_재개는_2차Hook과_handler를_호출하지않는다(
         )])
 
     with agent.override(model=FunctionModel(model_call)):
-        pending_result = agent.run_sync("변경해줘", deps=_deps("실습"))
+        pending_result = agent.run_sync("변경해줘", deps=_deps(shared=True))
     assert isinstance(pending_result.output, DeferredToolRequests)
 
     monkeypatch.setattr(hook, "run_kubectl", forbidden_handler)
 
     with agent.override(model=TestModel(call_tools=[], custom_output_args=GOOD_RESPONSE)):
         resumed = agent.run_sync(
-            deps=_deps("실습"),
-            output_type=[SKILLS["실습"].output_fn, DeferredToolRequests],
+            deps=_deps(shared=True),
+            output_type=[SHARED.output_fn, DeferredToolRequests],
             message_history=pending_result.all_messages(),
             deferred_tool_results=DeferredToolResults(
                 approvals={"call-123": ToolDenied("사용자가 거절했습니다.")}
@@ -221,44 +221,28 @@ def test_Agent는_일반응답과_Deferred요청을_output으로_허용한다():
     assert agent.output_type == [build_response, DeferredToolRequests]
 
 
-# ── 현재 모드 못 박기 (#60) ─────────────────────────────────
+# ── 지시문 (DURO-100) ───────────────────────────────────────
 
-def _instruction(skill_name: str) -> str:
-    ctx = SimpleNamespace(deps=SimpleNamespace(skill=SKILLS[skill_name]))
-    return agent_module.add_current_mode(ctx)
-
-
-@pytest.mark.parametrize("mode", ["학습", "진단", "실습"])
-def test_매_턴_현재_모드를_이름으로_말한다(mode):
-    assert f"[현재 모드: {mode}]" in _instruction(mode)
+def _instructions(shared: bool) -> str:
+    ctx = SimpleNamespace(deps=_deps(shared))
+    return "\n".join([agent_module.BASE_PROMPT, agent_module.add_target(ctx), agent_module.add_skill_prompt(ctx)])
 
 
-def test_지금_쓸_수_있는_툴을_함께_말한다():
-    """모델이 문맥에서 추론하지 않게 한다 — 노출된 툴이 곧 가능한 일이다."""
-    실습 = _instruction("실습")
-    assert "scale_resource" in 실습 and "apply_manifest" in 실습
-    학습 = _instruction("학습")
-    assert "scale_resource" not in 학습
+@pytest.mark.parametrize("shared", [False, True])
+def test_지시문에_모드_개념이_없다(shared):
+    """학습/진단/실습 모드는 없앴다 — 모드 전환을 안내하는 문장이 남으면 모델이 없는 기능을 권한다."""
+    text = _instructions(shared)
+    for word in ("모드", "학습", "진단", "실습"):
+        assert word not in text, word
 
 
-def test_과거_모드의_거절을_따르지_말라고_못_박되_다른_모드로_한정한다():
-    """대화 기록에 남은 **이전 모드의** 거절 답변이 모델을 끌던 것이 #60 의 원인이었다.
-
-    한정을 빼면 반대 방향으로 아프다 — 학습 모드에서 변경을 요청받았을 때의 **정당한 거절**까지
-    눌러 버린다. 앱의 [실습 모드로] 버튼이 그 안내에서 나온다 (자동 리뷰 지적).
-    """
-    text = _instruction("실습")
-    assert "다른 모드에서" in text and "지나간 상태" in text
-    assert "**다른 모드의 과거 답변을** 근거로 거절하지 마라" in text
-    assert "그건 올바른 답변이다" in text          # 지금 모드에 없는 일은 거절해도 된다
+def test_변경_툴은_요청이_있을_때만_부르라고_한다():
+    assert "바꿔 달라고 요청했을 때만" in agent_module.BASE_PROMPT
 
 
-def test_출력_툴은_금지_목록에_걸리지_않는다():
-    """allowed_tools 에는 응답을 마무리하는 출력 툴이 없다. "이것뿐" 이라고만 하면 모델이
-    필수 출력 툴을 안 부를 수 있다 (자동 리뷰 P1)."""
-    text = _instruction("학습")
-    assert "클러스터에 쓸 수 있는 툴" in text
-    assert "출력 툴은 여기 해당하지 않는다" in text
+def test_Private_지시문은_Shared_대화와_직접_실행할_명령을_안내한다():
+    text = agent_module.add_skill_prompt(SimpleNamespace(deps=_deps(False)))
+    assert "Shared 대화" in text and "kubectl" in text
 
 
 # ── 재시도 (DURO-66 ③·④) ────────────────────────────────────

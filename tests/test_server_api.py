@@ -20,13 +20,13 @@ URL = "http://server.test"
 TOKEN = "internal-secret"
 USER = User(id="u-1", token="user-access-token")
 
-RUN = {"id": "r-1", "conversationId": "c-1", "requestId": "req-1", "seq": 1, "kind": "chat", "mode": "학습",
+RUN = {"id": "r-1", "conversationId": "c-1", "requestId": "req-1", "seq": 1, "kind": "chat", "mode": "Private",
        "status": "running", "inputText": "파드", "responsePayload": None, "agentMessages": None,
        "usageSummary": None, "startedAt": "2026-10-14T09:00:00", "finishedAt": None}
 PLAN = {"id": "0199f0a0-0000-7000-8000-000000000001", "code": "ap-261014-0900-scale_resource", "runId": "r-1",
         "toolCallId": "call-1", "toolName": "scale_resource", "status": "WAITING_APPROVAL", "risk": "caution",
         "payload": {"created_at": "2026-10-14T09:00:00+00:00", "args": {"kind": "deployment", "name": "nginx"},
-                    "skill": "실습", "target": {"context": "kind-dev"}, "command": ["scale"], "intent": "늘린다",
+                    "skill": "Shared", "target": {"context": "kind-dev"}, "command": ["scale"], "intent": "늘린다",
                     "expected_effects": ["3개"], "side_effects": ["자원"],
                     "dry_run_result": {"status": "succeeded", "stdout": "", "stderr": "", "at": "2026-10-14T09:00:00Z"},
                     "decision_guidance": "확인한다"},
@@ -62,7 +62,7 @@ async def test_입구_호출은_내부_토큰과_사용자_Bearer를_함께_싣�
     seen = server(lambda r: httpx.Response(200, json={
         "userId": "u-1",
         "conversation": {"id": "c-1", "clusterId": "cl-1", "teamId": None, "userId": "u-1", "title": "새 대화",
-                         "shared": True, "currentMode": "학습", "context": "kind-dev", "namespace": "study",
+                         "shared": True, "currentMode": "Private", "context": "kind-dev", "namespace": "study",
                          "clusterFingerprint": "fp"},
         "activeRun": {**RUN, "status": "awaiting_approval"}, "activeRunPlans": [PLAN],
         "history": [{"runId": "r-0", "agentMessages": [{"kind": "request"}]}],
@@ -87,7 +87,7 @@ async def test_입구가_아닌_호출은_사용자_토큰을_싣지_않는다(s
     seen = server(lambda r: httpx.Response(200, json={"run": {**RUN, "status": "completed"}, "closedPlans": [PLAN]}))
 
     update = await server_api.update_run("r-1", status="completed", append_agent_messages=[{"m": 1}],
-                                         current_mode="진단", title_from="첫 마디")
+                                         current_mode="Shared", title_from="첫 마디")
 
     request = seen[0]
     assert request.method == "PATCH" and request.url.path == "/internal/runs/r-1"
@@ -95,7 +95,7 @@ async def test_입구가_아닌_호출은_사용자_토큰을_싣지_않는다(s
     assert "Authorization" not in request.headers
     # 준 칸만 보낸다 (None = 그대로). 불투명 JSON 은 손대지 않는다
     assert _body(request) == {"status": "completed", "appendAgentMessages": [{"m": 1}],
-                              "currentMode": "진단", "titleFrom": "첫 마디"}
+                              "currentMode": "Shared", "titleFrom": "첫 마디"}
     assert update.run.status == "completed" and update.closed_plans[0].id == PLAN["id"]
 
 
@@ -107,10 +107,10 @@ async def test_run_시작과_request_id로_찾기(server):
         return httpx.Response(404, json={"code": "NOT_FOUND", "message": "없다"})
 
     seen = server(respond)
-    run, created = await server_api.start_run("c-1", USER, request_id="req-1", kind="chat", mode="학습",
+    run, created = await server_api.start_run("c-1", USER, request_id="req-1", kind="chat", mode="Private",
                                               input_text="파드")
     assert created is True and run.id == "r-1"
-    assert _body(seen[0]) == {"requestId": "req-1", "kind": "chat", "mode": "학습", "inputText": "파드"}
+    assert _body(seen[0]) == {"requestId": "req-1", "kind": "chat", "mode": "Private", "inputText": "파드"}
     assert await server_api.find_run("c-1", "req-x", USER) is None          # 404 는 "없다"
     assert seen[1].url.path == "/internal/conversations/c-1/runs/by-request/req-x"
 
@@ -138,7 +138,7 @@ async def test_server_오류는_같은_상태와_코드로_옮긴다(server):
     server(lambda r: httpx.Response(409, json={"code": "ACTIVE_RUN_EXISTS", "message": "활성 run 이 있다"}))
 
     with pytest.raises(ServerError) as raised:
-        await server_api.start_run("c-1", USER, request_id="r", kind="chat", mode="학습", input_text="x")
+        await server_api.start_run("c-1", USER, request_id="r", kind="chat", mode="Private", input_text="x")
 
     assert raised.value.status_code == 409
     assert raised.value.detail == {"code": "ACTIVE_RUN_EXISTS", "message": "활성 run 이 있다"}

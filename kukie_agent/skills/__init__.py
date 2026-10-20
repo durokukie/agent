@@ -1,17 +1,20 @@
-"""스킬 레지스트리 — 외부는 SKILLS 딕셔너리만 본다.
+"""스킬 레지스트리 — 대화의 공개 범위가 스킬을 정한다 (DURO-100).
 
-팀 결정 (가드레일 v2): MVP 스킬은 학습/진단/실습 3종.
-히스토리 스킬은 LLM이 호출하는 Action Plan 조회 툴과 함께 MVP 제외다.
+Private 대화는 읽기 5종만, Shared 대화는 읽기 5종 + 변경 4종. 학습/진단/실습 모드는 없앴다.
+공개 범위는 대화 안에서 바뀌지 않으므로 한 대화의 툴 목록·응답 스키마·시스템 프롬프트는 턴마다 같다
+(프롬프트 캐시가 맞도록 — 턴마다 달라지는 문구를 넣지 않는다).
 사전검토 스킬은 Issue #43에서 현재 가드레일 정책을 기준으로 후속 설계한다.
 """
-from kukie_agent.skills import diagnosis, learning, practice
-from kukie_agent.skills.base import COMMON_TOOLS, KukieResponse, Skill
+from kukie_agent.skills import private, shared
+from kukie_agent.skills.base import COMMON_TOOLS, Finding, KukieResponse, Skill
 
-SKILLS: dict[str, Skill] = {
-    s.name: s
-    for s in (learning.SKILL, diagnosis.SKILL, practice.SKILL)
-}
+PRIVATE = private.SKILL
+SHARED = shared.SKILL
 
-DEFAULT_SKILL = learning.SKILL
 
-__all__ = ["SKILLS", "DEFAULT_SKILL", "Skill", "KukieResponse", "COMMON_TOOLS"]
+def skill_for(shared: bool) -> Skill:
+    """방의 공개 범위 → 스킬. Shared 방만 변경 툴을 받는다."""
+    return SHARED if shared else PRIVATE
+
+
+__all__ = ["PRIVATE", "SHARED", "skill_for", "Skill", "KukieResponse", "Finding", "COMMON_TOOLS"]

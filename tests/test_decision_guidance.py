@@ -32,7 +32,7 @@ async def _ready_plan(monkeypatch, tmp_path: Path) -> ActionPlan:
         },
         command=["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
         risk="caution",
-        skill="실습",
+        skill="Shared",
         target={
             "context": "minikube",
             "namespace": "study",
@@ -120,7 +120,7 @@ async def test_generate_decision_guidance_validates_before_model_call(
         args={"kind": "deployment", "name": "nginx", "replicas": 3},
         command=["scale", "deployment", "nginx", "--replicas=3"],
         risk="caution",
-        skill="실습",
+        skill="Shared",
         target={"context": "minikube", "namespace": "study"},
         intent="nginx 레플리카를 늘린다.",
         expected_effects=["레플리카가 3개가 된다."],

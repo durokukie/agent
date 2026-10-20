@@ -32,20 +32,31 @@ class ToolStep(BaseModel):
     explanations: list[FieldExplanation]
 
 
+class Finding(BaseModel):
+    """원인 분석 결론 — (a)원인 (b)근거 (c)권장 조치를 구조로 강제."""
+    cause: str
+    evidence: str
+    recommendation: str
+
+
 class KukieResponse(BaseModel):
-    """공통 응답 뼈대. 스킬별 특화 블록은 이걸 상속해 추가한다."""
+    """공통 응답 뼈대. Private·Shared 가 같은 스키마를 쓴다 — 대화마다 출력 스키마가 같아야 캐시가 맞는다 (DURO-100)."""
     narration: str
     steps: list[ToolStep] = []
     suggested_next_action: str | None = None   # 답변·실행 결과에 근거한 다음 행동 안내
+    finding: Finding | None = None             # "왜 안 돼요?" 에 원인을 찾았을 때만. 앱이 이 칸을 그린다
 
 
 # ── 스킬 정의 ────────────────────────────────────────────────
 
-# 공통 베이스 툴 — 어떤 스킬이든 항상 포함
+# 공통 베이스 툴 — 읽기 5종. Private·Shared 어느 대화든 항상 포함
 # (탈출구 run_readonly_kubectl은 팀 결정으로 제거 — 안내 폴백으로 대체)
 COMMON_TOOLS: frozenset[str] = frozenset({
     "list_resources",
     "explain_command",
+    "describe_resource",
+    "get_events",
+    "get_logs",
 })
 
 

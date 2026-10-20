@@ -38,7 +38,6 @@ DELETE_ARGS = {
 def client(dev_auth, fresh_session, fake_kubeconfig, plan_dir):
     test_client = TestClient(server.app)
     assert test_client.post("/session").status_code == 200
-    assert test_client.post("/chat", json={"text": "/mode 실습"}).status_code == 200
     return test_client
 
 

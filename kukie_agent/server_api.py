@@ -380,7 +380,7 @@ async def update_run(
     """run 갱신 한 번. 준 칸만 바꾼다 (None = 그대로).
 
     server 가 한 트랜잭션에서 한다: 종료 상태면 finishedAt + 열린 plan 마감(결정 있고 결과 없음 → UNKNOWN,
-    나머지 → EXPIRED), current_mode 면 방의 모드, title_from 이면 첫 마디로 제목 짓기 (기본 제목일 때만).
+    나머지 → EXPIRED), current_mode 면 방의 스킬 이름(Private·Shared), title_from 이면 첫 마디로 제목 짓기 (기본 제목일 때만).
     agent_messages 는 기존 배열 뒤에 **이어 붙인다** — 승인·재개가 같은 run 을 이어 쓰기 때문이다.
     """
     body: dict[str, Any] = {}

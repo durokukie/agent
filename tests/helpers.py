@@ -67,7 +67,7 @@ def ready_plan(call_id: str) -> ActionPlan:
             args=dict(SCALE_PLAN_ARGS),
             command=list(SCALE_COMMAND),
             risk="caution",
-            skill="실습",
+            skill="Shared",
             target=dict(SCALE_TARGET),
             intent=SCALE_INTENT,
             expected_effects=list(SCALE_EXPECTED),
@@ -100,7 +100,7 @@ def waiting_plan(fake, run_id: str, call_id: str) -> str:
         payload={
             "created_at": "2026-10-14T00:00:00+00:00",
             "args": dict(SCALE_PLAN_ARGS),
-            "skill": "실습",
+            "skill": "Shared",
             "target": dict(SCALE_TARGET),
             "command": list(SCALE_COMMAND),
             "intent": SCALE_INTENT,

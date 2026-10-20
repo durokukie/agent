@@ -32,7 +32,6 @@ KUKIE_DEV_AUTH=1 로 개발 모드를 켰을 때만 열리고, 그 밖(server �
 """
 from __future__ import annotations
 
-import dataclasses
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -51,8 +50,7 @@ from kukie_agent.guardrail.action_plan import ActionPlan
 from kukie_agent.guardrail.approval import ApprovalRequest, build_approval_request
 from kukie_agent.kubectl.config import KubeconfigError, read_kubeconfig
 from kukie_agent.observability import setup as setup_observability
-from kukie_agent.router import pick_skill
-from kukie_agent.skills import DEFAULT_SKILL, SKILLS
+from kukie_agent.skills import SHARED
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +275,8 @@ async def start_session() -> dict[str, Any]:
         context, namespace = read_kubeconfig()
     except KubeconfigError as exc:
         raise HTTPException(503, f"kubeconfig 를 읽을 수 없다: {exc}") from exc
-    _session = Session(deps=Deps(context=context, namespace=namespace, skill=DEFAULT_SKILL))
+    # 로컬 개발엔 방이 없다 — 변경까지 시험할 수 있게 Shared 로 연다
+    _session = Session(deps=Deps(context=context, namespace=namespace, skill=SHARED))
     return _session_view(_session)
 
 
@@ -309,16 +308,13 @@ async def chat(body: ChatIn) -> dict[str, Any]:
 async def _chat_turn(session: Session, text: str) -> tuple[dict[str, Any], Any]:
     """한 턴. flat /chat 과 /conversations/{id}/chat 이 같이 쓴다.
 
-    반환 (payload, run 결과). 모드 전환만 한 입력은 LLM 을 안 부르므로 결과가 None 이다.
+    반환 (payload, run 결과). "/mode " 입력은 LLM 을 안 부르므로 결과가 None 이다.
     잠금·티켓 검사는 부르는 쪽이 한다 (flat 은 processing 플래그, 대화 단위는 asyncio.Lock).
     """
-    skill = pick_skill(text, session.skill)
-    if skill is not session.skill:
-        session.deps = dataclasses.replace(session.deps, skill=skill)
-    if text.startswith("/mode "):          # 모드 전환만 한 입력은 LLM 을 부르지 않는다
-        requested = text.removeprefix("/mode ").strip()
-        return ({"kind": "mode", "skill": session.skill.name,
-                 "known": requested in SKILLS}, None)   # 모르는 모드면 현재 스킬 유지 + known=False
+    if text.startswith("/mode "):
+        # 모드는 없어졌다 (DURO-100) — 스킬은 방의 공개 범위로 정해지고 바뀌지 않는다.
+        # 모드 버튼이 남은 옛 앱을 위해서만 받아 두고, 아무것도 바꾸지 않은 채 known=False 로 답한다
+        return {"kind": "mode", "skill": session.skill.name, "known": False}, None
 
     session.processing = True
     try:

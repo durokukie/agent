@@ -40,8 +40,7 @@ from pydantic_ai.tools import DeferredToolRequests
 
 from kukie_agent import server_api
 from kukie_agent.deps import Deps
-from kukie_agent.skills import DEFAULT_SKILL, SKILLS
-from kukie_agent.tools.mutate import MUTATING_TOOLS
+from kukie_agent.skills import skill_for
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +68,9 @@ class ConversationRegistry:
     def register(self, room: server_api.ConversationInfo, history: list[Any] | None = None) -> Conversation:
         from kukie_agent.server import Session   # 순환 import (server → conversations_api → 여기) 회피
 
-        skill = SKILLS.get(room.current_mode, DEFAULT_SKILL)
-        if not room.shared and skill.allowed_tools & MUTATING_TOOLS:
-            # private 방은 변경 불가 (기획 05 §3). 게이트가 생기기 전에 남은 current_mode=실습 행을 그대로 복원하면
-            # 카드는 뜨는데 승인은 403 이라 방이 막힌다 — 판정을 입력이 아니라 세션 상태에 건다.
-            skill = DEFAULT_SKILL
+        # 스킬은 방의 공개 범위로만 정한다 (DURO-100). room.current_mode 는 옛 모드 이름이 남아 있을 수 있어 보지 않는다 —
+        # private 방은 변경 툴이 아예 없다 (기획 05 §3)
+        skill = skill_for(room.shared)
         session = Session(
             deps=Deps(context=room.context, namespace=room.namespace, skill=skill),
             history=list(history or []),

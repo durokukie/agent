@@ -5,7 +5,7 @@
 - 모든 변경 툴에 위험도 스티커가 등록돼 있는지 (미등록 = fail-closed 대상)
 - LLM이 kubectl args를 직접 조립하는 경로가 없는지 (탈출구 제거 확인)
 """
-from kukie_agent.skills import SKILLS
+from kukie_agent.skills import PRIVATE, SHARED, skill_for
 from kukie_agent.skills.base import COMMON_TOOLS
 from kukie_agent.tools.mutate import MUTATE_TOOLS, MUTATING_TOOLS, RISK_STICKERS, Risk
 from kukie_agent.tools.read import READ_TOOLS
@@ -41,14 +41,18 @@ def test_읽기_툴은_5종이다():
     }
 
 
-def test_스킬_레지스트리와_공통_툴():
-    # MVP 스킬 3종 (히스토리·사전검토는 Action Plan 조회 툴과 함께 보류)
-    assert set(SKILLS) == {"학습", "진단", "실습"}
-    for skill in SKILLS.values():
-        assert COMMON_TOOLS <= skill.allowed_tools
+def test_공통_툴은_읽기_툴_5종_전부다():
+    """Private·Shared 어느 대화든 읽기는 전부 된다 (DURO-100). 이름으로 참조하므로 목록이 어긋나면 여기서 잡힌다."""
+    assert COMMON_TOOLS == {t.__name__ for t in READ_TOOLS}
 
 
-def test_실습_스킬만_변경_툴을_가진다():
-    for skill in SKILLS.values():
-        has_mutating = bool(skill.allowed_tools & MUTATING_TOOLS)
-        assert has_mutating == (skill.name == "실습"), skill.name
+def test_공개_범위가_스킬을_정한다():
+    assert skill_for(False) is PRIVATE and skill_for(True) is SHARED
+    assert PRIVATE.allowed_tools == COMMON_TOOLS                  # 변경 툴 0
+    assert SHARED.allowed_tools == COMMON_TOOLS | MUTATING_TOOLS
+
+
+def test_두_스킬은_응답_스키마가_같다():
+    """대화마다 출력 스키마가 같아야 앱이 같은 모양(finding 포함)으로 그린다."""
+    assert PRIVATE.output_type is SHARED.output_type
+    assert PRIVATE.output_fn is SHARED.output_fn

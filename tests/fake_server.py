@@ -89,7 +89,7 @@ class FakeServer:
     def add_conversation(
         self, *, owner: str = "u-1", shared: bool = False, cluster_id: str | None = None,
         team_id: str | None = None, title: str = DEFAULT_TITLE, namespace: str | None = None,
-        current_mode: str = "학습",
+        current_mode: str = "Private",
     ) -> str:
         """POST /member/conversations 와 같은 결과 — 클러스터의 context·지문을 방에 복사한다."""
         if cluster_id is None:
@@ -166,7 +166,7 @@ class FakeServer:
         return next(p for p in self.plans.values() if p["toolCallId"] == tool_call_id)
 
     def put_run(self, conversation_id: str, *, request_id: str, status: str = "running", kind: str = "chat",
-                input_text: str | None = "x", mode: str = "학습") -> dict[str, Any]:
+                input_text: str | None = "x", mode: str = "Private") -> dict[str, Any]:
         """저장에 실패해 활성으로 남은 run 같은, 정상 흐름으로는 만들기 어려운 상태를 직접 놓는다."""
         run = self._new_run(conversation_id, request_id=request_id, kind=kind, mode=mode, input_text=input_text)
         run["status"] = status
