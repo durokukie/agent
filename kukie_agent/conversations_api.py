@@ -251,14 +251,13 @@ async def chat(
 
         # 승인 카드면 run 은 열린 채(awaiting_approval) 남는다 — approve/resume 이 이어서 끝낸다 (문서 7절)
         status = "awaiting_approval" if payload.get("kind") == "approval" else "completed"
-        # current_mode(지금은 스킬 이름 Private/Shared) 기록과 첫 마디로 제목 짓기(#59)를 run 기록과 한 번에 보낸다 — server 가 한 트랜잭션에서 한다.
+        # 첫 마디로 제목 짓기(#59)를 run 기록과 한 번에 보낸다 — server 가 한 트랜잭션에서 한다.
         # 제목이 될 수 있는 마디인지, 첫 마디인지는 server 가 본다 (판정이 두 곳에 갈라지면 한쪽만 고쳐진다).
         await _save_or_fail(
             conversation_id, run, on_failure=_chat_store_failure(), failure_status="failed",
             session=session, history_before=before, status=status, response_payload=payload,
             append_agent_messages=_messages_json(result) if result is not None else None,
             usage_summary=_usage_json(result) if result is not None else None,
-            current_mode=session.skill.name,
             title_from=body.text if kind == "chat" else None,
         )
         return payload
@@ -470,8 +469,7 @@ async def _continue_run(
         await _save_or_fail(conversation.id, run, **failure, status="awaiting_approval", **fields)
         return outcome
     # completed 는 종료 상태다 — 남은 계획이 있으면 server 가 같이 닫는다
-    await _save_or_fail(conversation.id, run, **failure, status="completed",
-                        current_mode=conversation.session.skill.name, **fields)
+    await _save_or_fail(conversation.id, run, **failure, status="completed", **fields)
     return outcome
 
 

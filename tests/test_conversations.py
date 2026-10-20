@@ -197,10 +197,10 @@ def test_등록된_클러스터로_대화하면_임시_kubeconfig로_실행하�
     assert call["expectedFingerprint"] == fake_server.conversation(room)["clusterFingerprint"]
 
 
-def test_스킬은_방의_공개_범위로만_정하고_남은_current_mode는_보지_않는다(fake_server):
-    """DURO-100: 모드는 없다. server 에 옛 모드 이름(실습 등)이 남아 있어도 private 방은 Private 로 연다."""
-    assert _reopen(new_room(fake_server, current_mode="실습")).session.skill.name == "Private"
-    assert _reopen(new_room(fake_server, shared=True, current_mode="학습")).session.skill.name == "Shared"
+def test_스킬은_방의_공개_범위로만_정한다(fake_server):
+    """DURO-100: 모드는 없다. private 방은 Private, shared 방은 Shared 로 연다."""
+    assert _reopen(new_room(fake_server)).session.skill.name == "Private"
+    assert _reopen(new_room(fake_server, shared=True)).session.skill.name == "Shared"
 
 
 def test_private_방은_승인이_막힌다(client, fake_server):
@@ -312,7 +312,6 @@ def test_mode_입력은_LLM_없이_run으로만_남고_스킬은_그대로다(cl
     assert r.status_code == 200
     assert r.json() == {"kind": "mode", "skill": "Private", "known": False}
     assert conversations.registry.get(room).session.skill.name == "Private"
-    assert fake_server.conversation(room)["currentMode"] == "Private"
     turn = fake_server.turns(room)[0]
     assert turn["kind"] == "mode_change" and turn["payload"]["kind"] == "mode"
 
