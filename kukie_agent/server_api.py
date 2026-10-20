@@ -255,7 +255,6 @@ class ConversationInfo:
     user_id: str
     title: str
     shared: bool
-    current_mode: str
     context: str
     namespace: str
     cluster_fingerprint: str | None
@@ -265,7 +264,7 @@ class ConversationInfo:
         return cls(
             id=str(data["id"]), cluster_id=str(data["clusterId"]), team_id=data.get("teamId"),
             user_id=str(data["userId"]), title=data.get("title", ""), shared=bool(data.get("shared")),
-            current_mode=data["currentMode"], context=data["context"], namespace=data["namespace"],
+            context=data["context"], namespace=data["namespace"],
             cluster_fingerprint=data.get("clusterFingerprint"),
         )
 
@@ -375,18 +374,18 @@ async def start_run(
 async def update_run(
     run_id: str, *, status: str | None = None, response_payload: dict[str, Any] | None = None,
     append_agent_messages: list[Any] | None = None, usage_summary: dict[str, Any] | None = None,
-    current_mode: str | None = None, title_from: str | None = None,
+    title_from: str | None = None,
 ) -> RunUpdate:
     """run 갱신 한 번. 준 칸만 바꾼다 (None = 그대로).
 
     server 가 한 트랜잭션에서 한다: 종료 상태면 finishedAt + 열린 plan 마감(결정 있고 결과 없음 → UNKNOWN,
-    나머지 → EXPIRED), current_mode 면 방의 스킬 이름(Private·Shared), title_from 이면 첫 마디로 제목 짓기 (기본 제목일 때만).
+    나머지 → EXPIRED), title_from 이면 첫 마디로 제목 짓기 (기본 제목일 때만).
     agent_messages 는 기존 배열 뒤에 **이어 붙인다** — 승인·재개가 같은 run 을 이어 쓰기 때문이다.
     """
     body: dict[str, Any] = {}
     for key, value in (
         ("status", status), ("responsePayload", response_payload), ("appendAgentMessages", append_agent_messages),
-        ("usageSummary", usage_summary), ("currentMode", current_mode), ("titleFrom", title_from),
+        ("usageSummary", usage_summary), ("titleFrom", title_from),
     ):
         if value is not None:
             body[key] = value

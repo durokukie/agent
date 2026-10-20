@@ -68,7 +68,7 @@ class ConversationRegistry:
     def register(self, room: server_api.ConversationInfo, history: list[Any] | None = None) -> Conversation:
         from kukie_agent.server import Session   # 순환 import (server → conversations_api → 여기) 회피
 
-        # 스킬은 방의 공개 범위로만 정한다 (DURO-100). room.current_mode 는 옛 모드 이름이 남아 있을 수 있어 보지 않는다 —
+        # 스킬은 방의 공개 범위로만 정한다 (DURO-100) —
         # private 방은 변경 툴이 아예 없다 (기획 05 §3)
         skill = skill_for(room.shared)
         session = Session(

@@ -89,7 +89,6 @@ class FakeServer:
     def add_conversation(
         self, *, owner: str = "u-1", shared: bool = False, cluster_id: str | None = None,
         team_id: str | None = None, title: str = DEFAULT_TITLE, namespace: str | None = None,
-        current_mode: str = "Private",
     ) -> str:
         """POST /member/conversations 와 같은 결과 — 클러스터의 context·지문을 방에 복사한다."""
         if cluster_id is None:
@@ -98,7 +97,7 @@ class FakeServer:
         conversation_id = str(uuid.uuid4())
         self.conversations[conversation_id] = {
             "id": conversation_id, "clusterId": cluster_id, "userId": owner, "title": title or DEFAULT_TITLE,
-            "shared": shared, "currentMode": current_mode, "context": cluster["contextName"],
+            "shared": shared, "context": cluster["contextName"],
             "namespace": namespace or cluster["namespace"], "clusterFingerprint": cluster["fingerprint"],
             "version": 1, "updatedAt": _now(),
         }
@@ -217,8 +216,8 @@ class FakeServer:
         data = {
             "userId": user.id,
             "conversation": {
-                **{k: room[k] for k in ("id", "clusterId", "userId", "title", "shared", "currentMode",
-                                        "context", "namespace", "clusterFingerprint")},
+                **{k: room[k] for k in ("id", "clusterId", "userId", "title", "shared", "context",
+                                        "namespace", "clusterFingerprint")},
                 "teamId": self.clusters[room["clusterId"]]["teamId"],
             },
             "activeRun": self._run_json(active) if active else None,
@@ -271,10 +270,10 @@ class FakeServer:
         return closed
 
     async def update_run(self, run_id: str, *, status=None, response_payload=None, append_agent_messages=None,
-                         usage_summary=None, current_mode=None, title_from=None):
+                         usage_summary=None, title_from=None):
         fields = {k: v for k, v in dict(status=status, response_payload=response_payload,
                                         append_agent_messages=append_agent_messages, usage_summary=usage_summary,
-                                        current_mode=current_mode, title_from=title_from).items() if v is not None}
+                                        title_from=title_from).items() if v is not None}
         self.calls.append(("update_run", {"runId": run_id, **fields}))
         run = self.runs.get(run_id)
         if run is None:
@@ -294,9 +293,6 @@ class FakeServer:
                 closed = self._close_plans(run_id)
             else:
                 run["finishedAt"] = None
-        if current_mode is not None:
-            room["currentMode"] = current_mode
-            room["version"] += 1
         if title_from is not None and _titleable(title_from) and room["title"] == DEFAULT_TITLE:
             earlier = [r for r in self.runs_of(room["id"])
                        if r["kind"] == "chat" and r["seq"] < run["seq"] and _titleable(r["inputText"])]
