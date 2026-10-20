@@ -233,8 +233,10 @@ def test_지시문은_옛_모드를_지나간_것으로만_말한다(shared):
     """학습/진단/실습 모드는 없앴다 — 모드 전환을 안내하는 문장이 남으면 모델이 없는 기능을 권한다.
     단 옛 대화 기록의 모드 거절에 끌리지 않게 하는 규칙 8 하나는 남긴다 (#60 / DURO-85, 리뷰)."""
     text = _instructions(shared)
-    rule = next(line for line in agent_module.BASE_PROMPT.split("\n\n")[0].split("\n8. ")[1:])
-    assert "지금 노출된 툴이 정한다" in rule and "모드 전환을 안내하지 마라" in rule
+    # 8번 한 규칙만 뗀다 — 9번이 생겨도 그 안의 모드 낱말은 검사에 남게 (리뷰)
+    rule = agent_module.BASE_PROMPT.split("\n\n")[0].split("\n8. ")[1].split("\n9. ")[0]
+    assert "지금 노출된 툴이 정한다" in rule and "모드들로의 전환은 안내하지 마라" in rule
+    assert "어디서 되는지 안내하는 것은 옳다" in rule   # Private 의 Shared 안내를 누르지 않게 (리뷰)
     rest = text.replace("8. " + rule, "")
     for word in ("모드", "학습", "진단", "실습"):
         assert word not in rest, word
