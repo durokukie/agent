@@ -229,11 +229,15 @@ def _instructions(shared: bool) -> str:
 
 
 @pytest.mark.parametrize("shared", [False, True])
-def test_지시문에_모드_개념이_없다(shared):
-    """학습/진단/실습 모드는 없앴다 — 모드 전환을 안내하는 문장이 남으면 모델이 없는 기능을 권한다."""
+def test_지시문은_옛_모드를_지나간_것으로만_말한다(shared):
+    """학습/진단/실습 모드는 없앴다 — 모드 전환을 안내하는 문장이 남으면 모델이 없는 기능을 권한다.
+    단 옛 대화 기록의 모드 거절에 끌리지 않게 하는 규칙 8 하나는 남긴다 (#60 / DURO-85, 리뷰)."""
     text = _instructions(shared)
+    rule = next(line for line in agent_module.BASE_PROMPT.split("\n\n")[0].split("\n8. ")[1:])
+    assert "지금 노출된 툴이 정한다" in rule and "모드 전환을 안내하지 마라" in rule
+    rest = text.replace("8. " + rule, "")
     for word in ("모드", "학습", "진단", "실습"):
-        assert word not in text, word
+        assert word not in rest, word
 
 
 def test_변경_툴은_요청이_있을_때만_부르라고_한다():

@@ -12,9 +12,9 @@ PRIVATE = private.SKILL
 SHARED = shared.SKILL
 
 
-def skill_for(shared: bool) -> Skill:
+def skill_for(is_shared: bool) -> Skill:
     """방의 공개 범위 → 스킬. Shared 방만 변경 툴을 받는다."""
-    return SHARED if shared else PRIVATE
+    return SHARED if is_shared else PRIVATE
 
 
 __all__ = ["PRIVATE", "SHARED", "skill_for", "Skill", "KukieResponse", "Finding", "COMMON_TOOLS"]
