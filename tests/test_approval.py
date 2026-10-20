@@ -38,7 +38,7 @@ def _ready_plan(
         },
         command=["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
         risk="caution",
-        skill="실습",
+        skill="Shared",
         target={
             "context": "kind-dev",
             "namespace": "study",
@@ -67,7 +67,7 @@ def _ready_manifest_plan(monkeypatch, plan_dir, call_id: str, manifest: str) -> 
         },
         command=["apply", "-f", "-", "-n", "study"],
         risk="caution",
-        skill="실습",
+        skill="Shared",
         target={
             "context": "kind-dev",
             "namespace": "study",

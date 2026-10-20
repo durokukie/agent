@@ -197,25 +197,61 @@ def test_등록된_클러스터로_대화하면_임시_kubeconfig로_실행하�
     assert call["expectedFingerprint"] == fake_server.conversation(room)["clusterFingerprint"]
 
 
-def test_private_방은_server에_실습_모드가_남아_있어도_변경_모드로_복원하지_않는다(fake_server):
-    """자동 리뷰 5차: 게이트 전 커밋으로 남은 current_mode=실습 private 행을 그대로 열면 카드는 뜨고 승인은 403 이라 방이 막힌다."""
-    room = new_room(fake_server, current_mode="실습")
-    assert _reopen(room).session.skill.name == "학습"
+def test_스킬은_방의_공개_범위로만_정하고_남은_current_mode는_보지_않는다(fake_server):
+    """DURO-100: 모드는 없다. server 에 옛 모드 이름(실습 등)이 남아 있어도 private 방은 Private 로 연다."""
+    assert _reopen(new_room(fake_server, current_mode="실습")).session.skill.name == "Private"
+    assert _reopen(new_room(fake_server, shared=True, current_mode="학습")).session.skill.name == "Shared"
 
 
-def test_private_방은_실습_모드와_승인이_막힌다(client, fake_server):
-    """기획 05 §3: Private 는 조회·진단만, 실제 변경은 불가. 변경이 필요하면 Shared 를 새로 만든다."""
+def test_private_방은_승인이_막힌다(client, fake_server):
+    """기획 05 §3: Private 는 조회만, 실제 변경은 불가. 변경 툴이 아예 없고, 승인·재개도 server 가 403 으로 막는다."""
     room = new_room(fake_server)                                            # shared=False
-    r = _say(client, room, "/mode 실습")
-    assert r.status_code == 403 and r.json()["detail"]["code"] == "PRIVATE_SESSION"
-    assert fake_server.conversation(room)["currentMode"] == "학습"          # 안 바뀜
-    assert fake_server.runs_of(room) == []                                   # run 도 안 남음
-    assert _say(client, room, "/mode 진단").status_code == 200
     r = client.post(f"/conversations/{room}/approve", json={"call_id": "c", "approved": True}, headers=USER)
     assert r.status_code == 403 and r.json()["detail"]["code"] == "PRIVATE_SESSION"
     assert client.post(f"/conversations/{room}/resume", headers=USER).status_code == 403
-    assert _say(client, new_room(fake_server, shared=True), "/mode 실습").json() == {
-        "kind": "mode", "skill": "실습", "known": True}
+
+
+def _capture_turns(seen: list[dict]):
+    """모델이 받은 툴 목록·지시문·응답 스키마를 턴마다 적는 FunctionModel."""
+    def capture(messages, info):
+        seen.append({
+            "tools": [(t.name, t.parameters_json_schema) for t in info.function_tools],
+            "output": [(t.name, t.parameters_json_schema) for t in info.output_tools],
+            # @agent.instructions 의 결과는 ModelRequest.instructions 로 온다 (parts 가 아니다)
+            "instructions": messages[-1].instructions,
+        })
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name=info.output_tools[0].name,
+            args={"narration": "답변입니다.", "suggested_next_action": None},
+        )])
+    return FunctionModel(capture)
+
+
+@pytest.mark.parametrize("shared,expected", [
+    (False, set()),
+    (True, {"apply_manifest", "scale_resource", "rollout_restart", "delete_resource"}),
+])
+def test_방의_공개_범위가_노출되는_툴을_정한다(client, fake_server, shared, expected):
+    """Private 는 읽기 5종만, Shared 는 읽기 + 변경 4종 (DURO-100)."""
+    seen: list[dict] = []
+    room = new_room(fake_server, shared=shared)
+    with agent.override(model=_capture_turns(seen)):
+        assert _say(client, room, "파드 보여줘").status_code == 200
+    read = {"list_resources", "explain_command", "describe_resource", "get_events", "get_logs"}
+    assert {name for name, _ in seen[-1]["tools"]} == read | expected
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_한_대화의_툴_목록과_지시문은_턴마다_같다(client, fake_server, shared):
+    """프롬프트 캐시가 맞으려면 대화 안에서 앞부분(툴·지시문·응답 스키마)이 그대로여야 한다 (DURO-100)."""
+    seen: list[dict] = []
+    room = new_room(fake_server, shared=shared)
+    with agent.override(model=_capture_turns(seen)):
+        _say(client, room, "안녕")
+        _say(client, room, "/mode 실습")                    # 옛 앱의 모드 버튼 — 아무것도 바꾸지 않는다
+        _say(client, room, "nginx 를 늘려줘")
+    assert len(seen) == 2 and seen[0] == seen[1]
+    assert seen[0]["instructions"]
 
 
 # ── 채팅 · run 기록 ────────────────────────────────────────
@@ -265,11 +301,18 @@ def test_같은_request_id에_다른_입력은_409_REQUEST_MISMATCH(client, fake
     assert r.status_code == 409 and r.json()["detail"]["code"] == "REQUEST_MISMATCH"
 
 
-def test_모드_전환은_LLM_없이_run으로_남고_채팅방_모드가_바뀐다(client, fake_server):
+def test_mode_입력은_LLM_없이_run으로만_남고_스킬은_그대로다(client, fake_server, monkeypatch):
+    """모드는 없어졌다 (DURO-100). 옛 앱이 보내는 "/mode …" 는 known=False 로만 답하고 run 종류는 예전대로 남긴다."""
     room = new_room(fake_server)
-    r = _say(client, room, "/mode 진단")
-    assert r.json() == {"kind": "mode", "skill": "진단", "known": True}
-    assert fake_server.conversation(room)["currentMode"] == "진단"
+
+    async def no_llm(*args, **kwargs):
+        raise AssertionError("/mode 는 LLM 을 부르지 않는다")
+    monkeypatch.setattr(server, "_run_agent", no_llm)
+    r = _say(client, room, "/mode 실습")                     # private 방에서도 403 이 아니다 — 바꾸는 게 없다
+    assert r.status_code == 200
+    assert r.json() == {"kind": "mode", "skill": "Private", "known": False}
+    assert conversations.registry.get(room).session.skill.name == "Private"
+    assert fake_server.conversation(room)["currentMode"] == "Private"
     turn = fake_server.turns(room)[0]
     assert turn["kind"] == "mode_change" and turn["payload"]["kind"] == "mode"
 
@@ -318,7 +361,7 @@ def test_실패한_요청을_같은_request_id로_다시_보내면_저장된_실
         assert _say(client, room, "파드").status_code == 200
 
 
-def test_chat은_첫_마디를_제목_후보로_보내고_모드_전환은_보내지_않는다(client, fake_server):
+def test_chat은_첫_마디를_제목_후보로_보내고_mode_입력은_보내지_않는다(client, fake_server):
     """제목을 지을지(기본 제목인지, 첫 마디인지, 30자)는 server 가 정한다 — agent 는 원문을 run 기록과 함께 보낸다 (#59)."""
     room = new_room(fake_server, shared=True)
     _say(client, room, "/mode 실습")
@@ -330,43 +373,15 @@ def test_chat은_첫_마디를_제목_후보로_보내고_모드_전환은_보�
     assert fake_server.conversation(room)["title"] == "nginx 를 4개로 늘려줘"   # 한 번만 정해진다
 
 
-def test_모드를_바꾸면_다음_턴의_지시문이_실제로_바뀐다(client, fake_server):
-    """#60 은 문구가 아니라 **전환이 ctx.deps.skill 까지 오느냐** 의 문제였다."""
-    seen: list[str] = []
-
-    def capture(messages, info):
-        # @agent.instructions 의 결과는 ModelRequest.instructions 로 온다 (parts 가 아니다)
-        for message in messages:
-            text = getattr(message, "instructions", None)
-            if isinstance(text, str) and "[현재 모드:" in text:
-                seen.append(text[text.index("[현재 모드:"):][:20])
-        out = info.output_tools[0]
-        return ModelResponse(parts=[ToolCallPart(
-            tool_name=out.name,
-            args={"narration": "답변입니다.", "suggested_next_action": None},
-        )])
-
-    room = new_room(fake_server, shared=True)                # 실습 모드는 shared 방에서만 (기획 05 §3)
-    with agent.override(model=FunctionModel(capture)):
-        _say(client, room, "안녕")
-    assert seen and "학습" in seen[-1]
-
-    assert _say(client, room, "/mode 실습").json()["skill"] == "실습"   # 이 요청은 LLM 을 부르지 않는다
-
-    with agent.override(model=FunctionModel(capture)):
-        _say(client, room, "nginx 를 늘려줘")
-    assert "실습" in seen[-1]          # 전환이 다음 턴의 deps 까지 왔다
-
-
 # ── 채팅방 독립성 · 복원 ───────────────────────────────────
 
-def test_채팅방끼리_기록과_모드가_섞이지_않는다(client, fake_server):
-    a, b = new_room(fake_server), new_room(fake_server)
-    _say(client, a, "/mode 진단")
+def test_채팅방끼리_기록과_스킬이_섞이지_않는다(client, fake_server):
+    a, b = new_room(fake_server, shared=True), new_room(fake_server)
     with agent.override(model=chat_model()):
+        _say(client, a, "파드")
         _say(client, b, "파드")
-    assert fake_server.conversation(a)["currentMode"] == "진단"
-    assert fake_server.conversation(b)["currentMode"] == "학습"
+    assert conversations.registry.get(a).session.skill.name == "Shared"
+    assert conversations.registry.get(b).session.skill.name == "Private"
     assert len(fake_server.turns(a)) == 1 and len(fake_server.turns(b)) == 1
 
 
@@ -379,7 +394,7 @@ def test_서버가_다시_떠도_history가_복원된다(client, fake_server):
 
     restored = _reopen(room)                         # 프로세스 재시작 흉내 — 메모리만 비운다
     assert len(restored.session.history) == live_history
-    assert restored.session.skill.name == "학습" and restored.session.pending is None
+    assert restored.session.skill.name == "Private" and restored.session.pending is None
 
 
 def test_복원_한도는_UTF8_바이트_기준이고_최신_run_하나가_넘어도_복원하지_않는다(client, fake_server, monkeypatch):

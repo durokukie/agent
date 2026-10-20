@@ -127,12 +127,11 @@ def _tool_model(tool_name, args, call_id):
 
 
 def _decide(client, tool_name, args, call_id, approved):
-    """한 번의 승인 흐름: 실습 모드 → 모델이 변경 툴을 부름 → 훅이 dry-run·판단 가이드로 카드를 만듦 → 승인/거절.
+    """한 번의 승인 흐름: 모델이 변경 툴을 부름 → 훅이 dry-run·판단 가이드로 카드를 만듦 → 승인/거절.
 
     카드 내용까지 확인하고, 결정 뒤의 카드와 Action Plan 을 돌려준다.
     """
     assert client.post("/session").status_code == 200
-    assert client.post("/chat", json={"text": "/mode 실습"}).status_code == 200
 
     with guidance_agent.override(model=TestModel(
         custom_output_text="대상과 복구 기준을 확인한다."

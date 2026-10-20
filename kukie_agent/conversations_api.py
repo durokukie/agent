@@ -19,7 +19,7 @@ run 을 종료 상태로 닫으면 server 가 같은 트랜잭션에서 남은 �
   - 대화 읽기·입력: 대화 컨텍스트 purpose=chat (private 는 주인만, 팀 shared 는 지금 구성원, 팀 없는 방은 주인만)
   - 승인·재개: 대화 컨텍스트 purpose=approve (PRIVATE_SESSION / NOT_TEAM_ADMIN / FORBIDDEN)
   - 클러스터로 실행: 연결 정보 (못 보는 클러스터 404, 방이 복사해 둔 지문과 다르면 409 CLUSTER_CHANGED)
-여기서 직접 막는 것은 private 방의 변경 모드 진입(PRIVATE_SESSION) 하나다 — 입력 내용으로 정해지는 규칙이라.
+private 방의 변경은 툴 목록이 막는다 — private 방 스킬에는 변경 툴이 없다 (DURO-100, skills/__init__.py).
 
 오류는 전부 FastAPI 의 detail 자리에 {code, message} 객체로 간다 — 응답은 {"detail": {code, message}}.
 앱의 http.ts 가 detail 이 객체면 code 를 꺼낸다 (api-spec 공통 절). server 의 오류 코드도 같은 상태로 그대로 나간다.
@@ -43,8 +43,6 @@ from kukie_agent import progress, server_api
 from kukie_agent.auth import User, current_user
 from kukie_agent.clusters import access
 from kukie_agent.conversations import Conversation, registry
-from kukie_agent.skills import SKILLS
-from kukie_agent.tools.mutate import MUTATING_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -101,16 +99,6 @@ async def _connection(room: server_api.ConversationInfo, user: User) -> server_a
     방이 만들 때 복사한 지문을 함께 보내 "승인한 대상 = 실행 대상" 을 server 가 대조한다 (409 CLUSTER_CHANGED).
     """
     return await access.connection(room.cluster_id, user, expected_fingerprint=room.cluster_fingerprint)
-
-
-def _mutating_mode(name: str) -> bool:
-    skill = SKILLS.get(name)
-    return skill is not None and bool(skill.allowed_tools & MUTATING_TOOLS)
-
-
-def _private_change_blocked() -> HTTPException:
-    return _error(403, "PRIVATE_SESSION",
-                  "Private 대화에서는 클러스터를 변경할 수 없다 — 변경은 Shared 대화를 새로 만들어서 (기획 05)")
 
 
 def _messages_json(result: Any) -> list[Any]:
@@ -191,10 +179,8 @@ async def chat(
     context, conversation = await _open(conversation_id, user, "chat")
     room = context.conversation
     session = conversation.session
-    is_mode = body.text.startswith("/mode ")
-    kind = "mode_change" if is_mode else "chat"
-    if is_mode and not room.shared and _mutating_mode(body.text.removeprefix("/mode ").strip()):
-        raise _private_change_blocked()          # 변경 도구가 있는 모드는 shared 방에서만 (문서 05 §3)
+    # "/mode " 는 옛 앱이 보내는 입력이다 — 아무것도 바꾸지 않지만 run 종류는 예전대로 남긴다 (server._chat_turn)
+    kind = "mode_change" if body.text.startswith("/mode ") else "chat"
 
     # 재전송이면 실행하지 않고 저장된 결과를 그대로 — 승인 대기 검사보다 먼저 (응답 유실 뒤 재시도 규약)
     stored = await server_api.find_run(conversation_id, body.request_id, user)
@@ -265,7 +251,7 @@ async def chat(
 
         # 승인 카드면 run 은 열린 채(awaiting_approval) 남는다 — approve/resume 이 이어서 끝낸다 (문서 7절)
         status = "awaiting_approval" if payload.get("kind") == "approval" else "completed"
-        # 모드 갱신과 첫 마디로 제목 짓기(#59)를 run 기록과 한 번에 보낸다 — server 가 한 트랜잭션에서 한다.
+        # current_mode(지금은 스킬 이름 Private/Shared) 기록과 첫 마디로 제목 짓기(#59)를 run 기록과 한 번에 보낸다 — server 가 한 트랜잭션에서 한다.
         # 제목이 될 수 있는 마디인지, 첫 마디인지는 server 가 본다 (판정이 두 곳에 갈라지면 한쪽만 고쳐진다).
         await _save_or_fail(
             conversation_id, run, on_failure=_chat_store_failure(), failure_status="failed",

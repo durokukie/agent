@@ -81,7 +81,7 @@ def get_logs(ctx: RunContext[Deps], pod: str, namespace: str | None = None,
 
 
 def explain_command(ctx: RunContext[Deps], resource_or_field: str) -> KubectlResult:
-    """리소스나 필드의 공식 스키마 설명을 조회한다. 순수 학습 툴 — 클러스터 상태를 바꾸지 않는다.
+    """리소스나 필드의 공식 스키마 설명을 조회한다. 순수 설명 툴 — 클러스터 상태를 바꾸지 않는다.
 
     "replicas가 뭐예요?", "Deployment의 spec에 뭐가 들어가요?" 같은 개념 질문에 쓴다.
     예: "deployment", "deployment.spec.replicas", "pod.spec.containers".

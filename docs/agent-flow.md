@@ -11,7 +11,7 @@ flowchart TD
 
     subgraph CLI_["server.py — 로컬 FastAPI (DURO-49)"]
         CLI["POST /chat {text}<br/>(승인 대기 중이면 409)"]
-        CLI --> R["router.pick_skill(msg, current)<br/>→ 학습 스킬 (코드가 결정, LLM 아님)"]
+        CLI --> R["session.skill<br/>→ 대화의 공개 범위로 정한 Private / Shared (대화 안에서 고정, LLM 아님)"]
         R --> RUN["agent.run(msg,<br/>deps=Deps(context, namespace, skill),<br/>output_type=[skill.output_fn, DeferredToolRequests],<br/>message_history=session.history)"]
     end
 
@@ -38,7 +38,7 @@ flowchart TD
 
     KR -.-> T
     V -->|"통과"| OUT["result.output (KukieResponse)<br/>narration + suggested_next_action<br/>+ steps[command, output, explanations]"]
-    OUT --> CLI2["server._to_payload → {kind: answer}<br/>앱이 [학습 모드] + 명령 블록 + 설명 표 렌더링"]
+    OUT --> CLI2["server._to_payload → {kind: answer}<br/>앱이 답변 + 명령 블록 + 설명 표 렌더링"]
     CLI2 --> U
 
     style CLI_ fill:#f5f5f5,stroke:#999,stroke-dasharray: 5 5
@@ -93,7 +93,7 @@ flowchart TD
 flowchart LR
     S["POST /session"] --> K["kubectl/config.read_kubeconfig()<br/>current-context / namespace"]
     K --> C["사용자 확인<br/>'kind-dev / study 맞나요?'"]
-    C -->|"y"| D["Deps(context, namespace,<br/>skill=DEFAULT_SKILL)"]
+    C -->|"y"| D["Deps(context, namespace,<br/>skill=SHARED)<br/>로컬 개발엔 방이 없다"]
     D --> LOOP["대화 루프 진입<br/>(그림 1)"]
 ```
 
@@ -104,11 +104,11 @@ flowchart LR
 | 세션 시작 | `start_session()`, `read_kubeconfig()` | `server.py`, `kubectl/config.py` | ✅ DURO-49 |
 | 채팅·결과 분기·승인 재개 | `chat()`, `_to_payload()`, `approve()` | `server.py` | ✅ DURO-49 + #27 승인 연결 |
 | 렌더링 | — | 앱 (2단계) | ❌ |
-| 스킬 결정 | `pick_skill()` | `router.py` | ✅ (/mode + sticky) |
+| 스킬 결정 | `skill_for(room.shared)` | `skills/__init__.py`, `conversations.py` | ✅ DURO-100 (공개 범위로 고정, 모드 없음) |
 | 에이전트 설정 | `Agent(...)`, `add_target()`, `add_skill_prompt()` | `agent.py` | ✅ |
-| 툴 등록 | `FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS]).filtered(_only_skill_tools)` | `agent.py` | ✅ 스킬별 필터; 변경 4종은 실습만 + Hook |
+| 툴 등록 | `FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS]).filtered(_only_skill_tools)` | `agent.py` | ✅ 스킬별 필터; 변경 4종은 Shared 만 + Hook |
 | 읽기 툴 5종 | `list_resources` 등 | `tools/read.py` | ✅ |
-| 변경 툴 4종 | `delete_resource` 등 | `tools/mutate.py` | ✅ 실습에만 노출, 가드레일 훅 대상 |
+| 변경 툴 4종 | `delete_resource` 등 | `tools/mutate.py` | ✅ Shared 대화에만 노출, 가드레일 훅 대상 |
 | 명령 조립 | `assemble()` | `kubectl/assemble.py` | 부분 (apply TODO) |
 | 실행 | `run_kubectl()` | `kubectl/runner.py` | ✅ |
 | 훅 파이프라인 | `guardrail()` | `guardrail/hook.py` | ✅ 2-pass 승인·실행·기록 |
@@ -124,7 +124,7 @@ flowchart LR
 
 | 결정 | 주체 | 시점 |
 |---|---|---|
-| 어떤 스킬 | 코드 (`router`) / 사용자 (`/mode`) | run 전 |
+| 어떤 스킬 | 코드 (`skill_for` — 방의 공개 범위) | 방을 열 때 |
 | 어떤 툴, 어떤 값, intent | LLM | ② (1차 호출) |
 | kubectl 명령 문장 | 코드 (`assemble` / 툴 내부) | ③ |
 | 위험도 | 코드 (`RISK_STICKERS`) | 훅 ② |
@@ -134,9 +134,12 @@ flowchart LR
 | 해석 (narration, 다음 행동 안내) | LLM | ④ (2차 호출) |
 
 `suggested_next_action: str | None = None`은 현재 답변과 실행 결과에 근거한 짧은 다음 행동 안내다.
-현재 모드에서 가능한 행동이면 전환을 제안하지 않고, 다른 모드가 필요하면 모드 이름과 이유를 안내한다.
-추가 행동이 필요하지 않으면 `null`이다. 제안 자체는 모드를 바꾸거나 작업을 실행하거나 사용자 승인을 대신하지 않는다.
-모드는 `/mode`로 선택하고, 변경 작업의 승인·거절은 기존 `/approve` 절차를 따른다.
+추가 행동이 필요하지 않으면 `null`이다. 제안 자체는 작업을 실행하거나 사용자 승인을 대신하지 않는다.
+변경 작업의 승인·거절은 기존 `/approve` 절차를 따른다.
+
+학습/진단/실습 모드는 없앴다 (DURO-100). Private 대화는 읽기 5종만, Shared 대화는 읽기 5종 + 변경 4종을 받는다.
+공개 범위는 대화 안에서 바뀌지 않으므로 한 대화의 툴 목록·응답 스키마·지시문은 턴마다 같다 (프롬프트 캐시).
+`/mode …` 입력은 모드 버튼이 남은 옛 앱을 위해서만 받아 `{kind: "mode", known: false}` 로 답하고 아무것도 바꾸지 않는다.
 
 API 변경(#48): 기존 `suggested_transition`을 참조하는 소비자는 `suggested_next_action`으로 변경해야 한다.
 구 필드는 응답에 함께 제공하지 않는다.

@@ -38,7 +38,7 @@ def _create_plan(
         },
         command=["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
         risk="caution",
-        skill="실습",
+        skill="Shared",
         target={
             "context": "minikube",
             "namespace": "study",
@@ -69,7 +69,7 @@ def test_초안은_모든_필드를_frontmatter에만_저장한다(monkeypatch, 
             "replicas": 3,
             "namespace": "study",
         },
-        "skill": "실습",
+        "skill": "Shared",
         "target": {
             "context": "minikube",
             "namespace": "study",
@@ -105,7 +105,7 @@ def test_create_draft_keeps_structured_fields_in_memory(monkeypatch, tmp_path):
         "namespace": "study",
     }
     assert plan.call_id == "call-123"
-    assert plan.skill == "실습"
+    assert plan.skill == "Shared"
     assert plan.target["name"] == "nginx"
     assert plan.command[-1] == "study"
     assert plan.risk_level == "caution"
@@ -129,7 +129,7 @@ def test_create_draft는_dict가_아닌_args를_거부한다(monkeypatch, tmp_pa
             args=[],
             command=["scale", "deployment", "nginx"],
             risk="caution",
-            skill="실습",
+            skill="Shared",
             target={"context": "minikube"},
             intent="nginx를 확장한다.",
             expected_effects=["Pod가 늘어난다."],
@@ -182,7 +182,7 @@ def test_create_draft_reserves_unique_filename_atomically(monkeypatch, tmp_path)
             args={"name": label},
             command=["scale", label],
             risk="caution",
-            skill="실습",
+            skill="Shared",
             target={"name": label},
             intent=label,
             expected_effects=[],
@@ -696,7 +696,7 @@ def test_예약_제목과_여러_줄_effect도_손실_없이_복원한다(
         args={"namespace": "study"},
         command=["scale", "deployment", "nginx", "--replicas=3", "-n", "study"],
         risk="caution",
-        skill="실습",
+        skill="Shared",
         target={"context": "minikube", "namespace": "study"},
         intent=intent,
         expected_effects=expected_effects,
@@ -780,7 +780,7 @@ def test_call_id로_일치하는_Plan을_복원한다(monkeypatch, tmp_path):
         args={"kind": "pod", "name": "old", "namespace": "study"},
         command=["delete", "pod", "old", "-n", "study"],
         risk="destructive",
-        skill="실습",
+        skill="Shared",
         target={
             "context": "minikube",
             "namespace": "study",

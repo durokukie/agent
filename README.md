@@ -5,7 +5,7 @@
 
 ```
 사용자: nginx 파드가 자꾸 죽는데 왜 그래?
-Kukie : [진단] CrashLoopBackOff — 로그를 보니 설정 파일 경로가 잘못됐습니다.
+Kukie : CrashLoopBackOff — 로그를 보니 설정 파일 경로가 잘못됐습니다.
         (실행한 명령과 각 플래그의 뜻을 함께 보여줌)
 
 사용자: 그럼 재시작해줘
@@ -77,9 +77,9 @@ agent 에 남은 공개 API 는 `POST /conversations/{id}/chat`·`/approve`·`/r
 
 | 영역 | 파일 |
 |---|---|
-| 에이전트 정의, 스킬별 툴 필터 | `kukie_agent/agent.py`, `kukie_agent/skills/` |
+| 에이전트 정의, 스킬(Private·Shared 대화)별 툴 필터 | `kukie_agent/agent.py`, `kukie_agent/skills/` |
 | 가드레일 훅, Action Plan, 판단 가이드 | `kukie_agent/guardrail/` |
-| 읽기 툴 4종, 변경 툴 4종 | `kukie_agent/tools/` |
+| 읽기 툴 5종, 변경 툴 4종 | `kukie_agent/tools/` |
 | kubectl 명령 조립·실행 (`shell=False`) | `kukie_agent/kubectl/` |
 | FastAPI 서버, 대화 실행(chat·approve·resume)·클러스터 연결 확인·개요 | `kukie_agent/server.py`, `kukie_agent/conversations_api.py`, `kukie_agent/clusters_api.py` |
 | 채팅방별 세션·잠금·재시작 복원 | `kukie_agent/conversations.py` |

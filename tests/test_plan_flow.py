@@ -69,7 +69,6 @@ def _room(fake) -> str:
 
 
 def _card(client, room, *, call_id="call-1", args=None, tool="scale_resource"):
-    client.post(f"/conversations/{room}/chat", json={"text": "/mode 실습"}, headers=USER)
     with agent.override(model=_mutation_model(call_id, args, tool)):
         r = client.post(f"/conversations/{room}/chat", json={"text": "늘려줘"}, headers=USER)
     assert r.status_code == 200, r.text
@@ -155,7 +154,6 @@ def test_dry_run이_떨어지면_FAILED와_DRY_RUN_FAILED가_남는다(client, f
     room = _room(fake_server)
     monkeypatch.setattr(hook, "run_kubectl",
                         lambda *a, **k: _ok("", success=False, exit_code=1, stderr="quota exceeded"))
-    client.post(f"/conversations/{room}/chat", json={"text": "/mode 실습"}, headers=USER)
     with agent.override(model=_mutation_model()):
         client.post(f"/conversations/{room}/chat", json={"text": "늘려줘"}, headers=USER)
 
@@ -169,7 +167,6 @@ def test_dry_run이_떨어지면_FAILED와_DRY_RUN_FAILED가_남는다(client, f
 def test_run이_없는_flat_엔드포인트의_계획은_server에_들어가지_않는다(client, fake_server, fake_kubeconfig, plan_dir):
     """flat /chat 은 run 을 만들지 않는다 — 계획은 .md 로만 남는다 (issue #58 댓글 4번)."""
     client.post("/session")
-    server._session.deps = server.dataclasses.replace(server._session.deps, skill=server.SKILLS["실습"])
     try:
         with agent.override(model=_mutation_model("call-flat")):
             r = client.post("/chat", json={"text": "늘려줘"})
@@ -385,7 +382,6 @@ def test_한_장을_거절한_뒤_재시작하면_되살리지_않는다(client,
     남는다. 남은 한 장만 되살려 재개하면 그 call 이 답 없이 모델에 가서 그 방은 갇힌다.
     """
     room = _room(fake_server)
-    client.post(f"/conversations/{room}/chat", json={"text": "/mode 실습"}, headers=USER)
 
     def two_cards(messages, info):
         return ModelResponse(parts=[
@@ -415,7 +411,6 @@ def test_한_장을_거절한_뒤_재시작하면_되살리지_않는다(client,
 def test_저장_실패로_run이_failed가_돼도_계획이_닫힌다(client, fake_server, monkeypatch):
     """_save_or_fail 의 대체 쓰기 경로 — 종료 상태(failed)로 닫으면 server 가 같은 트랜잭션에서 계획을 닫는다."""
     room = _room(fake_server)
-    client.post(f"/conversations/{room}/chat", json={"text": "/mode 실습"}, headers=USER)
     original = server_api.update_run
 
     async def flaky(run_id, **fields):
