@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,7 +35,8 @@ def built() -> dict:
 def test_응답_머리는_context_namespace_수집시각이다():
     body = built()
     assert (body["context"], body["namespace"], body["at"]) == ("eks-shop", "shop", "2026-10-19T12:00:00Z")
-    assert set(body) == {"context", "namespace", "at", "workloads", "pods", "events"}
+    assert set(body) == {"context", "namespace", "at", "workloads", "pods", "events", "network"}
+    assert body["network"] is None                                           # CNI 조회 출력을 안 넘기면 null
 
 
 def test_워크로드_상태_판정():
@@ -151,6 +153,71 @@ def test_빈_목록과_깨진_출력():
         overview.build(context="c", namespace="n", now=NOW, workloads="not json", pods="{}", events="{}")
 
 
+# ── 네트워크(CNI) ──────────────────────────────────────────
+
+def _daemonsets(*names_and_images: tuple[str, str]) -> str:
+    return json.dumps({"kind": "List", "items": [
+        {"kind": "DaemonSet", "metadata": {"name": name, "namespace": "kube-system"},
+         "spec": {"template": {"spec": {"containers": [{"name": "main", "image": image}]}}}}
+        for name, image in names_and_images]})
+
+
+def test_Helm_으로_깐_Cilium을_kube_system_DaemonSet으로_알아본다():
+    assert overview.parse_network(fixture("daemonsets")) == {"name": "Cilium", "version": "1.20.3", "source": "daemonset"}
+
+
+@pytest.mark.parametrize(("daemonset", "name"), [
+    ("cilium", "Cilium"), ("calico-node", "Calico"), ("aws-node", "Amazon VPC CNI"),
+    ("kube-flannel-ds", "Flannel"), ("kube-flannel", "Flannel"), ("weave-net", "Weave"), ("antrea-agent", "Antrea"),
+])
+def test_CNI_DaemonSet_이름표(daemonset, name):
+    found = overview.parse_network(_daemonsets(("kube-proxy", "k/kube-proxy:v1.34.0"), (daemonset, "r/x:v1.2.3")))
+    assert found == {"name": name, "version": "1.2.3", "source": "daemonset"}
+
+
+def test_Cilium과_aws_node가_같이_있으면_Cilium이다():
+    """Cilium 을 vpc-cni 위에 얹어(chaining) 돌리면 aws-node 도 남는다 — 모듈 설명 "네트워크"."""
+    found = overview.parse_network(_daemonsets(("aws-node", "r/amazon-k8s-cni:v1.20.4-eksbuild.1"),
+                                               ("cilium", "quay.io/cilium/cilium:v1.20.3")))
+    assert found is not None and (found["name"], found["version"]) == ("Cilium", "1.20.3")
+    found = overview.parse_network(_daemonsets(("aws-node", "r/amazon-k8s-cni:v1.20.4-eksbuild.1"),
+                                               ("calico-node", "docker.io/calico/node:v3.30.0")))
+    assert found is not None and found["name"] == "Calico"
+
+
+def test_CNI_DaemonSet이_없거나_출력을_못_읽으면_None():
+    assert overview.parse_network(_daemonsets(("kube-proxy", "k/kube-proxy:v1.34.0"))) is None
+    assert overview.parse_network('{"items": []}') is None
+    assert overview.parse_network(None) is None
+    assert overview.parse_network("not json") is None                        # 다른 칸과 달리 502 로 올리지 않는다
+    assert overview.parse_network('{"items": {}}') is None
+    # metadata·spec 의 모양이 이상해도 개요 전체를 500 으로 만들지 않는다 (PR #117 리뷰)
+    assert overview.parse_network('{"items": [{"metadata": "cilium"}]}') is None
+    assert overview.parse_network('{"items": [{"metadata": {"name": ["x"]}}]}') is None
+    assert overview.parse_network('{"items": [{"metadata": {"name": "cilium"}, "spec": "x"}]}') is None
+    # 컨테이너가 없으면 이름만 안다
+    assert overview.parse_network(json.dumps({"items": [{"metadata": {"name": "cilium"}, "spec": {}}]})) == {
+        "name": "Cilium", "version": None, "source": "daemonset"}
+
+
+@pytest.mark.parametrize(("image", "version"), [
+    ("quay.io/cilium/cilium:v1.20.3@sha256:abc", "1.20.3"),
+    ("quay.io/cilium/cilium:v1.20.3", "1.20.3"),
+    ("602401143452.dkr.ecr.ap-northeast-2.amazonaws.com/amazon-k8s-cni:v1.20.4-eksbuild.1", "1.20.4-eksbuild.1"),
+    ("docker.io/calico/node:3.30.0", "3.30.0"),
+    ("registry.local:5000/cilium/cilium:v1.19.0", "1.19.0"),     # 레지스트리 포트는 태그가 아니다
+    ("registry.local:5000/cilium/cilium", None),
+    ("quay.io/cilium/cilium@sha256:abc", None),                  # 다이제스트만 있다
+    ("quay.io/cilium/cilium:latest", None),
+    ("cilium", None),
+    ("weaveworks/weave-kube:vnext", "vnext"),                    # 숫자가 아니면 v 를 떼지 않는다
+    ("", None),
+    (None, None),
+])
+def test_버전은_이미지_태그에서_뗀다(image, version):
+    assert overview.image_version(image) == version
+
+
 @pytest.mark.parametrize(("seconds", "expected"), [(0, "0s"), (59, "59s"), (60, "1m"), (3599, "59m"),
                                                    (3600, "1h"), (86399, "23h"), (86400, "1d"), (-5, "0s")])
 def test_age는_가장_큰_단위_하나(seconds, expected):
@@ -173,7 +240,7 @@ def _result(stdout: str = "", *, stderr: str = "", success: bool = True) -> Kube
 
 def _by_resource(args: list[str]) -> KubectlResult:
     return _result(fixture({"deployments,statefulsets,daemonsets": "workloads", "pods": "pods",
-                            "events": "events"}[args[1]]))
+                            "events": "events", "daemonsets": "daemonsets"}[args[1]]))
 
 
 def test_인증_없으면_401(client, fake_server):
@@ -208,19 +275,22 @@ def test_팀_구성원은_개요를_읽고_namespace_범위로만_조회한다(c
     body = r.json()
     assert (body["context"], body["namespace"]) == ("eks-shop", "shop")
     assert len(body["workloads"]) == 7 and len(body["pods"]) == 5 and len(body["events"]) == 20
+    assert body["network"] == {"name": "Cilium", "version": "1.20.3", "source": "daemonset"}
     assert datetime.fromisoformat(body["at"]).tzinfo is not None
     assert "secret-token" not in r.text
     assert [call["args"] for call in seen] == [
         ["get", "deployments,statefulsets,daemonsets", "-o", "json", "-n", "shop"],
         ["get", "pods", "-o", "json", "-n", "shop"],
         ["get", "events", "-o", "json", "-n", "shop"],
+        ["get", "daemonsets", "-o", "json", "-n", "kube-system"],          # CNI — 앞의 세 조회 뒤에 한 번
     ]
     # 클러스터 범위 조회는 하지 않는다 — EKS 고객 클러스터는 namespace Edit 만 준다
     assert not any(flag in call["args"] for call in seen for flag in ("-A", "--all-namespaces", "nodes"))
+    assert all(call["args"].count("-n") == 1 for call in seen)
     assert {call["context"] for call in seen} == {"eks-shop"} and not any(call["dry_run"] for call in seen)
     # 대시보드가 자주 부른다 — 기본 30초보다 짧게 끊는다
     assert {call["timeout"] for call in seen} == {clusters_api.OVERVIEW_TIMEOUT} and clusters_api.OVERVIEW_TIMEOUT < 30
-    # server 에서 받은 값으로 만든 임시 kubeconfig 하나로 세 번 돌리고, 끝나면 지운다
+    # server 에서 받은 값으로 만든 임시 kubeconfig 하나로 네 번 돌리고, 끝나면 지운다
     assert all("secret-token" in call["body"] for call in seen)
     assert len({call["kubeconfig"] for call in seen}) == 1 and not seen[0]["kubeconfig"].exists()
     # 읽기 전용 — 상태를 남기지 않는다
@@ -245,6 +315,36 @@ def test_kubectl_실패는_연결_확인과_같은_기준으로_갈라_502(clien
     assert r.status_code == 502
     assert r.json()["detail"]["code"] == code and stderr in r.json()["detail"]["message"]
     assert len(ran) == 1                                                     # 첫 실패에서 멈춘다
+
+
+@pytest.mark.parametrize("stderr", [
+    'Error from server (Forbidden): daemonsets.apps is forbidden: User "x" cannot list resource "daemonsets" '
+    'in API group "apps" in the namespace "kube-system"',
+    "Command '[kubectl ...]' timed out after 15 seconds",
+])
+def test_CNI_조회가_실패해도_개요는_200이고_network만_null(client, fake_server, monkeypatch, caplog, stderr):
+    cluster = fake_server.add_cluster(namespace="shop")
+
+    def fake(args, **kwargs):
+        if "kube-system" in args:
+            return _result(stderr=stderr, success=False)
+        return _by_resource(args)
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    with caplog.at_level("DEBUG", logger="kukie_agent.clusters_api"):
+        r = client.get(f"/clusters/{cluster}/overview", headers=USER)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["network"] is None and len(body["workloads"]) == 7
+    assert "CNI 조회를 건너뛴다" in caplog.text and "cannot list" not in caplog.text   # 원문은 남기지 않는다
+
+
+def test_CNI_조회_출력이_깨져도_개요는_200(client, fake_server, monkeypatch):
+    cluster = fake_server.add_cluster()
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl",
+                        lambda args, **k: _result("not json") if "kube-system" in args else _by_resource(args))
+    r = client.get(f"/clusters/{cluster}/overview", headers=USER)
+    assert r.status_code == 200 and r.json()["network"] is None
 
 
 def test_kubectl_출력이_JSON이_아니면_502_CLUSTER_BAD_RESPONSE(client, fake_server, monkeypatch):
