@@ -191,6 +191,10 @@ def test_CNI_DaemonSet이_없거나_출력을_못_읽으면_None():
     assert overview.parse_network(None) is None
     assert overview.parse_network("not json") is None                        # 다른 칸과 달리 502 로 올리지 않는다
     assert overview.parse_network('{"items": {}}') is None
+    # metadata·spec 의 모양이 이상해도 개요 전체를 500 으로 만들지 않는다 (PR #117 리뷰)
+    assert overview.parse_network('{"items": [{"metadata": "cilium"}]}') is None
+    assert overview.parse_network('{"items": [{"metadata": {"name": ["x"]}}]}') is None
+    assert overview.parse_network('{"items": [{"metadata": {"name": "cilium"}, "spec": "x"}]}') is None
     # 컨테이너가 없으면 이름만 안다
     assert overview.parse_network(json.dumps({"items": [{"metadata": {"name": "cilium"}, "spec": {}}]})) == {
         "name": "Cilium", "version": None, "source": "daemonset"}
@@ -327,7 +331,7 @@ def test_CNI_조회가_실패해도_개요는_200이고_network만_null(client, 
         return _by_resource(args)
 
     monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
-    with caplog.at_level("INFO", logger="kukie_agent.clusters_api"):
+    with caplog.at_level("DEBUG", logger="kukie_agent.clusters_api"):
         r = client.get(f"/clusters/{cluster}/overview", headers=USER)
     assert r.status_code == 200
     body = r.json()

@@ -236,14 +236,14 @@ def parse_network(stdout: str | None) -> dict[str, Any] | None:
     if stdout is None:
         return None
     try:
-        items = _items(stdout)
-    except ValueError:
+        by_name = {(item.get("metadata") or {}).get("name"): item for item in _items(stdout)}
+        for daemonset, display in CNI_DAEMONSETS:
+            item = by_name.get(daemonset)
+            if item is not None:
+                return {"name": display, "version": image_version(_first_image(item)), "source": "daemonset"}
+    except (ValueError, AttributeError, TypeError):
+        # JSON 이 아니거나, metadata·spec 이 객체가 아니거나, 이름이 해시할 수 없는 값일 때 (PR #117 리뷰)
         return None
-    by_name = {(item.get("metadata") or {}).get("name"): item for item in items}
-    for daemonset, display in CNI_DAEMONSETS:
-        item = by_name.get(daemonset)
-        if item is not None:
-            return {"name": display, "version": image_version(_first_image(item)), "source": "daemonset"}
     return None
 
 

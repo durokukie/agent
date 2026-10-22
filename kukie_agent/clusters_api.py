@@ -104,9 +104,10 @@ async def cluster_overview(
             network = run_kubectl(overview.NETWORK_COMMAND, context=conn.context_name,
                                   kubeconfig=path, timeout=OVERVIEW_TIMEOUT)
         if not network.success:
-            # 고객 클러스터는 kube-system 을 못 읽는 게 보통이다. 원문(사용자·ARN 이 실린다)은 남기지 않고 갈래만 남긴다
-            logger.info("개요의 CNI 조회를 건너뛴다 (kube-system DaemonSet): %s, exit=%s",
-                        _failure_status(network.stderr or network.stdout), network.exit_code)
+            # 고객 클러스터는 kube-system 을 못 읽는 게 보통이라 대시보드가 부를 때마다 난다 — debug 로 둔다 (PR #117 리뷰).
+            # 원문(사용자·ARN 이 실린다)은 남기지 않고 갈래만 남긴다
+            logger.debug("개요의 CNI 조회를 건너뛴다 (kube-system DaemonSet): %s",
+                         _failure_status(network.stderr or network.stdout))
         try:
             return overview.build(context=conn.context_name, namespace=conn.namespace,
                                   now=datetime.now(timezone.utc),
