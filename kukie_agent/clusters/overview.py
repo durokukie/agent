@@ -5,6 +5,16 @@ kubectl 은 clusters_api.py 가 돌리고, 여기는 그 출력(JSON 문자열)�
 
 조회 범위는 클러스터에 등록된 namespace 하나다. EKS 고객 클러스터는 namespace 범위 Edit 만 주므로
 `-A`·`get nodes` 같은 클러스터 범위 조회는 하지 않는다 (READ_COMMANDS 가 그 목록이다).
+예외는 CNI 를 알아보는 NETWORK_COMMAND 하나다 — kube-system 의 DaemonSet 만 읽고, 못 읽으면 network 를 null 로 둔다.
+
+네트워크(CNI) — network
+  EKS 애드온이 아닌 CNI(예: Helm 으로 깐 Cilium)도 대시보드가 보이도록 kube-system 의 DaemonSet 이름으로 알아본다.
+  CNI_DAEMONSETS 에서 위에 있는 것이 먼저다. Cilium·Calico 를 aws-node(Amazon VPC CNI)보다 앞에 둔 것은
+  Cilium 이 vpc-cni 위에 얹혀(chaining) 돌 때도 aws-node 가 남아 있기 때문이다 — 둘 다 있으면 Cilium 이라고 답한다.
+  (Calico 를 네트워크 정책 용도로만 vpc-cni 와 함께 쓰는 경우도 Calico 로 보인다 — 단순하게 둔 것이다.)
+  버전은 그 DaemonSet 의 첫 컨테이너 이미지 태그다 (`quay.io/cilium/cilium:v1.20.3@sha256:…` → `1.20.3`).
+  태그가 없거나 latest 이면 null. kube-system 밖에 까는 설치(tigera-operator 의 calico-system,
+  새 Flannel 의 kube-flannel 등)는 보지 않는다 — 그때도 network 는 null 이다.
 
 상태 판정 (웹의 Available·Progressing·Degraded)
   - Available    ready ≥ desired 이고 새 버전으로 다 바뀌었다 (desired 0 도 여기)
@@ -41,6 +51,21 @@ READ_COMMANDS: dict[str, list[str]] = {
     "events": ["get", "events", "-o", "json"],
 }
 
+#: CNI 조회 (모듈 설명 "네트워크"). namespace 를 이미 담고 있어 부르는 쪽이 `-n` 을 붙이지 않는다.
+#: 고객 클러스터에서는 Forbidden 이 흔하다 — 실패해도 개요 전체를 실패로 만들지 않고 network 만 null 이다.
+NETWORK_COMMAND: list[str] = ["get", "daemonsets", "-o", "json", "-n", "kube-system"]
+
+#: kube-system DaemonSet 이름 → 표시 이름. 위에 있는 것이 먼저다 (모듈 설명 "네트워크")
+CNI_DAEMONSETS: tuple[tuple[str, str], ...] = (
+    ("cilium", "Cilium"),
+    ("calico-node", "Calico"),
+    ("antrea-agent", "Antrea"),
+    ("kube-flannel-ds", "Flannel"),
+    ("kube-flannel", "Flannel"),
+    ("weave-net", "Weave"),
+    ("aws-node", "Amazon VPC CNI"),
+)
+
 #: 응답에 싣는 이벤트 수 (최근 것부터)
 MAX_EVENTS = 20
 
@@ -55,8 +80,12 @@ WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet")
 
 def build(
     *, context: str, namespace: str, workloads: str, pods: str, events: str, now: datetime,
+    network: str | None = None,
 ) -> dict[str, Any]:
-    """kubectl 세 번의 stdout(JSON) 으로 ClusterOverview 응답을 만든다."""
+    """READ_COMMANDS 세 번의 stdout(JSON) 으로 ClusterOverview 응답을 만든다.
+
+    network 는 NETWORK_COMMAND 의 stdout 이다. 그 조회가 실패했으면 None 을 넘긴다 — 응답의 network 는 null.
+    """
     return {
         "context": context,
         "namespace": namespace,
@@ -64,6 +93,7 @@ def build(
         "workloads": parse_workloads(_items(workloads), now),
         "pods": parse_pods(_items(pods), now),
         "events": parse_events(_items(events)),
+        "network": parse_network(network),
     }
 
 
@@ -194,6 +224,48 @@ def _event_time(item: dict[str, Any]) -> datetime | None:
         if parsed is not None:
             return parsed
     return None
+
+
+# ── 네트워크(CNI) ──────────────────────────────────────────
+
+def parse_network(stdout: str | None) -> dict[str, Any] | None:
+    """kube-system DaemonSet 목록에서 CNI 를 찾는다 (모듈 설명 "네트워크"). 못 찾거나 못 읽으면 None.
+
+    다른 칸과 달리 깨진 출력도 오류로 올리지 않는다 — 부가 정보라 개요 전체를 502 로 만들 까닭이 없다.
+    """
+    if stdout is None:
+        return None
+    try:
+        items = _items(stdout)
+    except ValueError:
+        return None
+    by_name = {(item.get("metadata") or {}).get("name"): item for item in items}
+    for daemonset, display in CNI_DAEMONSETS:
+        item = by_name.get(daemonset)
+        if item is not None:
+            return {"name": display, "version": image_version(_first_image(item)), "source": "daemonset"}
+    return None
+
+
+def image_version(image: str | None) -> str | None:
+    """이미지 참조의 태그에서 버전을 뗀다. `repo/cilium:v1.20.3@sha256:…` → `1.20.3`. 태그가 없거나 latest 면 None."""
+    if not image:
+        return None
+    name = image.split("@", 1)[0]                 # 다이제스트를 뗀다
+    last = name.rsplit("/", 1)[-1]                # registry:5000/… 의 포트를 태그로 읽지 않게 마지막 조각만 본다
+    if ":" not in last:
+        return None
+    tag = last.split(":", 1)[1]
+    if not tag or tag == "latest":
+        return None
+    return tag[1:] if tag[0] in "vV" and len(tag) > 1 and tag[1].isdigit() else tag
+
+
+def _first_image(item: dict[str, Any]) -> str | None:
+    pod_spec = ((item.get("spec") or {}).get("template") or {}).get("spec") or {}
+    containers = [c for c in pod_spec.get("containers") or [] if isinstance(c, dict)]
+    image = containers[0].get("image") if containers else None
+    return image if isinstance(image, str) else None
 
 
 # ── 공통 ─────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 """클러스터 연결 확인 엔드포인트 (기획 04 §8, issue #61).
 
   POST /clusters/{id}/test       연결 확인 (kubectl version + auth can-i)
-  GET  /clusters/{id}/overview   개요 — 웹 대시보드의 클러스터 지도·통계 (issue #102, kubectl get × 3)
+  GET  /clusters/{id}/overview   개요 — 웹 대시보드의 클러스터 지도·통계 (issue #102, kubectl get × 3 + CNI 조회 1)
 
 등록·목록·수정·삭제는 Kukie API 서버(kukie-server)의 공개 API 다 (DURO-113) — kubeconfig 검사와 자격증명
 암호화도 그쪽에 있다. 연결 확인만 agent 에 남은 이유는 kubectl 이 여기서 돌기 때문이다.
@@ -34,8 +34,8 @@ router = APIRouter(prefix="/clusters", tags=["clusters"])
 #: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적, 이유는 thread_limiter).
 #: kubectl 은 30초씩 잡는다.
 PROBE_WORKERS = 4            # 연결 확인 (kubectl × 2, 최대 60초)
-OVERVIEW_WORKERS = 4         # 개요 (kubectl × 3). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
-#: 개요의 kubectl 한 번 시간 제한(초). 기본 30초 × 3 이면 한 요청이 슬롯을 90초 잡는다 — 닿지 않으면 첫 번째에서 15초로 끝난다 (자동 리뷰 지적)
+OVERVIEW_WORKERS = 4         # 개요 (kubectl × 4). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
+#: 개요의 kubectl 한 번 시간 제한(초). 기본 30초 × 4 면 한 요청이 슬롯을 2분 잡는다 — 닿지 않으면 첫 번째에서 15초로 끝난다 (자동 리뷰 지적)
 OVERVIEW_TIMEOUT = 15
 
 
@@ -80,6 +80,8 @@ async def cluster_overview(
 
     권한·자격증명은 연결 확인과 같은 길이다 — 못 보는 클러스터는 server 의 404, 팀 구성원 누구나 부른다.
     읽기 전용이고 namespace 범위(`-n`)로만 조회한다. 상태(status)는 남기지 않는다 — 그건 연결 확인의 일이다.
+    CNI(network)는 세 조회가 다 된 뒤 kube-system DaemonSet 을 한 번 더 읽어 알아본다 (overview.NETWORK_COMMAND).
+    그 조회는 실패해도(Forbidden·시간 초과) 개요를 실패로 만들지 않고 network 만 null 로 둔다.
 
     kubectl 이 실패하면 연결 확인과 같은 기준(_failure_status)으로 갈라 502 로 답한다.
       CLUSTER_AUTH_EXPIRED  인증 실패·권한 없음 (연결 확인의 auth_expired)
@@ -98,9 +100,17 @@ async def cluster_overview(
                 if not result.success:
                     _raise_kubectl_failure(result.stderr or result.stdout)   # 첫 실패에서 멈춘다
                 outputs[name] = result.stdout
+            # 앞의 세 조회가 다 된 뒤에만 돈다 — 닿지 않는 클러스터에서 시간을 더 쓰지 않는다
+            network = run_kubectl(overview.NETWORK_COMMAND, context=conn.context_name,
+                                  kubeconfig=path, timeout=OVERVIEW_TIMEOUT)
+        if not network.success:
+            # 고객 클러스터는 kube-system 을 못 읽는 게 보통이다. 원문(사용자·ARN 이 실린다)은 남기지 않고 갈래만 남긴다
+            logger.info("개요의 CNI 조회를 건너뛴다 (kube-system DaemonSet): %s, exit=%s",
+                        _failure_status(network.stderr or network.stdout), network.exit_code)
         try:
             return overview.build(context=conn.context_name, namespace=conn.namespace,
-                                  now=datetime.now(timezone.utc), **outputs)
+                                  now=datetime.now(timezone.utc),
+                                  network=network.stdout if network.success else None, **outputs)
         except ValueError as exc:
             # JSON 이 아니거나 items 가 목록이 아닐 때만 (json.JSONDecodeError 도 ValueError). 우리 코드의 버그는 500 으로 둔다.
             # 원문은 클러스터 내용이라 남기지 않고 예외 종류·위치만 남긴다
