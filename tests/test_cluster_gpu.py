@@ -563,7 +563,7 @@ def test_읽는_사이_kubeconfig가_바뀌었으면_GPU_여부를_남기지_않
     assert fake_server.clusters[cluster]["hasGpu"] is None
 
 
-def test_연결_정보에_지문이_없으면_GPU_여부를_남기지_않는다(client, fake_server, monkeypatch):
+def test_연결_정보에_지문이_없으면_GPU_여부를_남기지_않는다(client, fake_server, monkeypatch, caplog):
     """server 가 늘 409 로 거절할 호출이다 (PR #119 리뷰)."""
     cluster = fake_server.add_cluster(fingerprint="")
     fake_server.clusters[cluster]["fingerprint"] = ""
@@ -571,4 +571,7 @@ def test_연결_정보에_지문이_없으면_GPU_여부를_남기지_않는다(
                         lambda args, **k: _result(fixture("gpu_nodes.json")) if args == gpu.NODES_COMMAND
                         else _result("{}" if args[0] == "version" else "yes"))
     assert client.post(f"/clusters/{cluster}/test", headers=USER).json()["has_gpu"] is None
-    assert _gpu_calls(fake_server) == []
+    assert _gpu_calls(fake_server) == [] and "지문이 없다" in caplog.text
+
+    fake_server.clusters[cluster]["hasGpu"] = True                         # server 값과 같으면 지문 없이도 그 값을 준다
+    assert client.post(f"/clusters/{cluster}/test", headers=USER).json()["has_gpu"] is True

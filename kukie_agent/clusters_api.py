@@ -241,10 +241,14 @@ async def _record_gpu(conn: server_api.ClusterConnection, has_gpu: bool | None) 
     부가 정보라 개요·연결 확인을 실패로 만들 까닭이 없고, 다음 호출이 다시 남긴다.
     server 의 값이 이제 has_gpu 와 같은가(이미 같았거나 남겼다)를 준다.
     """
-    if has_gpu is None or not conn.fingerprint:
-        return False            # 지문이 없으면 server 가 늘 409 다 — 부르지 않는다
+    if has_gpu is None:
+        return False
     if has_gpu == conn.has_gpu:
         return True
+    if not conn.fingerprint:
+        # server 가 늘 409 로 거절할 호출이다 — 부르지 않되 동기화가 멈춘 것은 남긴다
+        logger.warning("클러스터 GPU 여부를 남기지 못했다: 연결 정보에 지문이 없다")
+        return False
     try:
         await server_api.update_cluster_gpu(conn.cluster_id, has_gpu=has_gpu, fingerprint=conn.fingerprint)
     except server_api.ServerError as exc:
