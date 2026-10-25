@@ -66,10 +66,15 @@ VLLM_PORT = 8000
 def gpu_nodes(stdout: str) -> list[dict[str, Any]]:
     """노드 목록에서 GPU 노드만 (모듈 설명 "GPU 노드"). 실시간 값은 아직 null 이다 — apply_dcgm 이 채운다.
 
-    모양이 다르면 ValueError — 부르는 쪽이 gpu 를 null 로 둔다.
+    모양이 다르면 ValueError — 부르는 쪽이 gpu 를 null 로 둔다. 다른 목록(_items)과 달리 items 칸이 없거나 객체가 아닌
+    항목이 섞여도 ValueError 다: 빈 목록은 "GPU 노드 없음" 으로 server 의 hasGpu 를 false 로 덮기 때문이다 (PR #119 리뷰).
     """
+    data = json.loads(stdout or "")
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        raise ValueError("노드 목록 모양이 아니다")
     rows: list[dict[str, Any]] = []
-    for item in _items(stdout):
+    for item in items:
         meta = item.get("metadata") or {}
         status = item.get("status") or {}
         labels = meta.get("labels") or {}

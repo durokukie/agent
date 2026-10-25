@@ -37,7 +37,7 @@ router = APIRouter(prefix="/clusters", tags=["clusters"])
 
 #: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적, 이유는 thread_limiter).
 #: kubectl 은 30초씩 잡는다.
-PROBE_WORKERS = 4            # 연결 확인 (kubectl × 2, 최대 60초)
+PROBE_WORKERS = 4            # 연결 확인 (kubectl × 3 — version·can-i 30초씩 + 노드 OVERVIEW_TIMEOUT, 최대 75초)
 OVERVIEW_WORKERS = 4         # 개요 (kubectl × 5, GPU 노드가 있으면 GPU_BUDGET 안에서 몇 번 더). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
 #: 개요의 kubectl 한 번 시간 제한(초). 기본 30초 × 4 면 한 요청이 슬롯을 2분 잡는다 — 닿지 않으면 첫 번째에서 15초로 끝난다 (자동 리뷰 지적)
 OVERVIEW_TIMEOUT = 15
@@ -74,19 +74,20 @@ async def test_cluster(
             return version, can_edit, has_gpu
 
     # run_kubectl 은 subprocess.run 을 그대로 부른다. 여기서 직접 부르면 닿지 않는 주소일 때
-    # 최대 60초(version + can-i) 동안 서버 전체가 멈춘다 (자동 리뷰 지적). 스레드로 넘긴다.
+    # 최대 75초(version + can-i + 노드) 동안 서버 전체가 멈춘다 (자동 리뷰 지적). 스레드로 넘긴다.
     version, can_edit, has_gpu = await to_thread.run_sync(probe, limiter=thread_limiter("probe", PROBE_WORKERS))
     status = "connected" if version.success else _failure_status(version.stderr)
     await server_api.update_cluster_status(cluster_id, status=status, checked_at=datetime.now(timezone.utc))
-    await _record_gpu(conn, has_gpu)
+    recorded = await _record_gpu(conn, has_gpu)
     return {
         "status": status,
         "reachable": version.success,
         # 실패 사유는 그대로 보여줘야 고칠 수 있다. 자격증명은 원래 stderr 에 실리지 않는다
         "detail": (version.stderr or version.stdout).strip()[:500],
         "can_change": can_edit.success and can_edit.stdout.strip() == "yes",
-        # 노드 목록으로 본 GPU 노드 유무 (못 읽었으면 null). 앱이 클러스터 목록을 다시 받을지 정한다
-        "has_gpu": has_gpu,
+        # 노드 목록으로 본 GPU 노드 유무. 못 읽었거나 server 에 남기지 못했으면 null — 앱은 이 값이 목록 값과 다를 때
+        # 클러스터 목록을 다시 받으므로, 못 남긴 값을 주면 다시 받아도 아이콘이 안 바뀐다 (PR #119 리뷰)
+        "has_gpu": has_gpu if recorded else None,
     }
 
 
@@ -232,18 +233,23 @@ def _has_gpu(nodes: KubectlResult) -> bool | None:
         return None
 
 
-async def _record_gpu(conn: server_api.ClusterConnection, has_gpu: bool | None) -> None:
+async def _record_gpu(conn: server_api.ClusterConnection, has_gpu: bool | None) -> bool:
     """알아낸 GPU 노드 유무가 server 에 남은 값과 다를 때만 남긴다 — 개요는 대시보드가 띄울 때마다 부른다.
 
-    모르면(None) 남기지 않는다 — 권한이 없어진 클러스터의 마지막 값을 지우지 않는다. 남기지 못해도 응답은 그대로 준다:
+    모르면(None) 남기지 않는다 — 권한이 없어진 클러스터의 마지막 값을 지우지 않는다. 남기지 못해도 오류로 올리지 않는다:
     부가 정보라 개요·연결 확인을 실패로 만들 까닭이 없고, 다음 호출이 다시 남긴다.
+    server 의 값이 이제 has_gpu 와 같은가(이미 같았거나 남겼다)를 준다.
     """
-    if has_gpu is None or has_gpu == conn.has_gpu:
-        return
+    if has_gpu is None:
+        return False
+    if has_gpu == conn.has_gpu:
+        return True
     try:
         await server_api.update_cluster_gpu(conn.cluster_id, has_gpu=has_gpu)
     except server_api.ServerError as exc:
         logger.warning("클러스터 GPU 여부를 남기지 못했다: %s", exc.code)
+        return False
+    return True
 
 
 def _raise_kubectl_failure(stderr: str) -> None:

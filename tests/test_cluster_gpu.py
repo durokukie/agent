@@ -502,3 +502,45 @@ def test_연결에_실패하면_노드를_읽지_않고_GPU_여부도_남기지_
     monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fail)
     assert client.post(f"/clusters/{cluster}/test", headers=USER).json()["status"] == "disconnected"
     assert gpu.NODES_COMMAND not in seen and _gpu_calls(fake_server) == []
+
+
+@pytest.mark.parametrize("stdout", ['{"kind": "List"}', '{"items": ["x"]}', '{"items": null}', "[]"])
+def test_노드_목록_모양이_아니면_GPU_여부를_모른다(client, fake_server, monkeypatch, stdout):
+    """빈 목록으로 읽으면 server 의 true 를 false 로 덮는다 (PR #119 리뷰). 개요·연결 확인 둘 다."""
+    cluster = fake_server.add_cluster(has_gpu=True)
+
+    def fake(args, **kwargs):
+        if args == gpu.NODES_COMMAND:
+            return _result(stdout)
+        return _result("{}" if args[0] == "version" else "yes") if args[0] in ("version", "auth") else _gpu_cluster(args)
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    assert client.get(f"/clusters/{cluster}/overview", headers=USER).json()["gpu"] is None
+    assert client.post(f"/clusters/{cluster}/test", headers=USER).json()["has_gpu"] is None
+    assert _gpu_calls(fake_server) == [] and fake_server.clusters[cluster]["hasGpu"] is True
+
+
+def test_연결_확인은_GPU_여부를_남기지_못했으면_has_gpu를_null로_준다(client, fake_server, monkeypatch):
+    """앱은 이 값이 목록과 다를 때 목록을 다시 받는다 — 못 남긴 값을 주면 다시 받아도 아이콘이 그대로다 (PR #119 리뷰)."""
+    from kukie_agent.server_api import ServerError
+
+    cluster = fake_server.add_cluster()
+
+    async def missing(*args, **kwargs):
+        raise ServerError(404, "NOT_FOUND", "없는 경로")                      # server#82 배포 전
+
+    monkeypatch.setattr("kukie_agent.server_api.update_cluster_gpu", missing)
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl",
+                        lambda args, **k: _result(fixture("gpu_nodes.json")) if args == gpu.NODES_COMMAND
+                        else _result("{}" if args[0] == "version" else "yes"))
+    r = client.post(f"/clusters/{cluster}/test", headers=USER)
+    assert r.json()["status"] == "connected" and r.json()["has_gpu"] is None
+
+
+def test_연결_확인은_server_값과_같으면_부르지_않고_그_값을_준다(client, fake_server, monkeypatch):
+    cluster = fake_server.add_cluster(has_gpu=False)
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl",
+                        lambda args, **k: _result(fixture("nodes.json")) if args == gpu.NODES_COMMAND
+                        else _result("{}" if args[0] == "version" else "yes"))
+    assert client.post(f"/clusters/{cluster}/test", headers=USER).json()["has_gpu"] is False
+    assert _gpu_calls(fake_server) == []
