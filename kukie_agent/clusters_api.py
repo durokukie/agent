@@ -1,7 +1,7 @@
 """클러스터 연결 확인 엔드포인트 (기획 04 §8, issue #61).
 
   POST /clusters/{id}/test       연결 확인 (kubectl version + auth can-i)
-  GET  /clusters/{id}/overview   개요 — 웹 대시보드의 클러스터 지도·통계 (issue #102, kubectl get × 3 + CNI 조회 1)
+  GET  /clusters/{id}/overview   개요 — 웹 대시보드의 클러스터 지도·통계 (issue #102, kubectl get × 3 + CNI 조회 1 + GPU 조회)
 
 등록·목록·수정·삭제는 Kukie API 서버(kukie-server)의 공개 API 다 (DURO-113) — kubeconfig 검사와 자격증명
 암호화도 그쪽에 있다. 연결 확인만 agent 에 남은 이유는 kubectl 이 여기서 돌기 때문이다.
@@ -24,8 +24,8 @@ from fastapi import APIRouter, Depends, HTTPException
 import kukie_agent.server as _server   # 순환 import: 이름은 호출 시점에만 쓴다
 from kukie_agent import server_api
 from kukie_agent.auth import User, current_user
-from kukie_agent.clusters import access, overview
-from kukie_agent.kubectl import run_kubectl, thread_limiter
+from kukie_agent.clusters import access, gpu, overview
+from kukie_agent.kubectl import KubectlResult, run_kubectl, thread_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +34,11 @@ router = APIRouter(prefix="/clusters", tags=["clusters"])
 #: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적, 이유는 thread_limiter).
 #: kubectl 은 30초씩 잡는다.
 PROBE_WORKERS = 4            # 연결 확인 (kubectl × 2, 최대 60초)
-OVERVIEW_WORKERS = 4         # 개요 (kubectl × 4). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
+OVERVIEW_WORKERS = 4         # 개요 (kubectl × 5, GPU 노드가 있으면 파드 목록·지표 몇 번 더). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
 #: 개요의 kubectl 한 번 시간 제한(초). 기본 30초 × 4 면 한 요청이 슬롯을 2분 잡는다 — 닿지 않으면 첫 번째에서 15초로 끝난다 (자동 리뷰 지적)
 OVERVIEW_TIMEOUT = 15
+#: GPU 지표(/metrics 파드 프록시) 한 번 시간 제한(초). 파드마다 한 번씩이라 개요보다 더 짧게 끊는다
+GPU_METRICS_TIMEOUT = 5
 
 
 @router.post("/{cluster_id}/test")
@@ -82,6 +84,8 @@ async def cluster_overview(
     읽기 전용이고 namespace 범위(`-n`)로만 조회한다. 상태(status)는 남기지 않는다 — 그건 연결 확인의 일이다.
     CNI(network)는 세 조회가 다 된 뒤 kube-system DaemonSet 을 한 번 더 읽어 알아본다 (overview.NETWORK_COMMAND).
     그 조회는 실패해도(Forbidden·시간 초과) 개요를 실패로 만들지 않고 network 만 null 로 둔다.
+    GPU(gpu)는 그 뒤에 노드 → 모든 파드 → 지표 순으로 읽는다 (clusters/gpu.py). 노드를 못 읽거나 GPU 노드가 없으면
+    gpu 만 null 이고, 노드가 없으면 파드·지표는 읽지 않는다.
 
     kubectl 이 실패하면 연결 확인과 같은 기준(_failure_status)으로 갈라 502 로 답한다.
       CLUSTER_AUTH_EXPIRED  인증 실패·권한 없음 (연결 확인의 auth_expired)
@@ -103,6 +107,11 @@ async def cluster_overview(
             # 앞의 세 조회가 다 된 뒤에만 돈다 — 닿지 않는 클러스터에서 시간을 더 쓰지 않는다
             network = run_kubectl(overview.NETWORK_COMMAND, context=conn.context_name,
                                   kubeconfig=path, timeout=OVERVIEW_TIMEOUT)
+
+            def run(args: list[str], timeout: int) -> KubectlResult:
+                return run_kubectl(args, context=conn.context_name, kubeconfig=path, timeout=timeout)
+
+            cluster_gpu = _collect_gpu(run, namespace_pods=outputs["pods"])
         if not network.success:
             # 고객 클러스터는 kube-system 을 못 읽는 게 보통이라 대시보드가 부를 때마다 난다 — debug 로 둔다 (PR #117 리뷰).
             # 원문(사용자·ARN 이 실린다)은 남기지 않고 갈래만 남긴다
@@ -111,7 +120,8 @@ async def cluster_overview(
         try:
             return overview.build(context=conn.context_name, namespace=conn.namespace,
                                   now=datetime.now(timezone.utc),
-                                  network=network.stdout if network.success else None, **outputs)
+                                  network=network.stdout if network.success else None, gpu=cluster_gpu,
+                                  **outputs)
         except ValueError as exc:
             # JSON 이 아니거나 items 가 목록이 아닐 때만 (json.JSONDecodeError 도 ValueError). 우리 코드의 버그는 500 으로 둔다.
             # 원문은 클러스터 내용이라 남기지 않고 예외 종류·위치만 남긴다
@@ -121,6 +131,58 @@ async def cluster_overview(
 
     # 연결 확인과 같은 이유로 스레드로 넘긴다 — kubectl 이 도는 동안 서버 전체가 멈추지 않게
     return await to_thread.run_sync(collect, limiter=thread_limiter("overview", OVERVIEW_WORKERS))
+
+
+def _collect_gpu(run, *, namespace_pods: str) -> dict[str, Any] | None:
+    """개요의 gpu 칸 (clusters/gpu.py 의 "읽는 순서"). 어느 단계가 실패해도 오류로 올리지 않는다 — 부가 정보다.
+
+    run(args, timeout) 은 개요와 같은 임시 kubeconfig 로 kubectl 을 돌린다. 실패 원문(사용자·ARN 이 실린다)은
+    남기지 않고 갈래만 debug 로 남긴다 — 고객 클러스터는 노드를 못 읽는 게 보통이라 대시보드가 부를 때마다 난다.
+    """
+    nodes_result = run(gpu.NODES_COMMAND, OVERVIEW_TIMEOUT)
+    if not nodes_result.success:
+        logger.debug("개요의 GPU 조회를 건너뛴다 (노드): %s", _failure_status(nodes_result.stderr or nodes_result.stdout))
+        return None
+    try:
+        nodes = gpu.gpu_nodes(nodes_result.stdout)
+    except (ValueError, AttributeError, TypeError):
+        logger.debug("개요의 GPU 조회를 건너뛴다 (노드 목록을 읽지 못했다)")
+        return None
+    if not nodes:
+        return None
+
+    pods_result = run(gpu.PODS_COMMAND, OVERVIEW_TIMEOUT)
+    if not pods_result.success:
+        # 모든 namespace 를 못 읽으면 개요가 이미 읽은 클러스터 namespace 에서만 찾는다
+        logger.debug("GPU 지표 파드를 클러스터 namespace 에서만 찾는다: %s",
+                     _failure_status(pods_result.stderr or pods_result.stdout))
+    pods = pods_result.stdout if pods_result.success else namespace_pods
+    try:
+        dcgm = gpu.dcgm_targets(pods, {row["node"] for row in nodes})
+        vllm = gpu.vllm_targets(pods)
+    except (ValueError, AttributeError, TypeError):
+        logger.debug("GPU 지표 파드를 찾지 못했다 (파드 목록을 읽지 못했다)")
+        dcgm, vllm = {}, []
+
+    def metrics(namespace: str, pod: str, port: int) -> str | None:
+        result = run(gpu.proxy_command(namespace, pod, port), GPU_METRICS_TIMEOUT)
+        if not result.success:
+            logger.debug("GPU 지표를 읽지 못했다 (%s/%s): %s", namespace, pod,
+                         _failure_status(result.stderr or result.stdout))
+            return None
+        return result.stdout
+
+    for row in nodes:
+        target = dcgm.get(row["node"])
+        text = metrics(*target) if target else None
+        if text is not None:
+            gpu.apply_dcgm(row, text)
+    serving: list[dict[str, Any]] = []
+    for namespace, pod, port, node in vllm:
+        text = metrics(namespace, pod, port)
+        if text is not None:
+            serving.extend(gpu.serving_rows(text, pod=pod, node=node))
+    return gpu.build(nodes, serving)
 
 
 def _raise_kubectl_failure(stderr: str) -> None:

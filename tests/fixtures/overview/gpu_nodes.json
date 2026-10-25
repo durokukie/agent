@@ -1,0 +1,25 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "metadata": {"name": "ip-10-60-43-165", "labels": {
+        "node.kubernetes.io/instance-type": "g6e.xlarge",
+        "nvidia.com/gpu.product": "NVIDIA-L40S", "nvidia.com/gpu.memory": "46068", "nvidia.com/gpu.count": "1"}},
+      "status": {"capacity": {"cpu": "4", "nvidia.com/gpu": "1"},
+                 "allocatable": {"cpu": "3920m", "nvidia.com/gpu": "1"}}
+    },
+    {
+      "metadata": {"name": "ip-10-60-50-12", "labels": {
+        "node.kubernetes.io/instance-type": "g6e.12xlarge",
+        "nvidia.com/gpu.product": "NVIDIA-L40S", "nvidia.com/gpu.memory": "46068", "nvidia.com/gpu.count": "4",
+        "nvidia.com/gpu.replicas": "4"}},
+      "status": {"capacity": {"cpu": "48", "nvidia.com/gpu": "16"},
+                 "allocatable": {"cpu": "47", "nvidia.com/gpu": "16"}}
+    },
+    {
+      "metadata": {"name": "ip-10-60-1-7", "labels": {"node.kubernetes.io/instance-type": "m7i.large"}},
+      "status": {"capacity": {"cpu": "2"}, "allocatable": {"cpu": "1930m"}}
+    }
+  ]
+}

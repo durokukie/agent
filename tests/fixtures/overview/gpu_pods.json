@@ -1,0 +1,45 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "metadata": {"name": "nvidia-dcgm-exporter-abcde", "namespace": "gpu-operator", "labels": {"app": "nvidia-dcgm-exporter"}},
+      "spec": {"nodeName": "ip-10-60-43-165", "containers": [
+        {"name": "nvidia-dcgm-exporter", "image": "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04",
+         "ports": [{"name": "metrics", "containerPort": 9400}]}]},
+      "status": {"phase": "Running"}
+    },
+    {
+      "metadata": {"name": "nvidia-dcgm-exporter-fghij", "namespace": "gpu-operator", "labels": {"app": "nvidia-dcgm-exporter"}},
+      "spec": {"nodeName": "ip-10-60-50-12", "containers": [
+        {"name": "nvidia-dcgm-exporter", "image": "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04",
+         "ports": [{"name": "metrics", "containerPort": 9400}]}]},
+      "status": {"phase": "Running"}
+    },
+    {
+      "metadata": {"name": "vllm-gpt-oss-20b-7c9d5b8f6-q2k8m", "namespace": "llm"},
+      "spec": {"nodeName": "ip-10-60-43-165", "containers": [
+        {"name": "vllm", "image": "vllm/vllm-openai:v0.11.0",
+         "args": ["--model", "openai/gpt-oss-20b", "--port", "8080"],
+         "ports": [{"name": "http", "containerPort": 8080}]}]},
+      "status": {"phase": "Running"}
+    },
+    {
+      "metadata": {"name": "qwen-0", "namespace": "llm"},
+      "spec": {"nodeName": "ip-10-60-50-12", "containers": [
+        {"name": "server", "image": "registry.example.com/serving:1.0",
+         "command": ["vllm", "serve", "Qwen/Qwen3-8B"]}]},
+      "status": {"phase": "Running"}
+    },
+    {
+      "metadata": {"name": "vllm-pending", "namespace": "llm"},
+      "spec": {"containers": [{"name": "vllm", "image": "vllm/vllm-openai:v0.11.0"}]},
+      "status": {"phase": "Pending"}
+    },
+    {
+      "metadata": {"name": "web-1", "namespace": "shop"},
+      "spec": {"nodeName": "ip-10-60-1-7", "containers": [{"name": "app", "image": "shop/web:1.2"}]},
+      "status": {"phase": "Running"}
+    }
+  ]
+}
