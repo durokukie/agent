@@ -202,6 +202,14 @@ def namespace_pods_command(namespace: str) -> list[str]:
     return ["get", "pods", "-n", namespace, "-o", "json"]
 
 
+def has_items(stdout: str) -> bool:
+    """kubectl 목록 출력에 항목이 하나라도 있는가. 모양이 다르면 False."""
+    try:
+        return bool(_items(stdout))
+    except ValueError:
+        return False
+
+
 def merge_pod_lists(outputs: list[str]) -> str:
     """파드 목록 출력 여럿을 하나로 — (namespace, 이름)이 같은 파드는 한 번만. 깨진 출력 하나는 건너뛴다."""
     seen: set[tuple[str, str]] = set()

@@ -239,9 +239,9 @@ def _collect_gpu(
     return gpu.build(nodes, serving), True
 
 
-#: 연결(클러스터 id·연결 지문·클러스터 namespace)마다 (기억한 시각, 다시 읽을 namespace, 지난번에 못 닿은 namespace)
-#: — _pods_by_namespace. 프로세스 안 기억이라 복제본마다 따로 채운다. 연결을 바꾸면 키가 달라져 옛 기억을 쓰지 않는다
-_readable_namespaces: dict[str, tuple[float, tuple[str, ...], tuple[str, ...]]] = {}
+#: 연결(클러스터 id·연결 지문·클러스터 namespace)마다 (기억한 시각, 다시 읽을 namespace, 지난번에 못 닿은 namespace,
+#: 지난번에 파드를 준 namespace) — _pods_by_namespace. 프로세스 안 기억이라 복제본마다 따로 채운다. 연결을 바꾸면 키가 달라져 옛 기억을 쓰지 않는다
+_readable_namespaces: dict[str, tuple[float, tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {}
 _readable_lock = threading.Lock()
 
 
@@ -256,8 +256,9 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
 
     대시보드가 부를 때마다 거부되는 조회가 고객 감사 로그에 쌓이지 않게 연결마다 READABLE_NAMESPACES_TTL 초 기억한다
     (agent#120 리뷰). 그동안은 목록을 다시 읽지 않고 기억한 namespace 만 읽으며, 라운드마다 Forbidden 으로 확인된 것을
-    더 뺀다(기억한 시각은 그대로라 TTL 이 늘지 않는다). 시간 초과는 남기고, 예산이 모자라 못 닿은 것은 다음 라운드
-    맨 앞에 둔다 — 같은 순서로 늘 같은 것이 잘리지 않게. 연결 지문이 없으면(cache_key None) 기억하지 않는다.
+    더 뺀다(기억한 시각은 그대로라 TTL 이 늘지 않는다). 시간 초과는 남긴다.
+    읽는 순서: 지난번에 파드를 준 것과 GPU 쪽 이름(값이 깜빡이지 않게) → 지난번에 예산이 모자라 못 닿은 것(늘 같은 것이
+    잘리지 않게) → 나머지. 연결 지문이 없으면(cache_key None) 기억하지 않는다.
     namespace 목록도 못 읽으면(GPU 읽기 RBAC 를 적용하지 않은 클러스터) 클러스터 namespace 파드만 쓴다.
     """
     def read(name: str) -> tuple[str | None, str]:
@@ -288,20 +289,23 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
         except (ValueError, AttributeError, TypeError):
             logger.debug("GPU 지표 파드를 클러스터 namespace 에서만 찾는다 (namespace 목록을 읽지 못했다)")
             return namespace_pods
-        unreached = set(cached[2]) if cached else set()
-        names.sort(key=lambda name: name not in unreached)       # 지난번에 못 닿은 것 먼저 (안정 정렬)
         remembered_at = now
+    unreached, productive = (set(cached[2]), set(cached[3])) if cached else (set(), set())
+    names.sort(key=lambda name: (0 if name in productive or gpu.hinted_namespace(name) else
+                                 1 if name in unreached else 2))           # 안정 정렬 — 같은 칸은 원래 순서
 
     with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
         results = list(pool.map(read, names))
     if cache_key:
         skipped = tuple(name for name, (_, outcome) in zip(names, results) if outcome == "skipped")
-        rest = tuple(name for name, (_, outcome) in zip(names, results) if outcome in ("ok", "unknown"))
+        keep = tuple(name for name, (_, outcome) in zip(names, results) if outcome != "forbidden")
+        # 못 닿은 것은 이번에 몰라서 남긴다. 파드를 준 것은 다음 라운드에도 앞에 둔다
+        gave = tuple(name for name, (stdout, _) in zip(names, results) if stdout and gpu.has_items(stdout))
         with _readable_lock:
             # 지운 클러스터·바뀐 연결의 옛 기억이 쌓이지 않게. TTL 두 배까지는 남겨, 목록을 다시 읽을 때 못 닿은 것을 안다
             for key in [key for key, entry in _readable_namespaces.items() if now - entry[0] >= 2 * READABLE_NAMESPACES_TTL]:
                 del _readable_namespaces[key]
-            _readable_namespaces[cache_key] = (remembered_at, skipped + rest, skipped)
+            _readable_namespaces[cache_key] = (remembered_at, keep, skipped, gave)
     return gpu.merge_pod_lists([namespace_pods, *(stdout for stdout, _ in results if stdout is not None)])
 
 

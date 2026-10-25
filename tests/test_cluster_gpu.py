@@ -513,6 +513,35 @@ def test_예산이_모자라_못_닿은_namespace는_다음에_맨_앞에서_읽
         assert seen == ["c"]                       # 지난번에 잘린 c 가 먼저
 
 
+def test_예산이_모자라도_GPU_쪽과_파드를_준_namespace는_매번_먼저_읽는다():
+    """못 닿은 것을 돌려 읽어도 지표가 있는 namespace 는 밀리지 않는다 — 화면 값이 깜빡이지 않게 (agent#120 리뷰)."""
+    pod = _list({"metadata": {"namespace": "team-x", "name": "p"}, "status": {"phase": "Running"}})
+    rounds: list[list[str]] = []
+
+    def run(args, timeout):
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("gpu-operator", "a", "b", "c", "team-x"))
+        rounds[-1].append(args[3])
+        return _result(pod if args[3] == "team-x" else "{}")
+
+    def budget_for(reads):
+        left = [reads]
+
+        def budget(limit):
+            left[0] -= 1
+            return limit if left[0] >= 0 else 0
+        return budget
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
+        rounds.append([])
+        clusters_api._pods_by_namespace(run, budget_for(2 + 5), "{}", namespace=None, cache_key="k")   # 처음은 전부
+        for _ in range(3):
+            rounds.append([])
+            clusters_api._pods_by_namespace(run, budget_for(3), "{}", namespace=None, cache_key="k")
+    assert all(r[:2] == ["gpu-operator", "team-x"] for r in rounds[1:])   # 매 라운드 먼저 읽힌다
+
+
 def test_연결_지문이_없으면_namespace를_기억하지_않는다(client, fake_server, monkeypatch):
     cluster = fake_server.add_cluster(namespace="shop")
     fake_server.clusters[cluster]["fingerprint"] = ""
