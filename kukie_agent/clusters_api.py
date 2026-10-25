@@ -85,6 +85,8 @@ async def test_cluster(
         # 실패 사유는 그대로 보여줘야 고칠 수 있다. 자격증명은 원래 stderr 에 실리지 않는다
         "detail": (version.stderr or version.stdout).strip()[:500],
         "can_change": can_edit.success and can_edit.stdout.strip() == "yes",
+        # 노드 목록으로 본 GPU 노드 유무 (못 읽었으면 null). 앱이 클러스터 목록을 다시 받을지 정한다
+        "has_gpu": has_gpu,
     }
 
 

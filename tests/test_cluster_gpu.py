@@ -486,7 +486,7 @@ def test_연결_확인도_노드_목록으로_GPU_여부를_남긴다(client, fa
 
     monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
     r = client.post(f"/clusters/{cluster}/test", headers=USER)
-    assert r.status_code == 200 and r.json()["status"] == "connected"
+    assert r.status_code == 200 and r.json()["status"] == "connected" and r.json()["has_gpu"] is True
     assert seen[-1] == gpu.NODES_COMMAND                                     # 지표는 읽지 않는다 — 개요의 일
     assert [body["hasGpu"] for body in _gpu_calls(fake_server)] == [True]
 
