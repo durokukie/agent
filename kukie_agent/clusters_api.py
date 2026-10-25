@@ -241,8 +241,8 @@ async def _record_gpu(conn: server_api.ClusterConnection, has_gpu: bool | None) 
     부가 정보라 개요·연결 확인을 실패로 만들 까닭이 없고, 다음 호출이 다시 남긴다.
     server 의 값이 이제 has_gpu 와 같은가(이미 같았거나 남겼다)를 준다.
     """
-    if has_gpu is None:
-        return False
+    if has_gpu is None or not conn.fingerprint:
+        return False            # 지문이 없으면 server 가 늘 409 다 — 부르지 않는다
     if has_gpu == conn.has_gpu:
         return True
     try:
