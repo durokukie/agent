@@ -182,7 +182,7 @@ def vllm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> list[t
     return targets[:MAX_METRIC_TARGETS]
 
 
-def namespace_names(stdout: str, *, skip: str | None = None, prefer: set[str] = frozenset()) -> list[str]:
+def namespace_names(stdout: str, *, skip: str | None = None, prefer: set[str] | frozenset[str] = frozenset()) -> list[str]:
     """파드를 읽어 볼 namespace — kube-* 와 skip(개요가 이미 읽은 클러스터 namespace)은 뺀다(Kukie 역할은 시스템
     namespace 를 읽지 않는다). prefer(GPU 지표 파드가 나온 적 있는 것)와 GPU 쪽 이름이 먼저, 그다음 이름순으로
     MAX_POD_NAMESPACES 개까지 — 상한이 지표 namespace 를 자르지 않게. 모양이 다르면 ValueError."""

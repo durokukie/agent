@@ -480,15 +480,16 @@ def test_기억을_쓰는_라운드에서도_Forbidden은_빼고_TTL은_늘리�
 
     denied = set()
     call()                                         # 둘 다 시간 초과 → 둘 다 남는다
-    assert clusters_api._readable_namespaces["k"][1] == ("a", "b")
+    assert clusters_api._readable_namespaces["k"].names == ("a", "b")
     denied = {"b"}
     now[0] += 10
     call()                                         # 기억을 쓰는 라운드: b 가 Forbidden 으로 확인돼 빠진다
-    assert clusters_api._readable_namespaces["k"][:2] == (0.0, ("a",))
+    memo = clusters_api._readable_namespaces["k"]
+    assert (memo.at, memo.names) == (0.0, ("a",))
     assert calls.count(gpu.NAMESPACES_COMMAND) == 1
 
 
-def test_예산이_모자라_못_닿은_namespace는_다음에_맨_앞에서_읽는다():
+def test_예산이_모자라_멈춘_자리부터_다음에_이어서_읽는다():
     budget_left = [2]
     seen: list[str] = []
 
@@ -510,12 +511,11 @@ def test_예산이_모자라_못_닿은_namespace는_다음에_맨_앞에서_읽
         seen.clear()
         budget_left[0] = 1
         clusters_api._pods_by_namespace(run, budget, "{}", namespace=None, gpu_node_names={L40S_1}, cache_key="k")
-        assert seen == ["c"]                       # 지난번에 잘린 c 가 먼저
+        assert seen == ["c"]                       # 지난번에 멈춘 자리(c)부터
 
 
-def test_예산이_모자라도_GPU_쪽과_GPU_파드가_나온_namespace는_매번_먼저_읽는다():
-    """못 닿은 것을 돌려 읽어도 지표가 있는 namespace 는 밀리지 않는다 — 화면 값이 깜빡이지 않게 (agent#120 리뷰).
-    보통 파드만 있는 namespace(a·b)는 앞 칸을 차지하지 않아, 못 닿은 c 도 다음 라운드에 읽힌다."""
+def test_예산이_모자라도_줄마다_돌아가며_읽어_어느_namespace도_빠지지_않는다():
+    """앞 줄(GPU 쪽 이름·GPU 파드가 나온 곳)이 먼저, 줄마다 지난번에 멈춘 자리부터 (agent#120 리뷰)."""
     vllm = {"metadata": {"namespace": "team-x", "name": "v"}, "status": {"phase": "Running"},
             "spec": {"nodeName": L40S_1, "containers": [{"name": "vllm", "image": "vllm/vllm-openai:v0.32.0"}]}}
     app = {"metadata": {"name": "web"}, "status": {"phase": "Running"}, "spec": {"nodeName": CPU, "containers": []}}
@@ -527,29 +527,41 @@ def test_예산이_모자라도_GPU_쪽과_GPU_파드가_나온_namespace는_매
         rounds[-1].append(args[3])
         return _result(_list(vllm) if args[3] == "team-x" else _list(app) if args[3] in ("a", "b") else "{}")
 
-    def budget_for(reads):
+    def call(reads):
         left = [reads]
 
         def budget(limit):
             left[0] -= 1
             return limit if left[0] >= 0 else 0
-        return budget
-
-    def call(reads):
         rounds.append([])
-        clusters_api._pods_by_namespace(run, budget_for(reads), "{}", namespace=None, gpu_node_names={L40S_1},
-                                        cache_key="k")
+        clusters_api._pods_by_namespace(run, budget, "{}", namespace=None, gpu_node_names={L40S_1}, cache_key="k")
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
-        call(2 + 5)                                                   # 처음은 전부 → team-x 에 vLLM
-        call(0)                                                       # 한 번 아무것도 못 읽어도 team-x 는 앞에 남는다
+        call(2 + 5)                                       # 처음은 전부 → team-x 에 vLLM, 앞 줄은 gpu-operator·team-x
+        call(0)                                           # 한 번 아무것도 못 읽어도 team-x 는 앞 줄에 남는다
         for _ in range(3):
-            call(3)                                                   # 한 라운드에 3개
-    # 매 라운드: 앞 칸 첫째, 못 닿은 것 하나(자리 보장), 앞 칸 나머지 순서
-    assert all([r[0], r[2]] == ["gpu-operator", "team-x"] for r in rounds[2:])
-    assert {r[1] for r in rounds[2:]} == {"a", "b", "c"}              # 끼운 한 자리는 돌아가며 — c 도 읽힌다
+            call(3)                                       # 앞 줄 둘 + 뒤 줄 하나
+        for _ in range(2):
+            call(1)                                       # 앞 줄보다 예산이 작아도 앞 줄 안에서 돈다
+    assert all(set(r[:2]) == {"gpu-operator", "team-x"} for r in rounds[2:5])
+    assert {r[2] for r in rounds[2:5]} == {"a", "b", "c"}
+    assert {r[0] for r in rounds[5:]} == {"gpu-operator", "team-x"}
 
+
+def test_목록을_부르지도_못한_라운드는_기억_시각을_늘리지_않는다():
+    """예산이 없어 get namespaces 를 못 부른 라운드가 TTL 을 미루지 않는다 (agent#120 리뷰)."""
+    now = [0.0]
+
+    def run(args, timeout):
+        return _result(_namespaces("llm")) if args == gpu.NAMESPACES_COMMAND else _result("{}")
+
+    clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, gpu_node_names={L40S_1},
+                                    cache_key="k", clock=lambda: now[0])
+    now[0] += clusters_api.READABLE_NAMESPACES_TTL
+    clusters_api._pods_by_namespace(run, lambda limit: 0, "{}", namespace=None, gpu_node_names={L40S_1},
+                                    cache_key="k", clock=lambda: now[0])
+    assert clusters_api._readable_namespaces["k"].at == 0.0
 
 def test_GPU_파드가_나온_namespace는_상한에_잘리지_않는다(monkeypatch):
     monkeypatch.setattr(gpu, "MAX_POD_NAMESPACES", 2)
