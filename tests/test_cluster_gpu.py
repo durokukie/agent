@@ -420,26 +420,41 @@ def test_GPU_쪽_이름이_아닌_namespace의_vLLM도_찾는다():
     assert sorted(seen) == ["gpu-operator", "team-a", "zz"]
 
 
-def test_시간_초과가_섞이면_읽힌_namespace를_기억하지_않는다():
-    """느려서 못 읽은 namespace 를 TTL 동안 빼 버리지 않는다 — Forbidden 만 확실한 '못 읽음' 이다."""
+def test_Forbidden인_namespace만_기억에서_빼고_시간_초과한_것은_다시_읽는다():
+    """느린 클러스터에서도 기억이 걸린다 — 모르는 것은 남기고 거부된 것만 뺀다 (agent#120 리뷰)."""
     calls: list[list[str]] = []
 
     def run(args, timeout):
         calls.append(args)
         if args == gpu.NAMESPACES_COMMAND:
-            return _result(_namespaces("a", "b"))
-        return _result(stderr="context deadline exceeded", success=False) if args[3] == "b" else _result("{}")
+            return _result(_namespaces("a", "slow", "denied"))
+        return {"a": _result("{}"), "slow": _result(stderr="context deadline exceeded", success=False),
+                "denied": _result(stderr=FORBIDDEN, success=False)}[args[3]]
 
     clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, cache_key="c1")
-    clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, cache_key="c1")
-    assert calls.count(gpu.NAMESPACES_COMMAND) == 2
-
     calls.clear()
-    forbidden = lambda args, timeout: (_result(_namespaces("a", "b")) if args == gpu.NAMESPACES_COMMAND
-                                       else _result(stderr=FORBIDDEN, success=False) if args[3] == "b" else _result("{}"))
-    clusters_api._pods_by_namespace(forbidden, lambda limit: limit, "{}", namespace=None, cache_key="c2")
-    assert clusters_api._readable_namespaces["c2"][1] == ("a",)
+    clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, cache_key="c1")
+    assert gpu.NAMESPACES_COMMAND not in calls
+    assert sorted(args[3] for args in calls) == ["a", "slow"]
 
+
+def test_기억은_TTL이_지나면_다시_목록을_읽고_옛_항목은_지운다():
+    now = [0.0]
+    calls: list[list[str]] = []
+
+    def run(args, timeout):
+        calls.append(args)
+        return _result(_namespaces("a")) if args == gpu.NAMESPACES_COMMAND else _result("{}")
+
+    clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, cache_key="old",
+                                    clock=lambda: now[0])
+    now[0] += clusters_api.READABLE_NAMESPACES_TTL
+    clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, cache_key="new",
+                                    clock=lambda: now[0])
+    clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, cache_key="old",
+                                    clock=lambda: now[0])
+    assert calls.count(gpu.NAMESPACES_COMMAND) == 3
+    assert set(clusters_api._readable_namespaces) == {"old", "new"}
 
 def test_namespace_탐색은_남은_GPU_예산의_절반까지만_쓴다(monkeypatch):
     """느린 API 서버에서도 지표를 읽을 시간을 남긴다 (agent#120 리뷰)."""

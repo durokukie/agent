@@ -46,8 +46,9 @@ OVERVIEW_TIMEOUT = 15
 GPU_METRICS_TIMEOUT = 5
 #: 모든 namespace 파드를 못 읽을 때 namespace 하나의 파드 목록 시간 제한(초). namespace 마다 한 번이라 지표처럼 짧게 끊는다
 GPU_PODS_TIMEOUT = 5
-#: 파드를 읽을 수 있었던 namespace 를 클러스터마다 기억하는 시간(초). 그동안은 그 namespace 만 읽는다
-READABLE_NAMESPACES_TTL = 600
+#: 파드를 읽을 수 있었던 namespace 를 연결마다 기억하는 시간(초). 그동안은 그 namespace 만 읽는다.
+#: 고객이 새 namespace 나 RoleBinding 을 더하면 이만큼 늦게 보인다 — 짧게 둔다
+READABLE_NAMESPACES_TTL = 120
 #: GPU 칸(노드·파드·지표 전부)에 쓰는 시간(초). 지표 파드가 16개 다 매달려도 개요 슬롯을 이 이상 더 잡지 않는다 (PR #118 리뷰).
 #: 다 쓰면 남은 조회는 건너뛰고 그 값만 null 이다
 GPU_BUDGET = 20
@@ -135,7 +136,7 @@ async def cluster_overview(
                 return run_kubectl(args, context=conn.context_name, kubeconfig=path, timeout=timeout)
 
             cluster_gpu, has_gpu = _collect_gpu(run, namespace_pods=outputs["pods"], namespace=conn.namespace,
-                                                 cache_key=cluster_id)
+                                                 cache_key=f"{cluster_id}:{conn.fingerprint}:{conn.namespace}")
         if not network.success:
             # 고객 클러스터는 kube-system 을 못 읽는 게 보통이라 대시보드가 부를 때마다 난다 — debug 로 둔다 (PR #117 리뷰).
             # 원문(사용자·ARN 이 실린다)은 남기지 않고 갈래만 남긴다
@@ -237,7 +238,8 @@ def _collect_gpu(
     return gpu.build(nodes, serving), True
 
 
-#: 클러스터마다 (기억한 시각, 파드를 읽을 수 있었던 namespace) — _pods_by_namespace
+#: 연결(클러스터 id·연결 지문·클러스터 namespace)마다 (기억한 시각, 다시 읽을 namespace) — _pods_by_namespace.
+#: 프로세스 안 기억이라 복제본마다 따로 채운다. 연결을 바꾸면 키가 달라져 옛 기억을 쓰지 않는다
 _readable_namespaces: dict[str, tuple[float, tuple[str, ...]]] = {}
 _readable_lock = threading.Lock()
 
@@ -249,8 +251,8 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
     namespace 목록을 읽고 namespace 마다 파드를 읽어(동시에, 하나에 GPU_PODS_TIMEOUT 초) 읽힌 것만 개요의 클러스터
     namespace 파드와 합친다. 클러스터 namespace(개요가 이미 읽었다)는 다시 읽지 않는다. 고객이 지표 RoleBinding 을
     걸지 않은 namespace 는 Forbidden 이라 조용히 빠진다.
-    읽힌 namespace 는 클러스터마다 READABLE_NAMESPACES_TTL 초 기억해 그동안은 그것만 읽는다 — 대시보드가 부를 때마다
-    거부되는 조회가 고객 감사 로그에 쌓이지 않게 (agent#120 리뷰). 찾은 것으로 일찍 멈추지 않는 이유: vLLM 은 몇 개인지
+    Forbidden 이 아닌 namespace(읽혔거나, 시간 초과·예산 부족으로 모르는 것)를 연결마다 READABLE_NAMESPACES_TTL 초
+    기억해 그동안은 그것만 읽는다 — 대시보드가 부를 때마다 거부되는 조회가 고객 감사 로그에 쌓이지 않게 (agent#120 리뷰). 찾은 것으로 일찍 멈추지 않는 이유: vLLM 은 몇 개인지
     정해져 있지 않고, vLLM·DCGM 이 없는 클러스터(학습용, AMD)도 있다.
     namespace 목록도 못 읽으면(GPU 읽기 RBAC 를 적용하지 않은 클러스터) 클러스터 namespace 파드만 쓴다.
     """
@@ -285,11 +287,14 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
 
     with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
         results = list(pool.map(read, names))
-    # 모든 namespace 의 답이 확실할 때만 기억한다 — 느려서 못 읽은 namespace 를 TTL 동안 빼 버리지 않게
-    if remember and cache_key and all(sure for _, sure in results):
-        readable = tuple(name for name, (stdout, _) in zip(names, results) if stdout is not None)
+    # Forbidden 만 뺀다 — 느려서 못 읽은 namespace 는 다음에 다시 본다
+    if remember and cache_key:
+        keep = tuple(name for name, (stdout, sure) in zip(names, results) if stdout is not None or not sure)
+        now = clock()
         with _readable_lock:
-            _readable_namespaces[cache_key] = (clock(), readable)
+            for key in [key for key, (at, _) in _readable_namespaces.items() if now - at >= READABLE_NAMESPACES_TTL]:
+                del _readable_namespaces[key]          # 지운 클러스터·바뀐 연결의 옛 기억이 쌓이지 않게
+            _readable_namespaces[cache_key] = (now, keep)
     return gpu.merge_pod_lists([namespace_pods, *(stdout for stdout, _ in results if stdout is not None)])
 
 
