@@ -58,9 +58,10 @@ def test_라벨이_없으면_자원_수와_인스턴스_종류로_메모리는_0
         "utilization_pct": None, "memory_used_mib": None, "temperature_c": None, "power_w": None}
 
 
-def test_allocatable이_없으면_capacity를_보고_0이면_GPU_노드가_아니다():
+def test_allocatable에_칸이_없을_때만_capacity를_보고_0이면_GPU_노드가_아니다():
+    """device plugin 이 죽으면 capacity 는 남고 allocatable 만 0 이다 — 쓸 수 있는 GPU 가 없다 (PR #118 리뷰)."""
     stdout = _list(_node("a", capacity={"nvidia.com/gpu": "1"}),
-                   _node("b", allocatable={"nvidia.com/gpu": "0"}),
+                   _node("b", allocatable={"nvidia.com/gpu": "0"}, capacity={"nvidia.com/gpu": "8"}),
                    _node("c", allocatable={"nvidia.com/gpu": "abc"}))
     assert [r["node"] for r in gpu.gpu_nodes(stdout)] == ["a"]
 
@@ -87,37 +88,44 @@ def test_노드_목록이_깨졌으면_ValueError():
 
 # ── 지표 파드 찾기 ──────────────────────────────────────────
 
+def pods(name: str = "gpu_pods.json") -> list[dict]:
+    return gpu.running_pods(fixture(name))
+
+
 def test_GPU_노드마다_DCGM_exporter_파드_하나를_찾는다():
-    assert gpu.dcgm_targets(fixture("gpu_pods.json"), {L40S_1, L40S_4}) == {
+    assert gpu.dcgm_targets(pods(), {L40S_1, L40S_4}) == {
         L40S_1: ("gpu-operator", "nvidia-dcgm-exporter-abcde", 9400),
         L40S_4: ("gpu-operator", "nvidia-dcgm-exporter-fghij", 9400),
     }
-    assert gpu.dcgm_targets(fixture("gpu_pods.json"), {L40S_1}) == {
+    assert gpu.dcgm_targets(pods(), {L40S_1}) == {
         L40S_1: ("gpu-operator", "nvidia-dcgm-exporter-abcde", 9400)}       # GPU 노드가 아닌 곳의 exporter 는 안 본다
 
 
 def test_vLLM_파드는_이미지나_명령으로_찾고_포트는_인자를_먼저_본다():
-    assert gpu.vllm_targets(fixture("gpu_pods.json")) == [
+    assert gpu.vllm_targets(pods(), {L40S_1, L40S_4}) == [
         ("llm", "qwen-0", 8000, L40S_4),                                   # 명령 `vllm serve`, 포트를 안 적으면 기본 8000
         ("llm", "vllm-gpt-oss-20b-7c9d5b8f6-q2k8m", 8080, L40S_1),          # --port 8080
     ]                                                                      # Running 이 아닌 파드는 빠진다
+    # GPU 노드 밖의 vllm 파드(`vllm bench` Job 등)는 대상 칸을 먹지 않는다 (PR #118 리뷰)
+    assert gpu.vllm_targets(pods(), {L40S_1}) == [("llm", "vllm-gpt-oss-20b-7c9d5b8f6-q2k8m", 8080, L40S_1)]
 
 
 def test_포트_이름과_등호_인자():
-    def pod(container: dict) -> str:
-        return _list({"metadata": {"name": "p", "namespace": "n"}, "spec": {"containers": [container]},
-                      "status": {"phase": "Running"}})
-    assert gpu.vllm_targets(pod({"image": "vllm/vllm-openai", "args": ["--port=9000"]}))[0][2] == 9000
-    assert gpu.vllm_targets(pod({"image": "vllm/vllm-openai", "ports": [
-        {"name": "grpc", "containerPort": 9001}, {"name": "http", "containerPort": 8001}]}))[0][2] == 8001
-    assert gpu.vllm_targets(pod({"image": "vllm/vllm-openai", "ports": [{"containerPort": 7000}]}))[0][2] == 7000
+    def port(container: dict) -> int:
+        item = {"metadata": {"name": "p", "namespace": "n"}, "spec": {"nodeName": "g", "containers": [container]},
+                "status": {"phase": "Running"}}
+        return gpu.vllm_targets(gpu.running_pods(_list(item)), {"g"})[0][2]
+    assert port({"image": "vllm/vllm-openai", "args": ["--port=9000"]}) == 9000
+    assert port({"image": "vllm/vllm-openai", "ports": [
+        {"name": "grpc", "containerPort": 9001}, {"name": "http", "containerPort": 8001}]}) == 8001
+    assert port({"image": "vllm/vllm-openai", "ports": [{"containerPort": 7000}]}) == 7000
 
 
 def test_지표_파드_수에는_상한이_있다():
-    pods = _list(*({"metadata": {"name": f"v{i:02d}", "namespace": "llm"},
-                    "spec": {"containers": [{"image": "vllm/vllm-openai"}]}, "status": {"phase": "Running"}}
+    many = _list(*({"metadata": {"name": f"v{i:02d}", "namespace": "llm"},
+                    "spec": {"nodeName": "g", "containers": [{"image": "vllm/vllm-openai"}]}, "status": {"phase": "Running"}}
                    for i in range(20)))
-    assert len(gpu.vllm_targets(pods)) == gpu.MAX_METRIC_TARGETS
+    assert len(gpu.vllm_targets(gpu.running_pods(many), {"g"})) == gpu.MAX_METRIC_TARGETS
 
 
 def test_proxy_command는_파드_프록시로_metrics를_읽는다():
@@ -145,6 +153,15 @@ def test_GPU가_여럿이면_사용률은_평균_메모리_전력은_합_온도�
     gpu.apply_dcgm(row, text)
     assert row == {"memory_mib": 8000,                                      # 라벨이 없으면 DCGM 의 used + free
                    "utilization_pct": 75, "memory_used_mib": 3000, "temperature_c": 70, "power_w": 500}
+
+
+def test_MIG_인스턴스는_부모_UUID가_같아도_따로_센다():
+    """MIG 줄은 부모 GPU 의 UUID 를 같이 쓰고 GPU_I_ID 로만 갈린다 (PR #118 리뷰)."""
+    text = "\n".join(f'DCGM_FI_DEV_FB_USED{{gpu="0",UUID="GPU-A",GPU_I_ID="{i}",GPU_I_PROFILE="1g.10gb"}} 9000'
+                     for i in range(7))
+    row = {"memory_mib": 81920}
+    gpu.apply_dcgm(row, text)
+    assert row["memory_used_mib"] == 63000
 
 
 def test_DCGM_지표가_없거나_깨졌으면_null_그대로():
@@ -182,6 +199,25 @@ def test_옛_vLLM_지표_이름도_읽고_엔진이_여럿이면_합친다():
     assert row["itl_p95_ms"] == 47.5                                        # 20개 중 19번째, 0~0.05 사이
 
 
+def test_model_name이_없는_info_지표로_유령_줄이_생기지_않는다():
+    """실제 vLLM 은 model_name 라벨 없는 info 지표를 늘 낸다 (PR #118 리뷰)."""
+    text = fixture("vllm.txt") + "\n".join([
+        'vllm:cache_config_info{block_size="16",cache_dtype="auto",engine="0",num_gpu_blocks="1234"} 1.0',
+        'vllm:lora_requests_info{max_lora="1",running_lora_adapters="",waiting_lora_adapters=""} 1.0',
+    ])
+    assert [r["model"] for r in gpu.serving_rows(text, pod="vllm-x", node="n")] == ["openai/gpt-oss-20b"]
+
+
+def test_무한대_값은_읽지_않는다():
+    """±Inf 가 round() 에 들어가면 OverflowError 로 개요 전체가 500 이다 (PR #118 리뷰)."""
+    row = {"memory_mib": 0}
+    gpu.apply_dcgm(row, 'DCGM_FI_DEV_FB_USED{gpu="0",UUID="GPU-A"} +Inf\nDCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-A"} 60')
+    assert (row["memory_used_mib"], row["temperature_c"]) == (None, 60)
+    [model] = gpu.serving_rows('vllm:num_requests_running{model_name="m"} -Inf\n'
+                               'vllm:num_requests_waiting{model_name="m"} 2', pod="p", node="n")
+    assert (model["running"], model["waiting"]) == (0, 2)
+
+
 def test_vLLM_지표가_없는_파드는_줄이_없다():
     assert gpu.serving_rows("http_requests_total 3\n", pod="router", node="n") == []
 
@@ -208,6 +244,7 @@ def test_Prometheus_글_형식():
         "broken",
     ]))
     assert rows == [("a", {"b": "c", "d": 'e "q" , f'}, 1.5), ("plain", {}, 2.0), ("inf_bucket", {"le": "+Inf"}, 3.0)]
+    assert gpu.parse_metrics("x +Inf\ny -Inf\nz Inf") == []
 
 
 # ── 엔드포인트 ─────────────────────────────────────────────
@@ -259,13 +296,13 @@ def test_GPU_클러스터는_노드_파드_지표_순으로_읽어_gpu_칸을_�
     assert [(s["model"], s["pod"], s["node"]) for s in body["serving"]] == [
         ("openai/gpt-oss-20b", "vllm-gpt-oss-20b-7c9d5b8f6-q2k8m", L40S_1)]   # 지표를 못 읽은 qwen-0 은 빠진다
     assert body["benchmarks"] == []
-    assert [args for args, _ in seen[4:]] == [
-        gpu.NODES_COMMAND, gpu.PODS_COMMAND,
+    assert [args for args, _ in seen[4:6]] == [gpu.NODES_COMMAND, gpu.PODS_COMMAND]
+    assert sorted(args for args, _ in seen[6:]) == sorted([           # 지표는 동시에 읽는다
         gpu.proxy_command("gpu-operator", "nvidia-dcgm-exporter-abcde", 9400),
         gpu.proxy_command("gpu-operator", "nvidia-dcgm-exporter-fghij", 9400),
         gpu.proxy_command("llm", "qwen-0", 8000),
         gpu.proxy_command("llm", "vllm-gpt-oss-20b-7c9d5b8f6-q2k8m", 8080),
-    ]
+    ])
     # 지표는 파드마다 한 번이라 더 짧게 끊는다
     assert {timeout for args, timeout in seen if args[1] == "--raw"} == {clusters_api.GPU_METRICS_TIMEOUT}
     assert clusters_api.GPU_METRICS_TIMEOUT < clusters_api.OVERVIEW_TIMEOUT
@@ -335,3 +372,50 @@ def test_노드나_파드_목록이_깨져도_개요는_200(client, fake_server,
     r = client.get(f"/clusters/{cluster}/overview", headers=USER)
     assert r.status_code == 200
     assert [n["node"] for n in r.json()["gpu"]["nodes"]] == [L40S_1, L40S_4] and r.json()["gpu"]["serving"] == []
+
+
+def test_GPU_조회는_시간_예산을_넘기면_남은_지표를_건너뛴다():
+    """지표 파드가 다 매달려도 개요 슬롯을 GPU_BUDGET 이상 잡지 않는다 (PR #118 리뷰)."""
+    now = [0.0]
+    seen: list[tuple[list[str], int]] = []
+
+    def run(args, timeout):
+        seen.append((args, timeout))
+        now[0] += {"nodes": 2, "pods": 3}.get(args[1], 0)
+        if args[1] == "--raw":
+            now[0] += timeout                                                # 지표는 시간 제한까지 매달린다
+            return _result(stderr="timed out", success=False)
+        return _gpu_cluster(args)
+
+    body = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
+    assert [r["node"] for r in body["nodes"]] == [L40S_1, L40S_4] and body["serving"] == []
+    raw = [timeout for args, timeout in seen if args[1] == "--raw"]
+    assert all(1 <= t <= clusters_api.GPU_METRICS_TIMEOUT for t in raw)
+    assert now[0] <= clusters_api.GPU_BUDGET                                 # 넘기면 건너뛴다
+    assert len(raw) < 4
+
+
+def test_노드_조회에서_예산을_다_쓰면_파드는_읽지_않는다():
+    now = [0.0]
+    seen: list[list[str]] = []
+
+    def run(args, timeout):
+        seen.append(args)
+        now[0] += clusters_api.GPU_BUDGET
+        return _gpu_cluster(args)
+
+    body = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
+    assert seen == [gpu.NODES_COMMAND] and len(body["nodes"]) == 2
+
+
+def test_지표_값이_무한대여도_개요는_200(client, fake_server, monkeypatch):
+    cluster = fake_server.add_cluster()
+
+    def fake(args, **kwargs):
+        if args[1] == "--raw":
+            return _result('DCGM_FI_DEV_FB_USED{gpu="0",UUID="GPU-A"} +Inf\nvllm:num_requests_running{model_name="m"} +Inf')
+        return _gpu_cluster(args)
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    r = client.get(f"/clusters/{cluster}/overview", headers=USER)
+    assert r.status_code == 200 and r.json()["gpu"]["nodes"][0]["memory_used_mib"] is None

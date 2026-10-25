@@ -5,25 +5,29 @@ overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순�
 읽는 순서 (clusters_api.cluster_overview)
   1. NODES_COMMAND   노드 목록. 못 읽으면(고객 EKS 는 namespace 범위 권한뿐이라 Forbidden) 여기서 멈추고 gpu 는 null.
                      GPU 노드가 없어도 null — 앱은 null 이면 GPU 화면을 띄우지 않는다
-  2. PODS_COMMAND    모든 namespace 의 파드. DCGM exporter·vLLM 파드를 찾는다. 못 읽으면 개요가 이미 읽은
-                     클러스터 namespace 의 파드에서만 찾는다
+  2. PODS_COMMAND    모든 namespace 의 파드. GPU 노드 위의 DCGM exporter·vLLM 파드를 찾는다. 못 읽으면 개요가 이미 읽은
+                     클러스터 namespace 의 파드에서만 찾는다 (running_pods 로 한 번만 파싱한다)
   3. proxy_command   찾은 파드의 /metrics 를 API 서버 **파드 프록시**로 읽는다 (Prometheus 없이 kubectl 권한만으로).
                      서비스 프록시가 아니라 파드 프록시인 이유: DCGM exporter 는 노드마다 하나인 DaemonSet 이라 서비스로
                      부르면 아무 파드 하나에 붙어 다른 노드의 값을 받는다. vLLM 도 레플리카마다 값이 다르다
   지표를 못 읽으면 그 노드의 실시간 값만 null, 그 파드만 serving 에서 빠진다 — 개요는 그대로 200.
 
 GPU 노드 — nodes
-  status.allocatable(없으면 capacity)에 GPU_RESOURCES 중 하나가 1 이상인 노드.
+  status.allocatable 에 GPU_RESOURCES 중 하나가 1 이상인 노드. allocatable 에 그 자원 칸이 아예 없을 때만 capacity 를 본다 —
+  device plugin 이 죽으면 kubelet 이 capacity 는 두고 allocatable 만 0 으로 내리는데, 그 노드는 쓸 수 있는 GPU 가 없다.
   count    라벨 nvidia.com/gpu.count(GPU Feature Discovery 가 붙이는 물리 GPU 수)가 있으면 그것, 없으면 자원 수.
            time-slicing·MPS 를 켜면 자원 수가 나눈 조각 수로 불어나기 때문이다
   product  라벨 nvidia.com/gpu.product (AMD 는 amd.com/gpu.product-name), 없으면 인스턴스 종류 라벨, 그것도 없으면 ""
   memory_mib  노드 전체 GPU 메모리 = GPU 하나 메모리(라벨 nvidia.com/gpu.memory, MiB) × count.
               라벨이 없으면 DCGM 의 FB_USED + FB_FREE + FB_RESERVED 합, 그것도 없으면 0
   실시간 값(DCGM) — GPU 마다 나오는 줄을 노드 하나로 모은다: 사용률은 평균, 메모리 사용·전력은 합, 온도는 가장 높은 것.
+  MIG 인스턴스는 부모 GPU 의 UUID 를 같이 쓰고 GPU_I_ID 로만 갈리므로 (UUID, GPU_I_ID) 로 묶는다.
   AMD 는 DCGM 이 없어 실시간 값이 늘 null 이다.
 
 서빙 — serving
-  vLLM 파드(컨테이너 이미지나 명령에 vllm 이 있는 것)의 /metrics 에서 model_name 라벨마다 한 줄.
+  GPU 노드 위의 vLLM 파드(컨테이너 이미지나 명령에 vllm 이 있는 것)의 /metrics 에서 model_name 라벨마다 한 줄.
+  GPU 노드로 좁히는 것은 `vllm bench` Job 같은 클라이언트 파드가 지표 대상 칸(MAX_METRIC_TARGETS)을 먹지 않게 하려는 것이다.
+  아래 지표만 본다 — vllm:cache_config_info 처럼 model_name 이 없는 info 지표로 유령 줄이 생기지 않게.
     running·waiting   vllm:num_requests_running·waiting (엔진이 여럿이면 합)
     kv_cache_pct      vllm:kv_cache_usage_perc (옛 vLLM 은 gpu_cache_usage_perc) × 100, 엔진이 여럿이면 평균
     ttft_p95_ms       vllm:time_to_first_token_seconds 히스토그램의 p95
@@ -89,12 +93,12 @@ def gpu_nodes(stdout: str) -> list[dict[str, Any]]:
 
 
 def _gpu_resource(status: dict[str, Any]) -> tuple[str | None, int]:
-    for field in ("allocatable", "capacity"):
-        resources = status.get(field) or {}
-        for name in GPU_RESOURCES:
-            amount = _positive_int(resources.get(name))
-            if amount:
-                return name, amount
+    allocatable = status.get("allocatable") or {}
+    capacity = status.get("capacity") or {}
+    for name in GPU_RESOURCES:
+        amount = _positive_int(allocatable[name] if name in allocatable else capacity.get(name))
+        if amount:
+            return name, amount
     return None, 0
 
 
@@ -122,10 +126,20 @@ def _memory_label_mib(labels: dict[str, Any]) -> int:
 
 # ── 지표를 읽을 파드 ───────────────────────────────────────
 
-def dcgm_targets(pods_stdout: str, gpu_node_names: set[str]) -> dict[str, tuple[str, str, int]]:
-    """GPU 노드마다 그 위의 DCGM exporter 파드 하나 — {노드: (namespace, 파드, 포트)}."""
+def running_pods(stdout: str) -> list[dict[str, Any]]:
+    """파드 목록에서 Running 이고 이름이 있는 것. 모양이 다르면 ValueError."""
+    rows = []
+    for item in _items(stdout):
+        meta = item.get("metadata")
+        if isinstance(meta, dict) and meta.get("name") and (item.get("status") or {}).get("phase") == "Running":
+            rows.append(item)
+    return rows
+
+
+def dcgm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> dict[str, tuple[str, str, int]]:
+    """GPU 노드마다 그 위의 DCGM exporter 파드 하나 — {노드: (namespace, 파드, 포트)}. pods 는 running_pods."""
     targets: dict[str, tuple[str, str, int]] = {}
-    for item in _running(pods_stdout):
+    for item in pods:
         node = (item.get("spec") or {}).get("nodeName")
         if node not in gpu_node_names or node in targets or not _is_dcgm(item):
             continue
@@ -137,10 +151,12 @@ def dcgm_targets(pods_stdout: str, gpu_node_names: set[str]) -> dict[str, tuple[
     return targets
 
 
-def vllm_targets(pods_stdout: str) -> list[tuple[str, str, int, str]]:
-    """vLLM 파드 — [(namespace, 파드, 포트, 노드)]. 이름순."""
+def vllm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> list[tuple[str, str, int, str]]:
+    """GPU 노드 위의 vLLM 파드 — [(namespace, 파드, 포트, 노드)]. 이름순. pods 는 running_pods."""
     targets: list[tuple[str, str, int, str]] = []
-    for item in _running(pods_stdout):
+    for item in pods:
+        if (item.get("spec") or {}).get("nodeName") not in gpu_node_names:
+            continue
         if _is_dcgm(item) or not any(_vllm_container(c) for c in _containers(item)):
             continue
         meta = item["metadata"]
@@ -153,15 +169,6 @@ def vllm_targets(pods_stdout: str) -> list[tuple[str, str, int, str]]:
 def proxy_command(namespace: str, pod: str, port: int) -> list[str]:
     """API 서버 파드 프록시로 /metrics 를 읽는 kubectl 인자 (모듈 설명 "읽는 순서" 3)."""
     return ["get", "--raw", f"/api/v1/namespaces/{namespace}/pods/{pod}:{port}/proxy/metrics"]
-
-
-def _running(stdout: str) -> list[dict[str, Any]]:
-    rows = []
-    for item in _items(stdout):
-        meta = item.get("metadata")
-        if isinstance(meta, dict) and meta.get("name") and (item.get("status") or {}).get("phase") == "Running":
-            rows.append(item)
-    return rows
 
 
 def _containers(item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -214,11 +221,11 @@ def _port(item: dict[str, Any], *, names: tuple[str, ...], default: int, match) 
 
 def apply_dcgm(row: dict[str, Any], text: str) -> None:
     """DCGM exporter /metrics 로 노드 한 줄의 실시간 값을 채운다 (모듈 설명 "GPU 노드")."""
-    per_gpu: dict[str, dict[str, float]] = {}
+    per_gpu: dict[tuple[str, str], dict[str, float]] = {}
     for name, labels, value in parse_metrics(text):
         if not name.startswith("DCGM_FI_DEV_"):
             continue
-        gpu = labels.get("UUID") or labels.get("gpu") or ""
+        gpu = (labels.get("UUID") or labels.get("gpu") or "", labels.get("GPU_I_ID") or "")
         per_gpu.setdefault(gpu, {})[name] = value
     if not per_gpu:
         return
@@ -243,11 +250,11 @@ def serving_rows(text: str, *, pod: str, node: str) -> list[dict[str, Any]]:
     """vLLM /metrics 에서 모델마다 한 줄 (모듈 설명 "서빙"). vLLM 지표가 없으면 빈 목록."""
     models: dict[str, dict[str, Any]] = {}
     for name, labels, value in parse_metrics(text):
-        if not name.startswith("vllm:"):
+        metric = name[len("vllm:"):] if name.startswith("vllm:") else ""
+        if metric not in _VLLM_METRICS:
             continue
         model = models.setdefault(labels.get("model_name") or pod, {
             "running": 0.0, "waiting": 0.0, "kv": [], "kv_old": [], "ttft": {}, "itl": {}, "itl_old": {}})
-        metric = name[len("vllm:"):]
         if metric == "num_requests_running":
             model["running"] += value
         elif metric == "num_requests_waiting":
@@ -277,6 +284,12 @@ def serving_rows(text: str, *, pod: str, node: str) -> list[dict[str, Any]]:
             "itl_p95_ms": _ms(histogram_quantile(0.95, m["itl"] or m["itl_old"])),
         })
     return rows
+
+
+_VLLM_METRICS = frozenset({
+    "num_requests_running", "num_requests_waiting", "kv_cache_usage_perc", "gpu_cache_usage_perc",
+    "time_to_first_token_seconds_bucket", "inter_token_latency_seconds_bucket", "time_per_output_token_seconds_bucket",
+})
 
 
 def _add_bucket(buckets: dict[float, float], labels: dict[str, str], value: float) -> None:
@@ -341,8 +354,8 @@ def parse_metrics(text: str) -> list[tuple[str, dict[str, str], float]]:
         if match is None:
             continue
         value = _float(match[3])
-        if value is None or math.isnan(value):
-            continue
+        if value is None or not math.isfinite(value):
+            continue            # ±Inf 값은 round() 에서 OverflowError 다. 버킷의 le="+Inf" 는 라벨이라 따로 읽는다
         labels = {key: raw.replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\")
                   for key, raw in _LABEL.findall(match[2] or "")}
         rows.append((match[1], labels, value))

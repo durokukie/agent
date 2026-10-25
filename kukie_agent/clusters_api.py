@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
@@ -34,11 +36,16 @@ router = APIRouter(prefix="/clusters", tags=["clusters"])
 #: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적, 이유는 thread_limiter).
 #: kubectl 은 30초씩 잡는다.
 PROBE_WORKERS = 4            # 연결 확인 (kubectl × 2, 최대 60초)
-OVERVIEW_WORKERS = 4         # 개요 (kubectl × 5, GPU 노드가 있으면 파드 목록·지표 몇 번 더). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
+OVERVIEW_WORKERS = 4         # 개요 (kubectl × 5, GPU 노드가 있으면 GPU_BUDGET 안에서 몇 번 더). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
 #: 개요의 kubectl 한 번 시간 제한(초). 기본 30초 × 4 면 한 요청이 슬롯을 2분 잡는다 — 닿지 않으면 첫 번째에서 15초로 끝난다 (자동 리뷰 지적)
 OVERVIEW_TIMEOUT = 15
 #: GPU 지표(/metrics 파드 프록시) 한 번 시간 제한(초). 파드마다 한 번씩이라 개요보다 더 짧게 끊는다
 GPU_METRICS_TIMEOUT = 5
+#: GPU 칸(노드·파드·지표 전부)에 쓰는 시간(초). 지표 파드가 16개 다 매달려도 개요 슬롯을 이 이상 더 잡지 않는다 (PR #118 리뷰).
+#: 다 쓰면 남은 조회는 건너뛰고 그 값만 null 이다
+GPU_BUDGET = 20
+#: 지표를 동시에 읽는 수. 개요 슬롯(OVERVIEW_WORKERS) 하나 안에서 잠깐 쓰는 스레드라 limiter 밖이다 — 많아야 4 × 4
+GPU_METRICS_WORKERS = 4
 
 
 @router.post("/{cluster_id}/test")
@@ -133,13 +140,19 @@ async def cluster_overview(
     return await to_thread.run_sync(collect, limiter=thread_limiter("overview", OVERVIEW_WORKERS))
 
 
-def _collect_gpu(run, *, namespace_pods: str) -> dict[str, Any] | None:
+def _collect_gpu(run, *, namespace_pods: str, clock=time.monotonic) -> dict[str, Any] | None:
     """개요의 gpu 칸 (clusters/gpu.py 의 "읽는 순서"). 어느 단계가 실패해도 오류로 올리지 않는다 — 부가 정보다.
 
     run(args, timeout) 은 개요와 같은 임시 kubeconfig 로 kubectl 을 돌린다. 실패 원문(사용자·ARN 이 실린다)은
     남기지 않고 갈래만 debug 로 남긴다 — 고객 클러스터는 노드를 못 읽는 게 보통이라 대시보드가 부를 때마다 난다.
+    전체를 GPU_BUDGET 초 안에 끝낸다 — 조회마다 남은 시간만큼만 기다리고, 1초도 안 남으면 건너뛴다.
     """
-    nodes_result = run(gpu.NODES_COMMAND, OVERVIEW_TIMEOUT)
+    deadline = clock() + GPU_BUDGET
+
+    def budget(limit: int) -> int:
+        return min(limit, int(deadline - clock()))
+
+    nodes_result = run(gpu.NODES_COMMAND, budget(OVERVIEW_TIMEOUT))
     if not nodes_result.success:
         logger.debug("개요의 GPU 조회를 건너뛴다 (노드): %s", _failure_status(nodes_result.stderr or nodes_result.stdout))
         return None
@@ -151,35 +164,43 @@ def _collect_gpu(run, *, namespace_pods: str) -> dict[str, Any] | None:
     if not nodes:
         return None
 
-    pods_result = run(gpu.PODS_COMMAND, OVERVIEW_TIMEOUT)
+    if budget(OVERVIEW_TIMEOUT) < 1:
+        return gpu.build(nodes, [])
+    pods_result = run(gpu.PODS_COMMAND, budget(OVERVIEW_TIMEOUT))
     if not pods_result.success:
         # 모든 namespace 를 못 읽으면 개요가 이미 읽은 클러스터 namespace 에서만 찾는다
         logger.debug("GPU 지표 파드를 클러스터 namespace 에서만 찾는다: %s",
                      _failure_status(pods_result.stderr or pods_result.stdout))
-    pods = pods_result.stdout if pods_result.success else namespace_pods
+    gpu_node_names = {row["node"] for row in nodes}
     try:
-        dcgm = gpu.dcgm_targets(pods, {row["node"] for row in nodes})
-        vllm = gpu.vllm_targets(pods)
+        pods = gpu.running_pods(pods_result.stdout if pods_result.success else namespace_pods)
+        dcgm = gpu.dcgm_targets(pods, gpu_node_names)
+        vllm = gpu.vllm_targets(pods, gpu_node_names)
     except (ValueError, AttributeError, TypeError):
         logger.debug("GPU 지표 파드를 찾지 못했다 (파드 목록을 읽지 못했다)")
         dcgm, vllm = {}, []
 
-    def metrics(namespace: str, pod: str, port: int) -> str | None:
-        result = run(gpu.proxy_command(namespace, pod, port), GPU_METRICS_TIMEOUT)
+    def metrics(target: tuple[str, str, int]) -> str | None:
+        namespace, pod, port = target
+        timeout = budget(GPU_METRICS_TIMEOUT)
+        if timeout < 1:
+            return None
+        result = run(gpu.proxy_command(namespace, pod, port), timeout)
         if not result.success:
             logger.debug("GPU 지표를 읽지 못했다 (%s/%s): %s", namespace, pod,
                          _failure_status(result.stderr or result.stdout))
             return None
         return result.stdout
 
-    for row in nodes:
-        target = dcgm.get(row["node"])
-        text = metrics(*target) if target else None
+    dcgm_rows = [row for row in nodes if row["node"] in dcgm]
+    targets = [dcgm[row["node"]] for row in dcgm_rows] + [(ns, pod, port) for ns, pod, port, _ in vllm]
+    with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
+        texts = list(pool.map(metrics, targets))
+    for row, text in zip(dcgm_rows, texts):
         if text is not None:
             gpu.apply_dcgm(row, text)
     serving: list[dict[str, Any]] = []
-    for namespace, pod, port, node in vllm:
-        text = metrics(namespace, pod, port)
+    for (_, pod, _, node), text in zip(vllm, texts[len(dcgm_rows):]):
         if text is not None:
             serving.extend(gpu.serving_rows(text, pod=pod, node=node))
     return gpu.build(nodes, serving)
