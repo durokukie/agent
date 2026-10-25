@@ -332,6 +332,8 @@ class ClusterConnection:
     namespace: str
     fingerprint: str
     credential: dict[str, str] = field(repr=False)
+    #: server 에 남은 GPU 노드 유무. None 은 아직 모른다 — 개요·연결 확인이 알아내면 update_cluster_gpu 로 남긴다
+    has_gpu: bool | None = None
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "ClusterConnection":
@@ -340,6 +342,7 @@ class ClusterConnection:
             ca_data=data.get("caData"), insecure=bool(data.get("insecure")), context_name=data["contextName"],
             namespace=data["namespace"], fingerprint=data.get("fingerprint", ""),
             credential={str(k): str(v) for k, v in (data.get("credential") or {}).items()},
+            has_gpu=data["hasGpu"] if isinstance(data.get("hasGpu"), bool) else None,
         )
 
 
@@ -426,6 +429,11 @@ async def update_cluster_status(cluster_id: str, *, status: str, checked_at: dat
     return await _call("PATCH", _path("clusters", cluster_id, "status"), body={"status": status, "checkedAt": at})
 
 
+async def update_cluster_gpu(cluster_id: str, *, has_gpu: bool) -> dict[str, Any]:
+    """노드 목록으로 알아낸 GPU 노드 유무 (DURO-118). 앱은 클러스터 목록의 이 값으로 GPU 아이콘을 띄운다."""
+    return await _call("PATCH", _path("clusters", cluster_id, "gpu"), body={"hasGpu": has_gpu})
+
+
 # ── Action Plan ────────────────────────────────────────────
 
 async def create_plan(
@@ -464,5 +472,5 @@ async def plan_action(plan_id: str, action: str, body: dict[str, Any] | None = N
 #: 테스트의 메모리 가짜가 같은 이름으로 바꿔 끼우는 함수들 (tests/fake_server.py).
 API = (
     "conversation_context", "find_run", "start_run", "update_run", "interrupt", "interrupt_orphaned",
-    "cluster_connection", "update_cluster_status", "create_plan", "run_plans", "get_plan", "plan_action",
+    "cluster_connection", "update_cluster_status", "update_cluster_gpu", "create_plan", "run_plans", "get_plan", "plan_action",
 )

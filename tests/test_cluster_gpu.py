@@ -391,7 +391,8 @@ def test_GPU_조회는_시간_예산을_넘기면_남은_지표를_건너뛴다(
             return _result(stderr="timed out", success=False)
         return _gpu_cluster(args)
 
-    body = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
+    body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
+    assert has_gpu is True
     assert [r["node"] for r in body["nodes"]] == [L40S_1, L40S_4] and body["serving"] == []
     raw = [timeout for args, timeout in seen if args[1] == "--raw"]
     assert all(1 <= t <= clusters_api.GPU_METRICS_TIMEOUT for t in raw)
@@ -408,7 +409,7 @@ def test_노드_조회에서_예산을_다_쓰면_파드는_읽지_않는다():
         now[0] += clusters_api.GPU_BUDGET
         return _gpu_cluster(args)
 
-    body = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
+    body, _ = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
     assert seen == [gpu.NODES_COMMAND] and len(body["nodes"]) == 2
 
 
@@ -423,3 +424,81 @@ def test_지표_값이_무한대여도_개요는_200(client, fake_server, monkey
     monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
     r = client.get(f"/clusters/{cluster}/overview", headers=USER)
     assert r.status_code == 200 and r.json()["gpu"]["nodes"][0]["memory_used_mib"] is None
+
+
+# ── GPU 여부를 server 에 남기기 ─────────────────────────────
+
+def _gpu_calls(fake_server) -> list[dict]:
+    return [body for name, body in fake_server.calls if name == "update_cluster_gpu"]
+
+
+@pytest.mark.parametrize(("nodes", "stored", "expected"), [
+    ("gpu_nodes.json", None, [True]),            # 처음 알아냈다
+    ("gpu_nodes.json", False, [True]),           # GPU 노드가 새로 생겼다
+    ("gpu_nodes.json", True, []),                # 그대로면 부르지 않는다 — 대시보드가 띄울 때마다 부른다
+    ("nodes.json", None, [False]),
+    ("nodes.json", True, [False]),               # GPU 노드가 사라졌다
+    ("nodes.json", False, []),
+])
+def test_개요는_노드를_읽으면_GPU_여부가_바뀐_때만_server에_남긴다(client, fake_server, monkeypatch, nodes, stored, expected):
+    cluster = fake_server.add_cluster(has_gpu=stored)
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl",
+                        lambda args, **k: _result(fixture(nodes)) if args == gpu.NODES_COMMAND else _gpu_cluster(args))
+    assert client.get(f"/clusters/{cluster}/overview", headers=USER).status_code == 200
+    assert [body["hasGpu"] for body in _gpu_calls(fake_server)] == expected
+    assert fake_server.clusters[cluster]["hasGpu"] == (expected[-1] if expected else stored)
+
+
+@pytest.mark.parametrize("nodes", [_result(stderr=FORBIDDEN, success=False), _result("not json")])
+def test_노드를_못_읽으면_GPU_여부를_남기지_않는다(client, fake_server, monkeypatch, nodes):
+    """권한이 없어진 클러스터의 마지막 값을 지우지 않는다."""
+    cluster = fake_server.add_cluster(has_gpu=True)
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl",
+                        lambda args, **k: nodes if args == gpu.NODES_COMMAND else _gpu_cluster(args))
+    assert client.get(f"/clusters/{cluster}/overview", headers=USER).status_code == 200
+    assert _gpu_calls(fake_server) == [] and fake_server.clusters[cluster]["hasGpu"] is True
+
+
+def test_GPU_여부를_남기지_못해도_개요는_200(client, fake_server, monkeypatch, caplog):
+    from kukie_agent.server_api import ServerError
+
+    cluster = fake_server.add_cluster()
+
+    async def down(*args, **kwargs):
+        raise ServerError(503, "SERVER_UNAVAILABLE", "kukie-server 에 닿지 못했다")
+
+    monkeypatch.setattr("kukie_agent.server_api.update_cluster_gpu", down)
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", lambda args, **k: _gpu_cluster(args))
+    r = client.get(f"/clusters/{cluster}/overview", headers=USER)
+    assert r.status_code == 200 and r.json()["gpu"] is not None
+    assert "GPU 여부를 남기지 못했다: SERVER_UNAVAILABLE" in caplog.text
+
+
+def test_연결_확인도_노드_목록으로_GPU_여부를_남긴다(client, fake_server, monkeypatch):
+    cluster = fake_server.add_cluster(namespace="web")
+    seen: list[list[str]] = []
+
+    def fake(args, **kwargs):
+        seen.append(args)
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("gpu_nodes.json"))
+        return _result("{}" if args[0] == "version" else "yes")
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    r = client.post(f"/clusters/{cluster}/test", headers=USER)
+    assert r.status_code == 200 and r.json()["status"] == "connected"
+    assert seen[-1] == gpu.NODES_COMMAND                                     # 지표는 읽지 않는다 — 개요의 일
+    assert [body["hasGpu"] for body in _gpu_calls(fake_server)] == [True]
+
+
+def test_연결에_실패하면_노드를_읽지_않고_GPU_여부도_남기지_않는다(client, fake_server, monkeypatch):
+    cluster = fake_server.add_cluster()
+    seen: list[list[str]] = []
+
+    def fail(args, **kwargs):
+        seen.append(args)
+        return _result(stderr="dial tcp: i/o timeout", success=False)
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fail)
+    assert client.post(f"/clusters/{cluster}/test", headers=USER).json()["status"] == "disconnected"
+    assert gpu.NODES_COMMAND not in seen and _gpu_calls(fake_server) == []
