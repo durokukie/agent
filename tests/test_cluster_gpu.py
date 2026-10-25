@@ -374,8 +374,12 @@ def test_노드나_파드_목록이_깨져도_개요는_200(client, fake_server,
     assert [n["node"] for n in r.json()["gpu"]["nodes"]] == [L40S_1, L40S_4] and r.json()["gpu"]["serving"] == []
 
 
-def test_GPU_조회는_시간_예산을_넘기면_남은_지표를_건너뛴다():
-    """지표 파드가 다 매달려도 개요 슬롯을 GPU_BUDGET 이상 잡지 않는다 (PR #118 리뷰)."""
+def test_GPU_조회는_시간_예산을_넘기면_남은_지표를_건너뛴다(monkeypatch):
+    """지표 파드가 다 매달려도 개요 슬롯을 GPU_BUDGET 이상 잡지 않는다 (PR #118 리뷰).
+
+    가짜 시계는 호출마다 시간이 쌓인다고 보므로 지표를 차례로 돌린다 — 동시에 도는 것은 엔드포인트 테스트가 본다.
+    """
+    monkeypatch.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
     now = [0.0]
     seen: list[tuple[list[str], int]] = []
 
