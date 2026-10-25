@@ -191,6 +191,7 @@ def _collect_gpu(
 
     if budget(OVERVIEW_TIMEOUT) < 1:
         return gpu.build(nodes, []), True
+    gpu_node_names = {row["node"] for row in nodes}
     pods_result = run(gpu.PODS_COMMAND, budget(OVERVIEW_TIMEOUT))
     if pods_result.success:
         pods_stdout = pods_result.stdout
@@ -203,9 +204,7 @@ def _collect_gpu(
             return min(limit, int(search_deadline - clock()))
 
         pods_stdout = _pods_by_namespace(run, search_budget, namespace_pods, namespace=namespace,
-                                         gpu_node_names={row["node"] for row in nodes}, cache_key=cache_key,
-                                         clock=clock)
-    gpu_node_names = {row["node"] for row in nodes}
+                                         gpu_node_names=gpu_node_names, cache_key=cache_key, clock=clock)
     try:
         pods = gpu.running_pods(pods_stdout)
         dcgm = gpu.dcgm_targets(pods, gpu_node_names)
@@ -276,25 +275,31 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
     now = clock()
     with _readable_lock:
         cached = _readable_namespaces.get(cache_key) if cache_key else None
+    unreached, productive = (set(cached[2]), set(cached[3])) if cached else (set(), set())
     if cached and now - cached[0] < READABLE_NAMESPACES_TTL:
         remembered_at, names = cached[0], list(cached[1])
     else:
-        if budget(OVERVIEW_TIMEOUT) < 1:
-            return namespace_pods
-        names_result = run(gpu.NAMESPACES_COMMAND, budget(OVERVIEW_TIMEOUT))
-        if not names_result.success:
-            logger.debug("GPU 지표 파드를 클러스터 namespace 에서만 찾는다: %s",
-                         _failure_status(names_result.stderr or names_result.stdout))
-            return namespace_pods
-        try:
-            names = gpu.namespace_names(names_result.stdout, skip=namespace)
-        except (ValueError, AttributeError, TypeError):
-            logger.debug("GPU 지표 파드를 클러스터 namespace 에서만 찾는다 (namespace 목록을 읽지 못했다)")
-            return namespace_pods
+        names = None
+        if budget(OVERVIEW_TIMEOUT) >= 1:
+            names_result = run(gpu.NAMESPACES_COMMAND, budget(OVERVIEW_TIMEOUT))
+            if names_result.success:
+                try:
+                    names = gpu.namespace_names(names_result.stdout, skip=namespace, prefer=productive)
+                except (ValueError, AttributeError, TypeError):
+                    logger.debug("namespace 목록을 읽지 못했다")
+            else:
+                logger.debug("namespace 목록을 읽지 못했다: %s", _failure_status(names_result.stderr or names_result.stdout))
+        if names is None:
+            if not cached:
+                return namespace_pods       # GPU 읽기 RBAC 를 적용하지 않은 클러스터 — 클러스터 namespace 파드만
+            names = list(cached[1])         # 목록만 잠깐 못 읽었으면 지난 기억으로 읽는다 (Forbidden 은 아래에서 빠진다)
         remembered_at = now
-    unreached, productive = (set(cached[2]), set(cached[3])) if cached else (set(), set())
-    names.sort(key=lambda name: (0 if name in productive or gpu.hinted_namespace(name) else
-                                 1 if name in unreached else 2))           # 안정 정렬 — 같은 칸은 원래 순서
+    # 앞 칸: GPU 지표 파드가 나온 것·GPU 쪽 이름. 다음: 지난번에 못 닿은 것. 다만 못 닿은 것 하나는 앞 칸 첫째 바로 뒤에
+    # 끼워, 앞 칸이 늘 시간 초과해도 매 라운드 한 자리는 돈다 (agent#120 리뷰)
+    first = [name for name in names if name in productive or gpu.hinted_namespace(name)]
+    second = [name for name in names if name not in first and name in unreached]
+    third = [name for name in names if name not in first and name not in unreached]
+    names = first[:1] + second[:1] + first[1:] + second[1:] + third
 
     with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
         results = list(pool.map(read, names))

@@ -546,8 +546,45 @@ def test_예산이_모자라도_GPU_쪽과_GPU_파드가_나온_namespace는_매
         call(0)                                                       # 한 번 아무것도 못 읽어도 team-x 는 앞에 남는다
         for _ in range(3):
             call(3)                                                   # 한 라운드에 3개
-    assert all(r[:2] == ["gpu-operator", "team-x"] for r in rounds[2:])   # GPU 쪽 이름과 GPU 파드가 나온 곳이 먼저
-    assert {r[2] for r in rounds[2:]} == {"a", "b", "c"}              # 남은 한 칸은 돌아가며 — c 도 읽힌다
+    # 매 라운드: 앞 칸 첫째, 못 닿은 것 하나(자리 보장), 앞 칸 나머지 순서
+    assert all([r[0], r[2]] == ["gpu-operator", "team-x"] for r in rounds[2:])
+    assert {r[1] for r in rounds[2:]} == {"a", "b", "c"}              # 끼운 한 자리는 돌아가며 — c 도 읽힌다
+
+
+def test_GPU_파드가_나온_namespace는_상한에_잘리지_않는다(monkeypatch):
+    monkeypatch.setattr(gpu, "MAX_POD_NAMESPACES", 2)
+    names = gpu.namespace_names(_namespaces("a", "b", "c", "zz-llm-team"), prefer={"zz-llm-team"})
+    assert names == ["zz-llm-team", "a"]
+
+
+def test_목록을_다시_읽다_실패하면_지난_기억으로_읽는다():
+    now = [0.0]
+    listing_ok = [True]
+    seen: list[str] = []
+
+    def run(args, timeout):
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("llm")) if listing_ok[0] else _result(stderr="i/o timeout", success=False)
+        seen.append(args[3])
+        return _result("{}")
+
+    def call():
+        return clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None,
+                                               gpu_node_names={L40S_1}, cache_key="k", clock=lambda: now[0])
+
+    call()
+    now[0] += clusters_api.READABLE_NAMESPACES_TTL
+    listing_ok[0] = False
+    seen.clear()
+    call()
+    assert seen == ["llm"]
+
+
+def test_GPU_대상_판정은_모양이_이상한_파드_목록에도_False():
+    """개요를 500 으로 만들지 않는다 (agent#120 리뷰)."""
+    broken = '{"items": [{"metadata": {"name": "p"}, "status": "Running", "spec": "x"}]}'
+    assert gpu.has_gpu_targets(broken, {L40S_1}) is False
+    assert gpu.has_gpu_targets("not json", {L40S_1}) is False
 
 def test_연결_지문이_없으면_namespace를_기억하지_않는다(client, fake_server, monkeypatch):
     cluster = fake_server.add_cluster(namespace="shop")

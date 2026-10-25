@@ -182,13 +182,14 @@ def vllm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> list[t
     return targets[:MAX_METRIC_TARGETS]
 
 
-def namespace_names(stdout: str, *, skip: str | None = None) -> list[str]:
+def namespace_names(stdout: str, *, skip: str | None = None, prefer: set[str] = frozenset()) -> list[str]:
     """파드를 읽어 볼 namespace — kube-* 와 skip(개요가 이미 읽은 클러스터 namespace)은 뺀다(Kukie 역할은 시스템
-    namespace 를 읽지 않는다). GPU 쪽 이름이 먼저, 그다음 이름순으로 MAX_POD_NAMESPACES 개까지. 모양이 다르면 ValueError."""
+    namespace 를 읽지 않는다). prefer(GPU 지표 파드가 나온 적 있는 것)와 GPU 쪽 이름이 먼저, 그다음 이름순으로
+    MAX_POD_NAMESPACES 개까지 — 상한이 지표 namespace 를 자르지 않게. 모양이 다르면 ValueError."""
     names = sorted({name for item in _items(stdout)
                     if isinstance(name := (item.get("metadata") or {}).get("name"), str) and name
                     and not name.startswith("kube-") and name != skip})
-    names.sort(key=lambda name: not hinted_namespace(name))
+    names.sort(key=lambda name: not (name in prefer or hinted_namespace(name)))
     return names[:MAX_POD_NAMESPACES]
 
 
@@ -203,12 +204,12 @@ def namespace_pods_command(namespace: str) -> list[str]:
 
 
 def has_gpu_targets(stdout: str, gpu_node_names: set[str]) -> bool:
-    """파드 목록에 GPU 노드 위의 DCGM exporter 나 vLLM 파드가 있는가. 모양이 다르면 False."""
+    """파드 목록에 GPU 노드 위의 DCGM exporter 나 vLLM 파드가 있는가. 모양이 다르면 False (개요를 실패시키지 않는다)."""
     try:
         pods = running_pods(stdout)
-    except ValueError:
+        return bool(dcgm_targets(pods, gpu_node_names) or vllm_targets(pods, gpu_node_names))
+    except (ValueError, AttributeError, TypeError):
         return False
-    return bool(dcgm_targets(pods, gpu_node_names) or vllm_targets(pods, gpu_node_names))
 
 
 def merge_pod_lists(outputs: list[str]) -> str:
