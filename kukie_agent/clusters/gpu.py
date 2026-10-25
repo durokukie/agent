@@ -5,8 +5,11 @@ overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순�
 읽는 순서 (clusters_api.cluster_overview)
   1. NODES_COMMAND   노드 목록. 못 읽으면(고객 EKS 는 namespace 범위 권한뿐이라 Forbidden) 여기서 멈추고 gpu 는 null.
                      GPU 노드가 없어도 null — 앱은 null 이면 GPU 화면을 띄우지 않는다
-  2. PODS_COMMAND    모든 namespace 의 파드. GPU 노드 위의 DCGM exporter·vLLM 파드를 찾는다. 못 읽으면 개요가 이미 읽은
-                     클러스터 namespace 의 파드에서만 찾는다 (running_pods 로 한 번만 파싱한다)
+  2. PODS_COMMAND    모든 namespace 의 파드. GPU 노드 위의 DCGM exporter·vLLM 파드를 찾는다. 못 읽으면 NAMESPACES_COMMAND 로
+                     namespace 를 읽고 namespace 마다 파드를 읽어 읽힌 것만 모은다 — Kukie GPU 읽기 RBAC
+                     (kukie-infra customer-templates/gpu-read-rbac-v1.yaml)는 namespace 목록은 클러스터 전체에, 파드 목록은 고객이
+                     고른 namespace 에만 준다. namespace 목록도 못 읽으면 개요가 이미 읽은 클러스터 namespace 의 파드에서만 찾는다
+                     (running_pods 로 한 번만 파싱한다)
   3. proxy_command   찾은 파드의 /metrics 를 API 서버 **파드 프록시**로 읽는다 (Prometheus 없이 kubectl 권한만으로).
                      서비스 프록시가 아니라 파드 프록시인 이유: DCGM exporter 는 노드마다 하나인 DaemonSet 이라 서비스로
                      부르면 아무 파드 하나에 붙어 다른 노드의 값을 받는다. vLLM 도 레플리카마다 값이 다르다
@@ -50,6 +53,13 @@ from typing import Any
 NODES_COMMAND: list[str] = ["get", "nodes", "-o", "json"]
 #: DCGM exporter·vLLM 파드를 찾는 파드 목록 (모든 namespace). 부르는 쪽이 `-n` 을 붙이지 않는다
 PODS_COMMAND: list[str] = ["get", "pods", "-A", "-o", "json"]
+
+#: 모든 namespace 파드를 못 읽을 때 namespace 마다 파드를 읽으려고 보는 namespace 목록 (클러스터 범위)
+NAMESPACES_COMMAND: list[str] = ["get", "namespaces", "-o", "json"]
+#: namespace 마다 파드를 읽는 수 상한. 넘으면 GPU 쪽 이름(NAMESPACE_HINTS)이 들어간 것부터 고른다
+MAX_POD_NAMESPACES = 24
+#: DCGM exporter·vLLM 이 흔히 도는 namespace 이름 조각 — 상한을 넘을 때 먼저 읽는다
+NAMESPACE_HINTS: tuple[str, ...] = ("gpu", "nvidia", "dcgm", "vllm", "llm", "serving", "inference")
 
 #: GPU 로 보는 확장 자원 (위에 있는 것이 먼저)
 GPU_RESOURCES: tuple[str, ...] = ("nvidia.com/gpu", "amd.com/gpu")
@@ -169,6 +179,40 @@ def vllm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> list[t
                         (item.get("spec") or {}).get("nodeName") or ""))
     targets.sort(key=lambda t: (t[0], t[1]))
     return targets[:MAX_METRIC_TARGETS]
+
+
+def namespace_names(stdout: str) -> list[str]:
+    """파드를 읽어 볼 namespace — kube-* 는 뺀다(Kukie 역할은 시스템 namespace 를 읽지 않는다). GPU 쪽 이름이 먼저, 그다음 이름순.
+    MAX_POD_NAMESPACES 개까지. 모양이 다르면 ValueError."""
+    names = sorted({name for item in _items(stdout)
+                    if isinstance(name := (item.get("metadata") or {}).get("name"), str) and name
+                    and not name.startswith("kube-")})
+    names.sort(key=lambda name: not any(hint in name for hint in NAMESPACE_HINTS))
+    return names[:MAX_POD_NAMESPACES]
+
+
+def namespace_pods_command(namespace: str) -> list[str]:
+    """namespace 하나의 파드 목록 kubectl 인자 (모듈 설명 "읽는 순서" 2의 대체 길)."""
+    return ["get", "pods", "-n", namespace, "-o", "json"]
+
+
+def merge_pod_lists(outputs: list[str]) -> str:
+    """파드 목록 출력 여럿을 하나로 — (namespace, 이름)이 같은 파드는 한 번만. 깨진 출력 하나는 건너뛴다."""
+    seen: set[tuple[str, str]] = set()
+    items: list[dict[str, Any]] = []
+    for stdout in outputs:
+        try:
+            rows = _items(stdout)
+        except ValueError:      # JSON 이 아니거나 items 가 목록이 아니다 (json.JSONDecodeError 도 ValueError)
+            continue
+        for item in rows:
+            meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            key = (str(meta.get("namespace") or ""), str(meta.get("name") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+    return json.dumps({"items": items})
 
 
 def proxy_command(namespace: str, pod: str, port: int) -> list[str]:

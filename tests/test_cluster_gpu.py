@@ -339,13 +339,14 @@ def test_GPU_노드가_없으면_gpu는_null이고_파드는_읽지_않는다(cl
     assert gpu.PODS_COMMAND not in seen and not any(args[1] == "--raw" for args in seen)
 
 
-def test_모든_namespace_파드를_못_읽으면_클러스터_namespace_파드에서만_찾는다(client, fake_server, monkeypatch):
+def test_모든_namespace_파드도_namespace_목록도_못_읽으면_클러스터_namespace_파드에서만_찾는다(client, fake_server, monkeypatch):
+    """GPU 읽기 RBAC 를 적용하지 않은 고객 EKS — namespace 범위 권한뿐이다."""
     cluster = fake_server.add_cluster(namespace="llm")
     vllm_only = _list(*(item for item in json.loads(fixture("gpu_pods.json"))["items"]
                         if item["metadata"]["namespace"] == "llm"))
 
     def fake(args, **kwargs):
-        if args == gpu.PODS_COMMAND:
+        if args in (gpu.PODS_COMMAND, gpu.NAMESPACES_COMMAND):
             return _result(stderr=FORBIDDEN, success=False)
         if args == ["get", "pods", "-o", "json", "-n", "llm"]:
             return _result(vllm_only)
@@ -357,6 +358,64 @@ def test_모든_namespace_파드를_못_읽으면_클러스터_namespace_파드�
     body = r.json()["gpu"]
     assert [n["utilization_pct"] for n in body["nodes"]] == [None, None]    # DCGM 은 다른 namespace 라 못 찾는다
     assert [s["model"] for s in body["serving"]] == ["openai/gpt-oss-20b"]
+
+
+def _namespaces(*names: str) -> str:
+    return _list(*({"metadata": {"name": name}} for name in names))
+
+
+def test_모든_namespace_파드를_못_읽으면_namespace마다_읽은_파드를_합친다(client, fake_server, monkeypatch):
+    """GPU 읽기 RBAC: 파드 목록은 고객이 RoleBinding 한 namespace 에만 (kukie-infra#124 리뷰). 못 읽는 namespace 는 빠진다."""
+    cluster = fake_server.add_cluster(namespace="shop")
+    items = json.loads(fixture("gpu_pods.json"))["items"]
+    by_ns = {ns: _list(*(i for i in items if i["metadata"]["namespace"] == ns)) for ns in ("gpu-operator", "llm")}
+    seen: list[list[str]] = []
+
+    def fake(args, **kwargs):
+        seen.append(args)
+        if args == gpu.PODS_COMMAND:
+            return _result(stderr=FORBIDDEN, success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("default", "shop", "kube-system", "llm", "gpu-operator"))
+        if args[:3] == ["get", "pods", "-n"]:                                 # namespace_pods_command
+            return _result(by_ns[args[3]]) if args[3] in by_ns else _result(stderr=FORBIDDEN, success=False)
+        return _gpu_cluster(args)
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    r = client.get(f"/clusters/{cluster}/overview", headers=USER)
+    assert r.status_code == 200
+    body = r.json()["gpu"]
+    assert [n["utilization_pct"] for n in body["nodes"]] == [87, 87]          # 다른 namespace 의 DCGM 을 찾았다
+    assert [s["model"] for s in body["serving"]] == ["openai/gpt-oss-20b"]
+    per_ns = sorted(args[3] for args in seen if args[:3] == ["get", "pods", "-n"])
+    assert per_ns == ["default", "gpu-operator", "llm", "shop"]               # kube-* 는 읽지 않는다
+
+
+def test_namespace_목록도_못_읽으면_클러스터_namespace_파드만_쓴다():
+    pods = _list(*(i for i in json.loads(fixture("gpu_pods.json"))["items"] if i["metadata"]["namespace"] == "llm"))
+    seen: list[list[str]] = []
+
+    def run(args, timeout):
+        seen.append(args)
+        if args in (gpu.PODS_COMMAND, gpu.NAMESPACES_COMMAND):
+            return _result(stderr=FORBIDDEN, success=False)
+        return _gpu_cluster(args)
+
+    body, _ = clusters_api._collect_gpu(run, namespace_pods=pods)
+    assert [s["model"] for s in body["serving"]] == ["openai/gpt-oss-20b"]
+    assert not any(args[:3] == ["get", "pods", "-n"] for args in seen)
+
+
+def test_namespace는_GPU_쪽_이름부터_상한까지_고른다(monkeypatch):
+    monkeypatch.setattr(gpu, "MAX_POD_NAMESPACES", 3)
+    names = gpu.namespace_names(_namespaces("a", "b", "kube-system", "kube-public", "my-vllm", "c", "gpu-operator", "a"))
+    assert names == ["gpu-operator", "my-vllm", "a"]
+
+
+def test_파드_목록을_합칠_때_같은_파드는_한_번이고_깨진_출력은_건너뛴다():
+    pod = {"metadata": {"namespace": "llm", "name": "p"}, "status": {"phase": "Running"}}
+    merged = json.loads(gpu.merge_pod_lists([_list(pod), "not json", _list(pod), '{"items": {}}']))
+    assert merged["items"] == [pod]
 
 
 @pytest.mark.parametrize("broken", ["not json", '{"items": {}}'])

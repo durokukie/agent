@@ -43,6 +43,8 @@ OVERVIEW_WORKERS = 4         # 개요 (kubectl × 5, GPU 노드가 있으면 GPU
 OVERVIEW_TIMEOUT = 15
 #: GPU 지표(/metrics 파드 프록시) 한 번 시간 제한(초). 파드마다 한 번씩이라 개요보다 더 짧게 끊는다
 GPU_METRICS_TIMEOUT = 5
+#: 모든 namespace 파드를 못 읽을 때 namespace 하나의 파드 목록 시간 제한(초). namespace 마다 한 번이라 지표처럼 짧게 끊는다
+GPU_PODS_TIMEOUT = 5
 #: GPU 칸(노드·파드·지표 전부)에 쓰는 시간(초). 지표 파드가 16개 다 매달려도 개요 슬롯을 이 이상 더 잡지 않는다 (PR #118 리뷰).
 #: 다 쓰면 남은 조회는 건너뛰고 그 값만 null 이다
 GPU_BUDGET = 20
@@ -184,13 +186,14 @@ def _collect_gpu(
     if budget(OVERVIEW_TIMEOUT) < 1:
         return gpu.build(nodes, []), True
     pods_result = run(gpu.PODS_COMMAND, budget(OVERVIEW_TIMEOUT))
-    if not pods_result.success:
-        # 모든 namespace 를 못 읽으면 개요가 이미 읽은 클러스터 namespace 에서만 찾는다
-        logger.debug("GPU 지표 파드를 클러스터 namespace 에서만 찾는다: %s",
-                     _failure_status(pods_result.stderr or pods_result.stdout))
+    if pods_result.success:
+        pods_stdout = pods_result.stdout
+    else:
+        logger.debug("GPU 지표 파드를 namespace 마다 찾는다: %s", _failure_status(pods_result.stderr or pods_result.stdout))
+        pods_stdout = _pods_by_namespace(run, budget, namespace_pods)
     gpu_node_names = {row["node"] for row in nodes}
     try:
-        pods = gpu.running_pods(pods_result.stdout if pods_result.success else namespace_pods)
+        pods = gpu.running_pods(pods_stdout)
         dcgm = gpu.dcgm_targets(pods, gpu_node_names)
         vllm = gpu.vllm_targets(pods, gpu_node_names)
     except (ValueError, AttributeError, TypeError):
@@ -221,6 +224,38 @@ def _collect_gpu(
         if text is not None:
             serving.extend(gpu.serving_rows(text, pod=pod, node=node))
     return gpu.build(nodes, serving), True
+
+
+def _pods_by_namespace(run, budget, namespace_pods: str) -> str:
+    """모든 namespace 파드를 못 읽을 때의 파드 목록 — clusters/gpu.py "읽는 순서" 2.
+
+    namespace 목록을 읽고 namespace 마다 파드를 읽어(동시에, 하나에 GPU_PODS_TIMEOUT 초) 읽힌 것만 개요의 클러스터
+    namespace 파드와 합친다. 고객이 지표 RoleBinding 을 걸지 않은 namespace 는 Forbidden 이라 조용히 빠진다.
+    namespace 목록도 못 읽으면(GPU 읽기 RBAC 를 적용하지 않은 클러스터) 클러스터 namespace 파드만 쓴다.
+    """
+    if budget(OVERVIEW_TIMEOUT) < 1:
+        return namespace_pods
+    names_result = run(gpu.NAMESPACES_COMMAND, budget(OVERVIEW_TIMEOUT))
+    if not names_result.success:
+        logger.debug("GPU 지표 파드를 클러스터 namespace 에서만 찾는다: %s",
+                     _failure_status(names_result.stderr or names_result.stdout))
+        return namespace_pods
+    try:
+        names = gpu.namespace_names(names_result.stdout)
+    except (ValueError, AttributeError, TypeError):
+        logger.debug("GPU 지표 파드를 클러스터 namespace 에서만 찾는다 (namespace 목록을 읽지 못했다)")
+        return namespace_pods
+
+    def read(namespace: str) -> str:
+        timeout = budget(GPU_PODS_TIMEOUT)
+        if timeout < 1:
+            return "{}"
+        result = run(gpu.namespace_pods_command(namespace), timeout)
+        return result.stdout if result.success else "{}"
+
+    with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
+        outputs = list(pool.map(read, names))
+    return gpu.merge_pod_lists([namespace_pods, *outputs])
 
 
 def _has_gpu(nodes: KubectlResult) -> bool | None:
