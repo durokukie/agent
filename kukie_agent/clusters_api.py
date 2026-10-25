@@ -17,6 +17,7 @@ GPU 노드 유무(hasGpu)도 같은 까닭으로 연결 확인·개요가 노드
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -45,6 +46,8 @@ OVERVIEW_TIMEOUT = 15
 GPU_METRICS_TIMEOUT = 5
 #: 모든 namespace 파드를 못 읽을 때 namespace 하나의 파드 목록 시간 제한(초). namespace 마다 한 번이라 지표처럼 짧게 끊는다
 GPU_PODS_TIMEOUT = 5
+#: 파드를 읽을 수 있었던 namespace 를 클러스터마다 기억하는 시간(초). 그동안은 그 namespace 만 읽는다
+READABLE_NAMESPACES_TTL = 600
 #: GPU 칸(노드·파드·지표 전부)에 쓰는 시간(초). 지표 파드가 16개 다 매달려도 개요 슬롯을 이 이상 더 잡지 않는다 (PR #118 리뷰).
 #: 다 쓰면 남은 조회는 건너뛰고 그 값만 null 이다
 GPU_BUDGET = 20
@@ -131,7 +134,8 @@ async def cluster_overview(
             def run(args: list[str], timeout: int) -> KubectlResult:
                 return run_kubectl(args, context=conn.context_name, kubeconfig=path, timeout=timeout)
 
-            cluster_gpu, has_gpu = _collect_gpu(run, namespace_pods=outputs["pods"], namespace=conn.namespace)
+            cluster_gpu, has_gpu = _collect_gpu(run, namespace_pods=outputs["pods"], namespace=conn.namespace,
+                                                 cache_key=cluster_id)
         if not network.success:
             # 고객 클러스터는 kube-system 을 못 읽는 게 보통이라 대시보드가 부를 때마다 난다 — debug 로 둔다 (PR #117 리뷰).
             # 원문(사용자·ARN 이 실린다)은 남기지 않고 갈래만 남긴다
@@ -156,7 +160,7 @@ async def cluster_overview(
 
 
 def _collect_gpu(
-    run, *, namespace_pods: str, namespace: str | None = None, clock=time.monotonic,
+    run, *, namespace_pods: str, namespace: str | None = None, cache_key: str | None = None, clock=time.monotonic,
 ) -> tuple[dict[str, Any] | None, bool | None]:
     """(개요의 gpu 칸, GPU 노드 유무) — clusters/gpu.py 의 "읽는 순서". 어느 단계가 실패해도 오류로 올리지 않는다.
 
@@ -197,7 +201,7 @@ def _collect_gpu(
             return min(limit, int(search_deadline - clock()))
 
         pods_stdout = _pods_by_namespace(run, search_budget, namespace_pods, namespace=namespace,
-                                         gpu_node_names={row["node"] for row in nodes})
+                                         cache_key=cache_key, clock=clock)
     gpu_node_names = {row["node"] for row in nodes}
     try:
         pods = gpu.running_pods(pods_stdout)
@@ -233,44 +237,60 @@ def _collect_gpu(
     return gpu.build(nodes, serving), True
 
 
-def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | None, gpu_node_names: set[str]) -> str:
+#: 클러스터마다 (기억한 시각, 파드를 읽을 수 있었던 namespace) — _pods_by_namespace
+_readable_namespaces: dict[str, tuple[float, tuple[str, ...]]] = {}
+_readable_lock = threading.Lock()
+
+
+def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | None, cache_key: str | None,
+                       clock=time.monotonic) -> str:
     """모든 namespace 파드를 못 읽을 때의 파드 목록 — clusters/gpu.py "읽는 순서" 2.
 
     namespace 목록을 읽고 namespace 마다 파드를 읽어(동시에, 하나에 GPU_PODS_TIMEOUT 초) 읽힌 것만 개요의 클러스터
     namespace 파드와 합친다. 클러스터 namespace(개요가 이미 읽었다)는 다시 읽지 않는다. 고객이 지표 RoleBinding 을
     걸지 않은 namespace 는 Forbidden 이라 조용히 빠진다.
-    GPU 쪽 이름의 namespace 를 먼저 읽고, 거기서 GPU 노드마다 DCGM exporter 와 vLLM 하나 이상을 찾았으면 나머지는
-    읽지 않는다 — 대시보드가 부를 때마다 거부되는 조회가 고객 감사 로그에 쌓이지 않게 (agent#120 리뷰).
+    읽힌 namespace 는 클러스터마다 READABLE_NAMESPACES_TTL 초 기억해 그동안은 그것만 읽는다 — 대시보드가 부를 때마다
+    거부되는 조회가 고객 감사 로그에 쌓이지 않게 (agent#120 리뷰). 찾은 것으로 일찍 멈추지 않는 이유: vLLM 은 몇 개인지
+    정해져 있지 않고, vLLM·DCGM 이 없는 클러스터(학습용, AMD)도 있다.
     namespace 목록도 못 읽으면(GPU 읽기 RBAC 를 적용하지 않은 클러스터) 클러스터 namespace 파드만 쓴다.
     """
-    if budget(OVERVIEW_TIMEOUT) < 1:
-        return namespace_pods
-    names_result = run(gpu.NAMESPACES_COMMAND, budget(OVERVIEW_TIMEOUT))
-    if not names_result.success:
-        logger.debug("GPU 지표 파드를 클러스터 namespace 에서만 찾는다: %s",
-                     _failure_status(names_result.stderr or names_result.stdout))
-        return namespace_pods
-    try:
-        names = [name for name in gpu.namespace_names(names_result.stdout) if name != namespace]
-    except (ValueError, AttributeError, TypeError):
-        logger.debug("GPU 지표 파드를 클러스터 namespace 에서만 찾는다 (namespace 목록을 읽지 못했다)")
-        return namespace_pods
-
-    def read(name: str) -> str:
+    def read(name: str) -> tuple[str | None, bool]:
+        """(파드 목록, 확실한가) — 읽었거나 Forbidden 이면 확실하다. 시간 초과·예산 부족은 다음에 다시 본다."""
         timeout = budget(GPU_PODS_TIMEOUT)
         if timeout < 1:
-            return "{}"
+            return None, False
         result = run(gpu.namespace_pods_command(name), timeout)
-        return result.stdout if result.success else "{}"
+        if result.success:
+            return result.stdout, True
+        return None, "forbidden" in (result.stderr or result.stdout or "").lower()
 
-    outputs = [namespace_pods]
-    hinted = [name for name in names if gpu.hinted_namespace(name)]
-    for group in (hinted, [name for name in names if not gpu.hinted_namespace(name)]):
-        if not group or gpu.found_all(gpu.merge_pod_lists(outputs), gpu_node_names):
-            continue
-        with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
-            outputs.extend(pool.map(read, group))
-    return gpu.merge_pod_lists(outputs)
+    with _readable_lock:
+        cached = _readable_namespaces.get(cache_key) if cache_key else None
+    if cached and clock() - cached[0] < READABLE_NAMESPACES_TTL:
+        names, remember = list(cached[1]), False
+    else:
+        if budget(OVERVIEW_TIMEOUT) < 1:
+            return namespace_pods
+        names_result = run(gpu.NAMESPACES_COMMAND, budget(OVERVIEW_TIMEOUT))
+        if not names_result.success:
+            logger.debug("GPU 지표 파드를 클러스터 namespace 에서만 찾는다: %s",
+                         _failure_status(names_result.stderr or names_result.stdout))
+            return namespace_pods
+        try:
+            names = gpu.namespace_names(names_result.stdout, skip=namespace)
+        except (ValueError, AttributeError, TypeError):
+            logger.debug("GPU 지표 파드를 클러스터 namespace 에서만 찾는다 (namespace 목록을 읽지 못했다)")
+            return namespace_pods
+        remember = True
+
+    with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
+        results = list(pool.map(read, names))
+    # 모든 namespace 의 답이 확실할 때만 기억한다 — 느려서 못 읽은 namespace 를 TTL 동안 빼 버리지 않게
+    if remember and cache_key and all(sure for _, sure in results):
+        readable = tuple(name for name, (stdout, _) in zip(names, results) if stdout is not None)
+        with _readable_lock:
+            _readable_namespaces[cache_key] = (clock(), readable)
+    return gpu.merge_pod_lists([namespace_pods, *(stdout for stdout, _ in results if stdout is not None)])
 
 
 def _has_gpu(nodes: KubectlResult) -> bool | None:

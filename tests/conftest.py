@@ -21,6 +21,13 @@ models.ALLOW_MODEL_REQUESTS = False
 
 
 @pytest.fixture(autouse=True)
+def _forget_readable_namespaces(monkeypatch):
+    """GPU 개요가 클러스터마다 기억하는 namespace 를 테스트마다 비운다 — 같은 클러스터 id 가 다른 테스트로 새지 않게."""
+    from kukie_agent import clusters_api
+    monkeypatch.setattr(clusters_api, "_readable_namespaces", {})
+
+
+@pytest.fixture(autouse=True)
 def _server_off_by_default(monkeypatch):
     """kukie_agent 를 import 하면 load_dotenv(".env") 가 개발자 .env 의 KUKIE_SERVER_URL 을 환경에 올린다.
 
