@@ -471,7 +471,7 @@ def test_GPU_여부를_남기지_못해도_개요는_200(client, fake_server, mo
     monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", lambda args, **k: _gpu_cluster(args))
     r = client.get(f"/clusters/{cluster}/overview", headers=USER)
     assert r.status_code == 200 and r.json()["gpu"] is not None
-    assert "GPU 여부를 남기지 못했다: SERVER_UNAVAILABLE" in caplog.text
+    assert f"클러스터 {cluster} 의 GPU 여부를 남기지 못했다: SERVER_UNAVAILABLE" in caplog.text
 
 
 def test_연결_확인도_노드_목록으로_GPU_여부를_남긴다(client, fake_server, monkeypatch):

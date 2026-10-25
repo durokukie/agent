@@ -247,12 +247,12 @@ async def _record_gpu(conn: server_api.ClusterConnection, has_gpu: bool | None) 
         return True
     if not conn.fingerprint:
         # server 가 늘 409 로 거절할 호출이다 — 부르지 않되 동기화가 멈춘 것은 남긴다
-        logger.warning("클러스터 GPU 여부를 남기지 못했다: 연결 정보에 지문이 없다")
+        logger.warning("클러스터 %s 의 GPU 여부를 남기지 못했다: 연결 정보에 지문이 없다", conn.cluster_id)
         return False
     try:
         await server_api.update_cluster_gpu(conn.cluster_id, has_gpu=has_gpu, fingerprint=conn.fingerprint)
     except server_api.ServerError as exc:
-        logger.warning("클러스터 GPU 여부를 남기지 못했다: %s", exc.code)
+        logger.warning("클러스터 %s 의 GPU 여부를 남기지 못했다: %s", conn.cluster_id, exc.code)
         return False
     return True
 
