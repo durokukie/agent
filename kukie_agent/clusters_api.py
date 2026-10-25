@@ -203,7 +203,8 @@ def _collect_gpu(
             return min(limit, int(search_deadline - clock()))
 
         pods_stdout = _pods_by_namespace(run, search_budget, namespace_pods, namespace=namespace,
-                                         cache_key=cache_key, clock=clock)
+                                         gpu_node_names={row["node"] for row in nodes}, cache_key=cache_key,
+                                         clock=clock)
     gpu_node_names = {row["node"] for row in nodes}
     try:
         pods = gpu.running_pods(pods_stdout)
@@ -240,13 +241,13 @@ def _collect_gpu(
 
 
 #: 연결(클러스터 id·연결 지문·클러스터 namespace)마다 (기억한 시각, 다시 읽을 namespace, 지난번에 못 닿은 namespace,
-#: 지난번에 파드를 준 namespace) — _pods_by_namespace. 프로세스 안 기억이라 복제본마다 따로 채운다. 연결을 바꾸면 키가 달라져 옛 기억을 쓰지 않는다
+#: GPU 지표 파드(DCGM·vLLM)가 나온 namespace) — _pods_by_namespace. 프로세스 안 기억이라 복제본마다 따로 채운다. 연결을 바꾸면 키가 달라져 옛 기억을 쓰지 않는다
 _readable_namespaces: dict[str, tuple[float, tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = {}
 _readable_lock = threading.Lock()
 
 
-def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | None, cache_key: str | None,
-                       clock=time.monotonic) -> str:
+def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | None, gpu_node_names: set[str],
+                       cache_key: str | None, clock=time.monotonic) -> str:
     """모든 namespace 파드를 못 읽을 때의 파드 목록 — clusters/gpu.py "읽는 순서" 2.
 
     namespace 목록을 읽고 namespace 마다 파드를 읽어(동시에, 하나에 GPU_PODS_TIMEOUT 초) 읽힌 것만 개요의 클러스터
@@ -257,8 +258,9 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
     대시보드가 부를 때마다 거부되는 조회가 고객 감사 로그에 쌓이지 않게 연결마다 READABLE_NAMESPACES_TTL 초 기억한다
     (agent#120 리뷰). 그동안은 목록을 다시 읽지 않고 기억한 namespace 만 읽으며, 라운드마다 Forbidden 으로 확인된 것을
     더 뺀다(기억한 시각은 그대로라 TTL 이 늘지 않는다). 시간 초과는 남긴다.
-    읽는 순서: 지난번에 파드를 준 것과 GPU 쪽 이름(값이 깜빡이지 않게) → 지난번에 예산이 모자라 못 닿은 것(늘 같은 것이
-    잘리지 않게) → 나머지. 연결 지문이 없으면(cache_key None) 기억하지 않는다.
+    읽는 순서: GPU 지표 파드가 나온 적 있는 것과 GPU 쪽 이름(값이 깜빡이지 않게) → 지난번에 예산이 모자라 못 닿은 것
+    (늘 같은 것이 잘리지 않게) → 나머지. "나온 적 있는 것"은 그 namespace 를 읽었는데 GPU 파드가 없거나 Forbidden 일 때만
+    뺀다 — 한 번 느렸다고 뒤로 밀리지 않게. 연결 지문이 없으면(cache_key None) 기억하지 않는다.
     namespace 목록도 못 읽으면(GPU 읽기 RBAC 를 적용하지 않은 클러스터) 클러스터 namespace 파드만 쓴다.
     """
     def read(name: str) -> tuple[str | None, str]:
@@ -299,8 +301,10 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
     if cache_key:
         skipped = tuple(name for name, (_, outcome) in zip(names, results) if outcome == "skipped")
         keep = tuple(name for name, (_, outcome) in zip(names, results) if outcome != "forbidden")
-        # 못 닿은 것은 이번에 몰라서 남긴다. 파드를 준 것은 다음 라운드에도 앞에 둔다
-        gave = tuple(name for name, (stdout, _) in zip(names, results) if stdout and gpu.has_items(stdout))
+        before = set(cached[3]) if cached else set()
+        gave = tuple(name for name, (stdout, outcome) in zip(names, results)
+                     if (outcome == "ok" and gpu.has_gpu_targets(stdout, gpu_node_names))
+                     or (outcome in ("unknown", "skipped") and name in before))
         with _readable_lock:
             # 지운 클러스터·바뀐 연결의 옛 기억이 쌓이지 않게. TTL 두 배까지는 남겨, 목록을 다시 읽을 때 못 닿은 것을 안다
             for key in [key for key, entry in _readable_namespaces.items() if now - entry[0] >= 2 * READABLE_NAMESPACES_TTL]:

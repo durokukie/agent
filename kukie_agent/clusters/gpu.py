@@ -202,12 +202,13 @@ def namespace_pods_command(namespace: str) -> list[str]:
     return ["get", "pods", "-n", namespace, "-o", "json"]
 
 
-def has_items(stdout: str) -> bool:
-    """kubectl 목록 출력에 항목이 하나라도 있는가. 모양이 다르면 False."""
+def has_gpu_targets(stdout: str, gpu_node_names: set[str]) -> bool:
+    """파드 목록에 GPU 노드 위의 DCGM exporter 나 vLLM 파드가 있는가. 모양이 다르면 False."""
     try:
-        return bool(_items(stdout))
+        pods = running_pods(stdout)
     except ValueError:
         return False
+    return bool(dcgm_targets(pods, gpu_node_names) or vllm_targets(pods, gpu_node_names))
 
 
 def merge_pod_lists(outputs: list[str]) -> str:
