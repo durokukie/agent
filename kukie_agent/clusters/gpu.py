@@ -58,8 +58,9 @@ PODS_COMMAND: list[str] = ["get", "pods", "-A", "-o", "json"]
 NAMESPACES_COMMAND: list[str] = ["get", "namespaces", "-o", "json"]
 #: namespace 마다 파드를 읽는 수 상한. 넘으면 GPU 쪽 이름(NAMESPACE_HINTS)이 들어간 것부터 고른다
 MAX_POD_NAMESPACES = 24
-#: DCGM exporter·vLLM 이 흔히 도는 namespace 이름 조각 — 상한을 넘을 때 먼저 읽는다
-NAMESPACE_HINTS: tuple[str, ...] = ("gpu", "nvidia", "dcgm", "vllm", "llm", "serving", "inference")
+#: DCGM exporter·vLLM 이 흔히 도는 namespace 이름 조각 — 먼저 읽는다. kube-prometheus-stack 으로 깐 DCGM 은 보통 monitoring 에 있다
+NAMESPACE_HINTS: tuple[str, ...] = ("gpu", "nvidia", "dcgm", "vllm", "llm", "serving", "inference",
+                                    "monitor", "metric", "observ", "prom")
 
 #: GPU 로 보는 확장 자원 (위에 있는 것이 먼저)
 GPU_RESOURCES: tuple[str, ...] = ("nvidia.com/gpu", "amd.com/gpu")
@@ -187,8 +188,20 @@ def namespace_names(stdout: str) -> list[str]:
     names = sorted({name for item in _items(stdout)
                     if isinstance(name := (item.get("metadata") or {}).get("name"), str) and name
                     and not name.startswith("kube-")})
-    names.sort(key=lambda name: not any(hint in name for hint in NAMESPACE_HINTS))
+    names.sort(key=lambda name: not hinted_namespace(name))
     return names[:MAX_POD_NAMESPACES]
+
+
+def hinted_namespace(name: str) -> bool:
+    """GPU 지표·서빙 쪽 이름(NAMESPACE_HINTS)이 들어간 namespace."""
+    return any(hint in name for hint in NAMESPACE_HINTS)
+
+
+def found_all(pods_stdout: str, gpu_node_names: set[str]) -> bool:
+    """찾은 파드로 충분한가 — GPU 노드마다 DCGM exporter(상한까지)와 vLLM 하나 이상. 더 읽을 namespace 를 멈출지 정한다."""
+    pods = running_pods(pods_stdout)
+    want = min(len(gpu_node_names), MAX_METRIC_TARGETS)
+    return len(dcgm_targets(pods, gpu_node_names)) >= want and bool(vllm_targets(pods, gpu_node_names))
 
 
 def namespace_pods_command(namespace: str) -> list[str]:

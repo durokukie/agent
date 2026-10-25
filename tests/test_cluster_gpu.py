@@ -388,7 +388,53 @@ def test_모든_namespace_파드를_못_읽으면_namespace마다_읽은_파드�
     assert [n["utilization_pct"] for n in body["nodes"]] == [87, 87]          # 다른 namespace 의 DCGM 을 찾았다
     assert [s["model"] for s in body["serving"]] == ["openai/gpt-oss-20b"]
     per_ns = sorted(args[3] for args in seen if args[:3] == ["get", "pods", "-n"])
-    assert per_ns == ["default", "gpu-operator", "llm", "shop"]               # kube-* 는 읽지 않는다
+    # GPU 쪽 이름에서 DCGM·vLLM 을 다 찾아 default 는 읽지 않는다. kube-* 와 클러스터 namespace(shop)도 읽지 않는다
+    assert per_ns == ["gpu-operator", "llm"]
+
+
+def test_GPU_쪽_namespace에서_다_못_찾으면_나머지도_읽는다():
+    """vLLM 이 GPU 쪽 이름이 아닌 namespace 에 있으면 그것까지 읽는다."""
+    items = json.loads(fixture("gpu_pods.json"))["items"]
+    dcgm = _list(*(i for i in items if i["metadata"]["namespace"] == "gpu-operator"))
+    vllm = _list(*(dict(i, metadata=dict(i["metadata"], namespace="team-a"))
+                   for i in items if i["metadata"]["namespace"] == "llm"))
+    seen: list[str] = []
+
+    def run(args, timeout):
+        if args == gpu.PODS_COMMAND:
+            return _result(stderr=FORBIDDEN, success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("team-a", "gpu-operator", "zz"))
+        if args[:3] == ["get", "pods", "-n"]:
+            seen.append(args[3])
+            return _result({"gpu-operator": dcgm, "team-a": vllm}.get(args[3], "{}"))
+        return _gpu_cluster(args)
+
+    body, _ = clusters_api._collect_gpu(run, namespace_pods="{}")
+    assert [s["model"] for s in body["serving"]] == ["openai/gpt-oss-20b"]
+    assert seen[0] == "gpu-operator" and sorted(seen[1:]) == ["team-a", "zz"]
+
+
+def test_namespace_탐색은_남은_GPU_예산의_절반까지만_쓴다(monkeypatch):
+    """느린 API 서버에서도 지표를 읽을 시간을 남긴다 (agent#120 리뷰)."""
+    monkeypatch.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
+    now = [0.0]
+    searched: list[float] = []
+
+    def run(args, timeout):
+        now[0] += {"nodes": 1}.get(args[1], 0)
+        if args == gpu.PODS_COMMAND:
+            return _result(stderr=FORBIDDEN, success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces(*(f"ns-{i}" for i in range(20))))
+        if args[:3] == ["get", "pods", "-n"]:
+            now[0] += timeout                                                # namespace 마다 시간 제한까지 매달린다
+            searched.append(now[0])
+            return _result(stderr="timed out", success=False)
+        return _gpu_cluster(args)
+
+    clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
+    assert searched and max(searched) <= 1 + (clusters_api.GPU_BUDGET - 1) / 2 + 1
 
 
 def test_namespace_목록도_못_읽으면_클러스터_namespace_파드만_쓴다():
@@ -410,6 +456,7 @@ def test_namespace는_GPU_쪽_이름부터_상한까지_고른다(monkeypatch):
     monkeypatch.setattr(gpu, "MAX_POD_NAMESPACES", 3)
     names = gpu.namespace_names(_namespaces("a", "b", "kube-system", "kube-public", "my-vllm", "c", "gpu-operator", "a"))
     assert names == ["gpu-operator", "my-vllm", "a"]
+    assert gpu.hinted_namespace("monitoring") and gpu.hinted_namespace("observability")
 
 
 def test_파드_목록을_합칠_때_같은_파드는_한_번이고_깨진_출력은_건너뛴다():
