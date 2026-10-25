@@ -75,7 +75,7 @@ class FakeServer:
         self, *, owner: str = "u-1", team_id: str | None = None, name: str | None = None,
         context: str = "kind-dev", namespace: str = "study", fingerprint: str | None = None,
         credential: dict[str, str] | None = None, api_server: str = "https://cluster.example",
-        ca_data: str | None = "QQ==", insecure: bool = False,
+        ca_data: str | None = "QQ==", insecure: bool = False, has_gpu: bool | None = None,
     ) -> str:
         cluster_id = str(uuid.uuid4())
         self.clusters[cluster_id] = {
@@ -83,6 +83,7 @@ class FakeServer:
             "provider": "GENERIC", "apiServer": api_server, "caData": ca_data, "insecure": insecure,
             "contextName": context, "namespace": namespace, "fingerprint": fingerprint or f"fp-{cluster_id}",
             "credential": credential or {"token": "secret-token"}, "status": "disconnected", "lastCheckedAt": None,
+            "hasGpu": has_gpu,
         }
         return cluster_id
 
@@ -336,7 +337,8 @@ class FakeServer:
             raise ServerError(409, "CLUSTER_CHANGED", "이 대화가 쓰던 클러스터의 접속 대상이 바뀌었다")
         return server_api.ClusterConnection.from_json({
             "clusterId": cluster_id, **{k: cluster[k] for k in (
-                "name", "apiServer", "caData", "insecure", "contextName", "namespace", "fingerprint", "credential")},
+                "name", "apiServer", "caData", "insecure", "contextName", "namespace", "fingerprint", "credential",
+                "hasGpu")},
         })
 
     async def update_cluster_status(self, cluster_id: str, *, status: str, checked_at: datetime):
@@ -346,6 +348,16 @@ class FakeServer:
             raise _not_found(cluster_id)
         cluster["status"] = status
         cluster["lastCheckedAt"] = checked_at.isoformat()
+        return {k: v for k, v in cluster.items() if k != "credential"}
+
+    async def update_cluster_gpu(self, cluster_id: str, *, has_gpu: bool, fingerprint: str):
+        self.calls.append(("update_cluster_gpu", {"id": cluster_id, "hasGpu": has_gpu, "fingerprint": fingerprint}))
+        cluster = self.clusters.get(cluster_id)
+        if cluster is None:
+            raise _not_found(cluster_id)
+        if cluster["fingerprint"] != fingerprint:
+            raise ServerError(409, "CLUSTER_CHANGED", "이 대화가 쓰던 클러스터의 접속 대상이 바뀌었다")
+        cluster["hasGpu"] = has_gpu
         return {k: v for k, v in cluster.items() if k != "credential"}
 
     # ── Action Plan (contract 3절 상태 머신) ─────────────────

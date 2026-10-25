@@ -69,7 +69,8 @@ def test_연결_확인은_임시_kubeconfig로_실행하고_상태를_server에_
     r = client.post(f"/clusters/{cluster}/test", headers=USER)
 
     assert r.status_code == 200
-    assert r.json() == {"status": "connected", "reachable": True, "detail": "{}", "can_change": True}
+    assert r.json() == {"status": "connected", "reachable": True, "detail": "{}", "can_change": True,
+                        "has_gpu": None}                              # 노드 목록을 못 읽었다 ("yes" 는 JSON 이 아니다)
     assert "secret-token" not in r.text                               # 자격증명은 응답에 없다
     # 서버의 기본 kubeconfig 가 아니라 server 에서 받은 값으로 만든 임시 파일로 실행했다
     assert all(call["kubeconfig"] is not None and "secret-token" in call["body"] for call in seen)

@@ -9,6 +9,8 @@
 권한은 server 가 본다. 연결 정보를 사용자 토큰으로 받으므로(clusters/access.py) 못 보는 클러스터는 그 호출이
 404 를 준다. 팀 구성원도 부를 수 있고, 결과(status·last_checked_at)를 `PATCH /internal/clusters/{id}/status` 로
 남긴다 — 연결 확인의 부산물이라 "쓰기는 Admin" 경계에서 일부러 빼 뒀다 (자동 리뷰 지적).
+GPU 노드 유무(hasGpu)도 같은 까닭으로 연결 확인·개요가 노드 목록을 읽었을 때 `PATCH /internal/clusters/{id}/gpu` 로
+남긴다 (DURO-118). 앱은 클러스터 목록의 그 값으로 GPU 아이콘을 띄운다 — 개요를 부르지 않고도.
 
 **자격증명은 어떤 응답에도 실리지 않는다** (기획 04 §4).
 """
@@ -35,7 +37,7 @@ router = APIRouter(prefix="/clusters", tags=["clusters"])
 
 #: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적, 이유는 thread_limiter).
 #: kubectl 은 30초씩 잡는다.
-PROBE_WORKERS = 4            # 연결 확인 (kubectl × 2, 최대 60초)
+PROBE_WORKERS = 4            # 연결 확인 (kubectl × 3 — version·can-i 30초씩 + 노드 OVERVIEW_TIMEOUT, 최대 75초)
 OVERVIEW_WORKERS = 4         # 개요 (kubectl × 5, GPU 노드가 있으면 GPU_BUDGET 안에서 몇 번 더). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
 #: 개요의 kubectl 한 번 시간 제한(초). 기본 30초 × 4 면 한 요청이 슬롯을 2분 잡는다 — 닿지 않으면 첫 번째에서 15초로 끝난다 (자동 리뷰 지적)
 OVERVIEW_TIMEOUT = 15
@@ -56,27 +58,36 @@ async def test_cluster(
     """연결 확인 (기획 04 §8). 서버 버전을 읽고 변경 권한이 있는지 물어본다."""
     conn = await access.connection(cluster_id, user)
 
-    def probe() -> tuple[Any, Any]:
+    def probe() -> tuple[Any, Any, bool | None]:
         with access.kubeconfig(conn) as path:
-            return (
-                run_kubectl(["version", "-o", "json"], context=conn.context_name, kubeconfig=path),
-                run_kubectl(
-                    ["auth", "can-i", "update", "deployments", "-n", conn.namespace],
-                    context=conn.context_name, kubeconfig=path,
-                ),
+            version = run_kubectl(["version", "-o", "json"], context=conn.context_name, kubeconfig=path)
+            can_edit = run_kubectl(
+                ["auth", "can-i", "update", "deployments", "-n", conn.namespace],
+                context=conn.context_name, kubeconfig=path,
             )
+            has_gpu = None
+            if version.success:
+                # 노드 목록만 본다 (지표는 개요의 일). 고객 EKS 는 Forbidden 이라 None — 남기지 않는다
+                nodes = run_kubectl(gpu.NODES_COMMAND, context=conn.context_name, kubeconfig=path,
+                                    timeout=OVERVIEW_TIMEOUT)
+                has_gpu = _has_gpu(nodes)
+            return version, can_edit, has_gpu
 
     # run_kubectl 은 subprocess.run 을 그대로 부른다. 여기서 직접 부르면 닿지 않는 주소일 때
-    # 최대 60초(version + can-i) 동안 서버 전체가 멈춘다 (자동 리뷰 지적). 스레드로 넘긴다.
-    version, can_edit = await to_thread.run_sync(probe, limiter=thread_limiter("probe", PROBE_WORKERS))
+    # 최대 75초(version + can-i + 노드) 동안 서버 전체가 멈춘다 (자동 리뷰 지적). 스레드로 넘긴다.
+    version, can_edit, has_gpu = await to_thread.run_sync(probe, limiter=thread_limiter("probe", PROBE_WORKERS))
     status = "connected" if version.success else _failure_status(version.stderr)
     await server_api.update_cluster_status(cluster_id, status=status, checked_at=datetime.now(timezone.utc))
+    recorded = await _record_gpu(conn, has_gpu)
     return {
         "status": status,
         "reachable": version.success,
         # 실패 사유는 그대로 보여줘야 고칠 수 있다. 자격증명은 원래 stderr 에 실리지 않는다
         "detail": (version.stderr or version.stdout).strip()[:500],
         "can_change": can_edit.success and can_edit.stdout.strip() == "yes",
+        # 노드 목록으로 본 GPU 노드 유무. 못 읽었거나 server 에 남기지 못했으면 null — 앱은 이 값이 목록 값과 다를 때
+        # 클러스터 목록을 다시 받으므로, 못 남긴 값을 주면 다시 받아도 아이콘이 안 바뀐다 (PR #119 리뷰)
+        "has_gpu": has_gpu if recorded else None,
     }
 
 
@@ -92,7 +103,7 @@ async def cluster_overview(
     CNI(network)는 세 조회가 다 된 뒤 kube-system DaemonSet 을 한 번 더 읽어 알아본다 (overview.NETWORK_COMMAND).
     그 조회는 실패해도(Forbidden·시간 초과) 개요를 실패로 만들지 않고 network 만 null 로 둔다.
     GPU(gpu)는 그 뒤에 노드 → 모든 파드 → 지표 순으로 읽는다 (clusters/gpu.py). 노드를 못 읽거나 GPU 노드가 없으면
-    gpu 만 null 이고, 노드가 없으면 파드·지표는 읽지 않는다.
+    gpu 만 null 이고, 노드가 없으면 파드·지표는 읽지 않는다. 노드를 읽었으면 GPU 노드 유무를 server 에 남긴다(_record_gpu).
 
     kubectl 이 실패하면 연결 확인과 같은 기준(_failure_status)으로 갈라 502 로 답한다.
       CLUSTER_AUTH_EXPIRED  인증 실패·권한 없음 (연결 확인의 auth_expired)
@@ -102,7 +113,7 @@ async def cluster_overview(
     """
     conn = await access.connection(cluster_id, user)
 
-    def collect() -> dict[str, Any]:
+    def collect() -> tuple[dict[str, Any], bool | None]:
         outputs: dict[str, str] = {}
         with access.kubeconfig(conn) as path:
             for name, args in overview.READ_COMMANDS.items():
@@ -118,7 +129,7 @@ async def cluster_overview(
             def run(args: list[str], timeout: int) -> KubectlResult:
                 return run_kubectl(args, context=conn.context_name, kubeconfig=path, timeout=timeout)
 
-            cluster_gpu = _collect_gpu(run, namespace_pods=outputs["pods"])
+            cluster_gpu, has_gpu = _collect_gpu(run, namespace_pods=outputs["pods"])
         if not network.success:
             # 고객 클러스터는 kube-system 을 못 읽는 게 보통이라 대시보드가 부를 때마다 난다 — debug 로 둔다 (PR #117 리뷰).
             # 원문(사용자·ARN 이 실린다)은 남기지 않고 갈래만 남긴다
@@ -128,7 +139,7 @@ async def cluster_overview(
             return overview.build(context=conn.context_name, namespace=conn.namespace,
                                   now=datetime.now(timezone.utc),
                                   network=network.stdout if network.success else None, gpu=cluster_gpu,
-                                  **outputs)
+                                  **outputs), has_gpu
         except ValueError as exc:
             # JSON 이 아니거나 items 가 목록이 아닐 때만 (json.JSONDecodeError 도 ValueError). 우리 코드의 버그는 500 으로 둔다.
             # 원문은 클러스터 내용이라 남기지 않고 예외 종류·위치만 남긴다
@@ -137,11 +148,17 @@ async def cluster_overview(
                                       "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
 
     # 연결 확인과 같은 이유로 스레드로 넘긴다 — kubectl 이 도는 동안 서버 전체가 멈추지 않게
-    return await to_thread.run_sync(collect, limiter=thread_limiter("overview", OVERVIEW_WORKERS))
+    body, has_gpu = await to_thread.run_sync(collect, limiter=thread_limiter("overview", OVERVIEW_WORKERS))
+    await _record_gpu(conn, has_gpu)
+    return body
 
 
-def _collect_gpu(run, *, namespace_pods: str, clock=time.monotonic) -> dict[str, Any] | None:
-    """개요의 gpu 칸 (clusters/gpu.py 의 "읽는 순서"). 어느 단계가 실패해도 오류로 올리지 않는다 — 부가 정보다.
+def _collect_gpu(
+    run, *, namespace_pods: str, clock=time.monotonic,
+) -> tuple[dict[str, Any] | None, bool | None]:
+    """(개요의 gpu 칸, GPU 노드 유무) — clusters/gpu.py 의 "읽는 순서". 어느 단계가 실패해도 오류로 올리지 않는다.
+
+    유무는 노드 목록을 읽었을 때만 True·False 이고, 못 읽었으면 None(모른다)이다.
 
     run(args, timeout) 은 개요와 같은 임시 kubeconfig 로 kubectl 을 돌린다. 실패 원문(사용자·ARN 이 실린다)은
     남기지 않고 갈래만 debug 로 남긴다 — 고객 클러스터는 노드를 못 읽는 게 보통이라 대시보드가 부를 때마다 난다.
@@ -155,17 +172,17 @@ def _collect_gpu(run, *, namespace_pods: str, clock=time.monotonic) -> dict[str,
     nodes_result = run(gpu.NODES_COMMAND, budget(OVERVIEW_TIMEOUT))
     if not nodes_result.success:
         logger.debug("개요의 GPU 조회를 건너뛴다 (노드): %s", _failure_status(nodes_result.stderr or nodes_result.stdout))
-        return None
+        return None, None
     try:
         nodes = gpu.gpu_nodes(nodes_result.stdout)
     except (ValueError, AttributeError, TypeError):
         logger.debug("개요의 GPU 조회를 건너뛴다 (노드 목록을 읽지 못했다)")
-        return None
+        return None, None
     if not nodes:
-        return None
+        return None, False
 
     if budget(OVERVIEW_TIMEOUT) < 1:
-        return gpu.build(nodes, [])
+        return gpu.build(nodes, []), True
     pods_result = run(gpu.PODS_COMMAND, budget(OVERVIEW_TIMEOUT))
     if not pods_result.success:
         # 모든 namespace 를 못 읽으면 개요가 이미 읽은 클러스터 namespace 에서만 찾는다
@@ -203,7 +220,41 @@ def _collect_gpu(run, *, namespace_pods: str, clock=time.monotonic) -> dict[str,
     for (_, pod, _, node), text in zip(vllm, texts[len(dcgm_rows):]):
         if text is not None:
             serving.extend(gpu.serving_rows(text, pod=pod, node=node))
-    return gpu.build(nodes, serving)
+    return gpu.build(nodes, serving), True
+
+
+def _has_gpu(nodes: KubectlResult) -> bool | None:
+    """연결 확인의 노드 목록으로 본 GPU 노드 유무. 못 읽었으면 None."""
+    if not nodes.success:
+        return None
+    try:
+        return bool(gpu.gpu_nodes(nodes.stdout))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+async def _record_gpu(conn: server_api.ClusterConnection, has_gpu: bool | None) -> bool:
+    """알아낸 GPU 노드 유무가 server 에 남은 값과 다를 때만 남긴다 — 개요는 대시보드가 띄울 때마다 부른다.
+
+    모르면(None) 남기지 않는다 — 권한이 없어진 클러스터의 마지막 값을 지우지 않는다. 읽는 사이 kubeconfig 가 바뀌었으면
+    server 가 지문으로 가려 409 CLUSTER_CHANGED 다 (kukie-server#82 리뷰). 남기지 못해도 오류로 올리지 않는다:
+    부가 정보라 개요·연결 확인을 실패로 만들 까닭이 없고, 다음 호출이 다시 남긴다.
+    server 의 값이 이제 has_gpu 와 같은가(이미 같았거나 남겼다)를 준다.
+    """
+    if has_gpu is None:
+        return False
+    if has_gpu == conn.has_gpu:
+        return True
+    if not conn.fingerprint:
+        # server 가 늘 409 로 거절할 호출이다 — 부르지 않되 동기화가 멈춘 것은 남긴다
+        logger.warning("클러스터 %s 의 GPU 여부를 남기지 못했다: 연결 정보에 지문이 없다", conn.cluster_id)
+        return False
+    try:
+        await server_api.update_cluster_gpu(conn.cluster_id, has_gpu=has_gpu, fingerprint=conn.fingerprint)
+    except server_api.ServerError as exc:
+        logger.warning("클러스터 %s 의 GPU 여부를 남기지 못했다: %s", conn.cluster_id, exc.code)
+        return False
+    return True
 
 
 def _raise_kubectl_failure(stderr: str) -> None:
