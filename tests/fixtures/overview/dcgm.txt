@@ -1,0 +1,15 @@
+# HELP DCGM_FI_DEV_GPU_UTIL GPU utilization (in %).
+# TYPE DCGM_FI_DEV_GPU_UTIL gauge
+DCGM_FI_DEV_GPU_UTIL{gpu="0",UUID="GPU-11111111",pci_bus_id="00000000:30:00.0",device="nvidia0",modelName="NVIDIA L40S",Hostname="ip-10-60-43-165",DCGM_FI_DRIVER_VERSION="580.95.05"} 87
+# HELP DCGM_FI_DEV_FB_USED Framebuffer memory used (in MiB).
+# TYPE DCGM_FI_DEV_FB_USED gauge
+DCGM_FI_DEV_FB_USED{gpu="0",UUID="GPU-11111111",pci_bus_id="00000000:30:00.0",device="nvidia0",modelName="NVIDIA L40S",Hostname="ip-10-60-43-165",DCGM_FI_DRIVER_VERSION="580.95.05"} 41820
+# HELP DCGM_FI_DEV_FB_FREE Framebuffer memory free (in MiB).
+# TYPE DCGM_FI_DEV_FB_FREE gauge
+DCGM_FI_DEV_FB_FREE{gpu="0",UUID="GPU-11111111",pci_bus_id="00000000:30:00.0",device="nvidia0",modelName="NVIDIA L40S",Hostname="ip-10-60-43-165",DCGM_FI_DRIVER_VERSION="580.95.05"} 3726
+# HELP DCGM_FI_DEV_GPU_TEMP GPU temperature (in C).
+# TYPE DCGM_FI_DEV_GPU_TEMP gauge
+DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-11111111",pci_bus_id="00000000:30:00.0",device="nvidia0",modelName="NVIDIA L40S",Hostname="ip-10-60-43-165",DCGM_FI_DRIVER_VERSION="580.95.05"} 61
+# HELP DCGM_FI_DEV_POWER_USAGE Power draw (in W).
+# TYPE DCGM_FI_DEV_POWER_USAGE gauge
+DCGM_FI_DEV_POWER_USAGE{gpu="0",UUID="GPU-11111111",pci_bus_id="00000000:30:00.0",device="nvidia0",modelName="NVIDIA L40S",Hostname="ip-10-60-43-165",DCGM_FI_DRIVER_VERSION="580.95.05"} 284.312

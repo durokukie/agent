@@ -5,7 +5,8 @@ kubectl 은 clusters_api.py 가 돌리고, 여기는 그 출력(JSON 문자열)�
 
 조회 범위는 클러스터에 등록된 namespace 하나다. EKS 고객 클러스터는 namespace 범위 Edit 만 주므로
 `-A`·`get nodes` 같은 클러스터 범위 조회는 하지 않는다 (READ_COMMANDS 가 그 목록이다).
-예외는 CNI 를 알아보는 NETWORK_COMMAND 하나다 — kube-system 의 DaemonSet 만 읽고, 못 읽으면 network 를 null 로 둔다.
+예외는 CNI 를 알아보는 NETWORK_COMMAND(kube-system 의 DaemonSet)와 GPU 를 알아보는 gpu.py 의 조회(노드·모든 파드·지표)다.
+둘 다 못 읽으면 그 칸(network·gpu)만 null 이고 개요는 그대로다.
 
 네트워크(CNI) — network
   EKS 애드온이 아닌 CNI(예: Helm 으로 깐 Cilium)도 대시보드가 보이도록 kube-system 의 DaemonSet 이름으로 알아본다.
@@ -80,11 +81,12 @@ WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet")
 
 def build(
     *, context: str, namespace: str, workloads: str, pods: str, events: str, now: datetime,
-    network: str | None = None,
+    network: str | None = None, gpu: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """READ_COMMANDS 세 번의 stdout(JSON) 으로 ClusterOverview 응답을 만든다.
 
     network 는 NETWORK_COMMAND 의 stdout 이다. 그 조회가 실패했으면 None 을 넘긴다 — 응답의 network 는 null.
+    gpu 는 gpu.build 가 만든 칸 그대로다 (조회가 여러 번이라 부르는 쪽이 모은다). GPU 노드가 없거나 못 읽으면 None.
     """
     return {
         "context": context,
@@ -94,6 +96,7 @@ def build(
         "pods": parse_pods(_items(pods), now),
         "events": parse_events(_items(events)),
         "network": parse_network(network),
+        "gpu": gpu,
     }
 
 

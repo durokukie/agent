@@ -35,8 +35,9 @@ def built() -> dict:
 def test_응답_머리는_context_namespace_수집시각이다():
     body = built()
     assert (body["context"], body["namespace"], body["at"]) == ("eks-shop", "shop", "2026-10-19T12:00:00Z")
-    assert set(body) == {"context", "namespace", "at", "workloads", "pods", "events", "network"}
+    assert set(body) == {"context", "namespace", "at", "workloads", "pods", "events", "network", "gpu"}
     assert body["network"] is None                                           # CNI 조회 출력을 안 넘기면 null
+    assert body["gpu"] is None                                               # GPU 칸을 안 넘기면 null (clusters/gpu.py)
 
 
 def test_워크로드_상태_판정():
@@ -240,7 +241,7 @@ def _result(stdout: str = "", *, stderr: str = "", success: bool = True) -> Kube
 
 def _by_resource(args: list[str]) -> KubectlResult:
     return _result(fixture({"deployments,statefulsets,daemonsets": "workloads", "pods": "pods",
-                            "events": "events", "daemonsets": "daemonsets"}[args[1]]))
+                            "events": "events", "daemonsets": "daemonsets", "nodes": "nodes"}[args[1]]))
 
 
 def test_인증_없으면_401(client, fake_server):
@@ -276,6 +277,7 @@ def test_팀_구성원은_개요를_읽고_namespace_범위로만_조회한다(c
     assert (body["context"], body["namespace"]) == ("eks-shop", "shop")
     assert len(body["workloads"]) == 7 and len(body["pods"]) == 5 and len(body["events"]) == 20
     assert body["network"] == {"name": "Cilium", "version": "1.20.3", "source": "daemonset"}
+    assert body["gpu"] is None                                               # GPU 노드가 없다 (test_cluster_gpu.py)
     assert datetime.fromisoformat(body["at"]).tzinfo is not None
     assert "secret-token" not in r.text
     assert [call["args"] for call in seen] == [
@@ -283,14 +285,15 @@ def test_팀_구성원은_개요를_읽고_namespace_범위로만_조회한다(c
         ["get", "pods", "-o", "json", "-n", "shop"],
         ["get", "events", "-o", "json", "-n", "shop"],
         ["get", "daemonsets", "-o", "json", "-n", "kube-system"],          # CNI — 앞의 세 조회 뒤에 한 번
+        ["get", "nodes", "-o", "json"],                                     # GPU — 노드 목록 (못 읽으면 gpu 만 null)
     ]
-    # 클러스터 범위 조회는 하지 않는다 — EKS 고객 클러스터는 namespace Edit 만 준다
-    assert not any(flag in call["args"] for call in seen for flag in ("-A", "--all-namespaces", "nodes"))
-    assert all(call["args"].count("-n") == 1 for call in seen)
+    # 클러스터 범위 조회는 GPU 를 알아보는 노드 목록뿐이다 — GPU 노드가 없으면 모든 namespace 파드는 읽지 않는다
+    assert not any(flag in call["args"] for call in seen for flag in ("-A", "--all-namespaces"))
+    assert all(call["args"].count("-n") == 1 for call in seen[:4])
     assert {call["context"] for call in seen} == {"eks-shop"} and not any(call["dry_run"] for call in seen)
     # 대시보드가 자주 부른다 — 기본 30초보다 짧게 끊는다
     assert {call["timeout"] for call in seen} == {clusters_api.OVERVIEW_TIMEOUT} and clusters_api.OVERVIEW_TIMEOUT < 30
-    # server 에서 받은 값으로 만든 임시 kubeconfig 하나로 네 번 돌리고, 끝나면 지운다
+    # server 에서 받은 값으로 만든 임시 kubeconfig 하나로 다섯 번 돌리고, 끝나면 지운다
     assert all("secret-token" in call["body"] for call in seen)
     assert len({call["kubeconfig"] for call in seen}) == 1 and not seen[0]["kubeconfig"].exists()
     # 읽기 전용 — 상태를 남기지 않는다

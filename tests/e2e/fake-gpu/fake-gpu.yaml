@@ -1,0 +1,35 @@
+# 가짜 GPU 지표 — kind 노드에 붙인 nvidia.com/gpu 와 함께 개요의 gpu 칸을 손으로 확인할 때 쓴다 (DURO-118).
+# 이미지는 busybox 를 이름만 바꾼 것이다(에이전트는 이미지 이름의 dcgm-exporter·vllm 으로 찾는다). 절차는 README.md.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: nvidia-dcgm-exporter, namespace: gpu-operator}
+spec:
+  selector: {matchLabels: {app: nvidia-dcgm-exporter}}
+  template:
+    metadata: {labels: {app: nvidia-dcgm-exporter}}
+    spec:
+      containers:
+        - name: nvidia-dcgm-exporter
+          image: local/fake-dcgm-exporter:test
+          imagePullPolicy: Never
+          command: ["sh", "-c", "mkdir -p /www && cp /m/metrics /www/metrics && exec httpd -f -p 9400 -h /www"]
+          ports: [{name: metrics, containerPort: 9400}]
+          volumeMounts: [{name: metrics, mountPath: /m}]
+      volumes: [{name: metrics, configMap: {name: fake-dcgm-metrics}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: vllm-gpt-oss-20b, namespace: default}
+spec:
+  selector: {matchLabels: {app: vllm-gpt-oss-20b}}
+  template:
+    metadata: {labels: {app: vllm-gpt-oss-20b}}
+    spec:
+      containers:
+        - name: vllm
+          image: local/fake-vllm-openai:test
+          imagePullPolicy: Never
+          command: ["sh", "-c", "mkdir -p /www && cp /m/metrics /www/metrics && exec httpd -f -p 8000 -h /www"]
+          ports: [{name: http, containerPort: 8000}]
+          volumeMounts: [{name: metrics, mountPath: /m}]
+      volumes: [{name: metrics, configMap: {name: fake-vllm-metrics}}]
