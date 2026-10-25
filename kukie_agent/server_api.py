@@ -429,9 +429,13 @@ async def update_cluster_status(cluster_id: str, *, status: str, checked_at: dat
     return await _call("PATCH", _path("clusters", cluster_id, "status"), body={"status": status, "checkedAt": at})
 
 
-async def update_cluster_gpu(cluster_id: str, *, has_gpu: bool) -> dict[str, Any]:
-    """노드 목록으로 알아낸 GPU 노드 유무 (DURO-118). 앱은 클러스터 목록의 이 값으로 GPU 아이콘을 띄운다."""
-    return await _call("PATCH", _path("clusters", cluster_id, "gpu"), body={"hasGpu": has_gpu})
+async def update_cluster_gpu(cluster_id: str, *, has_gpu: bool, fingerprint: str) -> dict[str, Any]:
+    """노드 목록으로 알아낸 GPU 노드 유무 (DURO-118). 앱은 클러스터 목록의 이 값으로 GPU 아이콘을 띄운다.
+
+    fingerprint 는 노드를 읽을 때 쓴 연결 정보의 지문이다 — 그 사이 kubeconfig 가 바뀌었으면 server 가 409 CLUSTER_CHANGED.
+    """
+    return await _call("PATCH", _path("clusters", cluster_id, "gpu"),
+                       body={"hasGpu": has_gpu, "fingerprint": fingerprint})
 
 
 # ── Action Plan ────────────────────────────────────────────

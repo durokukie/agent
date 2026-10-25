@@ -544,3 +544,20 @@ def test_연결_확인은_server_값과_같으면_부르지_않고_그_값을_�
                         else _result("{}" if args[0] == "version" else "yes"))
     assert client.post(f"/clusters/{cluster}/test", headers=USER).json()["has_gpu"] is False
     assert _gpu_calls(fake_server) == []
+
+
+def test_읽는_사이_kubeconfig가_바뀌었으면_GPU_여부를_남기지_않는다(client, fake_server, monkeypatch):
+    """노드를 읽은 연결의 지문을 같이 보낸다 — 그 사이 바뀌었으면 server 가 409 (kukie-server#82 리뷰)."""
+    cluster = fake_server.add_cluster(namespace="web")
+
+    def fake(args, **kwargs):
+        if args == gpu.NODES_COMMAND:
+            fake_server.clusters[cluster]["fingerprint"] = "새-지문"           # 읽는 사이 kubeconfig 를 바꿨다
+            return _result(fixture("gpu_nodes.json"))
+        return _result("{}" if args[0] == "version" else "yes")
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    r = client.post(f"/clusters/{cluster}/test", headers=USER)
+    assert r.json()["status"] == "connected" and r.json()["has_gpu"] is None
+    assert [body["fingerprint"] for body in _gpu_calls(fake_server)] == [f"fp-{cluster}"]
+    assert fake_server.clusters[cluster]["hasGpu"] is None

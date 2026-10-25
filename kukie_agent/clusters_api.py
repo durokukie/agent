@@ -236,7 +236,8 @@ def _has_gpu(nodes: KubectlResult) -> bool | None:
 async def _record_gpu(conn: server_api.ClusterConnection, has_gpu: bool | None) -> bool:
     """알아낸 GPU 노드 유무가 server 에 남은 값과 다를 때만 남긴다 — 개요는 대시보드가 띄울 때마다 부른다.
 
-    모르면(None) 남기지 않는다 — 권한이 없어진 클러스터의 마지막 값을 지우지 않는다. 남기지 못해도 오류로 올리지 않는다:
+    모르면(None) 남기지 않는다 — 권한이 없어진 클러스터의 마지막 값을 지우지 않는다. 읽는 사이 kubeconfig 가 바뀌었으면
+    server 가 지문으로 가려 409 CLUSTER_CHANGED 다 (kukie-server#82 리뷰). 남기지 못해도 오류로 올리지 않는다:
     부가 정보라 개요·연결 확인을 실패로 만들 까닭이 없고, 다음 호출이 다시 남긴다.
     server 의 값이 이제 has_gpu 와 같은가(이미 같았거나 남겼다)를 준다.
     """
@@ -245,7 +246,7 @@ async def _record_gpu(conn: server_api.ClusterConnection, has_gpu: bool | None) 
     if has_gpu == conn.has_gpu:
         return True
     try:
-        await server_api.update_cluster_gpu(conn.cluster_id, has_gpu=has_gpu)
+        await server_api.update_cluster_gpu(conn.cluster_id, has_gpu=has_gpu, fingerprint=conn.fingerprint)
     except server_api.ServerError as exc:
         logger.warning("클러스터 GPU 여부를 남기지 못했다: %s", exc.code)
         return False
