@@ -438,7 +438,7 @@ def test_Forbidden인_namespace만_기억에서_빼고_시간_초과한_것은_�
     assert sorted(args[3] for args in calls) == ["a", "slow"]
 
 
-def test_기억은_TTL이_지나면_다시_목록을_읽고_옛_항목은_지운다():
+def test_기억은_TTL이_지나면_다시_목록을_읽고_오래된_항목은_지운다():
     now = [0.0]
     calls: list[list[str]] = []
 
@@ -446,15 +446,89 @@ def test_기억은_TTL이_지나면_다시_목록을_읽고_옛_항목은_지운
         calls.append(args)
         return _result(_namespaces("a")) if args == gpu.NAMESPACES_COMMAND else _result("{}")
 
-    clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, cache_key="old",
-                                    clock=lambda: now[0])
+    def call(key):
+        clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, cache_key=key,
+                                        clock=lambda: now[0])
+
+    call("gone")                                   # 다시 부르지 않는 연결
+    call("live")
     now[0] += clusters_api.READABLE_NAMESPACES_TTL
-    clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, cache_key="new",
-                                    clock=lambda: now[0])
-    clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, cache_key="old",
-                                    clock=lambda: now[0])
+    call("live")                                   # TTL 이 지나 목록을 다시 읽는다
     assert calls.count(gpu.NAMESPACES_COMMAND) == 3
-    assert set(clusters_api._readable_namespaces) == {"old", "new"}
+    assert "gone" in clusters_api._readable_namespaces       # TTL 두 배까지는 남긴다
+    now[0] += clusters_api.READABLE_NAMESPACES_TTL
+    call("live")
+    assert set(clusters_api._readable_namespaces) == {"live"}
+
+
+def test_기억을_쓰는_라운드에서도_Forbidden은_빼고_TTL은_늘리지_않는다():
+    now = [0.0]
+    denied = {"b"}
+    calls: list[list[str]] = []
+
+    def run(args, timeout):
+        calls.append(args)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("a", "b"))
+        if args[3] in denied:
+            return _result(stderr=FORBIDDEN, success=False)
+        return _result(stderr="context deadline exceeded", success=False)  # a 는 처음에 느렸다
+
+    def call():
+        clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, cache_key="k",
+                                        clock=lambda: now[0])
+
+    denied = set()
+    call()                                         # 둘 다 시간 초과 → 둘 다 남는다
+    assert clusters_api._readable_namespaces["k"][1] == ("a", "b")
+    denied = {"b"}
+    now[0] += 10
+    call()                                         # 기억을 쓰는 라운드: b 가 Forbidden 으로 확인돼 빠진다
+    assert clusters_api._readable_namespaces["k"][:2] == (0.0, ("a",))
+    assert calls.count(gpu.NAMESPACES_COMMAND) == 1
+
+
+def test_예산이_모자라_못_닿은_namespace는_다음에_맨_앞에서_읽는다():
+    budget_left = [2]
+    seen: list[str] = []
+
+    def run(args, timeout):
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("a", "b", "c"))
+        seen.append(args[3])
+        return _result("{}")
+
+    def budget(limit):
+        budget_left[0] -= 1
+        return limit if budget_left[0] >= 0 else 0
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
+        budget_left[0] = 4                         # 목록(확인·조회) 2번 + namespace 2개
+        clusters_api._pods_by_namespace(run, budget, "{}", namespace=None, cache_key="k")
+        assert seen == ["a", "b"]
+        seen.clear()
+        budget_left[0] = 1
+        clusters_api._pods_by_namespace(run, budget, "{}", namespace=None, cache_key="k")
+        assert seen == ["c"]                       # 지난번에 잘린 c 가 먼저
+
+
+def test_연결_지문이_없으면_namespace를_기억하지_않는다(client, fake_server, monkeypatch):
+    cluster = fake_server.add_cluster(namespace="shop")
+    fake_server.clusters[cluster]["fingerprint"] = ""
+
+    def fake(args, **kwargs):
+        if args == gpu.PODS_COMMAND:
+            return _result(stderr=FORBIDDEN, success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("llm"))
+        if args[:3] == ["get", "pods", "-n"]:
+            return _result("{}")
+        return _gpu_cluster(args)
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    assert client.get(f"/clusters/{cluster}/overview", headers=USER).status_code == 200
+    assert clusters_api._readable_namespaces == {}
 
 def test_namespace_탐색은_남은_GPU_예산의_절반까지만_쓴다(monkeypatch):
     """느린 API 서버에서도 지표를 읽을 시간을 남긴다 (agent#120 리뷰)."""
