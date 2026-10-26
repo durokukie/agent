@@ -4,7 +4,7 @@ overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순�
 
 읽는 순서 (clusters_api.cluster_overview)
   1. NODES_COMMAND   노드 목록. 못 읽으면(고객 EKS 는 namespace 범위 권한뿐이라 Forbidden) 여기서 멈추고 gpu 는 null.
-                     GPU 노드가 없어도 null — 앱은 null 이면 GPU 화면을 띄우지 않는다
+                     GPU 노드가 없으면 GPU 를 기다리는 파드(waiting)를 찾는다 — 아래 "꺼진 GPU 클러스터"
   2. PODS_COMMAND    모든 namespace 의 파드. GPU 노드 위의 DCGM exporter·vLLM 파드를 찾는다. 못 읽으면 NAMESPACES_COMMAND 로
                      namespace 를 읽고 namespace 마다 파드를 읽어 읽힌 것만 모은다 — Kukie GPU 읽기 RBAC
                      (kukie-infra customer-templates/gpu-read-rbac-v1.yaml)는 namespace 목록은 클러스터 전체에, 파드 목록은 고객이
@@ -38,6 +38,14 @@ GPU 노드 — nodes
   p95 는 Prometheus histogram_quantile 처럼 버킷 안에서 선형으로 나눈 값이다. 히스토그램은 서빙 프로세스가 뜬 뒤 누적이라
   "지금 5분" 이 아니라 "뜬 뒤 전체" 의 p95 다 — 한 번 읽기로는 구간을 자를 수 없다. 요청이 없었으면 null.
   vLLM 지표가 하나도 없는 파드(라우터 등)는 빠진다.
+
+꺼진 GPU 클러스터 — waiting
+  GPU 노드 그룹을 0대로 내려 둔 클러스터(우리 kukie-gpu 처럼 평소 0대)는 노드 목록에 GPU 노드가 없다. 그래도 GPU 를 요청한
+  파드(vLLM 등)가 남아 Pending 이면 "GPU 클러스터인데 지금 꺼짐" 이다. 그 파드를 waiting 에 싣고 nodes 는 빈 배열로 둔다.
+  끝난 파드(Succeeded·Failed)는 세지 않는다. 파드는 2와 같은 길로 찾는다(이때는 지표를 읽지 않으니 남은 예산을 다 쓴다). 다만 server 의 hasGpu 가 false 인 클러스터
+  (GPU 가 없다고 이미 안 곳)는 찾지 않는다 — GPU 없는 클러스터마다 개요 때 파드 조회가 늘지 않게. 그런 곳도 몇 분에 한 번은
+  다시 찾는다(clusters_api.GPU_ABSENT_RECHECK — 0대인 채 GPU 워크로드를 새로 올린 경우). GPU 노드가 있을 때도
+  같은 파드 목록에서 GPU 를 기다리는 파드를 waiting 에 싣는다(늘어나는 중인 레플리카 등).
 
 측정 기록 — benchmarks
   측정 Job 도구가 아직 없어 늘 빈 배열이다. 계약(api-spec §3)대로 채울 때는 에이전트가 거른다 — 우리 GPU 클러스터의 팀 Admin 만.
@@ -182,15 +190,17 @@ def vllm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> list[t
     return targets[:MAX_METRIC_TARGETS]
 
 
-def namespace_names(stdout: str, *, skip: str | None = None, prefer: set[str] | frozenset[str] = frozenset()) -> list[str]:
-    """파드를 읽어 볼 namespace — kube-* 와 skip(개요가 이미 읽은 클러스터 namespace)은 뺀다(Kukie 역할은 시스템
-    namespace 를 읽지 않는다). prefer(GPU 지표 파드가 나온 적 있는 것)와 GPU 쪽 이름이 먼저, 그다음 이름순으로
-    MAX_POD_NAMESPACES 개까지 — 상한이 지표 namespace 를 자르지 않게. 모양이 다르면 ValueError."""
+def namespace_names(stdout: str, *, skip: str | None = None,
+                    prefer: set[str] | frozenset[str] = frozenset()) -> tuple[list[str], bool]:
+    """(파드를 읽어 볼 namespace, 목록 전부인가) — kube-* 와 skip(개요가 이미 읽은 클러스터 namespace)은 뺀다(Kukie 역할은
+    시스템 namespace 를 읽지 않는다). prefer(GPU 지표·기다리는 파드가 나온 적 있는 것)와 GPU 쪽 이름이 먼저, 그다음
+    이름순으로 MAX_POD_NAMESPACES 개까지 — 상한이 지표 namespace 를 자르지 않게. 잘랐으면 두 번째 값이 False 다
+    (끝까지 읽었다고 말할 수 없다). 모양이 다르면 ValueError."""
     names = sorted({name for item in _items(stdout)
                     if isinstance(name := (item.get("metadata") or {}).get("name"), str) and name
                     and not name.startswith("kube-") and name != skip})
     names.sort(key=lambda name: not (name in prefer or hinted_namespace(name)))
-    return names[:MAX_POD_NAMESPACES]
+    return names[:MAX_POD_NAMESPACES], len(names) <= MAX_POD_NAMESPACES
 
 
 def hinted_namespace(name: str) -> bool:
@@ -201,6 +211,38 @@ def hinted_namespace(name: str) -> bool:
 def namespace_pods_command(namespace: str) -> list[str]:
     """namespace 하나의 파드 목록 kubectl 인자 (모듈 설명 "읽는 순서" 2의 대체 길)."""
     return ["get", "pods", "-n", namespace, "-o", "json"]
+
+
+def waiting_pods(stdout: str) -> list[dict[str, Any]]:
+    """GPU 를 요청했는데 아직 돌지 않는 파드 — [{namespace, pod, gpus, phase}]. 끝난 파드(Succeeded·Failed)와 Running 은 뺀다.
+    이름순으로 MAX_METRIC_TARGETS 개까지. 모양이 다르면 ValueError."""
+    rows: list[dict[str, Any]] = []
+    for item in _items(stdout):
+        meta = item.get("metadata")
+        phase = (item.get("status") or {}).get("phase") or "Pending"
+        if not isinstance(meta, dict) or not meta.get("name") or phase in ("Running", "Succeeded", "Failed"):
+            continue
+        gpus = sum(_requested_gpus(c) for c in _containers(item))
+        if gpus:
+            rows.append({"namespace": meta.get("namespace") or "default", "pod": meta["name"],
+                         "gpus": gpus, "phase": phase})
+    rows.sort(key=lambda r: (r["namespace"], r["pod"]))
+    return rows[:MAX_METRIC_TARGETS]
+
+
+def _requested_gpus(container: dict[str, Any]) -> int:
+    """컨테이너가 요청한 GPU 수. 확장 자원은 limits 만 적어도 requests 가 같은 값이 된다 — 둘 중 큰 것."""
+    resources = container.get("resources") or {}
+    return max((_positive_int((resources.get(kind) or {}).get(name))
+                for kind in ("limits", "requests") for name in GPU_RESOURCES), default=0)
+
+
+def has_waiting_pods(stdout: str) -> bool:
+    """파드 목록에 GPU 를 기다리는 파드가 있는가. 모양이 다르면 False (기억을 고칠 때만 쓴다)."""
+    try:
+        return bool(waiting_pods(stdout))
+    except (ValueError, AttributeError, TypeError):
+        return False
 
 
 def has_gpu_targets(stdout: str, gpu_node_names: set[str]) -> bool:
@@ -392,11 +434,13 @@ def _ms(seconds: float | None) -> float | None:
 
 # ── 합치기 ───────────────────────────────────────────────
 
-def build(nodes: list[dict[str, Any]], serving: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """ClusterGpu. GPU 노드가 없으면 None — 앱은 GPU 화면을 띄우지 않는다."""
-    if not nodes:
+def build(nodes: list[dict[str, Any]], serving: list[dict[str, Any]],
+          waiting: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    """ClusterGpu. GPU 노드도 GPU 를 기다리는 파드도 없으면 None — 앱은 "GPU 노드가 없어요" 를 띄운다.
+    노드는 없고 기다리는 파드만 있으면 꺼진 GPU 클러스터다(nodes 빈 배열)."""
+    if not nodes and not waiting:
         return None
-    return {"nodes": nodes, "serving": serving, "benchmarks": []}
+    return {"nodes": nodes, "serving": serving, "benchmarks": [], "waiting": waiting or []}
 
 
 # ── Prometheus 글 형식 ────────────────────────────────────
