@@ -68,7 +68,7 @@ GPU_METRICS_WORKERS = 4
 #:          읽지 않게 (agent#121 리뷰)
 #: 둘 다 이 프로세스에서 기록이 없으면(처음 봤거나 오래 안 불러 지웠으면) 바로 한 번 찾는다 — 오래 안 부른 연결이 다시
 #: 와도 미뤄지지 않게 (agent#121 리뷰). 재시작·하루 넘게 안 부른 연결마다 한 번 더 찾는 값이다.
-#: 파드 조회를 실제로 보낸 라운드만 센다 — 예산이 모자라 조회를 보내지도 못한 라운드는 간격을 태우지 않는다. 보냈는데 거부·
+#: 파드 조회를 보낸 라운드만 센다 — 예산이 모자라 조회를 보내지 못하는 라운드는 창을 잡기 전에 끝난다. 보냈는데 거부·
 #: 시간 초과로 못 읽은 라운드는 센다 — 끝까지 못 읽는 곳(GPU 읽기 RBAC 가 없는 곳 등)이 개요마다 다시 묻지 않게 (agent#121 리뷰).
 #: 프로세스 안 시각이라 복제본마다·재시작마다 따로 센다
 GPU_ABSENT_RECHECK = 600
@@ -261,7 +261,7 @@ def _collect_gpu(
     때만이다 — 모든 namespace 파드를 읽었거나, namespace 마다 읽은 것이 전부 성공·거부로 끝났을 때. 시간 초과·예산 부족·
     파드 목록 파싱 실패로 못 본 곳이 있으면 None 이다(꺼진 GPU 클러스터를 한 번의 실패로 "GPU 없음" 으로 덮지 않게).
     known 은 server 에 남은 값이다. True(GPU 클러스터)가 아니면 노드가 없을 때 파드를 GPU_ABSENT_RECHECK 초에 한 번만
-    찾는다(_claim_absent_search) — 이 프로세스에서 기록이 없으면 바로 한 번. 그 사이에는 (None, 지금 값) 이다.
+    찾는다(_absent_search_due) — 이 프로세스에서 기록이 없으면 바로 한 번. 그 사이에는 (None, 지금 값) 이다.
 
     run(args, timeout) 은 개요와 같은 임시 kubeconfig 로 kubectl 을 돌린다. 실패 원문(사용자·ARN 이 실린다)은
     남기지 않고 갈래만 debug 로 남긴다 — 고객 클러스터는 노드를 못 읽는 게 보통이라 대시보드가 부를 때마다 난다.
@@ -281,15 +281,11 @@ def _collect_gpu(
     except (ValueError, AttributeError, TypeError):
         logger.debug("개요의 GPU 조회를 건너뛴다 (노드 목록을 읽지 못했다)")
         return None, None
-    claim: _AbsentClaim | None = None
-    if not nodes and known is not True:
-        claim = _claim_absent_search(cache_key, unknown=known is None, clock=clock)
-        if claim is None:
-            return None, (False if known is False else None)
-
     if budget(OVERVIEW_TIMEOUT) < 1:
-        _release_absent_search(cache_key, claim)            # 파드를 못 읽었으니 간격을 태우지 않는다
         return gpu.build(nodes, []), (True if nodes else None)
+    # 예산을 본 뒤에 창을 잡는다 — 바로 아래에서 파드 조회를 늘 보내므로, 잡은 창은 조회를 보낸 라운드다
+    if not nodes and known is not True and not _absent_search_due(cache_key, unknown=known is None, clock=clock):
+        return None, (False if known is False else None)
     gpu_node_names = {row["node"] for row in nodes}
     pods_result = run(gpu.PODS_COMMAND, budget(OVERVIEW_TIMEOUT))
     if pods_result.success:
@@ -364,48 +360,28 @@ class _NamespaceMemo:
 #: 연결을 바꾸면 키가 달라져 옛 기억을 쓰지 않는다
 _readable_namespaces: dict[str, _NamespaceMemo] = {}
 _readable_lock = threading.Lock()
-#: 연결마다 GPU 노드 없는 곳에서 기다리는 파드를 마지막으로 찾은 시각 — _claim_absent_search
+#: 연결마다 GPU 노드 없는 곳에서 기다리는 파드를 마지막으로 찾은 시각 — _absent_search_due
 _gpu_absent_checked: dict[str, float] = {}
 
 
-@dataclass(frozen=True)
-class _AbsentClaim:
-    """이번 개요가 찾기로 한 창 — 못 읽고 끝나면 _release_absent_search 가 이전 시각으로 되돌린다."""
-    at: float
-    previous: float | None
-
-
-def _claim_absent_search(cache_key: str | None, *, unknown: bool, clock=time.monotonic) -> _AbsentClaim | None:
-    """GPU 노드가 없는 연결에서 지금 기다리는 파드를 찾을 때면 그 창을 잡는다 (GPU_ABSENT_RECHECK). 아니면 None.
-    기록이 없으면 바로, 있으면 마지막으로 찾은 뒤 간격이 지났을 때. 창은 잠금 안에서 바로 잡는다 — 같은 연결의 개요가
-    동시에 와도 한 번만 찾게 (agent#121 리뷰). 연결 지문이 없으면(cache_key None) 셀 키가 없다 — 모르는 곳(unknown,
-    server 값 null)은 찾고, false 는 찾지 않는다(지금 서버는 등록한 클러스터마다 지문을 준다)."""
-    now = clock()
+def _absent_search_due(cache_key: str | None, *, unknown: bool, clock=time.monotonic) -> bool:
+    """GPU 노드가 없는 연결에서 지금 기다리는 파드를 찾을 때인가 (GPU_ABSENT_RECHECK). 기록이 없으면 바로, 있으면 마지막으로
+    찾은 뒤 간격이 지났을 때. True 면 그 자리에서 시각을 남긴다 — 잠금 안이라 같은 연결의 개요가 동시에 와도 한 번만
+    찾는다 (agent#121 리뷰). 부르는 쪽은 예산을 본 뒤에 불러 True 면 반드시 파드 조회를 보낸다.
+    연결 지문이 없으면(cache_key None) 셀 키가 없다 — 모르는 곳(unknown, server 값 null)은 찾고, false 는 찾지 않는다
+    (지금 서버는 등록한 클러스터마다 지문을 준다)."""
     if cache_key is None:
-        return _AbsentClaim(at=now, previous=None) if unknown else None
+        return unknown
+    now = clock()
     with _readable_lock:
         for key in [key for key, at in _gpu_absent_checked.items()
                     if key != cache_key and now - at >= GPU_ABSENT_RECHECK_FORGET]:
             del _gpu_absent_checked[key]
         last = _gpu_absent_checked.get(cache_key)
         if last is not None and now - last < GPU_ABSENT_RECHECK:
-            return None
+            return False
         _gpu_absent_checked[cache_key] = now
-        return _AbsentClaim(at=now, previous=last)
-
-
-def _release_absent_search(cache_key: str | None, claim: _AbsentClaim | None) -> None:
-    """잡은 창에서 파드를 하나도 못 읽었다 — 이전 시각으로 되돌려 다음 개요가 다시 찾게. 그 사이 다른 개요가 새로
-    잡았으면 건드리지 않는다."""
-    if cache_key is None or claim is None:
-        return
-    with _readable_lock:
-        if _gpu_absent_checked.get(cache_key) != claim.at:
-            return
-        if claim.previous is None:
-            del _gpu_absent_checked[cache_key]
-        else:
-            _gpu_absent_checked[cache_key] = claim.previous
+        return True
 
 
 def _rotate(names: list[str], start: int) -> list[str]:

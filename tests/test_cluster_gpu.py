@@ -533,7 +533,7 @@ def test_namespace_목록이_상한으로_잘렸거나_지난_기억으로_읽�
     assert call("whole") is False                            # 목록을 못 읽어 지난 기억으로 읽었다
 
 
-def test_모르는_연결도_GPU_노드가_없으면_간격마다_한_번만_찾고_못_읽은_라운드는_세지_않는다(monkeypatch):
+def test_모르는_연결도_GPU_노드가_없으면_간격마다_한_번만_찾고_조회를_못_보낸_라운드는_세지_않는다(monkeypatch):
     """namespace 가 상한보다 많아 끝까지 못 읽는 곳이 개요마다 파드를 전부 다시 읽지 않게 (agent#121 리뷰)."""
     monkeypatch.setattr(gpu, "MAX_POD_NAMESPACES", 1)
     now = [0.0]
@@ -557,7 +557,7 @@ def test_모르는_연결도_GPU_노드가_없으면_간격마다_한_번만_찾
                                          clock=lambda: now[0])
 
     budget_left[0] = False
-    assert call() == (None, None)                             # 파드를 하나도 못 읽었다 — 간격을 태우지 않는다
+    assert call() == (None, None)                             # 예산이 모자라 조회를 못 보냈다 — 창을 잡지 않는다
     budget_left[0] = True
     seen.clear()
     assert call() == (None, None) and gpu.NAMESPACES_COMMAND in seen   # 바로 다시 찾는다(끝까지는 못 읽음)
@@ -573,18 +573,15 @@ def test_GPU_없음_시각은_오래_안_부른_연결도_되감기지_않고_�
     """한 시간에 한 번 대시보드를 여는 쓰임에서도 다시 찾고, 같은 연결의 동시 개요는 한 번만 찾는다 (agent#121 리뷰)."""
     now = [0.0]
 
-    def claim(key):
-        return clusters_api._claim_absent_search(key, unknown=False, clock=lambda: now[0])
+    def due(key):
+        return clusters_api._absent_search_due(key, unknown=False, clock=lambda: now[0])
 
-    assert claim("a") is not None and claim("b") is not None  # 기록이 없다 — 바로 한 번 찾는다
-    assert claim("a") is None                                 # 같은 연결의 두 번째 개요 — 창은 이미 잡혔다
+    assert due("a") and due("b")                              # 기록이 없다 — 바로 한 번 찾는다
+    assert not due("a")                                       # 같은 연결의 두 번째 개요 — 창은 이미 잡혔다
     now[0] += 3600                                            # 한 시간 뒤 묶음으로 다시
-    first = claim("a")
-    assert first is not None and claim("b") is not None      # b 도 찾을 때다
-    clusters_api._release_absent_search("a", first)           # 못 읽고 끝났다 — 되돌린다
-    assert claim("a") is not None
+    assert due("a") and due("b")                              # b 도 찾을 때다
     now[0] += 3 * 24 * 3600                                   # 주말 — a 가 b 를 지워도
-    assert claim("a") is not None and claim("b") is not None  # 지워진 b 도 미뤄지지 않고 바로 찾는다
+    assert due("a") and due("b")                              # 지워진 b 도 미뤄지지 않고 바로 찾는다
 
 
 def test_파드_목록을_읽지_못했으면_기다리는_파드가_없다고_단정하지_않는다(client, fake_server, monkeypatch, caplog):
