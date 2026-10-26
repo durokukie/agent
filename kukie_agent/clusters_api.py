@@ -16,6 +16,7 @@ GPU 노드 유무(hasGpu)도 같은 까닭으로 연결 확인·개요가 노드
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -53,6 +54,11 @@ READABLE_NAMESPACES_TTL = 120
 #: GPU 칸(노드·파드·지표 전부)에 쓰는 시간(초). 지표 파드가 16개 다 매달려도 개요 슬롯을 이 이상 더 잡지 않는다 (PR #118 리뷰).
 #: 다 쓰면 남은 조회는 건너뛰고 그 값만 null 이다
 GPU_BUDGET = 20
+#: 같은 연결의 개요를 여러 요청이 나눠 쓰는 시간(초). GPU 화면은 20초마다(앱 OVERVIEW_LIVE_MS) 개요를 다시 읽는데, 여러
+#: 사람·탭이 같은 클러스터를 보면 그 수만큼 kubectl 이 돌고 고객 API 서버 감사 로그에도 그만큼 쌓인다. 이 시간 안의 요청은
+#: 진행 중이거나 막 끝난 한 번의 결과를 같이 쓴다. 한 사람의 20초 주기보다 짧게 둬서 혼자 볼 때는 늘 새로 읽는다.
+#: 나눠 쓰려면 응답에 사람마다 다른 값이 없어야 한다 — 지금은 없다. benchmarks 를 Admin 에게만 채우게 되면 나눠 쓴 뒤에 거른다
+OVERVIEW_SHARE_TTL = 10
 #: 지표를 동시에 읽는 수. 개요 슬롯(OVERVIEW_WORKERS) 하나 안에서 잠깐 쓰는 스레드라 limiter 밖이다 — 많아야 4 × 4
 GPU_METRICS_WORKERS = 4
 
@@ -156,10 +162,57 @@ async def cluster_overview(
             raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
                                       "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
 
-    # 연결 확인과 같은 이유로 스레드로 넘긴다 — kubectl 이 도는 동안 서버 전체가 멈추지 않게
-    body, has_gpu = await to_thread.run_sync(collect, limiter=thread_limiter("overview", OVERVIEW_WORKERS))
-    await _record_gpu(conn, has_gpu)
-    return body
+    async def compute() -> dict[str, Any]:
+        # 연결 확인과 같은 이유로 스레드로 넘긴다 — kubectl 이 도는 동안 서버 전체가 멈추지 않게
+        body, has_gpu = await to_thread.run_sync(collect, limiter=thread_limiter("overview", OVERVIEW_WORKERS))
+        await _record_gpu(conn, has_gpu)
+        return body
+
+    # 권한은 위에서 요청마다 본다(access.connection). 나눠 쓰는 것은 그 뒤의 kubectl 결과뿐이다.
+    # 지문이 없으면 연결이 바뀐 걸 모르니 나눠 쓰지 않는다
+    key = f"{cluster_id}:{conn.fingerprint}:{conn.namespace}" if conn.fingerprint else None
+    return await _shared_overview(key, compute)
+
+
+@dataclass
+class _SharedOverview:
+    """연결 하나의 개요 한 번 — _shared_overview."""
+    task: asyncio.Future
+    finished_at: float | None = None   # 성공으로 끝난 시각. 실패한 것은 남기지 않는다
+
+
+#: 연결(클러스터 id·연결 지문·클러스터 namespace)마다 진행 중이거나 막 끝난 개요. 프로세스 안 값이라 복제본마다 따로다
+_shared_overviews: dict[str, _SharedOverview] = {}
+
+
+async def _shared_overview(key: str | None, compute, *, clock=time.monotonic) -> dict[str, Any]:
+    """같은 연결의 개요를 OVERVIEW_SHARE_TTL 초 동안 나눠 쓴다 — 진행 중이면 그 한 번을 같이 기다리고, 막 끝났으면 그 결과.
+
+    실패(502 등)는 나눠 쓰지 않는다 — 같이 기다리던 요청은 같은 실패를 받고, 다음 요청은 새로 읽는다.
+    기다리던 요청이 끊겨도(브라우저 탭 닫힘) 그 한 번은 끝까지 돈다 — 다른 요청이 같이 기다릴 수 있다.
+    """
+    if key is None:
+        return await compute()
+    now = clock()
+    for stale in [k for k, e in _shared_overviews.items()
+                  if e.finished_at is not None and now - e.finished_at >= OVERVIEW_SHARE_TTL]:
+        del _shared_overviews[stale]
+    entry = _shared_overviews.get(key)
+    if entry is None:
+        entry = _SharedOverview(task=asyncio.ensure_future(compute()))
+        _shared_overviews[key] = entry
+
+        def finished(task: asyncio.Future, entry: _SharedOverview = entry) -> None:
+            if task.cancelled() or task.exception() is not None:
+                if _shared_overviews.get(key) is entry:
+                    del _shared_overviews[key]
+            else:
+                entry.finished_at = clock()
+
+        entry.task.add_done_callback(finished)
+    elif entry.task.done():
+        return entry.task.result()
+    return await asyncio.shield(entry.task)
 
 
 def _collect_gpu(
