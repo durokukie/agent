@@ -26,6 +26,10 @@ def _forget_readable_namespaces(monkeypatch):
     from kukie_agent import clusters_api
     monkeypatch.setattr(clusters_api, "_readable_namespaces", {})
     monkeypatch.setattr(clusters_api, "_gpu_absent_checked", {})
+    # 나눠 쓰는 개요도 비우고 끈다(TTL 0 이면 진행 중인 것도 나눠 쓰지 않는다) — 같은 개요를 두 번 불러 다른 kubectl
+    # 결과를 보는 테스트가 많다. 나눠 쓰기를 보는 테스트(test_cluster_overview_share.py)만 켠다
+    monkeypatch.setattr(clusters_api, "_shared_overviews", {})
+    monkeypatch.setattr(clusters_api, "OVERVIEW_SHARE_TTL", 0)
 
 
 @pytest.fixture(autouse=True)
