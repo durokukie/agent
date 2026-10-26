@@ -543,7 +543,23 @@ def test_모르는_연결도_GPU_노드가_없으면_간격마다_한_번만_찾
     now[0] += clusters_api.GPU_ABSENT_RECHECK
     seen.clear()
     call()
-    assert gpu.NAMESPACES_COMMAND in seen or any(args[:3] == ["get", "pods", "-n"] for args in seen)
+    assert any(args[:3] == ["get", "pods", "-n"] for args in seen)   # 간격이 지나 다시 namespace 마다 찾았다
+
+
+def test_GPU_없음_시각은_오래_안_부른_연결도_되감기지_않고_동시_개요는_창_하나를_나눈다():
+    """한 시간에 한 번 대시보드를 여는 쓰임에서도 다시 찾고, 같은 연결의 동시 개요는 한 번만 찾는다 (agent#121 리뷰)."""
+    now = [0.0]
+
+    def claim(key):
+        return clusters_api._claim_absent_search(key, first=False, clock=lambda: now[0])
+
+    assert claim("a") is None and claim("b") is None          # false 를 처음 봤다 — 센다
+    now[0] += 3600                                            # 한 시간 뒤 묶음으로 다시
+    first = claim("a")
+    assert first is not None and claim("b") is not None      # b 도 지워지지 않고 찾을 때다
+    assert claim("a") is None                                 # 같은 연결의 두 번째 개요 — 창은 이미 잡혔다
+    clusters_api._release_absent_search("a", first)           # 못 읽고 끝났다 — 되돌린다
+    assert claim("a") is not None
 
 
 def test_파드_목록을_읽지_못했으면_기다리는_파드가_없다고_단정하지_않는다(client, fake_server, monkeypatch, caplog):
