@@ -43,7 +43,8 @@ GPU 노드 — nodes
   GPU 노드 그룹을 0대로 내려 둔 클러스터(우리 kukie-gpu 처럼 평소 0대)는 노드 목록에 GPU 노드가 없다. 그래도 GPU 를 요청한
   파드(vLLM 등)가 남아 Pending 이면 "GPU 클러스터인데 지금 꺼짐" 이다. 그 파드를 waiting 에 싣고 nodes 는 빈 배열로 둔다.
   끝난 파드(Succeeded·Failed)는 세지 않는다. 파드는 2와 같은 길로 찾는다(이때는 지표를 읽지 않으니 남은 예산을 다 쓴다). 다만 server 의 hasGpu 가 false 인 클러스터
-  (GPU 가 없다고 이미 안 곳)는 찾지 않는다 — GPU 없는 클러스터마다 개요 때 파드 조회가 늘지 않게. GPU 노드가 있을 때도
+  (GPU 가 없다고 이미 안 곳)는 찾지 않는다 — GPU 없는 클러스터마다 개요 때 파드 조회가 늘지 않게. 그런 곳도 몇 분에 한 번은
+  다시 찾는다(clusters_api.GPU_ABSENT_RECHECK — 0대인 채 GPU 워크로드를 새로 올린 경우). GPU 노드가 있을 때도
   같은 파드 목록에서 GPU 를 기다리는 파드를 waiting 에 싣는다(늘어나는 중인 레플리카 등).
 
 측정 기록 — benchmarks

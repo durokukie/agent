@@ -25,6 +25,7 @@ def _forget_readable_namespaces(monkeypatch):
     """GPU 개요가 클러스터마다 기억하는 namespace 를 테스트마다 비운다 — 같은 클러스터 id 가 다른 테스트로 새지 않게."""
     from kukie_agent import clusters_api
     monkeypatch.setattr(clusters_api, "_readable_namespaces", {})
+    monkeypatch.setattr(clusters_api, "_gpu_absent_checked", {})
 
 
 @pytest.fixture(autouse=True)

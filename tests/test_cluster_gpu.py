@@ -342,6 +342,33 @@ def test_GPU가_없다고_이미_안_클러스터는_파드를_읽지_않는다(
     assert gpu.PODS_COMMAND not in seen and not any(args[1] == "--raw" for args in seen)
 
 
+def test_GPU가_없다고_남은_클러스터도_간격마다_한_번은_기다리는_파드를_다시_찾는다():
+    """노드 그룹은 0대 그대로 GPU 워크로드를 새로 올린 경우 (agent#121 Codex 리뷰)."""
+    now = [0.0]
+    seen: list[list[str]] = []
+
+    def run(args, timeout):
+        seen.append(args)
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        return _result(_list(_vllm_pending()))
+
+    def call():
+        return clusters_api._collect_gpu(run, namespace_pods="{}", cache_key="c:fp:ns", known=False,
+                                         clock=lambda: now[0])
+
+    assert call() == (None, False)                            # 처음 본 때 — 찾지 않는다
+    now[0] += clusters_api.GPU_ABSENT_RECHECK - 1
+    assert call() == (None, False) and gpu.PODS_COMMAND not in seen
+    now[0] += 1
+    body, has_gpu = call()                                    # 간격이 지났다 — 한 번 찾는다
+    assert has_gpu is True and body["waiting"][0]["pod"] == "vllm-gpt-oss-20b-b897b5d97-kkjsq"
+    seen.clear()
+    assert call() == (None, False) and gpu.PODS_COMMAND not in seen   # 다음 간격까지는 다시 멈춘다
+    assert clusters_api._collect_gpu(run, namespace_pods="{}", cache_key=None, known=False,
+                                     clock=lambda: now[0] + 10 * clusters_api.GPU_ABSENT_RECHECK) == (None, False)
+
+
 def _vllm_pending(namespace: str = "llm", name: str = "vllm-gpt-oss-20b-b897b5d97-kkjsq") -> dict:
     return {"metadata": {"name": name, "namespace": namespace}, "status": {"phase": "Pending"},
             "spec": {"containers": [{"name": "vllm", "image": "vllm/vllm-openai:v0.32.0",

@@ -55,6 +55,10 @@ READABLE_NAMESPACES_TTL = 120
 GPU_BUDGET = 20
 #: 지표를 동시에 읽는 수. 개요 슬롯(OVERVIEW_WORKERS) 하나 안에서 잠깐 쓰는 스레드라 limiter 밖이다 — 많아야 4 × 4
 GPU_METRICS_WORKERS = 4
+#: server 에 GPU 가 없다고 남은 클러스터도 이 간격(초)마다 한 번은 GPU 를 기다리는 파드를 다시 찾는다 — 노드 그룹을 0대로 둔 채
+#: vLLM 같은 GPU 워크로드를 새로 올리면 노드가 뜨기 전에도 GPU 클러스터로 바뀌게 (agent#121 Codex 리뷰). 그 사이에는 찾지 않는다.
+#: 프로세스 안 시각이라 복제본마다·재시작마다 처음 본 때부터 센다
+GPU_ABSENT_RECHECK = 600
 
 
 @router.post("/{cluster_id}/test")
@@ -116,7 +120,8 @@ async def cluster_overview(
     그 조회는 실패해도(Forbidden·시간 초과) 개요를 실패로 만들지 않고 network 만 null 로 둔다.
     GPU(gpu)는 그 뒤에 노드 → 모든 파드 → 지표 순으로 읽는다 (clusters/gpu.py). 노드를 못 읽으면 gpu 만 null 이고 그 뒤는
     읽지 않는다. GPU 노드가 없으면 GPU 를 기다리는 파드를 찾는다 — 있으면 nodes 가 빈 gpu 칸(꺼진 GPU 클러스터), 없으면 null.
-    server 에 GPU 가 없다고 남은 클러스터는 이 파드를 찾지 않는다. 알아낸 GPU 클러스터 여부를 server 에 남긴다(_record_gpu).
+    server 에 GPU 가 없다고 남은 클러스터는 이 파드를 GPU_ABSENT_RECHECK 초에 한 번만 찾는다. 알아낸 GPU 클러스터 여부를
+    server 에 남긴다(_record_gpu).
 
     kubectl 이 실패하면 연결 확인과 같은 기준(_failure_status)으로 갈라 502 로 답한다.
       CLUSTER_AUTH_EXPIRED  인증 실패·권한 없음 (연결 확인의 auth_expired)
@@ -179,7 +184,8 @@ def _collect_gpu(
     노드 목록을 못 읽었으면 None(모른다)이다. 노드가 없을 때 False 는 파드를 끝까지 읽어 기다리는 파드가 없다고 확인했을
     때만이다 — 모든 namespace 파드를 읽었거나, namespace 마다 읽은 것이 전부 성공·거부로 끝났을 때. 시간 초과·예산 부족·
     파드 목록 파싱 실패로 못 본 곳이 있으면 None 이다(꺼진 GPU 클러스터를 한 번의 실패로 "GPU 없음" 으로 덮지 않게).
-    known 은 server 에 남은 값이다. False(GPU 가 없다고 이미 안 클러스터)면 노드가 없을 때 파드를 찾지 않는다.
+    known 은 server 에 남은 값이다. False(GPU 가 없다고 이미 안 클러스터)면 노드가 없을 때 파드를 찾지 않는다 — 다만
+    GPU_ABSENT_RECHECK 초마다 한 번은 다시 찾는다(_absent_recheck_due).
 
     run(args, timeout) 은 개요와 같은 임시 kubeconfig 로 kubectl 을 돌린다. 실패 원문(사용자·ARN 이 실린다)은
     남기지 않고 갈래만 debug 로 남긴다 — 고객 클러스터는 노드를 못 읽는 게 보통이라 대시보드가 부를 때마다 난다.
@@ -199,7 +205,7 @@ def _collect_gpu(
     except (ValueError, AttributeError, TypeError):
         logger.debug("개요의 GPU 조회를 건너뛴다 (노드 목록을 읽지 못했다)")
         return None, None
-    if not nodes and known is False:
+    if not nodes and known is False and not _absent_recheck_due(cache_key, clock):
         return None, False
 
     if budget(OVERVIEW_TIMEOUT) < 1:
@@ -278,6 +284,25 @@ class _NamespaceMemo:
 #: 연결을 바꾸면 키가 달라져 옛 기억을 쓰지 않는다
 _readable_namespaces: dict[str, _NamespaceMemo] = {}
 _readable_lock = threading.Lock()
+#: 연결마다 GPU 없는 클러스터를 마지막으로 다시 찾은(또는 처음 본) 시각 — _absent_recheck_due
+_gpu_absent_checked: dict[str, float] = {}
+
+
+def _absent_recheck_due(cache_key: str | None, clock=time.monotonic) -> bool:
+    """GPU 가 없다고 남은 연결을 지금 다시 찾을 때인가. 처음 본 때부터 GPU_ABSENT_RECHECK 초마다 한 번 True.
+    연결 지문이 없으면(cache_key None) 다시 찾지 않는다 — 연결이 바뀐 걸 모르는 클러스터라 지금처럼 멈춘다."""
+    if cache_key is None:
+        return False
+    now = clock()
+    with _readable_lock:
+        for key in [key for key, at in _gpu_absent_checked.items()
+                    if key != cache_key and now - at >= 2 * GPU_ABSENT_RECHECK]:
+            del _gpu_absent_checked[key]
+        last = _gpu_absent_checked.setdefault(cache_key, now)
+        if now - last < GPU_ABSENT_RECHECK:
+            return False
+        _gpu_absent_checked[cache_key] = now
+        return True
 
 
 def _rotate(names: list[str], start: int) -> list[str]:
