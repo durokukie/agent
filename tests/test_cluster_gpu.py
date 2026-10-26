@@ -456,9 +456,9 @@ def test_GPU_노드가_0대인_라운드는_기다리는_파드가_나온_namesp
             return _result(_namespaces("team-b", "zz"))
         return _result(_list(_vllm_pending(namespace="team-b")) if args[3] == "team-b" else "{}")
 
-    _, complete = clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, gpu_node_names=set(),
-                                                  cache_key="c9")
-    assert clusters_api._readable_namespaces["c9"].productive == {"team-b"} and complete is True
+    _, complete, looked = clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None,
+                                                          gpu_node_names=set(), cache_key="c9")
+    assert clusters_api._readable_namespaces["c9"].productive == {"team-b"} and complete is True and looked is True
 
 
 def _namespace_search_cluster(pods_by_namespace: dict[str, KubectlResult]):
@@ -508,6 +508,42 @@ def test_namespace_목록이_상한으로_잘렸거나_지난_기억으로_읽�
     now[0] += clusters_api.READABLE_NAMESPACES_TTL
     listing_ok[0] = False
     assert call("whole") is False                            # 목록을 못 읽어 지난 기억으로 읽었다
+
+
+def test_모르는_연결도_GPU_노드가_없으면_간격마다_한_번만_찾고_못_읽은_라운드는_세지_않는다(monkeypatch):
+    """namespace 가 상한보다 많아 끝까지 못 읽는 곳이 개요마다 파드를 전부 다시 읽지 않게 (agent#121 리뷰)."""
+    monkeypatch.setattr(gpu, "MAX_POD_NAMESPACES", 1)
+    now = [0.0]
+    seen: list[list[str]] = []
+    budget_left = [True]
+
+    def run(args, timeout):
+        seen.append(args)
+        if args == gpu.NODES_COMMAND:
+            if not budget_left[0]:
+                now[0] += clusters_api.GPU_BUDGET                  # 노드 조회가 예산을 다 먹었다
+            return _result(fixture("nodes.json"))
+        if args == gpu.PODS_COMMAND:
+            return _result(stderr=FORBIDDEN, success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("a", "b"))                 # 상한 1 — 끝까지 못 읽는다
+        return _result("{}")
+
+    def call():
+        return clusters_api._collect_gpu(run, namespace_pods="{}", cache_key="c:fp:ns", known=None,
+                                         clock=lambda: now[0])
+
+    budget_left[0] = False
+    assert call() == (None, None)                             # 파드를 하나도 못 읽었다 — 간격을 태우지 않는다
+    budget_left[0] = True
+    seen.clear()
+    assert call() == (None, None) and gpu.NAMESPACES_COMMAND in seen   # 바로 다시 찾는다(끝까지는 못 읽음)
+    seen.clear()
+    assert call() == (None, None) and seen == [gpu.NODES_COMMAND]      # 간격 안 — 노드만 본다
+    now[0] += clusters_api.GPU_ABSENT_RECHECK
+    seen.clear()
+    call()
+    assert gpu.NAMESPACES_COMMAND in seen or any(args[:3] == ["get", "pods", "-n"] for args in seen)
 
 
 def test_파드_목록을_읽지_못했으면_기다리는_파드가_없다고_단정하지_않는다(client, fake_server, monkeypatch, caplog):
@@ -780,7 +816,7 @@ def test_목록을_부르지도_못한_라운드는_기억_시각을_늘리지_�
 
 def test_GPU_파드가_나온_namespace는_상한에_잘리지_않는다(monkeypatch):
     monkeypatch.setattr(gpu, "MAX_POD_NAMESPACES", 2)
-    names = gpu.namespace_names(_namespaces("a", "b", "c", "zz-llm-team"), prefer={"zz-llm-team"})
+    names, whole = gpu.namespace_names(_namespaces("a", "b", "c", "zz-llm-team"), prefer={"zz-llm-team"})
     assert names == ["zz-llm-team", "a"]
 
 
@@ -893,11 +929,11 @@ def test_namespace_목록도_못_읽으면_클러스터_namespace_파드만_쓴�
 
 def test_namespace는_GPU_쪽_이름부터_상한까지_고른다(monkeypatch):
     monkeypatch.setattr(gpu, "MAX_POD_NAMESPACES", 3)
-    names = gpu.namespace_names(_namespaces("a", "b", "kube-system", "kube-public", "my-vllm", "c", "gpu-operator", "a"))
+    names, whole = gpu.namespace_names(_namespaces("a", "b", "kube-system", "kube-public", "my-vllm", "c", "gpu-operator", "a"))
     assert names == ["gpu-operator", "my-vllm", "a"]
     assert gpu.hinted_namespace("monitoring") and gpu.hinted_namespace("observability")
     # 클러스터 namespace 는 상한을 매기기 전에 뺀다 — 한 칸을 먹지 않는다
-    assert gpu.namespace_names(_namespaces("gpu-operator", "a", "b"), skip="gpu-operator") == ["a", "b"]
+    assert gpu.namespace_names(_namespaces("gpu-operator", "a", "b"), skip="gpu-operator") == (["a", "b"], True)
 
 
 def test_파드_목록을_합칠_때_같은_파드는_한_번이고_깨진_출력은_건너뛴다():
