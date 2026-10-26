@@ -5,7 +5,8 @@ kubectl 은 clusters_api.py 가 돌리고, 여기는 그 출력(JSON 문자열)�
 
 조회 범위는 클러스터에 등록된 namespace 하나다. EKS 고객 클러스터는 namespace 범위 Edit 만 주므로
 `-A`·`get nodes` 같은 클러스터 범위 조회는 하지 않는다 (READ_COMMANDS 가 그 목록이다).
-예외는 CNI 를 알아보는 NETWORK_COMMAND(kube-system 의 DaemonSet)와 GPU 를 알아보는 gpu.py 의 조회(노드·모든 파드·지표)다.
+예외는 CNI 를 알아보는 NETWORK_COMMAND(kube-system 의 DaemonSet)와 GPU 를 알아보는 gpu.py 의 조회(노드·모든 파드 — 못 읽으면
+namespace 목록과 namespace 마다 파드 — ·지표)다.
 둘 다 못 읽으면 그 칸(network·gpu)만 null 이고 개요는 그대로다.
 
 네트워크(CNI) — network
