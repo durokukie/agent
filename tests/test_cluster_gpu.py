@@ -459,6 +459,30 @@ def test_모든_namespace_파드를_못_읽어도_namespace마다_끝까지_읽�
     assert [body["hasGpu"] for body in _gpu_calls(fake_server)] == [False]
 
 
+def test_namespace_목록이_상한으로_잘렸거나_지난_기억으로_읽었으면_끝까지_읽은_게_아니다(monkeypatch):
+    """25번째부터는 읽지 않았고, TTL 지난 기억은 그 뒤 생긴 namespace 를 모른다 — GPU 없음으로 단정하지 않는다 (agent#121 리뷰)."""
+    monkeypatch.setattr(gpu, "MAX_POD_NAMESPACES", 2)
+    now = [0.0]
+    listing_ok = [True]
+
+    def run(args, timeout):
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("a", "b", "c")) if listing_ok[0] else _result(stderr="i/o timeout", success=False)
+        return _result("{}")
+
+    def call(key):
+        return clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, gpu_node_names=set(),
+                                               cache_key=key, clock=lambda: now[0])[1]
+
+    assert call("cut") is False                              # 셋 중 둘만 읽었다
+    assert call("cut") is False                              # 기억(TTL 안)도 잘린 목록이다
+    monkeypatch.setattr(gpu, "MAX_POD_NAMESPACES", 24)
+    assert call("whole") is True
+    now[0] += clusters_api.READABLE_NAMESPACES_TTL
+    listing_ok[0] = False
+    assert call("whole") is False                            # 목록을 못 읽어 지난 기억으로 읽었다
+
+
 def test_파드_목록을_읽지_못했으면_기다리는_파드가_없다고_단정하지_않는다(client, fake_server, monkeypatch, caplog):
     cluster = fake_server.add_cluster(has_gpu=True)
 

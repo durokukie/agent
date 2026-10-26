@@ -269,8 +269,9 @@ class _NamespaceMemo:
     """연결 하나의 namespace 기억 — _pods_by_namespace."""
     at: float                          # 목록을 마지막으로 읽어 본 시각
     names: tuple[str, ...]             # 다시 읽을 namespace (Forbidden 은 빠진다)
-    productive: frozenset[str]         # GPU 지표 파드(DCGM·vLLM)가 나온 namespace
+    productive: frozenset[str]         # GPU 지표 파드(DCGM·vLLM)나, GPU 노드 0대 라운드의 기다리는 파드가 나온 namespace
     cursors: tuple[int, int] = (0, 0)  # 앞 줄·뒤 줄에서 다음에 읽기 시작할 자리
+    whole: bool = True                 # names 가 목록 전부다 — MAX_POD_NAMESPACES 로 자르지 않았다
 
 
 #: 연결(클러스터 id·연결 지문·클러스터 namespace)마다의 기억. 프로세스 안 기억이라 복제본마다 따로 채운다.
@@ -290,8 +291,9 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
                        cache_key: str | None, clock=time.monotonic) -> tuple[str, bool]:
     """(파드 목록, 끝까지 읽었나) — 모든 namespace 파드를 못 읽을 때의 길, clusters/gpu.py "읽는 순서" 2.
 
-    끝까지 읽었다는 것은 읽을 namespace 를 알았고(목록 또는 기억) 그 전부가 성공이나 거부(Forbidden)로 끝났다는 것이다.
-    거부된 곳은 Kukie 가 볼 수 없는 곳이라 "못 본 곳" 으로 치지 않는다. 시간 초과·예산 부족이 하나라도 있으면 False.
+    끝까지 읽었다는 것은 namespace 목록 전부를 알았고(TTL 안의 기억도 된다) 그 전부가 성공이나 거부(Forbidden)로 끝났다는
+    것이다. 거부된 곳은 Kukie 가 볼 수 없는 곳이라 "못 본 곳" 으로 치지 않는다. 시간 초과·예산 부족이 하나라도 있거나,
+    목록이 MAX_POD_NAMESPACES 로 잘렸거나, 목록을 못 읽어 TTL 지난 기억으로 읽었으면 False 다 (agent#121 리뷰).
 
     namespace 목록을 읽고 namespace 마다 파드를 읽어(동시에, 하나에 GPU_PODS_TIMEOUT 초) 읽힌 것만 개요의 클러스터
     namespace 파드와 합친다. 클러스터 namespace(개요가 이미 읽었다)는 다시 읽지 않는다. 고객이 지표 RoleBinding 을
@@ -300,7 +302,7 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
 
     거부되는 조회가 대시보드를 부를 때마다 고객 감사 로그에 쌓이지 않게, 연결마다 READABLE_NAMESPACES_TTL 초 기억한다
     (agent#120 리뷰). 그동안은 목록을 다시 읽지 않고 기억한 namespace 만 읽고, Forbidden 으로 확인된 것은 그때그때 뺀다.
-    읽는 순서는 두 줄이다 — 앞 줄: GPU 지표 파드가 나온 적 있는 것과 GPU 쪽 이름, 뒤 줄: 나머지. 줄마다 지난번에 멈춘
+    읽는 순서는 두 줄이다 — 앞 줄: GPU 지표 파드(노드 0대 라운드는 기다리는 파드)가 나온 적 있는 것과 GPU 쪽 이름, 뒤 줄: 나머지. 줄마다 지난번에 멈춘
     자리부터 돌아가며 읽고(라운드 로빈), 앞 줄 첫째 다음에 뒤 줄 하나를 끼운다 — 예산이 모자라도 어느 줄도 굶지 않는다.
     목록을 다시 읽다 실패하면 지난 기억으로 읽는다. 연결 지문이 없으면(cache_key None) 기억하지 않는다.
     namespace 목록도 기억도 없으면(GPU 읽기 RBAC 를 적용하지 않은 클러스터) 클러스터 namespace 파드만 쓴다.
@@ -320,14 +322,16 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
         memo = _readable_namespaces.get(cache_key) if cache_key else None
     productive = set(memo.productive) if memo else set()
     names, listed_at = None, memo.at if memo else now
+    whole = False                                           # names 가 지금 목록 전부인가 — 끝까지 읽었나의 조건
     if memo and now - memo.at < READABLE_NAMESPACES_TTL:
-        names = list(memo.names)
+        names, whole = list(memo.names), memo.whole
     elif budget(OVERVIEW_TIMEOUT) >= 1:
         listed_at = now                                     # 목록을 실제로 읽어 본 라운드만 시각을 새로 한다
         names_result = run(gpu.NAMESPACES_COMMAND, budget(OVERVIEW_TIMEOUT))
         if names_result.success:
             try:
-                names = gpu.namespace_names(names_result.stdout, skip=namespace, prefer=productive)
+                every = gpu.all_namespace_names(names_result.stdout, skip=namespace, prefer=productive)
+                names, whole = every[:gpu.MAX_POD_NAMESPACES], len(every) <= gpu.MAX_POD_NAMESPACES
             except (ValueError, AttributeError, TypeError):
                 logger.debug("namespace 목록을 읽지 못했다")
         else:
@@ -359,13 +363,13 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
                 productive.discard(name)
         keep = tuple(name for name in names if results[name][1] != "forbidden")
         next_memo = _NamespaceMemo(at=listed_at, names=keep, productive=frozenset(productive & set(keep)),
-                                   cursors=(cursors[0] + tried[0], cursors[1] + tried[1]))
+                                   cursors=(cursors[0] + tried[0], cursors[1] + tried[1]), whole=whole)
         with _readable_lock:
             # 지운 클러스터·바뀐 연결의 옛 기억이 쌓이지 않게. TTL 두 배까지는 남겨 목록을 못 읽을 때 쓴다
             for key in [key for key, old in _readable_namespaces.items() if now - old.at >= 2 * READABLE_NAMESPACES_TTL]:
                 del _readable_namespaces[key]
             _readable_namespaces[cache_key] = next_memo
-    complete = all(outcome in ("ok", "forbidden") for _, outcome in results.values())
+    complete = whole and all(outcome in ("ok", "forbidden") for _, outcome in results.values())
     return gpu.merge_pod_lists([namespace_pods, *(stdout for stdout, _ in results.values() if stdout is not None)]), complete
 
 

@@ -190,14 +190,20 @@ def vllm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> list[t
 
 
 def namespace_names(stdout: str, *, skip: str | None = None, prefer: set[str] | frozenset[str] = frozenset()) -> list[str]:
-    """파드를 읽어 볼 namespace — kube-* 와 skip(개요가 이미 읽은 클러스터 namespace)은 뺀다(Kukie 역할은 시스템
-    namespace 를 읽지 않는다). prefer(GPU 지표 파드가 나온 적 있는 것)와 GPU 쪽 이름이 먼저, 그다음 이름순으로
-    MAX_POD_NAMESPACES 개까지 — 상한이 지표 namespace 를 자르지 않게. 모양이 다르면 ValueError."""
+    """파드를 읽어 볼 namespace — all_namespace_names 에서 MAX_POD_NAMESPACES 개까지 (상한이 지표 namespace 를 자르지 않게
+    앞쪽이 GPU 쪽이다). 모양이 다르면 ValueError."""
+    return all_namespace_names(stdout, skip=skip, prefer=prefer)[:MAX_POD_NAMESPACES]
+
+
+def all_namespace_names(stdout: str, *, skip: str | None = None,
+                        prefer: set[str] | frozenset[str] = frozenset()) -> list[str]:
+    """namespace 목록 전부 — kube-* 와 skip(개요가 이미 읽은 클러스터 namespace)은 뺀다(Kukie 역할은 시스템 namespace 를
+    읽지 않는다). prefer(GPU 지표·기다리는 파드가 나온 적 있는 것)와 GPU 쪽 이름이 먼저, 그다음 이름순. 모양이 다르면 ValueError."""
     names = sorted({name for item in _items(stdout)
                     if isinstance(name := (item.get("metadata") or {}).get("name"), str) and name
                     and not name.startswith("kube-") and name != skip})
     names.sort(key=lambda name: not (name in prefer or hinted_namespace(name)))
-    return names[:MAX_POD_NAMESPACES]
+    return names
 
 
 def hinted_namespace(name: str) -> bool:
