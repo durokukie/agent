@@ -68,7 +68,8 @@ GPU_METRICS_WORKERS = 4
 #:          읽지 않게 (agent#121 리뷰)
 #: 둘 다 이 프로세스에서 기록이 없으면(처음 봤거나 오래 안 불러 지웠으면) 바로 한 번 찾는다 — 오래 안 부른 연결이 다시
 #: 와도 미뤄지지 않게 (agent#121 리뷰). 재시작·하루 넘게 안 부른 연결마다 한 번 더 찾는 값이다.
-#: 실제로 파드를 읽어 본 라운드만 센다 — 예산이 모자라 하나도 못 읽은 라운드가 간격을 태우지 않게.
+#: 파드 조회를 실제로 보낸 라운드만 센다 — 예산이 모자라 조회를 보내지도 못한 라운드는 간격을 태우지 않는다. 보냈는데 거부·
+#: 시간 초과로 못 읽은 라운드는 센다 — 끝까지 못 읽는 곳(GPU 읽기 RBAC 가 없는 곳 등)이 개요마다 다시 묻지 않게 (agent#121 리뷰).
 #: 프로세스 안 시각이라 복제본마다·재시작마다 따로 센다
 GPU_ABSENT_RECHECK = 600
 GPU_ABSENT_RECHECK_FORGET = 24 * 3600   # 이만큼 안 부른 연결의 시각은 지운다 — 메모리만 지키려는 것이라 간격보다 훨씬 길게
@@ -260,7 +261,7 @@ def _collect_gpu(
     때만이다 — 모든 namespace 파드를 읽었거나, namespace 마다 읽은 것이 전부 성공·거부로 끝났을 때. 시간 초과·예산 부족·
     파드 목록 파싱 실패로 못 본 곳이 있으면 None 이다(꺼진 GPU 클러스터를 한 번의 실패로 "GPU 없음" 으로 덮지 않게).
     known 은 server 에 남은 값이다. True(GPU 클러스터)가 아니면 노드가 없을 때 파드를 GPU_ABSENT_RECHECK 초에 한 번만
-    찾는다(_claim_absent_search) — false 는 처음 본 때부터, null 은 바로 한 번. 그 사이에는 (None, 지금 값) 이다.
+    찾는다(_claim_absent_search) — 이 프로세스에서 기록이 없으면 바로 한 번. 그 사이에는 (None, 지금 값) 이다.
 
     run(args, timeout) 은 개요와 같은 임시 kubeconfig 로 kubectl 을 돌린다. 실패 원문(사용자·ARN 이 실린다)은
     남기지 않고 갈래만 debug 로 남긴다 — 고객 클러스터는 노드를 못 읽는 게 보통이라 대시보드가 부를 때마다 난다.
@@ -292,7 +293,7 @@ def _collect_gpu(
     gpu_node_names = {row["node"] for row in nodes}
     pods_result = run(gpu.PODS_COMMAND, budget(OVERVIEW_TIMEOUT))
     if pods_result.success:
-        pods_stdout, pods_complete, pods_looked = pods_result.stdout, True, True
+        pods_stdout, pods_complete = pods_result.stdout, True
     else:
         logger.debug("GPU 지표 파드를 namespace 마다 찾는다: %s", _failure_status(pods_result.stderr or pods_result.stdout))
         # 탐색은 남은 예산의 절반까지만 — 지표를 읽을 시간을 남긴다 (agent#120 리뷰). GPU 노드가 없으면 지표를 읽지 않으니
@@ -302,7 +303,7 @@ def _collect_gpu(
         def search_budget(limit: int) -> int:
             return min(limit, int(search_deadline - clock()))
 
-        pods_stdout, pods_complete, pods_looked = _pods_by_namespace(
+        pods_stdout, pods_complete = _pods_by_namespace(
             run, search_budget, namespace_pods, namespace=namespace, gpu_node_names=gpu_node_names,
             cache_key=cache_key, clock=clock)
     try:
@@ -319,8 +320,6 @@ def _collect_gpu(
         logger.debug("GPU 를 기다리는 파드를 찾지 못했다 (파드 목록을 읽지 못했다)")
         waiting = None                                      # 못 읽은 것과 "없다" 는 다르다 — 아래에서 None(모른다)
     if not nodes:
-        if not pods_looked:
-            _release_absent_search(cache_key, claim)        # 하나도 못 읽었다 — 다음 개요가 다시 찾게
         if waiting:
             return gpu.build([], [], waiting), True
         return None, (False if waiting is not None and pods_complete else None)
@@ -365,7 +364,7 @@ class _NamespaceMemo:
 #: 연결을 바꾸면 키가 달라져 옛 기억을 쓰지 않는다
 _readable_namespaces: dict[str, _NamespaceMemo] = {}
 _readable_lock = threading.Lock()
-#: 연결마다 GPU 노드 없는 곳에서 기다리는 파드를 마지막으로 찾은(false 는 처음 본) 시각 — _claim_absent_search
+#: 연결마다 GPU 노드 없는 곳에서 기다리는 파드를 마지막으로 찾은 시각 — _claim_absent_search
 _gpu_absent_checked: dict[str, float] = {}
 
 
@@ -417,8 +416,8 @@ def _rotate(names: list[str], start: int) -> list[str]:
 
 
 def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | None, gpu_node_names: set[str],
-                       cache_key: str | None, clock=time.monotonic) -> tuple[str, bool, bool]:
-    """(파드 목록, 끝까지 읽었나, 하나라도 읽어 봤나) — 모든 namespace 파드를 못 읽을 때의 길, clusters/gpu.py "읽는 순서" 2.
+                       cache_key: str | None, clock=time.monotonic) -> tuple[str, bool]:
+    """(파드 목록, 끝까지 읽었나) — 모든 namespace 파드를 못 읽을 때의 길, clusters/gpu.py "읽는 순서" 2.
 
     끝까지 읽었다는 것은 namespace 목록 전부를 알았고(TTL 안의 기억도 된다) 그 전부가 성공이나 거부(Forbidden)로 끝났다는
     것이다. 거부된 곳은 Kukie 가 볼 수 없는 곳이라 "못 본 곳" 으로 치지 않는다. 시간 초과·예산 부족이 하나라도 있거나,
@@ -466,7 +465,7 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
             logger.debug("namespace 목록을 읽지 못했다: %s", _failure_status(names_result.stderr or names_result.stdout))
     if names is None:
         if not memo:
-            return namespace_pods, False, False
+            return namespace_pods, False
         names = list(memo.names)                            # 목록만 못 읽었으면 지난 기억으로 읽는다
 
     cursors = memo.cursors if memo else (0, 0)
@@ -499,7 +498,7 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
             _readable_namespaces[cache_key] = next_memo
     settled = [outcome in ("ok", "forbidden") for _, outcome in results.values()]
     merged = gpu.merge_pod_lists([namespace_pods, *(stdout for stdout, _ in results.values() if stdout is not None)])
-    return merged, whole and all(settled), any(settled)
+    return merged, whole and all(settled)
 
 
 def _has_gpu(nodes: KubectlResult) -> bool | None:

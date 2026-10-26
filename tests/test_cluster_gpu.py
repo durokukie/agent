@@ -345,6 +345,53 @@ def test_GPU가_없다고_이미_안_클러스터는_간격_안에서는_파드�
     assert gpu.PODS_COMMAND not in seen and not any(args[1] == "--raw" for args in seen)
 
 
+def test_GPU가_없다고_남은_클러스터도_간격마다_한_번은_기다리는_파드를_다시_찾아_GPU_클러스터로_바꾼다():
+    """노드 그룹은 0대 그대로 GPU 워크로드를 새로 올린 경우 (agent#121 Codex 리뷰)."""
+    now = [0.0]
+    seen: list[list[str]] = []
+    pods = ["{}"]
+
+    def run(args, timeout):
+        seen.append(args)
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        return _result(pods[0])
+
+    def call(key="c:fp:ns"):
+        return clusters_api._collect_gpu(run, namespace_pods="{}", cache_key=key, known=False, clock=lambda: now[0])
+
+    assert call() == (None, False) and gpu.PODS_COMMAND in seen   # 이 프로세스에서 처음 — 바로 한 번 찾는다
+    pods[0] = _list(_vllm_pending())                          # 0대인 채 vLLM 을 올렸다
+    seen.clear()
+    now[0] += clusters_api.GPU_ABSENT_RECHECK - 1
+    assert call() == (None, False) and gpu.PODS_COMMAND not in seen   # 간격 안 — 노드만 본다
+    now[0] += 1
+    body, has_gpu = call()                                    # 간격이 지났다 — 찾아서 GPU 클러스터로 바뀐다
+    assert has_gpu is True and body["waiting"][0]["pod"] == "vllm-gpt-oss-20b-b897b5d97-kkjsq"
+    seen.clear()
+    assert call(None) == (None, False) and gpu.PODS_COMMAND not in seen   # 지문 없는 false 는 찾지 않는다
+
+
+def test_파드_조회를_보냈으면_못_읽었어도_간격을_센다():
+    """GPU 읽기 RBAC 가 없어 모든 파드·namespace 목록이 거부되는 곳이 개요마다 다시 묻지 않게 (agent#121 리뷰)."""
+    now = [0.0]
+    seen: list[list[str]] = []
+
+    def run(args, timeout):
+        seen.append(args)
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        return _result(stderr=FORBIDDEN, success=False)
+
+    def call():
+        return clusters_api._collect_gpu(run, namespace_pods="{}", cache_key="c:fp:ns", known=None, clock=lambda: now[0])
+
+    assert call() == (None, None) and gpu.PODS_COMMAND in seen
+    seen.clear()
+    now[0] += 20
+    assert call() == (None, None) and seen == [gpu.NODES_COMMAND]
+
+
 def _vllm_pending(namespace: str = "llm", name: str = "vllm-gpt-oss-20b-b897b5d97-kkjsq") -> dict:
     return {"metadata": {"name": name, "namespace": namespace}, "status": {"phase": "Pending"},
             "spec": {"containers": [{"name": "vllm", "image": "vllm/vllm-openai:v0.32.0",
@@ -432,9 +479,9 @@ def test_GPU_노드가_0대인_라운드는_기다리는_파드가_나온_namesp
             return _result(_namespaces("team-b", "zz"))
         return _result(_list(_vllm_pending(namespace="team-b")) if args[3] == "team-b" else "{}")
 
-    _, complete, looked = clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None,
-                                                          gpu_node_names=set(), cache_key="c9")
-    assert clusters_api._readable_namespaces["c9"].productive == {"team-b"} and complete is True and looked is True
+    _, complete = clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None,
+                                                  gpu_node_names=set(), cache_key="c9")
+    assert clusters_api._readable_namespaces["c9"].productive == {"team-b"} and complete is True
 
 
 def _namespace_search_cluster(pods_by_namespace: dict[str, KubectlResult]):
