@@ -73,10 +73,12 @@ def test_AMD_GPU도_센다():
     assert (row["product"], row["count"], row["memory_mib"]) == ("AMD_Instinct_MI300X_OAM", 8, 8 * 192 * 1024)
 
 
-def test_GPU_노드가_없으면_build는_None이다():
+def test_GPU_노드도_기다리는_파드도_없으면_build는_None이다():
     assert gpu.gpu_nodes(fixture("nodes.json")) == []
-    assert gpu.build([], []) is None
-    assert gpu.build([{"node": "n"}], []) == {"nodes": [{"node": "n"}], "serving": [], "benchmarks": []}
+    assert gpu.build([], []) is None and gpu.build([], [], []) is None
+    assert gpu.build([{"node": "n"}], []) == {"nodes": [{"node": "n"}], "serving": [], "benchmarks": [], "waiting": []}
+    waiting = [{"namespace": "llm", "pod": "vllm-0", "gpus": 1, "phase": "Pending"}]
+    assert gpu.build([], [], waiting) == {"nodes": [], "serving": [], "benchmarks": [], "waiting": waiting}
 
 
 def test_노드_목록이_깨졌으면_ValueError():
@@ -325,8 +327,9 @@ def test_노드를_못_읽으면_gpu만_null이고_파드_지표는_읽지_않�
     assert "GPU 조회를 건너뛴다" in caplog.text and "arn:aws" not in caplog.text   # 원문은 남기지 않는다
 
 
-def test_GPU_노드가_없으면_gpu는_null이고_파드는_읽지_않는다(client, fake_server, monkeypatch):
-    cluster = fake_server.add_cluster()
+def test_GPU가_없다고_이미_안_클러스터는_파드를_읽지_않는다(client, fake_server, monkeypatch):
+    """GPU 없는 클러스터마다 개요 때 파드 조회가 늘지 않게 — server 의 hasGpu 가 false 면 노드 목록에서 멈춘다."""
+    cluster = fake_server.add_cluster(has_gpu=False)
     seen: list[list[str]] = []
 
     def fake(args, **kwargs):
@@ -337,6 +340,86 @@ def test_GPU_노드가_없으면_gpu는_null이고_파드는_읽지_않는다(cl
     r = client.get(f"/clusters/{cluster}/overview", headers=USER)
     assert r.status_code == 200 and r.json()["gpu"] is None
     assert gpu.PODS_COMMAND not in seen and not any(args[1] == "--raw" for args in seen)
+
+
+def _vllm_pending(namespace: str = "llm", name: str = "vllm-gpt-oss-20b-b897b5d97-kkjsq") -> dict:
+    return {"metadata": {"name": name, "namespace": namespace}, "status": {"phase": "Pending"},
+            "spec": {"containers": [{"name": "vllm", "image": "vllm/vllm-openai:v0.32.0",
+                                     "resources": {"limits": {"nvidia.com/gpu": "1"}}}]}}
+
+
+@pytest.mark.parametrize("stored", [None, True])
+def test_GPU_노드가_0대여도_GPU를_기다리는_파드가_있으면_꺼진_GPU_클러스터다(client, fake_server, monkeypatch, stored):
+    """GPU 노드 그룹을 0대로 내려 둔 클러스터 (우리 kukie-gpu). 지표는 읽지 않는다."""
+    cluster = fake_server.add_cluster(has_gpu=stored)
+    seen: list[list[str]] = []
+
+    def fake(args, **kwargs):
+        seen.append(args)
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        if args == gpu.PODS_COMMAND:
+            return _result(_list(_vllm_pending()))
+        return _gpu_cluster(args)
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    r = client.get(f"/clusters/{cluster}/overview", headers=USER)
+    assert r.status_code == 200
+    assert r.json()["gpu"] == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [
+        {"namespace": "llm", "pod": "vllm-gpt-oss-20b-b897b5d97-kkjsq", "gpus": 1, "phase": "Pending"}]}
+    assert not any(args[1] == "--raw" for args in seen)
+    assert [body["hasGpu"] for body in _gpu_calls(fake_server)] == ([True] if stored is None else [])
+    assert fake_server.clusters[cluster]["hasGpu"] is True
+
+
+def test_GPU_노드가_없고_namespace마다_찾아도_없으면_모른다(client, fake_server, monkeypatch):
+    """못 본 namespace 가 있을 수 있어 false 로 덮지 않는다 — 꺼진 GPU 클러스터를 GPU 없음으로 잘못 남기지 않게."""
+    cluster = fake_server.add_cluster(has_gpu=True)
+
+    def fake(args, **kwargs):
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        if args == gpu.PODS_COMMAND:
+            return _result(stderr=FORBIDDEN, success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("llm"))
+        if args[:3] == ["get", "pods", "-n"] and args[3] == "llm":
+            return _result(stderr="context deadline exceeded", success=False)
+        return _gpu_cluster(args)
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    r = client.get(f"/clusters/{cluster}/overview", headers=USER)
+    assert r.status_code == 200 and r.json()["gpu"] is None
+    assert _gpu_calls(fake_server) == [] and fake_server.clusters[cluster]["hasGpu"] is True
+
+
+def test_GPU를_기다리는_파드는_끝나지_않았고_돌지_않는_것만_센다():
+    running = dict(_vllm_pending(name="run"), status={"phase": "Running"})
+    done = dict(_vllm_pending(name="done"), status={"phase": "Succeeded"})
+    cpu = {"metadata": {"name": "web", "namespace": "a"}, "status": {"phase": "Pending"},
+           "spec": {"containers": [{"name": "web", "resources": {"limits": {"cpu": "1"}}}]}}
+    two = {"metadata": {"name": "train", "namespace": "a"}, "status": {"phase": "Pending"},
+           "spec": {"containers": [{"name": "a", "resources": {"requests": {"amd.com/gpu": "1"}}},
+                                   {"name": "b", "resources": {"limits": {"nvidia.com/gpu": "2"}}}]}}
+    rows = gpu.waiting_pods(_list(_vllm_pending(), running, done, cpu, two))
+    assert [(r["namespace"], r["pod"], r["gpus"]) for r in rows] == [("a", "train", 3), ("llm", "vllm-gpt-oss-20b-b897b5d97-kkjsq", 1)]
+
+
+def test_GPU_노드가_0대인_라운드는_namespace_기억의_GPU_namespace를_지우지_않는다():
+    items = json.loads(fixture("gpu_pods.json"))["items"]
+    vllm = _list(*(i for i in items if i["metadata"]["namespace"] == "llm"))
+    pods = {"team-a": vllm}
+
+    def run(args, timeout):
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("team-a"))
+        return _result(pods.get(args[3], "{}"))
+
+    clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, gpu_node_names={L40S_1}, cache_key="c0")
+    assert clusters_api._readable_namespaces["c0"].productive == {"team-a"}
+    pods["team-a"] = _list(_vllm_pending(namespace="team-a"))
+    clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, gpu_node_names=set(), cache_key="c0")
+    assert clusters_api._readable_namespaces["c0"].productive == {"team-a"}
 
 
 def test_모든_namespace_파드도_namespace_목록도_못_읽으면_클러스터_namespace_파드에서만_찾는다(client, fake_server, monkeypatch):
@@ -823,6 +906,21 @@ def test_연결_확인도_노드_목록으로_GPU_여부를_남긴다(client, fa
     assert r.status_code == 200 and r.json()["status"] == "connected" and r.json()["has_gpu"] is True
     assert seen[-1] == gpu.NODES_COMMAND                                     # 지표는 읽지 않는다 — 개요의 일
     assert [body["hasGpu"] for body in _gpu_calls(fake_server)] == [True]
+
+
+@pytest.mark.parametrize(("stored", "expected"), [(None, None), (True, None), (False, False)])
+def test_연결_확인은_GPU_노드가_없으면_꺼진_GPU_클러스터일_수_있어_개요에_맡긴다(client, fake_server, monkeypatch, stored, expected):
+    cluster = fake_server.add_cluster(has_gpu=stored)
+
+    def fake(args, **kwargs):
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        return _result("{}" if args[0] == "version" else "yes")
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    r = client.post(f"/clusters/{cluster}/test", headers=USER)
+    assert r.json()["has_gpu"] is expected and _gpu_calls(fake_server) == []
+    assert fake_server.clusters[cluster]["hasGpu"] is stored
 
 
 def test_연결에_실패하면_노드를_읽지_않고_GPU_여부도_남기지_않는다(client, fake_server, monkeypatch):

@@ -78,6 +78,10 @@ async def test_cluster(
                 nodes = run_kubectl(gpu.NODES_COMMAND, context=conn.context_name, kubeconfig=path,
                                     timeout=OVERVIEW_TIMEOUT)
                 has_gpu = _has_gpu(nodes)
+                # GPU 노드가 없어도 0대로 내려 둔 GPU 클러스터일 수 있다 — GPU 를 기다리는 파드를 보는 개요가 정한다.
+                # 없다고 이미 안 클러스터만 그대로 false
+                if has_gpu is False and conn.has_gpu is not False:
+                    has_gpu = None
             return version, can_edit, has_gpu
 
     # run_kubectl 은 subprocess.run 을 그대로 부른다. 여기서 직접 부르면 닿지 않는 주소일 때
@@ -138,7 +142,8 @@ async def cluster_overview(
 
             cluster_gpu, has_gpu = _collect_gpu(run, namespace_pods=outputs["pods"], namespace=conn.namespace,
                                                  cache_key=(f"{cluster_id}:{conn.fingerprint}:{conn.namespace}"
-                                                            if conn.fingerprint else None))   # 지문이 없으면 연결이 바뀐 걸 모른다
+                                                            if conn.fingerprint else None),   # 지문이 없으면 연결이 바뀐 걸 모른다
+                                                 known=conn.has_gpu)
         if not network.success:
             # 고객 클러스터는 kube-system 을 못 읽는 게 보통이라 대시보드가 부를 때마다 난다 — debug 로 둔다 (PR #117 리뷰).
             # 원문(사용자·ARN 이 실린다)은 남기지 않고 갈래만 남긴다
@@ -163,11 +168,15 @@ async def cluster_overview(
 
 
 def _collect_gpu(
-    run, *, namespace_pods: str, namespace: str | None = None, cache_key: str | None = None, clock=time.monotonic,
+    run, *, namespace_pods: str, namespace: str | None = None, cache_key: str | None = None,
+    known: bool | None = None, clock=time.monotonic,
 ) -> tuple[dict[str, Any] | None, bool | None]:
-    """(개요의 gpu 칸, GPU 노드 유무) — clusters/gpu.py 의 "읽는 순서". 어느 단계가 실패해도 오류로 올리지 않는다.
+    """(개요의 gpu 칸, GPU 클러스터인가) — clusters/gpu.py 의 "읽는 순서". 어느 단계가 실패해도 오류로 올리지 않는다.
 
-    유무는 노드 목록을 읽었을 때만 True·False 이고, 못 읽었으면 None(모른다)이다.
+    GPU 노드가 있거나, 노드는 없어도 GPU 를 기다리는 파드가 있으면(0대로 내려 둔 GPU 클러스터) True 다.
+    노드 목록을 못 읽었으면 None(모른다)이다. 노드가 없을 때 False 는 모든 namespace 파드를 읽어 기다리는 파드가 없다고
+    확인했을 때만이다 — namespace 마다 찾은 것은 못 본 namespace 가 있을 수 있어 None 이다.
+    known 은 server 에 남은 값이다. False(GPU 가 없다고 이미 안 클러스터)면 노드가 없을 때 파드를 찾지 않는다.
 
     run(args, timeout) 은 개요와 같은 임시 kubeconfig 로 kubectl 을 돌린다. 실패 원문(사용자·ARN 이 실린다)은
     남기지 않고 갈래만 debug 로 남긴다 — 고객 클러스터는 노드를 못 읽는 게 보통이라 대시보드가 부를 때마다 난다.
@@ -187,11 +196,11 @@ def _collect_gpu(
     except (ValueError, AttributeError, TypeError):
         logger.debug("개요의 GPU 조회를 건너뛴다 (노드 목록을 읽지 못했다)")
         return None, None
-    if not nodes:
+    if not nodes and known is False:
         return None, False
 
     if budget(OVERVIEW_TIMEOUT) < 1:
-        return gpu.build(nodes, []), True
+        return gpu.build(nodes, []), (True if nodes else None)
     gpu_node_names = {row["node"] for row in nodes}
     pods_result = run(gpu.PODS_COMMAND, budget(OVERVIEW_TIMEOUT))
     if pods_result.success:
@@ -213,6 +222,12 @@ def _collect_gpu(
     except (ValueError, AttributeError, TypeError):
         logger.debug("GPU 지표 파드를 찾지 못했다 (파드 목록을 읽지 못했다)")
         dcgm, vllm = {}, []
+    try:
+        waiting = gpu.waiting_pods(pods_stdout)
+    except (ValueError, AttributeError, TypeError):
+        waiting = []
+    if not nodes:
+        return gpu.build([], [], waiting), (True if waiting else False if pods_result.success else None)
 
     def metrics(target: tuple[str, str, int]) -> str | None:
         namespace, pod, port = target
@@ -237,7 +252,7 @@ def _collect_gpu(
     for (_, pod, _, node), text in zip(vllm, texts[len(dcgm_rows):]):
         if text is not None:
             serving.extend(gpu.serving_rows(text, pod=pod, node=node))
-    return gpu.build(nodes, serving), True
+    return gpu.build(nodes, serving, waiting), True
 
 
 @dataclass(frozen=True)
@@ -324,7 +339,9 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
         for name, (stdout, outcome) in results.items():
             if outcome == "ok" and gpu.has_gpu_targets(stdout, gpu_node_names):
                 productive.add(name)
-            elif outcome in ("ok", "forbidden"):            # 읽었는데 GPU 파드가 없거나 거부 — 한 번 느렸다고 빼지 않는다
+            elif outcome == "forbidden" or (outcome == "ok" and gpu_node_names):
+                # 읽었는데 GPU 파드가 없거나 거부 — 한 번 느렸다고 빼지 않는다. GPU 노드가 0대인 라운드(꺼진 GPU
+                # 클러스터)는 지표 파드가 없는 게 당연하니 지난 기억을 지우지 않는다
                 productive.discard(name)
         keep = tuple(name for name in names if results[name][1] != "forbidden")
         next_memo = _NamespaceMemo(at=listed_at, names=keep, productive=frozenset(productive & set(keep)),
