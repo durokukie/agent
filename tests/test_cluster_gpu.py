@@ -417,9 +417,64 @@ def test_GPU_노드가_0대인_라운드는_namespace_기억의_GPU_namespace를
 
     clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, gpu_node_names={L40S_1}, cache_key="c0")
     assert clusters_api._readable_namespaces["c0"].productive == {"team-a"}
-    pods["team-a"] = _list(_vllm_pending(namespace="team-a"))
+    pods["team-a"] = "{}"                                    # 노드가 0대라 지표 파드가 없다
     clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, gpu_node_names=set(), cache_key="c0")
     assert clusters_api._readable_namespaces["c0"].productive == {"team-a"}
+
+
+def test_GPU_노드가_0대인_라운드는_기다리는_파드가_나온_namespace를_기억에_더한다():
+    """GPU 쪽 이름이 아닌 namespace 라도 — 노드가 뜨면 거기서 지표 파드가 돈다 (agent#121 리뷰)."""
+    def run(args, timeout):
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("team-b", "zz"))
+        return _result(_list(_vllm_pending(namespace="team-b")) if args[3] == "team-b" else "{}")
+
+    _, complete = clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None, gpu_node_names=set(),
+                                                  cache_key="c9")
+    assert clusters_api._readable_namespaces["c9"].productive == {"team-b"} and complete is True
+
+
+def _namespace_search_cluster(pods_by_namespace: dict[str, KubectlResult]):
+    """노드 0대, 모든 namespace 파드는 Forbidden, namespace 마다 읽으면 pods_by_namespace (없는 곳은 거부)."""
+    def fake(args, **kwargs):
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        if args == gpu.PODS_COMMAND:
+            return _result(stderr=FORBIDDEN, success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces(*pods_by_namespace))
+        if args[:3] == ["get", "pods", "-n"]:
+            return pods_by_namespace.get(args[3], _result(stderr=FORBIDDEN, success=False))
+        return _gpu_cluster(args)
+    return fake
+
+
+def test_모든_namespace_파드를_못_읽어도_namespace마다_끝까지_읽고_없으면_GPU_없음으로_남긴다(client, fake_server, monkeypatch):
+    """거부된 곳은 볼 수 없는 곳이라 못 본 곳으로 치지 않는다 — 다음 개요부터는 지름길로 멈춘다 (agent#121 리뷰)."""
+    cluster = fake_server.add_cluster()
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", _namespace_search_cluster(
+        {"llm": _result("{}"), "secret": _result(stderr=FORBIDDEN, success=False)}))
+    r = client.get(f"/clusters/{cluster}/overview", headers=USER)
+    assert r.status_code == 200 and r.json()["gpu"] is None
+    assert [body["hasGpu"] for body in _gpu_calls(fake_server)] == [False]
+
+
+def test_파드_목록을_읽지_못했으면_기다리는_파드가_없다고_단정하지_않는다(client, fake_server, monkeypatch, caplog):
+    cluster = fake_server.add_cluster(has_gpu=True)
+
+    def fake(args, **kwargs):
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        if args == gpu.PODS_COMMAND:
+            return _result('{"items": 3}')                   # 모양이 다르다
+        return _gpu_cluster(args)
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    with caplog.at_level("DEBUG", logger="kukie_agent.clusters_api"):
+        r = client.get(f"/clusters/{cluster}/overview", headers=USER)
+    assert r.status_code == 200 and r.json()["gpu"] is None
+    assert _gpu_calls(fake_server) == [] and fake_server.clusters[cluster]["hasGpu"] is True
+    assert "GPU 를 기다리는 파드를 찾지 못했다" in caplog.text
 
 
 def test_모든_namespace_파드도_namespace_목록도_못_읽으면_클러스터_namespace_파드에서만_찾는다(client, fake_server, monkeypatch):
@@ -691,7 +746,7 @@ def test_목록을_다시_읽다_실패하면_지난_기억으로_읽는다():
 
     def call():
         return clusters_api._pods_by_namespace(run, lambda limit: limit, "{}", namespace=None,
-                                               gpu_node_names={L40S_1}, cache_key="k", clock=lambda: now[0])
+                                               gpu_node_names={L40S_1}, cache_key="k", clock=lambda: now[0])[0]
 
     call()
     now[0] += clusters_api.READABLE_NAMESPACES_TTL
@@ -744,6 +799,30 @@ def test_namespace_탐색은_남은_GPU_예산의_절반까지만_쓴다(monkeyp
 
     clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
     assert searched and max(searched) <= 1 + (clusters_api.GPU_BUDGET - 1) / 2 + 1
+
+
+def test_GPU_노드가_없으면_namespace_탐색이_남은_예산을_다_쓴다(monkeypatch):
+    """지표를 읽지 않으니 반으로 자르지 않는다 — 기다리는 파드를 찾는 길이 이것뿐이다 (agent#121 리뷰)."""
+    monkeypatch.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
+    now = [0.0]
+    searched: list[float] = []
+
+    def run(args, timeout):
+        now[0] += {"nodes": 1}.get(args[1], 0)
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        if args == gpu.PODS_COMMAND:
+            return _result(stderr=FORBIDDEN, success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces(*(f"ns-{i}" for i in range(20))))
+        now[0] += timeout
+        searched.append(now[0])
+        return _result(stderr="timed out", success=False)
+
+    body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
+    assert max(searched) > 1 + (clusters_api.GPU_BUDGET - 1) / 2 + 1
+    assert max(searched) <= clusters_api.GPU_BUDGET + 1
+    assert (body, has_gpu) == (None, None)                   # 시간 초과가 있으면 모른다
 
 
 def test_namespace_목록도_못_읽으면_클러스터_namespace_파드만_쓴다():

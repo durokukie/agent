@@ -42,7 +42,7 @@ GPU 노드 — nodes
 꺼진 GPU 클러스터 — waiting
   GPU 노드 그룹을 0대로 내려 둔 클러스터(우리 kukie-gpu 처럼 평소 0대)는 노드 목록에 GPU 노드가 없다. 그래도 GPU 를 요청한
   파드(vLLM 등)가 남아 Pending 이면 "GPU 클러스터인데 지금 꺼짐" 이다. 그 파드를 waiting 에 싣고 nodes 는 빈 배열로 둔다.
-  끝난 파드(Succeeded·Failed)는 세지 않는다. 파드는 2와 같은 길로 찾는다. 다만 server 의 hasGpu 가 false 인 클러스터
+  끝난 파드(Succeeded·Failed)는 세지 않는다. 파드는 2와 같은 길로 찾는다(이때는 지표를 읽지 않으니 남은 예산을 다 쓴다). 다만 server 의 hasGpu 가 false 인 클러스터
   (GPU 가 없다고 이미 안 곳)는 찾지 않는다 — GPU 없는 클러스터마다 개요 때 파드 조회가 늘지 않게. GPU 노드가 있을 때도
   같은 파드 목록에서 GPU 를 기다리는 파드를 waiting 에 싣는다(늘어나는 중인 레플리카 등).
 
@@ -232,6 +232,14 @@ def _requested_gpus(container: dict[str, Any]) -> int:
     resources = container.get("resources") or {}
     return max((_positive_int((resources.get(kind) or {}).get(name))
                 for kind in ("limits", "requests") for name in GPU_RESOURCES), default=0)
+
+
+def has_waiting_pods(stdout: str) -> bool:
+    """파드 목록에 GPU 를 기다리는 파드가 있는가. 모양이 다르면 False (기억을 고칠 때만 쓴다)."""
+    try:
+        return bool(waiting_pods(stdout))
+    except (ValueError, AttributeError, TypeError):
+        return False
 
 
 def has_gpu_targets(stdout: str, gpu_node_names: set[str]) -> bool:
