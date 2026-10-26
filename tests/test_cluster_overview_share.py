@@ -80,6 +80,47 @@ def test_실패는_나눠_쓰지_않고_다음_요청은_새로_읽는다():
     assert after == {"ok": True} and calls["n"] == 2
 
 
+def test_실패한_한_번이_치워지기_전에_온_요청도_새로_읽는다():
+    """완료 콜백은 다음 루프 바퀴에 돈다 — 실패로 끝났는데 아직 치워지지 않은 entry 를 나눠 주지 않는다 (agent#122 리뷰)."""
+    calls, compute = _counter()
+
+    async def main():
+        failed = asyncio.get_running_loop().create_future()
+        failed.set_exception(HTTPException(502, {"code": "CLUSTER_UNREACHABLE"}))
+        failed.exception()                                    # 이 테스트가 읽었다 — 경고를 내지 않게
+        clusters_api._shared_overviews["k"] = clusters_api._SharedOverview(task=failed)   # 콜백이 돌기 전 모습
+        return await clusters_api._shared_overview("k", compute)
+
+    assert asyncio.run(main()) == {"n": 1} and calls["n"] == 1
+
+
+def test_끝나면_task_를_놓고_결과도_TTL_뒤에_치운다(monkeypatch):
+    """끝난 코루틴이 연결(평문 자격증명)을 붙잡지 않게, 다음 요청이 안 와도 결과가 남지 않게 (agent#122 리뷰)."""
+    monkeypatch.setattr(clusters_api, "OVERVIEW_SHARE_TTL", 0.01)
+    calls, compute = _counter()
+
+    async def main():
+        await clusters_api._shared_overview("k", compute)
+        await asyncio.sleep(0)
+        entry = clusters_api._shared_overviews["k"]
+        assert entry.task is None and entry.body == {"n": 1}
+        await asyncio.sleep(0.05)
+        return "k" in clusters_api._shared_overviews
+
+    assert asyncio.run(main()) is False
+
+
+def test_TTL_이_0_이면_진행_중인_것도_나눠_쓰지_않는다(monkeypatch):
+    monkeypatch.setattr(clusters_api, "OVERVIEW_SHARE_TTL", 0)
+    calls, compute = _counter()
+
+    async def main():
+        return await asyncio.gather(*(clusters_api._shared_overview("k", compute) for _ in range(3)))
+
+    asyncio.run(main())
+    assert calls["n"] == 3
+
+
 def test_연결이_다르거나_지문이_없으면_나눠_쓰지_않는다():
     calls, compute = _counter()
 
