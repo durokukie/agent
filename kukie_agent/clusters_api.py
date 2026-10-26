@@ -274,7 +274,7 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
     거부되는 조회가 대시보드를 부를 때마다 고객 감사 로그에 쌓이지 않게, 연결마다 READABLE_NAMESPACES_TTL 초 기억한다
     (agent#120 리뷰). 그동안은 목록을 다시 읽지 않고 기억한 namespace 만 읽고, Forbidden 으로 확인된 것은 그때그때 뺀다.
     읽는 순서는 두 줄이다 — 앞 줄: GPU 지표 파드가 나온 적 있는 것과 GPU 쪽 이름, 뒤 줄: 나머지. 줄마다 지난번에 멈춘
-    자리부터 돌아가며 읽어(라운드 로빈) 예산이 모자라도 어느 namespace 도 영원히 빠지지 않는다. 앞 줄이 늘 먼저다.
+    자리부터 돌아가며 읽고(라운드 로빈), 앞 줄 첫째 다음에 뒤 줄 하나를 끼운다 — 예산이 모자라도 어느 줄도 굶지 않는다.
     목록을 다시 읽다 실패하면 지난 기억으로 읽는다. 연결 지문이 없으면(cache_key None) 기억하지 않는다.
     namespace 목록도 기억도 없으면(GPU 읽기 RBAC 를 적용하지 않은 클러스터) 클러스터 namespace 파드만 쓴다.
     """
@@ -313,7 +313,9 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
     cursors = memo.cursors if memo else (0, 0)
     front = [name for name in names if name in productive or gpu.hinted_namespace(name)]
     back = [name for name in names if name not in front]
-    order = _rotate(front, cursors[0]) + _rotate(back, cursors[1])
+    # 줄마다 돌린 뒤 앞 줄 첫째 다음에 뒤 줄 하나를 끼운다 — 앞 줄이 예산을 다 써도 뒤 줄이 매 라운드 한 칸은 돈다
+    first, second = _rotate(front, cursors[0]), _rotate(back, cursors[1])
+    order = first[:1] + second[:1] + first[1:] + second[1:]
     with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
         results = dict(zip(order, pool.map(read, order)))
 

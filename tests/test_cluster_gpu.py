@@ -544,9 +544,35 @@ def test_예산이_모자라도_줄마다_돌아가며_읽어_어느_namespace�
             call(3)                                       # 앞 줄 둘 + 뒤 줄 하나
         for _ in range(2):
             call(1)                                       # 앞 줄보다 예산이 작아도 앞 줄 안에서 돈다
-    assert all(set(r[:2]) == {"gpu-operator", "team-x"} for r in rounds[2:5])
-    assert {r[2] for r in rounds[2:5]} == {"a", "b", "c"}
-    assert {r[0] for r in rounds[5:]} == {"gpu-operator", "team-x"}
+    assert all({r[0], r[2]} == {"gpu-operator", "team-x"} for r in rounds[2:5])   # 앞 줄 둘
+    assert {r[1] for r in rounds[2:5]} == {"a", "b", "c"}                          # 끼운 뒤 줄 한 칸이 돈다
+    assert {r[0] for r in rounds[5:]} == {"gpu-operator", "team-x"}               # 예산 1: 앞 줄 안에서 돈다
+
+
+def test_앞_줄이_예산을_다_써도_뒤_줄이_매_라운드_한_칸은_읽힌다():
+    names = ["gpu-a", "gpu-b", "gpu-c", "gpu-d", "team-a"]
+    rounds: list[list[str]] = []
+
+    def run(args, timeout):
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces(*names))
+        rounds[-1].append(args[3])
+        return _result("{}")
+
+    def call(reads):
+        left = [reads]
+
+        def budget(limit):
+            left[0] -= 1
+            return limit if left[0] >= 0 else 0
+        rounds.append([])
+        clusters_api._pods_by_namespace(run, budget, "{}", namespace=None, gpu_node_names={L40S_1}, cache_key="k")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
+        call(2 + 2)                                       # 목록 + 둘 — 앞 줄(gpu-*)은 넷이라 예산이 모자란다
+        call(2)
+    assert all("team-a" in r for r in rounds)
 
 
 def test_목록을_부르지도_못한_라운드는_기억_시각을_늘리지_않는다():
