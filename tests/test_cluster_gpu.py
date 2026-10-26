@@ -327,8 +327,8 @@ def test_노드를_못_읽으면_gpu만_null이고_파드_지표는_읽지_않�
     assert "GPU 조회를 건너뛴다" in caplog.text and "arn:aws" not in caplog.text   # 원문은 남기지 않는다
 
 
-def test_GPU가_없다고_이미_안_클러스터는_파드를_읽지_않는다(client, fake_server, monkeypatch):
-    """GPU 없는 클러스터마다 개요 때 파드 조회가 늘지 않게 — server 의 hasGpu 가 false 면 노드 목록에서 멈춘다."""
+def test_GPU가_없다고_이미_안_클러스터는_간격_안에서는_파드를_읽지_않는다(client, fake_server, monkeypatch):
+    """GPU 없는 클러스터마다 개요 때 파드 조회가 늘지 않게 — 한 번 찾은 뒤 GPU_ABSENT_RECHECK 동안은 노드 목록에서 멈춘다."""
     cluster = fake_server.add_cluster(has_gpu=False)
     seen: list[list[str]] = []
 
@@ -337,36 +337,12 @@ def test_GPU가_없다고_이미_안_클러스터는_파드를_읽지_않는다(
         return _result(fixture("nodes.json")) if args == gpu.NODES_COMMAND else _gpu_cluster(args)
 
     monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    assert client.get(f"/clusters/{cluster}/overview", headers=USER).status_code == 200
+    assert seen.count(gpu.PODS_COMMAND) == 1                  # 이 프로세스에서 처음 — 한 번 찾았다
+    seen.clear()
     r = client.get(f"/clusters/{cluster}/overview", headers=USER)
     assert r.status_code == 200 and r.json()["gpu"] is None
     assert gpu.PODS_COMMAND not in seen and not any(args[1] == "--raw" for args in seen)
-
-
-def test_GPU가_없다고_남은_클러스터도_간격마다_한_번은_기다리는_파드를_다시_찾는다():
-    """노드 그룹은 0대 그대로 GPU 워크로드를 새로 올린 경우 (agent#121 Codex 리뷰)."""
-    now = [0.0]
-    seen: list[list[str]] = []
-
-    def run(args, timeout):
-        seen.append(args)
-        if args == gpu.NODES_COMMAND:
-            return _result(fixture("nodes.json"))
-        return _result(_list(_vllm_pending()))
-
-    def call():
-        return clusters_api._collect_gpu(run, namespace_pods="{}", cache_key="c:fp:ns", known=False,
-                                         clock=lambda: now[0])
-
-    assert call() == (None, False)                            # 처음 본 때 — 찾지 않는다
-    now[0] += clusters_api.GPU_ABSENT_RECHECK - 1
-    assert call() == (None, False) and gpu.PODS_COMMAND not in seen
-    now[0] += 1
-    body, has_gpu = call()                                    # 간격이 지났다 — 한 번 찾는다
-    assert has_gpu is True and body["waiting"][0]["pod"] == "vllm-gpt-oss-20b-b897b5d97-kkjsq"
-    seen.clear()
-    assert call() == (None, False) and gpu.PODS_COMMAND not in seen   # 다음 간격까지는 다시 멈춘다
-    assert clusters_api._collect_gpu(run, namespace_pods="{}", cache_key=None, known=False,
-                                     clock=lambda: now[0] + 10 * clusters_api.GPU_ABSENT_RECHECK) == (None, False)
 
 
 def _vllm_pending(namespace: str = "llm", name: str = "vllm-gpt-oss-20b-b897b5d97-kkjsq") -> dict:
@@ -551,15 +527,17 @@ def test_GPU_없음_시각은_오래_안_부른_연결도_되감기지_않고_�
     now = [0.0]
 
     def claim(key):
-        return clusters_api._claim_absent_search(key, first=False, clock=lambda: now[0])
+        return clusters_api._claim_absent_search(key, unknown=False, clock=lambda: now[0])
 
-    assert claim("a") is None and claim("b") is None          # false 를 처음 봤다 — 센다
+    assert claim("a") is not None and claim("b") is not None  # 기록이 없다 — 바로 한 번 찾는다
+    assert claim("a") is None                                 # 같은 연결의 두 번째 개요 — 창은 이미 잡혔다
     now[0] += 3600                                            # 한 시간 뒤 묶음으로 다시
     first = claim("a")
-    assert first is not None and claim("b") is not None      # b 도 지워지지 않고 찾을 때다
-    assert claim("a") is None                                 # 같은 연결의 두 번째 개요 — 창은 이미 잡혔다
+    assert first is not None and claim("b") is not None      # b 도 찾을 때다
     clusters_api._release_absent_search("a", first)           # 못 읽고 끝났다 — 되돌린다
     assert claim("a") is not None
+    now[0] += 3 * 24 * 3600                                   # 주말 — a 가 b 를 지워도
+    assert claim("a") is not None and claim("b") is not None  # 지워진 b 도 미뤄지지 않고 바로 찾는다
 
 
 def test_파드_목록을_읽지_못했으면_기다리는_파드가_없다고_단정하지_않는다(client, fake_server, monkeypatch, caplog):

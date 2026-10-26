@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -260,9 +261,10 @@ def test_볼_수_없는_클러스터는_404이고_kubectl은_돌지_않는다(cl
 
 def test_팀_구성원은_개요를_읽고_namespace_범위로만_조회한다(client, fake_server, monkeypatch):
     fake_server.add_member("t-1", "u-2", "MEMBER")
-    # GPU 가 없다고 이미 아는 클러스터 — 처음 보는 클러스터는 꺼진 GPU 클러스터인지 파드를 한 번 더 본다 (test_cluster_gpu.py)
+    # GPU 가 없다고 이미 알고 방금 찾아본 클러스터 — 아니면 꺼진 GPU 클러스터인지 파드를 한 번 더 본다 (test_cluster_gpu.py)
     cluster = fake_server.add_cluster(owner="u-1", team_id="t-1", context="eks-shop", namespace="shop",
                                       credential={"token": "secret-token"}, has_gpu=False)
+    monkeypatch.setitem(clusters_api._gpu_absent_checked, f"{cluster}:fp-{cluster}:shop", time.monotonic())
     seen: list[dict] = []
 
     def fake(args, *, context, dry_run=False, stdin=None, timeout=30, kubeconfig=None):

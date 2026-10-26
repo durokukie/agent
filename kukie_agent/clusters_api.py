@@ -62,10 +62,12 @@ OVERVIEW_SHARE_TTL = 10
 #: 지표를 동시에 읽는 수. 개요 슬롯(OVERVIEW_WORKERS) 하나 안에서 잠깐 쓰는 스레드라 limiter 밖이다 — 많아야 4 × 4
 GPU_METRICS_WORKERS = 4
 #: GPU 노드가 없고 server 값이 GPU 클러스터(true)가 아닌 연결은 이 간격(초)마다 한 번만 GPU 를 기다리는 파드를 찾는다.
-#:   false  GPU 가 없다고 남은 곳 — 처음 본 때부터 간격마다 한 번. 노드 그룹을 0대로 둔 채 vLLM 같은 GPU 워크로드를 새로
-#:          올려도 노드가 뜨기 전에 GPU 클러스터로 바뀌게 (agent#121 Codex 리뷰)
-#:   null   아직 모르는 곳 — 바로 한 번, 그 뒤 간격마다. 끝까지 못 읽어 계속 모르는 곳(namespace 가 상한보다 많은 등)이
-#:          개요마다 파드를 전부 다시 읽지 않게 (agent#121 리뷰)
+#:   false  GPU 가 없다고 남은 곳 — 노드 그룹을 0대로 둔 채 vLLM 같은 GPU 워크로드를 새로 올려도 노드가 뜨기 전에 GPU
+#:          클러스터로 바뀌게 (agent#121 Codex 리뷰)
+#:   null   아직 모르는 곳 — 끝까지 못 읽어 계속 모르는 곳(namespace 가 상한보다 많은 등)이 개요마다 파드를 전부 다시
+#:          읽지 않게 (agent#121 리뷰)
+#: 둘 다 이 프로세스에서 기록이 없으면(처음 봤거나 오래 안 불러 지웠으면) 바로 한 번 찾는다 — 오래 안 부른 연결이 다시
+#: 와도 미뤄지지 않게 (agent#121 리뷰). 재시작·하루 넘게 안 부른 연결마다 한 번 더 찾는 값이다.
 #: 실제로 파드를 읽어 본 라운드만 센다 — 예산이 모자라 하나도 못 읽은 라운드가 간격을 태우지 않게.
 #: 프로세스 안 시각이라 복제본마다·재시작마다 따로 센다
 GPU_ABSENT_RECHECK = 600
@@ -280,7 +282,7 @@ def _collect_gpu(
         return None, None
     claim: _AbsentClaim | None = None
     if not nodes and known is not True:
-        claim = _claim_absent_search(cache_key, first=known is None, clock=clock)
+        claim = _claim_absent_search(cache_key, unknown=known is None, clock=clock)
         if claim is None:
             return None, (False if known is False else None)
 
@@ -374,22 +376,19 @@ class _AbsentClaim:
     previous: float | None
 
 
-def _claim_absent_search(cache_key: str | None, *, first: bool, clock=time.monotonic) -> _AbsentClaim | None:
+def _claim_absent_search(cache_key: str | None, *, unknown: bool, clock=time.monotonic) -> _AbsentClaim | None:
     """GPU 노드가 없는 연결에서 지금 기다리는 파드를 찾을 때면 그 창을 잡는다 (GPU_ABSENT_RECHECK). 아니면 None.
-    first 면 처음 보는 연결은 바로 찾고(server 값이 null), 아니면 처음 본 때부터 센다(false). 창은 잠금 안에서 바로
-    잡는다 — 같은 연결의 개요가 동시에 와도 한 번만 찾게 (agent#121 리뷰). 연결 지문이 없으면(cache_key None) 셀 키가
-    없다 — 모르는 곳(first)은 찾고, false 는 찾지 않는다(지금 서버는 등록한 클러스터마다 지문을 준다)."""
+    기록이 없으면 바로, 있으면 마지막으로 찾은 뒤 간격이 지났을 때. 창은 잠금 안에서 바로 잡는다 — 같은 연결의 개요가
+    동시에 와도 한 번만 찾게 (agent#121 리뷰). 연결 지문이 없으면(cache_key None) 셀 키가 없다 — 모르는 곳(unknown,
+    server 값 null)은 찾고, false 는 찾지 않는다(지금 서버는 등록한 클러스터마다 지문을 준다)."""
     now = clock()
     if cache_key is None:
-        return _AbsentClaim(at=now, previous=None) if first else None
+        return _AbsentClaim(at=now, previous=None) if unknown else None
     with _readable_lock:
         for key in [key for key, at in _gpu_absent_checked.items()
                     if key != cache_key and now - at >= GPU_ABSENT_RECHECK_FORGET]:
             del _gpu_absent_checked[key]
         last = _gpu_absent_checked.get(cache_key)
-        if last is None and not first:
-            _gpu_absent_checked[cache_key] = now            # false 를 처음 봤다 — 여기서부터 센다
-            return None
         if last is not None and now - last < GPU_ABSENT_RECHECK:
             return None
         _gpu_absent_checked[cache_key] = now
