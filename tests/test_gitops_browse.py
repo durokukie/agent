@@ -478,6 +478,22 @@ def test_kustomize_덮어쓰기가_있으면_notes_로_알린다():
 
 # ── 작은 것들 ──────────────────────────────────────────
 
+@pytest.mark.parametrize(("path", "tail"), [
+    ("apps/a b/#1?.yaml", "apps/a%20b/%231%3F.yaml"),
+    ("apps/100%.yaml", "apps/100%25.yaml"),
+    ("apps/한글.yaml", "apps/%ED%95%9C%EA%B8%80.yaml"),
+])
+def test_GitHub_링크는_경로_조각을_인코딩한다(path, tail):
+    assert browse.html_url(REPO, "c0", path, folder=False) == f"https://github.com/{REPO}/blob/c0/{tail}"
+
+
+def test_파일_응답의_링크도_인코딩된다(client, cluster, gh, monkeypatch):
+    _cluster_apps(monkeypatch)
+    gh.commits["c0"]["apps/my file#2.yaml"] = "a: b\n"
+    body = _file(client, cluster, "apps/my file#2.yaml").json()
+    assert body["html_url"].endswith("/blob/c0/apps/my%20file%232.yaml") and body["name"] == "my file#2.yaml"
+
+
 @pytest.mark.parametrize(("raw", "clean"), [
     ("", ""), ("/", ""), ("/apps/plain/", "apps/plain"), ("apps/../x", None), ("./apps", None), ("a\\b", None),
     ("a/\x00", None),

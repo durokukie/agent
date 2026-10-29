@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import quote
 
 import yaml
 from anyio import to_thread
@@ -451,9 +452,10 @@ async def file(gh: github.GitHub, repository: str, revision: Revision, path: str
 
 
 def html_url(repository: str, sha: str, path: str, *, folder: bool) -> str:
-    """GitHub 화면 주소 — 커밋 id 로 고정한다 (나중에 브랜치가 움직여도 같은 내용)."""
+    """GitHub 화면 주소 — 커밋 id 로 고정한다 (나중에 브랜치가 움직여도 같은 내용).
+    경로는 조각마다 퍼센트 인코딩한다 — `#`·`?`·`%`·공백·한글 파일 이름도 링크가 깨지지 않게 (`/` 는 그대로)."""
     kind = "tree" if folder else "blob"
-    return f"https://github.com/{repository}/{kind}/{sha}" + (f"/{path}" if path else "")
+    return f"https://github.com/{repository}/{kind}/{sha}" + (f"/{quote(path, safe='/')}" if path else "")
 
 
 # ── 앱 렌더 결과 ────────────────────────────────────────
