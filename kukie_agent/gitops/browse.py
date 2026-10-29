@@ -428,7 +428,7 @@ def _file_view(path: str, data: Any) -> dict[str, Any]:
     try:
         raw = base64.b64decode(str(data.get("content") or ""), validate=False)
         text = raw.decode("utf-8")
-    except (binascii.Error, ValueError):
+    except (binascii.Error, UnicodeDecodeError, ValueError):     # UnicodeDecodeError 도 ValueError 지만 뜻을 적어 둔다
         return {**view, "status": "binary"}
     if "\x00" in text:
         return {**view, "status": "binary"}

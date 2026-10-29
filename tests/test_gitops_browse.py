@@ -320,6 +320,14 @@ def test_글자가_아닌_파일은_binary(client, cluster, gh, monkeypatch):
     assert (body["status"], body["content"]) == ("binary", None)
 
 
+@pytest.mark.parametrize("data", [b"\xff\xd8\xff\xe0JFIF", b"caf\xe9\n"])     # NUL 없이 UTF-8 이 아닌 것 (JPEG, latin-1)
+def test_UTF8_이_아닌_파일도_500_이_아니라_binary(client, cluster, gh, monkeypatch, data):
+    _cluster_apps(monkeypatch)
+    gh.commits["c0"]["apps/photo.jpg"] = data
+    r = _file(client, cluster, "apps/photo.jpg")
+    assert r.status_code == 200 and (r.json()["status"], r.json()["content"]) == ("binary", None)
+
+
 def test_YAML_로_못_읽는_파일도_내용은_준다(client, cluster, gh, monkeypatch):
     _cluster_apps(monkeypatch)
     gh.commits["c0"]["apps/helm/templates/svc.yaml"] = "kind: Service\nmetadata:\n  name: {{ .Release.Name }}\n  x: [\n"
