@@ -286,3 +286,32 @@ def test_지원하지_않는_요청이면_kubectl_길(monkeypatch):
 
 def test_연결_목록을_못_읽으면_kubectl_길로_둔다(monkeypatch):
     assert _decide(monkeypatch, FakeCluster(), repos_error=True).path == "kubectl"
+
+
+def test_받는_도중_한도를_넘으면_멈춘다(api, tmp_path, monkeypatch):
+    """다 받은 뒤가 아니라 받으면서 센다 (agent#126 리뷰)."""
+    handlers, _ = api
+    handlers[("GET", f"/repos/{REPO}/tarball/abc")] = (200, _tarball({"a.yaml": "x" * 5000}))
+    monkeypatch.setattr(github, "MAX_TARBALL_BYTES", 100)
+
+    async def go():
+        async with github.GitHub(REPO, "t") as gh:
+            await gh.download("abc", tmp_path / "repo")
+
+    with pytest.raises(GitHubError, match="너무 크다"):
+        sync(go())
+    assert not (tmp_path / "repo").exists()
+
+
+def test_풀었을_때_크기가_한도를_넘으면_풀지_않는다(api, tmp_path, monkeypatch):
+    handlers, _ = api
+    handlers[("GET", f"/repos/{REPO}/tarball/abc")] = (200, _tarball({"big.yaml": "0" * 100_000}))   # 잘 압축된다
+    monkeypatch.setattr(github, "MAX_EXTRACTED_BYTES", 10_000)
+
+    async def go():
+        async with github.GitHub(REPO, "t") as gh:
+            await gh.download("abc", tmp_path / "repo")
+
+    with pytest.raises(GitHubError, match="너무 크다"):
+        sync(go())
+    assert not (tmp_path / "repo" / "acme-manifests-abc" / "big.yaml").exists()

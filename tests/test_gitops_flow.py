@@ -323,3 +323,14 @@ def test_PR_길이_아닌데_propose_git_change를_고집해도_run이_실패하
     with agent.override(model=FunctionModel(stubborn)):
         r = client.post(f"/conversations/{room}/chat", json={"text": "web 3개로"}, headers=USER)
     assert r.status_code == 200 and r.json()["kind"] == "answer"
+
+
+def test_승인하는_사이_base_브랜치가_앞서면_STALE이다(client, fake_server, room, gh, cluster):
+    """PR 파일이 그대로여도 다른 파일(kustomization.yaml 등)이 바뀌면 렌더 결과가 달라질 수 있다 (agent#126 리뷰)."""
+    _card(client, room)
+    gh.push_to_base("apps/plain/service.yaml", "kind: Service\n")
+    _decide(client, room)
+
+    assert _plan(fake_server, room)["status"] == "STALE"
+    assert gh.merges == [] and gh.pull_of(1)["state"] == "closed"
+    assert "다른 커밋이 들어왔어요" in str(_tool_result(fake_server, room)["content"])

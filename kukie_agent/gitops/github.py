@@ -30,6 +30,8 @@ TIMEOUT = 30.0
 BRANCH_PREFIX = "kukie/"
 #: 받아 올 레포 크기 상한 — 매니페스트 레포는 작다. 넘으면 PR 길을 포기한다(렌더 비교를 못 한다)
 MAX_TARBALL_BYTES = 50 * 1024 * 1024
+#: 푼 뒤의 크기 상한 — 작게 압축한 큰 파일로 디스크를 채우지 못하게
+MAX_EXTRACTED_BYTES = 200 * 1024 * 1024
 MAX_FILES = 20_000
 
 #: 테스트가 httpx.MockTransport 로 바꿔 끼운다. None 이면 진짜 네트워크
@@ -146,15 +148,21 @@ class GitHub:
 
     async def download(self, ref: str, dest: Path) -> Path:
         """그 커밋의 레포 내용을 dest 아래에 푼다. 레포 루트 폴더를 돌려준다."""
+        # 받으면서 센다 — 다 받은 뒤에 크기를 보면 큰 레포 하나가 그만큼 메모리를 먼저 문다 (agent#126 리뷰)
+        chunks: list[bytes] = []
+        received = 0
         try:
-            response = await self._client.get(self._repo_path("tarball", quote(ref, safe="")))
+            async with self._client.stream("GET", self._repo_path("tarball", quote(ref, safe=""))) as response:
+                if not response.is_success:
+                    raise GitHubError(response.status_code, "레포 내용을 받지 못했다")
+                async for chunk in response.aiter_bytes():
+                    received += len(chunk)
+                    if received > MAX_TARBALL_BYTES:
+                        raise GitHubError(None, "레포가 너무 크다")
+                    chunks.append(chunk)
         except httpx.HTTPError as exc:
             raise GitHubError(None, type(exc).__name__) from exc
-        if not response.is_success:
-            raise GitHubError(response.status_code, "레포 내용을 받지 못했다")
-        if len(response.content) > MAX_TARBALL_BYTES:
-            raise GitHubError(None, "레포가 너무 크다")
-        return _extract(response.content, dest)
+        return _extract(b"".join(chunks), dest)
 
     async def pull(self, number: int) -> PullRequest:
         return PullRequest.from_json(await self._request("GET", self._repo_path("pulls", str(number))))
@@ -253,6 +261,8 @@ def _extract(data: bytes, dest: Path) -> Path:
             members = [m for m in archive.getmembers() if m.isfile() or m.isdir()]
             if len(members) > MAX_FILES:
                 raise GitHubError(None, "레포 파일이 너무 많다")
+            if sum(m.size for m in members if m.isfile()) > MAX_EXTRACTED_BYTES:
+                raise GitHubError(None, "레포가 너무 크다")
             archive.extractall(dest, members=members, filter="data")
     except (tarfile.TarError, OSError) as exc:
         raise GitHubError(None, f"레포 내용을 풀지 못했다: {type(exc).__name__}") from exc

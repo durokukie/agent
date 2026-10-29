@@ -9,7 +9,8 @@ Plan 상태를 바꾸는 일은 guardrail/gitops_hook.py 가 한다. 여기는 G
   4. 새 브랜치 `kukie/<plan code>` 에 커밋 하나, 기본 브랜치로 PR
 
 승인 순간 (recheck) — 승인한 것과 지금이 같아야 머지한다. 다르면 STALE
-  PR 이 아직 열려 있고, base 가 같고, 바뀐 파일과 그 내용(blob id)이 승인 카드의 것과 정확히 같아야 한다
+  PR 이 아직 열려 있고, base 브랜치 끝이 승인 카드를 만든 커밋(base_sha) 그대로이고, 바뀐 파일과 그 내용(blob id)이
+  승인 카드의 것과 정확히 같아야 한다 — 그래야 머지 결과가 승인한 렌더 diff 와 같다
 """
 from __future__ import annotations
 
@@ -185,6 +186,12 @@ async def recheck(gitops: dict[str, Any], pull_request: dict[str, Any], token: s
             return pull, f"PR #{pull.number} 이 닫혔어요."
         if pull.base_ref != gitops["base"] or pull.head_ref != gitops["branch"]:
             return pull, f"PR #{pull.number} 의 브랜치가 바뀌었어요."
+        # base 가 앞서면 PR 파일이 그대로여도 렌더 결과가 달라질 수 있다 (다른 파일 — kustomization.yaml 등 — 이 바뀌었다).
+        # 승인한 렌더 diff 는 base_sha 기준이라, 새 base 로 다시 렌더 비교해 다시 제안하게 한다 (agent#126 리뷰)
+        head = await gh.branch_head(gitops["base"])
+        if head != gitops["base_sha"]:
+            return pull, (f"승인 카드를 만든 뒤 {gitops['base']} 브랜치에 다른 커밋이 들어왔어요 — "
+                          "지금 레포로 렌더 비교를 다시 해야 해요.")
         files = await gh.pull_files(pull.number)
         approved = {entry["path"]: entry["blob_sha"] for entry in gitops["files"]}
         if files != approved:

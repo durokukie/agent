@@ -57,6 +57,13 @@ class FakeGitHub:
         self.branches[pull["head_ref"]] = sha
         pull["head_sha"] = sha
 
+    def push_to_base(self, path: str, content: str, branch: str = "main") -> None:
+        """누군가 기본 브랜치에 다른 커밋을 넣었다."""
+        files = {**self.commits[self.branches[branch]], path: content}
+        sha = f"c{len(self.commits)}"
+        self.commits[sha] = files
+        self.branches[branch] = sha
+
     def connect(self, repository: str, token: str) -> "FakeGitHub":
         assert repository == self.repository, repository
         self.tokens.append(token)
