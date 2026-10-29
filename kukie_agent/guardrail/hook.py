@@ -19,6 +19,7 @@ ArgoCD 가 관리하는 리소스면 (DURO-129, kukie_agent/argocd.py) Plan 을 
 """
 from __future__ import annotations
 
+import json
 import logging
 import shlex
 from functools import partial
@@ -27,13 +28,17 @@ import yaml
 from anyio import to_thread
 from pydantic_ai import ApprovalRequired, ModelRetry, ToolFailed
 from pydantic_ai.capabilities.hooks import Hooks
+from pydantic_ai.messages import ModelRequest, RetryPromptPart, ToolCallPart, UserPromptPart
 
 from kukie_agent import argocd
+from kukie_agent.gitops import route as gitops_route
+from kukie_agent.gitops.memo import is_memo
 from kukie_agent.guardrail.action_plan import ActionPlan, PlanTarget
 from kukie_agent.guardrail.approval import _manifest_preview
 from kukie_agent.guardrail.decision_guidance import generate_decision_guidance
 from kukie_agent.guardrail.mutation_request import canonicalize_mutation_args
 from kukie_agent.kubectl import KubectlResult, assemble, run_kubectl, thread_limiter
+from kukie_agent.manifests import Replicas
 from kukie_agent.tools.mutate import MUTATING_TOOLS, RISK_STICKERS
 
 logger = logging.getLogger(__name__)
@@ -109,6 +114,53 @@ async def _argocd_ownership(ctx, target: PlanTarget) -> dict | None:
     except Exception:
         logger.exception("ArgoCD 판별을 건너뛴다")
         return None
+
+
+#: PR 길 리소스에 kubectl 을 부르면 한 번 돌려보낼 때 쓰는 머리말 (DURO-135). 같은 호출을 다시 하면 이 말로 알아본다
+PR_PATH_RETRY = "이 리소스는 지금 PR 길이다."
+#: 같은 일을 PR 로도 할 수 있는 kubectl 툴 — restart·delete 는 PR 로 하는 변경이 아니다
+_PR_ALTERNATIVE = frozenset({"scale_resource", "apply_manifest"})
+
+
+def _already_warned(ctx, tool_name: str, args: dict) -> bool:
+    """이번 턴에 같은 호출을 PR 길이라고 이미 돌려보냈나 — 그랬는데 또 부르면 사용자가 kubectl 을 고른 것으로 본다."""
+    def key(value: object) -> str:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+
+    wanted = key(args)
+    turn = []
+    for message in reversed(ctx.messages):
+        turn.append(message)
+        if isinstance(message, ModelRequest) and any(
+            isinstance(p, UserPromptPart) and not is_memo(p) for p in message.parts
+        ):
+            break                                     # 이번 턴의 시작 — 그 앞의 턴은 보지 않는다
+    parts = [part for message in turn for part in getattr(message, "parts", ())]
+    calls = {part.tool_call_id: part for part in parts if isinstance(part, ToolCallPart) and part.tool_call_id}
+    for part in parts:
+        if (
+            isinstance(part, RetryPromptPart) and part.tool_name == tool_name
+            and isinstance(part.content, str) and part.content.startswith(PR_PATH_RETRY)
+        ):
+            call = calls.get(part.tool_call_id or "")
+            if call is not None and key(call.args_as_dict()) == wanted:
+                return True
+    return False
+
+
+async def _pr_path(ctx, tool_name: str, target: PlanTarget, normalized_args: dict) -> gitops_route.Route | None:
+    """대상 가운데 PR 길인 리소스가 있으면 그 판단 (DURO-135). 없거나 판단을 못 하면 None — kubectl 길 그대로."""
+    change = Replicas(count=normalized_args["replicas"]) if tool_name == "scale_resource" else None
+    resources = target.get("resources") or [target]
+    for resource in resources[: argocd.MAX_RESOURCES]:
+        found = await gitops_route.decide(
+            kind=str(resource["kind"]), name=str(resource["name"]),
+            namespace=str(resource.get("namespace") or target.get("namespace") or "") or None,
+            context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig, cluster_id=ctx.deps.cluster_id, change=change,
+        )
+        if found.path == "pr":
+            return found
+    return None
 
 
 def _manifest_resources(manifest_yaml: str) -> list[dict[str, str]]:
@@ -268,6 +320,19 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
     # 승인 뒤(위 분기)에는 다시 보지 않는다 — 카드에 실린 경고를 보고 승인한 것이다.
     # 승인 순간 다시 판단해 길이 바뀌면 STALE 로 돌리는 것은 PR 길(DURO-134)과 함께 한다 (설계 1절)
     managed = await _argocd_ownership(ctx, target)
+    if managed is not None and tool_name in _PR_ALTERNATIVE and getattr(ctx.deps, "cluster_id", None) is not None:
+        # 길을 코드가 강제한다 (DURO-135): PR 길 리소스에 경고 없이 kubectl 을 부르면 이유를 붙여 한 번 돌려보낸다.
+        # 옛 답변("kubectl 로 바꿀게요")에 끌려간 호출이 여기서 걸린다. 같은 호출을 다시 하면 경고 카드와 함께 간다(경고 후 허용)
+        pr = await _pr_path(ctx, tool_name, target, normalized_args)
+        if pr is not None:
+            managed = {**managed, "route": {"path": "pr", "repository": pr.repository, "reason": pr.reason}}
+            # 이 툴의 재시도를 이미 썼으면 돌려보내지 않는다 — 한도(1)를 넘으면 run 이 실패한다. 카드의 route 칸이 대신 알린다
+            if not _already_warned(ctx, tool_name, args) and getattr(ctx, "retry", 0) < 1:
+                raise ModelRetry(
+                    f"{PR_PATH_RETRY} 이유: {pr.reason} 레플리카·이미지 태그·resources·환경변수 변경이면 "
+                    "propose_git_change 로 다시 하라. 그 밖의 변경이거나 사용자가 kubectl 로 바로 바꾸길 원하면"
+                    "(장애 대응 등) 같은 호출을 한 번 더 하라 — ArgoCD 경고 카드와 함께 승인을 받는다."
+                )
     plan = await ActionPlan.create_draft(
         run_id=ctx.deps.run_id,
         call_id=call.tool_call_id,

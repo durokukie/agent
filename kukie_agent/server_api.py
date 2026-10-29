@@ -526,9 +526,21 @@ async def repo_token(cluster_id: str, repository: str) -> RepoToken:
     return RepoToken.from_json(data)
 
 
+async def repo_link_state(conversation_id: str) -> dict[str, Any] | None:
+    """대화별 "마지막으로 본 레포 연결 상태" (숨은 칸, DURO-135). 한 번도 저장하지 않았으면 None. 값 모양은 gitops/memo.py 가 정한다."""
+    data = await _call("GET", _path("conversations", conversation_id, "repo-link-state"))
+    state = (data or {}).get("state")
+    return state if isinstance(state, dict) else None
+
+
+async def update_repo_link_state(conversation_id: str, state: dict[str, Any]) -> None:
+    """숨은 칸을 통째로 덮어쓴다. 대화 목록 순서(updatedAt)는 안 바뀐다."""
+    await _call("PUT", _path("conversations", conversation_id, "repo-link-state"), body={"state": state})
+
+
 #: 테스트의 메모리 가짜가 같은 이름으로 바꿔 끼우는 함수들 (tests/fake_server.py).
 API = (
     "conversation_context", "find_run", "start_run", "update_run", "interrupt", "interrupt_orphaned",
     "cluster_connection", "update_cluster_status", "update_cluster_gpu", "create_plan", "run_plans", "get_plan", "plan_action",
-    "manifest_repos", "repo_token",
+    "manifest_repos", "repo_token", "repo_link_state", "update_repo_link_state",
 )
