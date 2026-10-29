@@ -1,0 +1,29 @@
+# 웹 화면. 레플리카·이미지·자원·환경변수를 Kukie 가 PR 로 바꾸는 대상이다
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels: {app: web}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+        - name: web
+          image: public.ecr.aws/docker/library/nginx:1.28-alpine
+          ports:
+            - containerPort: 80
+          env:
+            - name: GREETING
+              value: hello
+            # 비밀번호는 Secret 에서 온다 — Kukie 는 이 값을 PR 로 바꾸지 않는다
+            - name: DB_URL
+              valueFrom:
+                secretKeyRef: {name: web-db, key: url}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}
