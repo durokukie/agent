@@ -248,6 +248,33 @@ class ApprovalRequest(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    # PR 길(propose_git_change)의 "PR 머지 승인" 카드 칸 (DURO-134) — 모양은 gitops_card. kubectl 카드에는 칸이 없다
+    gitops: dict[str, Any] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+
+#: 카드에 싣지 않는 Plan 의 gitops 칸 — 승인 순간 다시 볼 때 쓰는 내부 값이다
+_GITOPS_INTERNAL = frozenset({"base_sha", "route", "merge_methods", "conflict_keys"})
+
+
+def gitops_card(plan: ActionPlan) -> dict[str, Any] | None:
+    """PR 머지 승인 카드 칸. 앱(kukie-electron DURO-136)이 그린다.
+
+        {"repository": "acme/manifests", "base": "main", "branch": "kukie/…",
+         "pull_request": {"number": 12, "url": "https://github.com/acme/manifests/pull/12"},
+         "application": {name, namespace, repo_url, path, chart, target_revision, source_type, sync_status,
+                         auto_sync, self_heal, prune},
+         "files": ["apps/api/deployment.yaml", …], "file_diff": "git diff", "render_diff": "클러스터에서 바뀔 것",
+         "warnings": [...], "notice": "승인하면 Kukie 가 이 PR 을 머지해요. …"}
+    """
+    if plan.gitops is None:
+        return None
+    card = {key: value for key, value in plan.gitops.items() if key not in _GITOPS_INTERNAL}
+    card["files"] = [entry["path"] for entry in plan.gitops.get("files") or []]
+    card["pull_request"] = plan.pull_request
+    return card
 
 
 async def build_approval_request(
@@ -308,4 +335,5 @@ async def build_approval_request(
             else None
         ),
         argocd=plan.argocd,
+        gitops=gitops_card(plan),
     )

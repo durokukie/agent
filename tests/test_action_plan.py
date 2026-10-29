@@ -816,3 +816,25 @@ def test_call_id가_중복이면_승인할_Plan을_임의로_고르지_않는다
 
     with pytest.raises(ValueError, match="multiple Action Plans"):
         sync(ActionPlan.find_by_call_id("call-123"))
+
+
+def test_파일_계획도_PR을_싣고_STALE로_닫힌다(plan_dir):
+    """flat 엔드포인트의 파일 계획 — server 와 같은 규칙 (DURO-134)."""
+    async def go():
+        plan = await ActionPlan.create_draft(
+            call_id="call-git", tool="propose_git_change", args={"kind": "deployment", "name": "web"},
+            command=["github", "pr", "merge", "acme/manifests"], risk="caution", skill="Shared",
+            target={"context": "kind-dev"}, intent="늘린다", expected_effects=["3개"], side_effects=["자원"],
+            gitops={"repository": "acme/manifests", "branch": "kukie/x"},
+        )
+        await plan.record_dry_run("succeeded", "렌더 비교 통과", "")
+        await plan.offer("확인한다", pull_request={"number": 3, "url": "https://github.com/acme/manifests/pull/3"})
+        loaded = ActionPlan.load(plan.path)
+        assert loaded.pull_request == {"number": 3, "url": "https://github.com/acme/manifests/pull/3"}
+        assert loaded.gitops == {"repository": "acme/manifests", "branch": "kukie/x"}
+        await loaded.mark_stale()
+        assert ActionPlan.load(plan.path).status == "STALE"
+        with pytest.raises(ValueError):
+            await loaded.mark_stale()
+
+    sync(go())

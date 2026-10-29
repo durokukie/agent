@@ -50,7 +50,8 @@ READ_ONLY = {"list_resources", "explain_command", "describe_resource", "get_even
 
 @pytest.mark.parametrize("shared,expected", [
     (False, READ_ONLY),                     # Private — 읽기 5종만, 변경 툴은 아예 없다
-    (True, READ_ONLY | MUTATING_TOOLS),     # Shared — 읽기 + 변경 (변경은 가드레일 훅 → 승인 카드)
+    # Shared — 읽기 + 변경 (변경은 가드레일 훅 → 승인 카드) + PR 길 변경 (DURO-134, 역시 Shared 에만)
+    (True, READ_ONLY | MUTATING_TOOLS | {"propose_git_change"}),
 ])
 def test_공개_범위별로_허용된_툴만_LLM에게_노출된다(shared, expected):
     m = TestModel(call_tools=[], custom_output_args=GOOD_RESPONSE)

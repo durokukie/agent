@@ -18,7 +18,7 @@
 
 상태 (DURO-83 결정, 기획 10 이름):
   DRAFT → WAITING_APPROVAL → APPROVED → EXECUTING → APPLIED → (EFFECT_VERIFIED)
-  옆길: REJECTED, EXPIRED(카드 만료), STALE(전제 깨짐 — 기획 08, 아직 없다), FAILED(+failure_reason), UNKNOWN
+  옆길: REJECTED, EXPIRED(카드 만료), STALE(전제 깨짐 — 기획 08, 지금은 PR 길이 승인 순간 바뀐 때만), FAILED(+failure_reason), UNKNOWN
 EFFECT_VERIFIED 로 가는 경로는 아직 없다 (검증 = 기획 09, 다음 이슈).
 """
 from __future__ import annotations
@@ -109,6 +109,11 @@ class ActionPlan:
     # 만들 때 payload 에 싣는다. 동작(_act)마다 server 가 돌려준 payload 로 다시 맞춰진다 — kukie-server 의 PlanResponse.payload 는
     # 저장한 Map 을 모르는 키까지 그대로 준다. 승인 대조(request_hash·decision 의 call)에는 들어가지 않는다
     argocd: dict[str, Any] | None = None
+    # PR 길(propose_git_change)의 계획이면 레포·브랜치·고친 파일·diff·대상 Application (DURO-134, guardrail/gitops_hook.py).
+    # 만들 때 payload 에 싣고, kubectl 계획은 None 이다. 승인 대조(request_hash·decision 의 call)에는 들어가지 않는다
+    gitops: dict[str, Any] | None = None
+    # 승인 전에 연 PR {number, url} — offer 가 server 의 payload.pull_request 로 남긴다 (DURO-131)
+    pull_request: dict[str, Any] | None = None
 
     @property
     def remote(self) -> bool:
@@ -131,6 +136,7 @@ class ActionPlan:
         side_effects: list[str],
         run_id: str | None = None,
         argocd: dict[str, Any] | None = None,
+        gitops: dict[str, Any] | None = None,
     ) -> "ActionPlan":
         if not isinstance(args, dict):
             raise TypeError("args must be a dict")
@@ -156,6 +162,7 @@ class ActionPlan:
                     "side_effects": list(side_effects),
                     # 관리 리소스일 때만 칸이 생긴다 — 아닌 계획의 payload 는 예전과 같다
                     **({"argocd": argocd} if argocd is not None else {}),
+                    **({"gitops": gitops} if gitops is not None else {}),
                 },
             )
             return cls.from_response(created)
@@ -184,6 +191,7 @@ class ActionPlan:
                 expected_effects=list(expected_effects),
                 side_effects=list(side_effects),
                 argocd=argocd,
+                gitops=gitops,
             )
             try:
                 plan._write(exclusive=True)
@@ -233,6 +241,8 @@ class ActionPlan:
                 applied_at=metadata.get("applied_at"),
                 run_id=metadata.get("run_id"),
                 argocd=metadata.get("argocd"),
+                gitops=metadata.get("gitops"),
+                pull_request=metadata.get("pull_request"),
             )
         except (KeyError, TypeError) as exc:
             raise ValueError(f"invalid Action Plan frontmatter: {path}") from exc
@@ -265,6 +275,8 @@ class ActionPlan:
             run_id=plan.run_id,
             code=plan.code,
             argocd=payload.get("argocd"),
+            gitops=payload.get("gitops"),
+            pull_request=payload.get("pull_request"),
         )
 
     @classmethod
@@ -313,6 +325,8 @@ class ActionPlan:
             "run_id": self.run_id,
             # 판단 가이드(render_markdown)도 이 칸을 본다. 관리 리소스가 아니면 칸 자체가 없다 — 예전 계획서와 같은 모양
             **({"argocd": self.argocd} if self.argocd is not None else {}),
+            **({"gitops": self.gitops} if self.gitops is not None else {}),
+            **({"pull_request": self.pull_request} if self.pull_request is not None else {}),
         }
 
     def _serialize(self) -> str:
@@ -484,13 +498,20 @@ class ActionPlan:
             changes.update(status="FAILED", failure_reason="DRY_RUN_FAILED")
         self._update_fields(**changes)
 
-    async def offer(self, guidance: str) -> None:
-        """판단 가이드를 남기고 승인 카드로 내보낸다 — DRAFT → WAITING_APPROVAL (DURO-83)."""
+    async def offer(self, guidance: str, *, pull_request: dict[str, Any] | None = None) -> None:
+        """판단 가이드를 남기고 승인 카드로 내보낸다 — DRAFT → WAITING_APPROVAL (DURO-83).
+
+        pull_request 는 PR 길에서 승인 전에 연 PR {number, url} 이다 (DURO-134). server 가 payload.pull_request 로 남긴다.
+        """
         text = guidance.strip()
         if not text:
             raise ValueError("decision guidance must not be empty")
         if self.remote:
-            await self._act("offer", {"decisionGuidance": text})
+            await self._act("offer", {
+                "decisionGuidance": text,
+                **({"pullRequest": {"number": pull_request["number"], "url": pull_request["url"]}}
+                   if pull_request is not None else {}),
+            })
             return
         dry_run = self.dry_run_result
         if self.decision_guidance is not None:
@@ -501,7 +522,13 @@ class ActionPlan:
             or dry_run.get("status") not in {"succeeded", "unsupported"}
         ):
             raise ValueError("ActionPlan is not ready for approval")
-        self._update_fields(decision_guidance=text, status="WAITING_APPROVAL")
+        self._update_fields(
+            decision_guidance=text, status="WAITING_APPROVAL",
+            pull_request=(
+                {"number": pull_request["number"], "url": pull_request["url"]}
+                if pull_request is not None else self.pull_request
+            ),
+        )
 
     def _record_decision(self, *, approved: bool, user_id: str | None) -> None:
         self._update_fields(
@@ -569,14 +596,25 @@ class ActionPlan:
         stdout: str,
         stderr: str,
         exit_code: int | None,
+        merge_commit: str | None = None,
+        sync_result: dict[str, Any] | None = None,
     ) -> None:
-        """실행 결과. 성공이고 exit 0 이면 APPLIED, 아니면 FAILED + EXECUTION_FAILED."""
+        """실행 결과. 성공이고 exit 0 이면 APPLIED, 아니면 FAILED + EXECUTION_FAILED.
+
+        merge_commit·sync_result 는 PR 길의 결과다 (DURO-134) — server 가 executionResult.merge_commit · sync_result 로 남긴다.
+        """
+        gitops = {
+            **({"merge_commit": merge_commit} if merge_commit else {}),
+            **({"sync_result": sync_result} if sync_result is not None else {}),
+        }
         if self.remote:
             await self._act("result", {
                 "success": success,
                 "stdout": stdout,
                 "stderr": stderr,
                 "exitCode": exit_code,
+                **({"mergeCommit": merge_commit} if merge_commit else {}),
+                **({"syncResult": sync_result} if sync_result is not None else {}),
             })
             return
         if (
@@ -594,6 +632,7 @@ class ActionPlan:
                 "stderr": stderr,
                 "exit_code": exit_code,
                 "at": at,
+                **gitops,
             },
             # 적용 시각은 성공했을 때만 남긴다. 검증(기획 09)이 나중에 실패해 FAILED 로 가도 이 값은 지우지 않는다 (DURO-83)
             applied_at=at if applied else self.applied_at,
@@ -631,6 +670,18 @@ class ActionPlan:
         if self.status not in PLAN_OPEN:
             raise ValueError("ActionPlan is already closed")
         self._update_fields(status="FAILED", failure_reason=reason)
+
+    async def mark_stale(self) -> None:
+        """승인 순간 다시 보니 전제가 깨졌다 — 실행하지 않고 닫는다 (기획 08 STALE). 결정 전 계획만.
+
+        PR 길에서 승인하는 사이 레포 연결이 끊겼거나, Application 이 바뀌었거나, PR 이 닫히거나 바뀐 경우다 (DURO-134).
+        """
+        if self.remote:
+            await self._act("stale")
+            return
+        if self.status not in {"DRAFT", "WAITING_APPROVAL"} or self.decision is not None:
+            raise ValueError("ActionPlan is not waiting for a decision")
+        self._update_fields(status="STALE")
 
     async def mark_unknown(self) -> None:
         """실행 여부를 모른다 — 승인은 남았는데 결과가 없다 (run 의 recovery_required 와 같은 뜻)."""

@@ -239,3 +239,42 @@ def test_server_계획의_Markdown은_UUID가_아니라_code를_보여준다():
     markdown = plan.render_markdown(include_decision_guidance=False)
     assert f"id: {PLAN['code']}" in markdown and PLAN["id"] not in markdown
     assert "decision_guidance" not in markdown and "run_id: r-1" in markdown
+
+
+@pytest.mark.asyncio
+async def test_매니페스트_레포_목록과_설치_토큰은_내부_토큰만_싣는다(server):
+    """DURO-131 에이전트 계약. 토큰은 repr 에 안 나온다 — 로그에 찍혀도 새지 않게."""
+    def respond(request):
+        if request.url.path.endswith("/token"):
+            return httpx.Response(200, json={"repository": "acme/manifests", "repositoryId": 42,
+                                             "token": "ghs_secret", "expiresAt": "2026-10-30T10:00:00Z"})
+        return httpx.Response(200, json=[{"id": "m-1", "clusterId": "cl-1", "repository": "acme/manifests",
+                                          "repositoryId": 42, "installationId": 7, "connectedBy": "u-1",
+                                          "connectedAt": "2026-10-30T09:00:00"}])
+
+    seen = server(respond)
+    repos = await server_api.manifest_repos("cl-1")
+    token = await server_api.repo_token("cl-1", "https://github.com/Acme/Manifests.git")
+
+    assert seen[0].method == "GET" and seen[0].url.path == "/internal/clusters/cl-1/manifest-repos"
+    assert seen[1].method == "POST" and seen[1].url.path == "/internal/clusters/cl-1/manifest-repos/token"
+    assert _body(seen[1]) == {"repository": "https://github.com/Acme/Manifests.git"}
+    assert all("Authorization" not in r.headers and r.headers[server_api.TOKEN_HEADER] == TOKEN for r in seen)
+    assert [r.repository for r in repos] == ["acme/manifests"]
+    assert token.token == "ghs_secret" and "ghs_secret" not in repr(token)
+
+
+@pytest.mark.asyncio
+async def test_PR_길의_offer와_result는_PR_머지커밋_sync결과를_싣는다(server):
+    seen = server(lambda request: httpx.Response(200, json={**PLAN, "status": "APPLIED"}))
+    plan = ActionPlan.from_response(server_api.Plan.from_json(PLAN))
+    await plan.offer("확인한다", pull_request={"number": 12, "url": "https://github.com/acme/manifests/pull/12"})
+    await plan.mark_stale()
+    await plan.record_execution(success=True, stdout="merged", stderr="", exit_code=0,
+                                merge_commit="abc123", sync_result={"status": "healthy"})
+
+    assert _body(seen[0]) == {"decisionGuidance": "확인한다",
+                              "pullRequest": {"number": 12, "url": "https://github.com/acme/manifests/pull/12"}}
+    assert seen[1].url.path.endswith("/stale")
+    assert _body(seen[2]) == {"success": True, "stdout": "merged", "stderr": "", "exitCode": 0,
+                              "mergeCommit": "abc123", "syncResult": {"status": "healthy"}}

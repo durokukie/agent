@@ -229,7 +229,7 @@ def _capture_turns(seen: list[dict]):
 
 @pytest.mark.parametrize("shared,expected", [
     (False, set()),
-    (True, {"apply_manifest", "scale_resource", "rollout_restart", "delete_resource"}),
+    (True, {"apply_manifest", "scale_resource", "rollout_restart", "delete_resource", "propose_git_change"}),
 ])
 def test_방의_공개_범위가_노출되는_툴을_정한다(client, fake_server, shared, expected):
     """Private 는 읽기 5종만, Shared 는 읽기 + 변경 4종 (DURO-100)."""

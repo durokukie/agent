@@ -43,6 +43,15 @@ def _no_argocd_by_default(monkeypatch):
     ArgoCD 없는 클러스터로 돈다. 판별을 보는 테스트(test_argocd.py)가 직접 바꿔 끼운다."""
     from kukie_agent import argocd
     monkeypatch.setattr(argocd, "run_kubectl", lambda *a, **k: NO_ARGOCD)
+    # PR 길 판단·sync 지켜보기(kukie_agent/gitops)도 같은 클러스터를 본다 — 테스트가 진짜 kubectl·GitHub 를 부르지 않게
+    from kukie_agent.gitops import github, route, watch
+    monkeypatch.setattr(route, "run_kubectl", lambda *a, **k: NO_ARGOCD)
+    monkeypatch.setattr(watch, "run_kubectl", lambda *a, **k: NO_ARGOCD)
+
+    def no_github(*a, **k):
+        raise AssertionError("테스트가 진짜 GitHub 를 부르려 했다 — tests/fake_github.py 를 끼워라")
+
+    monkeypatch.setattr(github, "connect", no_github)
 
 
 @pytest.fixture(autouse=True)

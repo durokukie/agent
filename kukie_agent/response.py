@@ -44,6 +44,7 @@ STEP_LABELS: dict[str, str] = {
     "scale_resource": "레플리카 조정",
     "rollout_restart": "재시작",
     "delete_resource": "리소스 삭제",
+    "propose_git_change": "PR 머지",
 }
 
 

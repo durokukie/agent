@@ -64,6 +64,7 @@ class FakeServer:
         self.plans: dict[str, dict[str, Any]] = {}
         self.teams: dict[str, dict[str, str]] = {}     # team_id → {user_id: "ADMIN" | "MEMBER"}
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.manifest_repo_links: dict[str, set[str]] = {}      # cluster_id → 연결된 `owner/repo` (DURO-131)
         self._codes: dict[str, itertools.count] = {}
 
     # ── 테스트가 상태를 만들고 읽는 도구 (server_api 에는 없다) ─────────────
@@ -103,6 +104,12 @@ class FakeServer:
             "version": 1, "updatedAt": _now(),
         }
         return conversation_id
+
+    def link_repo(self, cluster_id: str, repository: str) -> None:
+        self.manifest_repo_links.setdefault(cluster_id, set()).add(repository.lower())
+
+    def unlink_repo(self, cluster_id: str, repository: str) -> None:
+        self.manifest_repo_links.get(cluster_id, set()).discard(repository.lower())
 
     def conversation(self, conversation_id: str) -> dict[str, Any]:
         return self.conversations[conversation_id]
@@ -360,6 +367,25 @@ class FakeServer:
         cluster["hasGpu"] = has_gpu
         return {k: v for k, v in cluster.items() if k != "credential"}
 
+    # ── GitOps 매니페스트 레포 (DURO-131) ─────────────────────
+
+    async def manifest_repos(self, cluster_id: str):
+        self.calls.append(("manifest_repos", {"clusterId": cluster_id}))
+        return [
+            server_api.ManifestRepo.from_json({"id": f"repo-{name}", "clusterId": cluster_id, "repository": name,
+                                               "repositoryId": 42, "installationId": 7})
+            for name in sorted(self.manifest_repo_links.get(cluster_id, set()))
+        ]
+
+    async def repo_token(self, cluster_id: str, repository: str):
+        from kukie_agent.gitops.repo import repo_name
+        self.calls.append(("repo_token", {"clusterId": cluster_id, "repository": repository}))
+        name = repo_name(repository) or repository.lower()
+        if name not in self.manifest_repo_links.get(cluster_id, set()):
+            raise ServerError(404, "MANIFEST_REPO_NOT_CONNECTED", f"연결된 레포가 아니다: {name}")
+        return server_api.RepoToken.from_json({"repository": name, "repositoryId": 42, "token": "ghs_fake-token",
+                                               "expiresAt": "2026-10-30T10:00:00Z"})
+
     # ── Action Plan (contract 3절 상태 머신) ─────────────────
 
     def _code(self, tool: str) -> str:
@@ -424,6 +450,8 @@ class FakeServer:
                 or plan["payload"].get("decision_guidance") is not None):
             raise _conflict()
         plan["payload"]["decision_guidance"] = guidance
+        if body.get("pullRequest") is not None:
+            plan["payload"]["pull_request"] = {"number": body["pullRequest"]["number"], "url": body["pullRequest"]["url"]}
         plan["status"] = "WAITING_APPROVAL"
 
     def _decision(self, plan: dict[str, Any], body: dict[str, Any]) -> None:
@@ -459,6 +487,10 @@ class FakeServer:
         at = _at()
         plan["executionResult"] = {"success": body["success"], "stdout": body["stdout"], "stderr": body["stderr"],
                                    "exit_code": body.get("exitCode"), "at": at}
+        if body.get("mergeCommit"):
+            plan["executionResult"]["merge_commit"] = body["mergeCommit"]
+        if body.get("syncResult") is not None:
+            plan["executionResult"]["sync_result"] = body["syncResult"]
         if body["success"] and body.get("exitCode") == 0:
             plan["status"], plan["appliedAt"] = "APPLIED", at.removesuffix("Z")
         else:
@@ -468,6 +500,12 @@ class FakeServer:
         if plan["status"] not in PLAN_OPEN:
             raise _conflict()
         plan["status"], plan["failureReason"] = "FAILED", body["reason"]
+
+    def _stale(self, plan: dict[str, Any], body: dict[str, Any]) -> None:
+        """승인 순간 전제가 깨졌다 — 결정 전 계획만 STALE 로 닫는다 (kukie-server 후속 엔드포인트와 같은 규칙)."""
+        if plan["status"] not in ("DRAFT", "WAITING_APPROVAL") or plan["decision"] is not None:
+            raise _conflict()
+        plan["status"] = "STALE"
 
     def _unknown(self, plan: dict[str, Any], body: dict[str, Any]) -> None:
         if plan["status"] not in ("APPROVED", "EXECUTING") or plan["executionResult"] is not None:

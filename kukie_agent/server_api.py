@@ -463,7 +463,8 @@ async def get_plan(plan_id: str) -> Plan:
 
 #: plan 동작 이름 — `POST /internal/plans/{id}/<action>`. 허용 안 되는 상태면 409 PLAN_STATE_CONFLICT,
 #: 승인한 호출과 실행하려는 호출이 다르면 409 PLAN_CALL_MISMATCH.
-PLAN_ACTIONS = frozenset({"dry-run", "offer", "decision", "start", "result", "fail", "unknown"})
+#: stale 은 승인 순간 전제가 깨졌다는 알림이다 (기획 08, GitOps 의 PR 길이 바뀜 — DURO-134). 결정 전 계획만 받는다
+PLAN_ACTIONS = frozenset({"dry-run", "offer", "decision", "start", "result", "fail", "unknown", "stale"})
 
 
 async def plan_action(plan_id: str, action: str, body: dict[str, Any] | None = None) -> Plan:
@@ -473,8 +474,61 @@ async def plan_action(plan_id: str, action: str, body: dict[str, Any] | None = N
     return Plan.from_json(await _call("POST", _path("plans", plan_id, action), body=body or {}))
 
 
+# ── GitOps 매니페스트 레포 (DURO-131) ─────────────────────────
+
+@dataclass(frozen=True)
+class ManifestRepo:
+    """클러스터에 연결된 매니페스트 레포 하나 (ManifestRepoResponse). repository 는 소문자 `owner/repo`."""
+
+    id: str
+    cluster_id: str
+    repository: str
+    repository_id: int
+    installation_id: int
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "ManifestRepo":
+        return cls(
+            id=str(data["id"]), cluster_id=str(data["clusterId"]), repository=str(data["repository"]).lower(),
+            repository_id=int(data.get("repositoryId") or 0), installation_id=int(data.get("installationId") or 0),
+        )
+
+
+@dataclass(frozen=True)
+class RepoToken:
+    """그 레포 하나로 범위를 좁힌 1시간 GitHub App 설치 토큰. 로그·LLM 입력·응답에 싣지 않는다 — repr 에서도 뺀다."""
+
+    repository: str
+    repository_id: int
+    expires_at: str
+    token: str = field(repr=False)
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "RepoToken":
+        return cls(
+            repository=str(data["repository"]).lower(), repository_id=int(data.get("repositoryId") or 0),
+            expires_at=str(data.get("expiresAt") or ""), token=str(data["token"]),
+        )
+
+
+async def manifest_repos(cluster_id: str) -> list[ManifestRepo]:
+    """클러스터에 지금 연결된 레포들. PR 길 판단(gitops/route.py)이 ArgoCD Application 의 repoURL 과 맞춰 본다."""
+    data = await _call("GET", _path("clusters", cluster_id, "manifest-repos"))
+    return [ManifestRepo.from_json(item) for item in data or []]
+
+
+async def repo_token(cluster_id: str, repository: str) -> RepoToken:
+    """연결된 레포의 설치 토큰. 쓸 때마다 받는다 (30분보다 남았으면 server 가 같은 토큰을 다시 준다).
+
+    repository 는 `owner/repo` 든 ArgoCD repoURL 이든 된다. 연결 안 됐거나 끊긴 레포면 404 MANIFEST_REPO_NOT_CONNECTED.
+    """
+    data = await _call("POST", _path("clusters", cluster_id, "manifest-repos", "token"), body={"repository": repository})
+    return RepoToken.from_json(data)
+
+
 #: 테스트의 메모리 가짜가 같은 이름으로 바꿔 끼우는 함수들 (tests/fake_server.py).
 API = (
     "conversation_context", "find_run", "start_run", "update_run", "interrupt", "interrupt_orphaned",
     "cluster_connection", "update_cluster_status", "update_cluster_gpu", "create_plan", "run_plans", "get_plan", "plan_action",
+    "manifest_repos", "repo_token",
 )

@@ -72,7 +72,8 @@ class ConversationRegistry:
         # private 방은 변경 툴이 아예 없다 (기획 05 §3)
         skill = skill_for(room.shared)
         session = Session(
-            deps=Deps(context=room.context, namespace=room.namespace, skill=skill),
+            deps=Deps(context=room.context, namespace=room.namespace, skill=skill,
+                      cluster_id=room.cluster_id, conversation_id=room.id),
             history=list(history or []),
         )
         conversation = Conversation(id=room.id, session=session)

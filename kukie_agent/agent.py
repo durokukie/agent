@@ -31,8 +31,10 @@ except ImportError:                          # pydantic-ai 2.3x — httpx2 전�
     AsyncHTTPX2TenacityTransport = None      # type: ignore[assignment,misc]
 
 from kukie_agent.deps import Deps
+from kukie_agent.guardrail import gitops_hook  # noqa: F401 — propose_git_change 훅을 같은 hooks 에 등록한다
 from kukie_agent.guardrail.hook import hooks as guardrail_hooks
 from kukie_agent.response import build_response
+from kukie_agent.tools.gitops import GITOPS_TOOLS
 from kukie_agent.tools.mutate import MUTATE_TOOLS
 from kukie_agent.tools.read import READ_TOOLS
 
@@ -68,7 +70,7 @@ suggested_next_action에 짧게 작성한다.
 제안은 작업 실행이나 사용자 승인을 의미하지 않는다."""
 
 # ── 툴 등록 ──────────────────────────────────────────────────
-_toolset: FunctionToolset[Deps] = FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS])
+_toolset: FunctionToolset[Deps] = FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS, *GITOPS_TOOLS])
 
 
 def _only_skill_tools(ctx: RunContext[Deps], tool_def: ToolDefinition) -> bool:
