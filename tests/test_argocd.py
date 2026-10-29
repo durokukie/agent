@@ -14,8 +14,8 @@ from fastapi.testclient import TestClient
 from pydantic_ai import ApprovalRequired
 from pydantic_ai.messages import ToolCallPart
 
-from helpers import USER
-from kukie_agent import argocd, server
+from helpers import OTHER, USER
+from kukie_agent import argocd, clusters_api, server
 from kukie_agent.guardrail import hook
 from kukie_agent.guardrail.action_plan import ActionPlan
 from kukie_agent.guardrail.approval import build_approval_request
@@ -664,3 +664,51 @@ def test_볼_수_없는_클러스터의_앱_상세는_404이고_kubectl은_돌�
     ran = _api(monkeypatch, _ok(_detailed()))
     r = client.get(_detail_url(cluster), headers=USER)
     assert r.status_code == 404 and r.json()["detail"]["code"] != "ARGOCD_APP_NOT_FOUND" and ran == []
+
+
+# ── 나눠 쓰기 — 목록·상세도 개요처럼 (clusters_api._shared_overview) ─────────
+
+@pytest.fixture
+def share_on(monkeypatch):
+    monkeypatch.setattr(clusters_api, "OVERVIEW_SHARE_TTL", 10)
+
+
+def test_같은_연결의_목록은_나눠_쓴다(client, fake_server, monkeypatch, share_on):
+    cluster = fake_server.add_cluster(owner="u-1")
+    ran = _api(monkeypatch, _ok({"items": [_application()]}))
+    first = client.get(f"/clusters/{cluster}/argocd/applications", headers=USER).json()
+    again = client.get(f"/clusters/{cluster}/argocd/applications", headers=USER).json()
+    assert first == again and ran == [argocd.LIST_COMMAND]
+
+
+def test_같은_앱의_상세는_나눠_쓰고_다른_앱_목록과는_따로다(client, fake_server, monkeypatch, share_on):
+    cluster = fake_server.add_cluster(owner="u-1")
+    ran = _api(monkeypatch, _ok(_detailed()))
+    for _ in range(2):
+        assert client.get(_detail_url(cluster), headers=USER).status_code == 200
+    assert len(ran) == 1
+    client.get(_detail_url(cluster, name="other"), headers=USER)
+    client.get(_detail_url(cluster, namespace="team-a"), headers=USER)
+    assert [args[2:5] for args in ran] == [["guestbook", "-n", "argocd"], ["other", "-n", "argocd"],
+                                           ["guestbook", "-n", "team-a"]]
+    _api(monkeypatch, _ok({"items": []}))
+    assert client.get(f"/clusters/{cluster}/argocd/applications", headers=USER).json()["applications"] == []
+
+
+@pytest.mark.parametrize(("url", "stderr", "code"), [
+    ("detail", 'Error from server (NotFound): applications.argoproj.io "guestbook" not found', 404),
+    ("list", "Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout", 502),
+])
+def test_없는_앱과_502는_나눠_쓰지_않는다(client, fake_server, monkeypatch, share_on, url, stderr, code):
+    cluster = fake_server.add_cluster(owner="u-1")
+    ran = _api(monkeypatch, _fail(stderr))
+    path = _detail_url(cluster) if url == "detail" else f"/clusters/{cluster}/argocd/applications"
+    assert [client.get(path, headers=USER).status_code for _ in range(2)] == [code, code]
+    assert len(ran) == 2
+
+
+def test_나눠_쓴_결과도_볼_수_없는_사람에게는_404(client, fake_server, monkeypatch, share_on):
+    cluster = fake_server.add_cluster(owner="u-1")
+    _api(monkeypatch, _ok(_detailed()))
+    assert client.get(_detail_url(cluster), headers=USER).status_code == 200
+    assert client.get(_detail_url(cluster), headers=OTHER).status_code == 404

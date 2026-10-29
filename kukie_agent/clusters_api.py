@@ -60,7 +60,8 @@ GPU_BUDGET = 20
 #: 같은 연결의 개요를 여러 요청이 나눠 쓰는 시간(초). GPU 화면은 20초마다(앱 OVERVIEW_LIVE_MS) 개요를 다시 읽는데, 여러
 #: 사람·탭이 같은 클러스터를 보면 그 수만큼 kubectl 이 돌고 고객 API 서버 감사 로그에도 그만큼 쌓인다. 이 시간 안의 요청은
 #: 진행 중이거나 막 끝난 한 번의 결과를 같이 쓴다. 한 사람의 20초 주기보다 짧게 둬서 혼자 볼 때는 늘 새로 읽는다.
-#: 나눠 쓰려면 응답에 사람마다 다른 값이 없어야 한다 — 지금은 없다. benchmarks 를 Admin 에게만 채우게 되면 나눠 쓴 뒤에 거른다
+#: 나눠 쓰려면 응답에 사람마다 다른 값이 없어야 한다 — 지금은 없다. benchmarks 를 Admin 에게만 채우게 되면 나눠 쓴 뒤에 거른다.
+#: ArgoCD 앱 목록·상세(DURO-145)도 같은 시간·같은 헬퍼로 나눠 쓴다 — 화면을 켜 두고 여러 사람이 볼 때 같다
 OVERVIEW_SHARE_TTL = 10
 #: 지표를 동시에 읽는 수. 개요 슬롯(OVERVIEW_WORKERS) 하나 안에서 잠깐 쓰는 스레드라 limiter 밖이다 — 많아야 4 × 4
 GPU_METRICS_WORKERS = 4
@@ -209,6 +210,7 @@ async def argocd_applications(
       absent     applications.argoproj.io CRD 가 없다 — ArgoCD 없음
       forbidden  읽을 권한이 없다 — 있는지 알 수 없다 (v4 제한 권한인 고객 클러스터)
     그 밖의 kubectl 실패는 개요와 같이 502 CLUSTER_AUTH_EXPIRED·CLUSTER_UNREACHABLE, 출력을 못 읽으면 502 CLUSTER_BAD_RESPONSE.
+    같은 연결의 목록은 개요처럼 OVERVIEW_SHARE_TTL 초 동안 나눠 쓴다 (_shared_overview, 실패는 나눠 쓰지 않는다).
     """
     conn = await access.connection(cluster_id, user)
 
@@ -231,8 +233,12 @@ async def argocd_applications(
                                       "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
         return {"status": "ok", "at": now, "applications": applications}
 
-    # 개요와 같은 이유로 스레드로 넘긴다 — kubectl 이 도는 동안 서버 전체가 멈추지 않게
-    return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+    async def compute() -> dict[str, Any]:
+        # 개요와 같은 이유로 스레드로 넘긴다 — kubectl 이 도는 동안 서버 전체가 멈추지 않게
+        return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+
+    # 권한은 위에서 요청마다 본다. 응답에 사람마다 다른 값이 없어 나눠 써도 된다 (개요와 같다)
+    return await _shared_overview(_share_key(_connection_key(cluster_id, conn), "argocd"), compute)
 
 
 @router.get("/{cluster_id}/argocd/applications/{namespace}/{name}")
@@ -251,6 +257,7 @@ async def argocd_application(
       forbidden  읽을 권한이 없다 (application null)
     그 Application 이 없으면 404 ARGOCD_APP_NOT_FOUND — 클러스터를 못 볼 때의 404 NOT_FOUND 와 code 로 가른다.
     그 밖의 실패는 목록과 같이 502 CLUSTER_AUTH_EXPIRED·CLUSTER_UNREACHABLE·CLUSTER_BAD_RESPONSE.
+    같은 연결·같은 앱의 상세는 목록처럼 OVERVIEW_SHARE_TTL 초 동안 나눠 쓴다. 404·502 는 나눠 쓰지 않는다 — 다음 요청이 새로 읽는다.
     """
     conn = await access.connection(cluster_id, user)
     if not argocd.valid_ref(namespace, name):
@@ -277,7 +284,17 @@ async def argocd_application(
                                       "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
         return {"status": "ok", "at": now, "application": application}
 
-    return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+    async def compute() -> dict[str, Any]:
+        return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+
+    key = _share_key(_connection_key(cluster_id, conn), "argocd", namespace, name)
+    return await _shared_overview(key, compute)
+
+
+def _share_key(key: str | None, *parts: str) -> str | None:
+    """_shared_overview 의 키를 읽는 것마다 가른다 — 개요는 연결 키 그대로, ArgoCD 목록·상세는 뒤에 붙인다.
+    `|` 는 클러스터 id·지문·쿠버네티스 이름에 없어 섞이지 않는다."""
+    return "|".join((key, *parts)) if key is not None else None
 
 
 def _app_not_found(namespace: str, name: str) -> HTTPException:
@@ -299,7 +316,8 @@ class _SharedOverview:
     finished_at: float | None = None         # 성공으로 끝난 시각
 
 
-#: 연결(클러스터 id·연결 지문·클러스터 namespace)마다 진행 중이거나 막 끝난 개요. 프로세스 안 값이라 복제본마다 따로다
+#: 연결(클러스터 id·연결 지문·클러스터 namespace)마다 진행 중이거나 막 끝난 개요 — ArgoCD 목록·상세는 _share_key 로 가른 키.
+#: 프로세스 안 값이라 복제본마다 따로다
 _shared_overviews: dict[str, _SharedOverview] = {}
 
 
