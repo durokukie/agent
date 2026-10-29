@@ -25,11 +25,19 @@ RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --no-edi
 # 바이트코드와 숨김 파일(맥의 .DS_Store 등)은 휠에 들어가지 않으므로 견주지 않는다
 RUN diff -r -x __pycache__ -x '.*' kukie_agent .venv/lib/python3.*/site-packages/kukie_agent
 
-# ── 2단계: 실행 이미지 — .venv 와 kubectl 만. 소스 폴더는 두지 않는다(두면 설치본 대신 그쪽이 import 된다)
+# ── 2단계: 실행 이미지 — .venv 와 kubectl · kustomize 만. 소스 폴더는 두지 않는다(두면 설치본 대신 그쪽이 import 된다)
 FROM ${PYTHON_IMAGE}
 # kubectl 은 등록된 클러스터에 대고 실행하는 도구라 이미지 안에 있어야 한다 (kukie_agent/kubectl/runner.py).
 # 버전을 고정하고 sha256 을 대조한다 — 빌드마다 다른 바이너리가 들어오지 않게.
 ARG KUBECTL_VERSION=v1.37.0
+# kustomize 는 GitOps 렌더 비교(kukie_agent/manifests, DURO-133)가 돌린다. ArgoCD 가 Kustomize 앱을 렌더링하는 것과 같은 버전이어야
+# 비교가 맞는다 — v5.8.1 은 ArgoCD v3.5.3 의 hack/tool-versions.sh 에 고정된 kustomize5_version 이다
+# (테스트 클러스터의 argo-cd 차트 10.9.2 = ArgoCD v3.5.3, kukie-gitops-test-infra kubernetes/argocd/values.yaml).
+# ArgoCD 를 올리면 그 버전의 tool-versions.sh 를 보고 아래 세 줄과 CI(.github/workflows/ci.yml)의 같은 값을 같이 바꾼다.
+# sha256 은 kustomize 릴리스의 checksums.txt 값이고, ArgoCD 레포 hack/installers/checksums 의 값과 같다
+ARG KUSTOMIZE_VERSION=v5.8.1
+ARG KUSTOMIZE_SHA256_AMD64=029a7f0f4e1932c52a0476cf02a0fd855c0bb85694b82c338fc648dcb53a819d
+ARG KUSTOMIZE_SHA256_ARM64=0953ea3e476f66d6ddfcd911d750f5167b9365aa9491b2326398e289fef2c142
 ARG TARGETARCH
 # TARGETARCH 는 BuildKit 이 채운다 — 구형 빌더면 빈 값이 URL 에 들어가 원인 모를 404 가 되므로 먼저 확인한다 (PR #82 리뷰)
 RUN : "${TARGETARCH:?BuildKit 이 필요하다 — DOCKER_BUILDKIT=1 로 빌드}" \
@@ -38,13 +46,22 @@ RUN : "${TARGETARCH:?BuildKit 이 필요하다 — DOCKER_BUILDKIT=1 로 빌드}
  && curl -fsSLo /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl.sha256" \
  && echo "$(cat /tmp/kubectl.sha256)  /usr/local/bin/kubectl" | sha256sum -c - \
  && chmod 0755 /usr/local/bin/kubectl && rm /tmp/kubectl.sha256 \
+ && case "${TARGETARCH}" in \
+      amd64) kustomize_sha256="${KUSTOMIZE_SHA256_AMD64}" ;; \
+      arm64) kustomize_sha256="${KUSTOMIZE_SHA256_ARM64}" ;; \
+      *) echo "kustomize sha256 이 없는 아키텍처: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSLo /tmp/kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_${TARGETARCH}.tar.gz" \
+ && echo "${kustomize_sha256}  /tmp/kustomize.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/kustomize.tar.gz -C /usr/local/bin kustomize \
+ && chmod 0755 /usr/local/bin/kustomize && rm /tmp/kustomize.tar.gz \
  && apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=build /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 # 옮겨 온 .venv 가 이 베이스에서 도는지 — 어긋나면 띄울 때가 아니라 빌드에서 멈춘다
-RUN python -c "import kukie_agent.server"
+RUN python -c "import kukie_agent.server" && kustomize version
 
 # 쓰기 가능한 HOME — 개발용 flat 엔드포인트(KUKIE_DEV_AUTH=1, server 없음)의 승인 계획 파일(~/.kukie/plans)이 여기 쌓인다.
 # 대화 경로는 저장을 전부 kukie-server 에 하므로 이 디렉터리에 지킬 상태가 없다 — 볼륨이 없어도 된다

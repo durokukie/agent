@@ -12,6 +12,7 @@ dependencies = [
     "uvicorn>=0.30",
     "httpx>=0.27",          # Kukie API 서버(kukie-server) — /users/me 인증(kukie_agent/auth)과 /internal 저장 API(kukie_agent/server_api). agent 는 DB 가 없다
     "anyio>=4.0",           # 블로킹 kubectl 을 스레드로 + 쓰임새별 상한 (kukie_agent/kubectl/runner.thread_limiter). 원래 FastAPI·httpx 가 끌어오지만 직접 import 한다
+    "ruamel-yaml>=0.18",    # 매니페스트 레포 YAML 을 주석·모양 그대로 고친다 (kukie_agent/manifests, DURO-133). pyyaml 로 다시 쓰면 파일 전체가 바뀐다
 ]
 
 [dependency-groups]

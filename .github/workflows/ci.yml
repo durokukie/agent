@@ -23,6 +23,17 @@ jobs:
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - run: uv sync --locked
+      # 렌더 비교 테스트(tests/test_manifests.py)가 진짜 kustomize build 를 돌린다. 버전·sha256 은 Dockerfile 과 같다 (ArgoCD v3.5.3 에 맞춘 값).
+      # 러너에 깔려 있는 kustomize 는 버전이 따로 놀아 덮어쓴다. CI 에서는 kustomize 가 없으면 그 테스트가 건너뛰지 않고 실패한다
+      - name: Install kustomize
+        env:
+          KUSTOMIZE_VERSION: v5.8.1
+          KUSTOMIZE_SHA256: 029a7f0f4e1932c52a0476cf02a0fd855c0bb85694b82c338fc648dcb53a819d
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/kustomize.tar.gz" "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          echo "${KUSTOMIZE_SHA256}  $RUNNER_TEMP/kustomize.tar.gz" | sha256sum -c -
+          sudo tar -xzf "$RUNNER_TEMP/kustomize.tar.gz" -C /usr/local/bin kustomize
+          kustomize version
       - run: uv run python -m pytest
 
   e2e:

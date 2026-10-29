@@ -1,0 +1,18 @@
+# Application 이 여기(overlays/prod)를 본다. Kukie 는 이 폴더만 고치고 base 는 건드리지 않는다 (DURO-133)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: shop-prod
+resources:
+  - ../../base
+replicas:
+  - name: api
+    count: 2
+images:
+  - name: public.ecr.aws/docker/library/nginx
+    newTag: 1.29-alpine
+  # 앱 레포 CI 가 digest 로 바꿔 커밋한다
+  - name: kukie-agent
+    newName: 320343233643.dkr.ecr.ap-northeast-2.amazonaws.com/kukie-agent
+    digest: sha256:d6c243eba5605e37d6e9d662f89c7058866db42b3b35989454842c3898ee689f
+patches:
+  - path: env.yaml
