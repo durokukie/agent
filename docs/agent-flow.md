@@ -57,7 +57,8 @@ flowchart TD
         direction TB
         H1["① 실행 args 정규화·보관<br/>apply_manifest는 원문 대신 manifest_sha256"]
         H1 --> H2["② RISK_STICKERS[tool_name]<br/>→ DESTRUCTIVE (미등록이면 fail-closed)"]
-        H2 --> H3["③ ActionPlan.create_draft(tool, args, command, risk,<br/>skill, target, intent, effects, side_effects)<br/>→ 대화 경로: kukie-server POST /internal/runs/{runId}/plans (DRAFT, id=UUID·code=ap-YYMMDD-HHMM-tool)<br/>→ flat 개발 엔드포인트: ~/.kukie/plans/ap-YYMMDD-HHMM-tool.md"]
+        H2 --> H2A["ArgoCD 판별 argocd.inspect(target)<br/>관리 리소스면 경고(level·warning) — 못 하면 None, 막지 않는다"]
+        H2A --> H3["③ ActionPlan.create_draft(tool, args, command, risk,<br/>skill, target, intent, effects, side_effects, argocd)<br/>→ 대화 경로: kukie-server POST /internal/runs/{runId}/plans (DRAFT, id=UUID·code=ap-YYMMDD-HHMM-tool)<br/>→ flat 개발 엔드포인트: ~/.kukie/plans/ap-YYMMDD-HHMM-tool.md"]
         H3 --> H4["④ run_kubectl(command, context, dry_run=True)<br/>plan.record_dry_run(status, stdout, stderr)"]
         H4 -->|"실패"| H4F["기록하는 자리에서 FAILED + DRY_RUN_FAILED<br/>raise ToolFailed"]
         H4 -->|"성공·미지원"| H5["⑤ plan.offer(decision guidance) → WAITING_APPROVAL<br/>raise ApprovalRequired(plan_id)"]

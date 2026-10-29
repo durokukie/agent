@@ -2,6 +2,7 @@
 
   POST /clusters/{id}/test       연결 확인 (kubectl version + auth can-i)
   GET  /clusters/{id}/overview   개요 — 웹 대시보드의 클러스터 지도·통계 (issue #102, kubectl get × 3 + CNI 조회 1 + GPU 조회)
+  GET  /clusters/{id}/argocd/applications   ArgoCD 화면의 Application 목록 (DURO-140, kubectl get × 1)
 
 등록·목록·수정·삭제는 Kukie API 서버(kukie-server)의 공개 API 다 (DURO-113) — kubeconfig 검사와 자격증명
 암호화도 그쪽에 있다. 연결 확인만 agent 에 남은 이유는 kubectl 이 여기서 돌기 때문이다.
@@ -29,7 +30,7 @@ from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException
 
 import kukie_agent.server as _server   # 순환 import: 이름은 호출 시점에만 쓴다
-from kukie_agent import server_api
+from kukie_agent import argocd, server_api
 from kukie_agent.auth import User, current_user
 from kukie_agent.clusters import access, gpu, overview
 from kukie_agent.kubectl import KubectlResult, run_kubectl, thread_limiter
@@ -41,6 +42,7 @@ router = APIRouter(prefix="/clusters", tags=["clusters"])
 #: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적, 이유는 thread_limiter).
 #: kubectl 은 30초씩 잡는다.
 PROBE_WORKERS = 4            # 연결 확인 (kubectl × 3 — version·can-i 30초씩 + 노드 OVERVIEW_TIMEOUT, 최대 75초)
+ARGOCD_WORKERS = 4           # ArgoCD 앱 목록 (kubectl × 1, OVERVIEW_TIMEOUT). ArgoCD 화면이 띄울 때 부른다 — 개요와 따로 묶는다
 OVERVIEW_WORKERS = 4         # 개요 (kubectl × 5, 노드를 읽고 GPU 가 없다고 이미 안 클러스터가 아니면 GPU_BUDGET 안에서 몇 번 더). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
 #: 개요의 kubectl 한 번 시간 제한(초). 기본 30초 × 4 면 한 요청이 슬롯을 2분 잡는다 — 닿지 않으면 첫 번째에서 15초로 끝난다 (자동 리뷰 지적)
 OVERVIEW_TIMEOUT = 15
@@ -189,6 +191,47 @@ async def cluster_overview(
 
     # 권한은 위에서 요청마다 본다(access.connection). 나눠 쓰는 것은 그 뒤의 kubectl 결과뿐이다
     return await _shared_overview(key, compute)
+
+
+@router.get("/{cluster_id}/argocd/applications")
+async def argocd_applications(
+    cluster_id: str,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """ArgoCD 화면의 Application 목록 (DURO-140). 응답 모양은 kukie-electron docs/api-spec.md `ArgoApplications`.
+
+    권한·자격증명은 개요와 같은 길이다 — 못 보는 클러스터는 server 의 404, 팀 구성원 누구나 부른다.
+    `get applications.argoproj.io -A` 한 번이다(개요의 gpu 처럼 클러스터 namespace 밖). 한 줄 모양은 argocd.application_row.
+
+    status 로 클러스터에 ArgoCD 가 있는지도 알린다 — 셋 다 200 이고, ok 가 아니면 applications 는 빈 배열이다.
+      ok         Application 을 읽었다 (0개일 수 있다)
+      absent     applications.argoproj.io CRD 가 없다 — ArgoCD 없음
+      forbidden  읽을 권한이 없다 — 있는지 알 수 없다 (v4 제한 권한인 고객 클러스터)
+    그 밖의 kubectl 실패는 개요와 같이 502 CLUSTER_AUTH_EXPIRED·CLUSTER_UNREACHABLE, 출력을 못 읽으면 502 CLUSTER_BAD_RESPONSE.
+    """
+    conn = await access.connection(cluster_id, user)
+
+    def collect() -> dict[str, Any]:
+        with access.kubeconfig(conn) as path:
+            result = run_kubectl(argocd.LIST_COMMAND, context=conn.context_name, kubeconfig=path,
+                                 timeout=OVERVIEW_TIMEOUT)
+        now = overview.iso(datetime.now(timezone.utc))
+        if not result.success:
+            kind = argocd.failure_kind(result.stderr or result.stdout)
+            if kind == "error":
+                _raise_kubectl_failure(result.stderr or result.stdout)
+            return {"status": kind, "at": now, "applications": []}
+        try:
+            applications = argocd.applications_response(result.stdout)
+        except ValueError as exc:
+            # 원문은 클러스터 내용이라 남기지 않는다 (개요와 같다)
+            logger.warning("ArgoCD 앱 목록을 읽지 못했다: %s", type(exc).__name__)
+            raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
+                                      "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
+        return {"status": "ok", "at": now, "applications": applications}
+
+    # 개요와 같은 이유로 스레드로 넘긴다 — kubectl 이 도는 동안 서버 전체가 멈추지 않게
+    return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
 
 
 def _connection_key(cluster_id: str, conn: server_api.ClusterConnection) -> str | None:
