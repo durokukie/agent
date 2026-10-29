@@ -41,6 +41,7 @@ class AppSource(BaseModel):
     path: str                            # spec.source.path — 레포 루트 기준
     directory_recurse: bool = False      # spec.source.directory.recurse (Directory 일 때만)
     ignore_differences: list[dict] = []  # spec.ignoreDifferences 그대로
+    respect_ignore_differences: bool = False  # spec.syncPolicy.syncOptions 에 RespectIgnoreDifferences=true 가 있나
 
 
 class Replicas(BaseModel):
@@ -117,7 +118,7 @@ RefuseCode = Literal[
     "no_source",            # git 에 원본이 없다 (오퍼레이터가 만든 것 등)
     "ambiguous",            # 같은 리소스가 여럿, 또는 컨테이너를 골라야 한다
     "secret",               # Secret 값은 PR 에 넣지 않는다
-    "ignored_field",        # ignoreDifferences 로 무시하는 칸 — git 을 고쳐도 반영되지 않는다
+    "ignored_field",        # RespectIgnoreDifferences 로 sync 때 빼는 칸 — git 을 고쳐도 반영되지 않는다
     "no_change",            # 이미 그 값이다
     "invalid_path",         # 레포 밖 경로, 또는 Application path 가 없다
     "outside_app",          # Application path 밖(base 등)을 고쳤다 — 다른 환경도 같이 바뀐다

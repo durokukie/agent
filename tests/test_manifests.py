@@ -270,7 +270,43 @@ def test_값이_요청과_다르면_걸린다(repo):
 
     result = refused(verify_change(repo, PROD, API, Replicas(count=4), {path: edited}), "render_mismatch")
 
-    assert "replicas 가 5" in result.message
+    assert "spec.replicas (요청대로면 4, 고친 뒤 5)" in result.message
+
+
+def test_요청하지_않은_resources_키가_바뀌면_걸린다(repo):
+    path = "apps/plain/deployment.yaml"
+    # cpu 를 올리면서 memory limit 을 지운다
+    edited = (repo / path).read_text().replace("requests: {cpu: 10m, memory: 16Mi}", "requests: {cpu: 100m, memory: 16Mi}") \
+        .replace("            limits: {memory: 64Mi}\n", "")
+
+    result = refused(verify_change(repo, PLAIN, WEB, Resources(requests={"cpu": "100m"}), {path: edited}),
+                     "render_mismatch")
+
+    assert "resources.limits" in result.message
+
+
+def test_요청하지_않은_환경변수가_바뀌면_걸린다(repo):
+    path = "apps/plain/deployment.yaml"
+    # PORT 를 더하면서 Secret 에서 오던 DB_URL 을 평문으로 바꾼다
+    edited = (repo / path).read_text().replace(
+        "              valueFrom:\n                secretKeyRef: {name: web-db, key: url}\n",
+        "              value: postgres://x\n            - name: PORT\n              value: '8080'\n")
+
+    result = refused(verify_change(repo, PLAIN, WEB, Env(values={"PORT": "8080"}), {path: edited}), "render_mismatch")
+
+    assert "env[DB_URL]" in result.message
+
+
+@needs_kustomize
+def test_kustomize_patch_가_다른_환경변수를_지우면_걸린다(repo):
+    patch = "apps/kustomize/overlays/prod/kukie-deployment-api-env.yaml"
+    files = ready(plan_change(repo, PROD, API, Env(values={"LOG_LEVEL": "debug"}))).files
+    files[patch] = files[patch].replace(
+        "            - name: LOG_LEVEL\n", "            - name: STAGE\n              $patch: delete\n            - name: LOG_LEVEL\n")
+
+    result = refused(verify_change(repo, PROD, API, Env(values={"LOG_LEVEL": "debug"}), files), "render_mismatch")
+
+    assert "env[STAGE]" in result.message
 
 
 def test_plain_Application_path_밖_파일을_고치면_걸린다(repo):
@@ -345,14 +381,22 @@ def test_Secret_이_바뀌는_diff_는_만들지_않는다(repo):
     assert "new-password" not in result.model_dump_json()
 
 
-def test_ignoreDifferences_로_무시하는_칸은_고치지_않는다(repo):
-    app = PLAIN.model_copy(update={"ignore_differences": [
+def test_RespectIgnoreDifferences_로_sync_때_빼는_칸은_고치지_않는다(repo):
+    app = PLAIN.model_copy(update={"respect_ignore_differences": True, "ignore_differences": [
         {"group": "apps", "kind": "Deployment", "jsonPointers": ["/spec/replicas"]}]})
     refused(plan_change(repo, app, WEB, Replicas(count=3)), "ignored_field")
 
 
-def test_ignoreDifferences_가_칸의_일부만_무시하면_경고를_단다(repo):
+def test_ignoreDifferences_만_있으면_고치되_자동_sync_가_안_될_수_있다고_경고한다(repo):
+    # ArgoCD 는 ignoreDifferences 를 sync 상태 계산에만 쓴다 — sync 하면 반영된다
     app = PLAIN.model_copy(update={"ignore_differences": [
+        {"group": "apps", "kind": "Deployment", "jsonPointers": ["/spec/replicas"]}]})
+    result = ready(plan_change(repo, app, WEB, Replicas(count=3)))
+    assert any("자동 sync" in w for w in result.warnings)
+
+
+def test_RespectIgnoreDifferences_가_칸의_일부만_빼면_경고를_단다(repo):
+    app = PLAIN.model_copy(update={"respect_ignore_differences": True, "ignore_differences": [
         {"group": "apps", "kind": "Deployment", "name": "web",
          "jsonPointers": ["/spec/template/spec/containers/0/env/0/value"]}]})
     result = ready(plan_change(repo, app, WEB, Env(values={"PORT": "8080"})))

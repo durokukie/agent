@@ -4,12 +4,14 @@
     verify_change = prepare → verify   ← 고칠 파일을 다른 데서(나중에 AI 가) 고른 경우
 
 prepare 는 고치기 전 렌더 결과에서 요청한 리소스를 찾고 함정(HPA · git 에 원본 없음 · Secret · ignoreDifferences)을 먼저 본다.
-verify 는 레포를 임시 폴더에 복사해 고친 파일을 쓰고 다시 렌더링한 뒤, 바뀐 것이 요청한 리소스의 요청한 칸뿐인지 본다.
+verify 는 레포를 임시 폴더에 복사해 고친 파일을 쓰고 다시 렌더링한 뒤, 다른 리소스는 그대로이고 요청한 리소스는
+"지금 렌더 결과에 요청만 직접 적용한 것(expected_after)"과 똑같은지 본다 — 요청하지 않은 키·환경변수는 한 칸도 바뀌면 안 된다.
 Kustomize 는 레포의 다른 kustomization 폴더(base · 다른 overlay)도 전·후를 렌더링해 같이 바뀌지 않았는지 본다.
 레포 폴더는 읽기만 한다 — 고친 내용은 결과(Ready.files)로만 나간다. git · GitHub · PR 은 이 모듈 밖이다 (DURO-131 · 134).
 """
 from __future__ import annotations
 
+import copy
 import re
 import shutil
 import tempfile
@@ -25,7 +27,9 @@ from kukie_agent.manifests.models import (
 from kukie_agent.manifests.render import (
     RenderError, kustomization_file, kustomize_roots, render, resolve_inside,
 )
-from kukie_agent.manifests.workload import POD_SPEC, SCALABLE, container, containers, dig, split_image
+from kukie_agent.manifests.workload import (
+    POD_SPEC, SCALABLE, container, containers, dig, split_image, with_tag,
+)
 
 # 값이 비밀번호·키처럼 보이는 환경변수 이름 — git 에 평문으로 남기지 않는다
 _SECRETISH = re.compile(r"PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|CREDENTIAL", re.I)
@@ -43,7 +47,7 @@ class Context:
     key: Key                   # 렌더 결과에서 찾은 요청한 리소스
     obj: dict                  # 그 리소스의 고치기 전 렌더 결과
     container: str | None      # 컨테이너 칸을 고치는 요청이면 그 이름
-    allowed: FieldPath         # 바뀌어도 되는 칸 — 이 아래만 바뀌어야 한다
+    allowed: FieldPath         # 요청이 고치는 칸의 뿌리 — ignoreDifferences 와 겹치는지 볼 때 쓴다 (렌더 비교는 expected_after)
     warnings: list[str] = field(default_factory=list)
 
     def relative(self, path: Path) -> str:
@@ -223,7 +227,11 @@ def _check_env(current: dict, change: Env, name: str) -> Refused | None:
 
 
 def _check_ignored(ctx: Context) -> Context | Refused:
-    """ArgoCD 가 ignoreDifferences 로 무시하는 칸이면 git 을 고쳐도 클러스터에 반영되지 않을 수 있다."""
+    """ArgoCD 의 ignoreDifferences 와 겹치는 칸인지.
+
+    ArgoCD 는 ignoreDifferences 를 sync 상태 계산에만 쓴다 — git 을 고쳐도 OutOfSync 로 안 보여 자동 sync 가 안 일어날 수 있지만,
+    sync 하면 반영된다. syncOptions 에 RespectIgnoreDifferences=true 가 있으면 sync 때도 그 칸을 빼서 git 을 고쳐도 반영되지 않는다.
+    """
     group = ctx.target.group
     _, kind, namespace, name = ctx.key
     for rule in ctx.app.ignore_differences:
@@ -235,14 +243,18 @@ def _check_ignored(ctx: Context) -> Context | Refused:
             continue
         for pointer in rule.get("jsonPointers") or []:
             ignored = compare.pointer_path(pointer, ctx.obj)
-            if ignored is None:
+            if ignored is None or not (compare.under(ctx.allowed, ignored) or compare.under(ignored, ctx.allowed)):
                 continue
-            if compare.under(ctx.allowed, ignored):
+            whole = compare.under(ctx.allowed, ignored)
+            if ctx.app.respect_ignore_differences and whole:
                 return Refused(code="ignored_field",
-                               message=f"ArgoCD 가 {compare.label(ctx.key)} 의 {pointer} 를 무시해요"
-                                       "(ignoreDifferences) — git 을 고쳐도 클러스터에 반영되지 않아요.")
-            if compare.under(ignored, ctx.allowed):
-                ctx.warnings.append(f"ArgoCD 가 {pointer} 는 무시해요(ignoreDifferences) — 그 부분은 반영되지 않을 수 있어요.")
+                               message=f"ArgoCD 가 {compare.label(ctx.key)} 의 {pointer} 를 sync 때 빼요"
+                                       "(ignoreDifferences + RespectIgnoreDifferences) — git 을 고쳐도 클러스터에 반영되지 않아요.")
+            if ctx.app.respect_ignore_differences:
+                ctx.warnings.append(f"ArgoCD 가 {pointer} 는 sync 때 빼요(RespectIgnoreDifferences) — 그 부분은 반영되지 않아요.")
+            else:
+                ctx.warnings.append(f"ArgoCD 가 {pointer} 의 차이는 보지 않아요(ignoreDifferences) — 머지해도 OutOfSync 로 "
+                                    "안 보여 자동 sync 가 안 일어날 수 있어요. sync 하면 반영돼요.")
         if rule.get("jqPathExpressions"):
             ctx.warnings.append("ignoreDifferences 에 jq 식이 있어요 — 무시하는 칸인지 코드가 확인하지 못했어요.")
         if rule.get("managedFieldsManagers"):
@@ -268,14 +280,14 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
         return Refused(code="render_mismatch", retry=True, message="고친 파일이 없어요.")
 
     with tempfile.TemporaryDirectory(prefix="kukie-manifests-") as tmp:
-        copy = Path(tmp) / "repo"
-        shutil.copytree(ctx.root, copy, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+        workdir = Path(tmp) / "repo"
+        shutil.copytree(ctx.root, workdir, symlinks=True, ignore=shutil.ignore_patterns(".git"))
         for relative, content in files.items():
-            (copy / relative).parent.mkdir(parents=True, exist_ok=True)
-            (copy / relative).write_text(content, encoding="utf-8")
+            (workdir / relative).parent.mkdir(parents=True, exist_ok=True)
+            (workdir / relative).write_text(content, encoding="utf-8")
         app_path = ctx.relative(ctx.app_dir)
         try:
-            after = compare.index(render(ctx.app.source_type, copy / app_path, root=copy,
+            after = compare.index(render(ctx.app.source_type, workdir / app_path, root=workdir,
                                          recurse=ctx.app.directory_recurse))
         except RenderError as exc:
             return Refused(code="render_failed", retry=True, message=f"고친 뒤 렌더링이 안 돼요. {exc}")
@@ -284,7 +296,7 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
         if refused:
             return refused
         if ctx.app.source_type == "Kustomize":
-            changed = _other_environments(ctx, copy, app_path)
+            changed = _other_environments(ctx, workdir, app_path)
             if changed:
                 return Refused(code="render_mismatch", retry=True,
                                message="다른 환경도 같이 바뀌어요: " + ", ".join(changed[:_SHOW_LIMIT])
@@ -321,18 +333,19 @@ def _compare_app(ctx: Context, after: dict[Key, dict]) -> Refused | None:
                                + f". {compare.label(ctx.key)} 만 바뀌게 고쳐 주세요.")
     if ctx.key not in after:
         return Refused(code="render_mismatch", retry=True, message=f"고친 뒤 {compare.label(ctx.key)} 가 사라져요.")
-    paths = compare.diff_paths(ctx.obj, after[ctx.key])
-    if not paths:
+    if not compare.diff_paths(ctx.obj, after[ctx.key]):
         return Refused(code="render_mismatch", retry=True,
                        message="고친 뒤에도 렌더 결과가 그대로예요 — 고친 곳이 이 리소스에 반영되지 않아요.")
-    stray = [p for p in paths if not compare.under(p, ctx.allowed)]
+    # 지금 렌더 결과에 요청만 직접 적용한 것과 글자 그대로 같아야 한다 — 요청한 키·이름 밖은 한 칸도 바뀌면 안 된다
+    expected = _normalized(expected_after(ctx), ctx.target.kind)
+    got = _normalized(after[ctx.key], ctx.target.kind)
+    stray = compare.diff_paths(expected, got)
     if stray:
         return Refused(code="render_mismatch", retry=True,
-                       message="요청하지 않은 칸도 바뀌어요: " + ", ".join(compare.show(p) for p in stray[:_SHOW_LIMIT])
-                               + f". {compare.show(ctx.allowed)} 만 바뀌어야 해요.")
-    problem = _applied(ctx, after[ctx.key])
-    if problem:
-        return Refused(code="render_mismatch", retry=True, message=f"고친 뒤 값이 요청과 달라요: {problem}")
+                       message="고친 뒤 결과가 요청과 달라요: "
+                               + ", ".join(f"{compare.show(p)} (요청대로면 {_brief(compare.value_at(expected, p))}, "
+                                           f"고친 뒤 {_brief(compare.value_at(got, p))})" for p in stray[:_SHOW_LIMIT])
+                               + ". 요청한 칸만 요청한 값으로 바뀌게 고쳐 주세요.")
     return None
 
 
@@ -344,42 +357,58 @@ def _describe(key: Key, before: dict[Key, dict], after: dict[Key, dict]) -> str:
     return compare.label(key)
 
 
-def _applied(ctx: Context, obj: dict) -> str | None:
+def expected_after(ctx: Context) -> dict:
+    """지금 렌더 결과에 요청만 그대로 적용한 것 — 고친 뒤 렌더 결과가 이것과 같아야 한다."""
+    obj = copy.deepcopy(ctx.obj)
     change = ctx.change
     if isinstance(change, Replicas):
-        got = dig(obj, ("spec", "replicas"))
-        return None if got == change.count else f"replicas 가 {got} 예요 (요청 {change.count})."
-    current = container(obj, ctx.target.kind, ctx.container or "") or {}
+        obj.setdefault("spec", {})["replicas"] = change.count
+        return obj
+    target = container(obj, ctx.target.kind, ctx.container or "")
+    assert target is not None   # prepare 가 이미 찾았다
     if isinstance(change, ImageTag):
-        image = str(current.get("image", ""))
-        _, tag, digest = split_image(image)
-        return None if tag == change.tag and not digest else f"이미지가 {image} 예요 (요청 태그 {change.tag})."
-    if isinstance(change, Resources):
+        target["image"] = with_tag(str(target.get("image", "")), change.tag)
+    elif isinstance(change, Resources):
+        resources = target.setdefault("resources", {})
         for section, values in (("requests", change.requests), ("limits", change.limits)):
-            for k, v in values.items():
-                got = dig(current, ("resources", section, k))
-                if str(got) != v:
-                    return f"resources.{section}.{k} 가 {got} 예요 (요청 {v})."
-        return None
-    assert isinstance(change, Env)
-    for name, value in change.values.items():
-        found = _env_item(current, name)
-        if not found or found.get("value") != value or "valueFrom" in found:
-            return f"환경변수 {name} 가 요청한 값이 아니에요."
-    for name in change.remove:
-        if _env_item(current, name):
-            return f"환경변수 {name} 가 아직 있어요."
-    return None
+            if values:
+                resources.setdefault(section, {}).update(values)
+    else:
+        assert isinstance(change, Env)
+        env = [e for e in target.get("env") or [] if e.get("name") not in change.remove]
+        for name, value in change.values.items():
+            found = next((e for e in env if e.get("name") == name), None)
+            if found is None:
+                env.append({"name": name, "value": value})
+            else:
+                found.pop("valueFrom", None)
+                found["value"] = value
+        target["env"] = env
+    return obj
 
 
-def _other_environments(ctx: Context, copy: Path, app_path: str) -> list[str]:
+def _normalized(obj: dict, kind: str) -> dict:
+    """빈 env 목록은 없는 것과 같다 — plain 은 `env: []` 로, Kustomize 는 칸을 지워 남길 수 있다."""
+    obj = copy.deepcopy(obj)
+    for item in containers(obj, kind):
+        if item.get("env") == []:
+            del item["env"]
+    return obj
+
+
+def _brief(value: object) -> str:
+    text = "없음" if value is compare.MISSING else str(value)
+    return text if len(text) <= 60 else text[:57] + "..."
+
+
+def _other_environments(ctx: Context, workdir: Path, app_path: str) -> list[str]:
     """레포의 다른 kustomization 폴더 중 고친 뒤 렌더 결과가 달라지는 곳 (전·후 모두 렌더링이 안 되는 곳은 뺀다)."""
     changed = []
     for root in kustomize_roots(ctx.root):
         if root == app_path:
             continue
         results = []
-        for base in (ctx.root, copy):
+        for base in (ctx.root, workdir):
             try:
                 results.append(compare.index(render("Kustomize", base / root, root=base)))
             except RenderError:

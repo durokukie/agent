@@ -83,6 +83,25 @@ def diff_paths(before: Any, after: Any, path: FieldPath = ()) -> list[FieldPath]
     return [] if before == after else [path]
 
 
+MISSING = object()
+
+
+def value_at(obj: Any, path: FieldPath) -> Any:
+    """diff_paths 가 돌려준 경로의 값 — `[이름]` 조각은 그 이름의 항목. 없으면 MISSING."""
+    for part in path:
+        if isinstance(part, str) and part.startswith("[") and isinstance(obj, list):
+            obj = next((i for i in obj if isinstance(i, dict) and f"[{i.get('name')}]" == part), MISSING)
+        elif isinstance(part, int) and isinstance(obj, list):
+            obj = obj[part] if part < len(obj) else MISSING
+        elif isinstance(obj, dict):
+            obj = obj.get(part, MISSING)
+        else:
+            return MISSING
+        if obj is MISSING:
+            return MISSING
+    return obj
+
+
 def show(path: FieldPath) -> str:
     text = ""
     for part in path:
