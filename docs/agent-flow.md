@@ -107,9 +107,10 @@ flowchart LR
 | 렌더링 | — | 앱 (2단계) | ❌ |
 | 스킬 결정 | `skill_for(room.shared)` | `skills/__init__.py`, `conversations.py` | ✅ DURO-100 (공개 범위로 고정, 모드 없음) |
 | 에이전트 설정 | `Agent(...)`, `add_target()`, `add_skill_prompt()` | `agent.py` | ✅ |
-| 툴 등록 | `FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS]).filtered(_only_skill_tools)` | `agent.py` | ✅ 스킬별 필터; 변경 4종은 Shared 만 + Hook |
+| 툴 등록 | `FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS, *GITOPS_TOOLS]).filtered(_only_skill_tools)` | `agent.py` | ✅ 스킬별 필터; 변경 4종·PR 길 1종은 Shared 만 + Hook |
 | 읽기 툴 5종 | `list_resources` 등 | `tools/read.py` | ✅ |
 | 변경 툴 4종 | `delete_resource` 등 | `tools/mutate.py` | ✅ Shared 대화에만 노출, 가드레일 훅 대상 |
+| PR 길 변경 툴 | `propose_git_change` — 승인 전 PR, 승인 = 머지, sync·health 지켜보기, 승인 순간 STALE 판단 | `tools/gitops.py`, `guardrail/gitops_hook.py`, `gitops/` | ✅ DURO-134 |
 | 명령 조립 | `assemble()` | `kubectl/assemble.py` | 부분 (apply TODO) |
 | 실행 | `run_kubectl()` | `kubectl/runner.py` | ✅ |
 | 훅 파이프라인 | `guardrail()` | `guardrail/hook.py` | ✅ 2-pass 승인·실행·기록 |

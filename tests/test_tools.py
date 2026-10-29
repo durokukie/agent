@@ -49,7 +49,7 @@ def test_공통_툴은_읽기_툴_5종_전부다():
 def test_공개_범위가_스킬을_정한다():
     assert skill_for(False) is PRIVATE and skill_for(True) is SHARED
     assert PRIVATE.allowed_tools == COMMON_TOOLS                  # 변경 툴 0
-    assert SHARED.allowed_tools == COMMON_TOOLS | MUTATING_TOOLS
+    assert SHARED.allowed_tools == COMMON_TOOLS | MUTATING_TOOLS | {"propose_git_change"}   # PR 길 (DURO-134)
 
 
 def test_두_스킬은_응답_스키마가_같다():

@@ -40,6 +40,10 @@ LLM 이 delete_resource(...) 호출
   └─ ⑦ 결과 기록 ─ APPLIED / FAILED / UNKNOWN 을 Plan 에 남김
 ```
 
+ArgoCD 가 관리하고 매니페스트 레포가 연결된 리소스는 kubectl 대신 **PR 길**로 간다 (`propose_git_change`, DURO-134).
+같은 틀에서 ③ dry-run 자리가 "고칠 곳 찾기 + 렌더 비교 + 승인 전 PR 열기" 로, ⑥ 실행이 "PR 머지 → ArgoCD sync·health 지켜보기" 로
+바뀐다. 승인 순간 길을 다시 판단해 레포 연결·Application·PR 이 바뀌었으면 실행하지 않고 STALE 로 닫는다.
+
 설계에서 지킨 원칙:
 
 | 결정 | 주체 | 이유 |
@@ -80,13 +84,15 @@ agent 에 남은 공개 API 는 `POST /conversations/{id}/chat`·`/approve`·`/r
 |---|---|
 | 에이전트 정의, 스킬(Private·Shared 대화)별 툴 필터 | `kukie_agent/agent.py`, `kukie_agent/skills/` |
 | 가드레일 훅, Action Plan, 판단 가이드 | `kukie_agent/guardrail/` |
-| 읽기 툴 5종, 변경 툴 4종 | `kukie_agent/tools/` |
+| 읽기 툴 5종, 변경 툴 4종, PR 길 변경 툴 `propose_git_change` | `kukie_agent/tools/` |
 | kubectl 명령 조립·실행 (`shell=False`) | `kukie_agent/kubectl/` |
 | FastAPI 서버, 대화 실행(chat·approve·resume)·클러스터 연결 확인·개요 | `kukie_agent/server.py`, `kukie_agent/conversations_api.py`, `kukie_agent/clusters_api.py` |
 | 채팅방별 세션·잠금·재시작 복원 | `kukie_agent/conversations.py` |
 | Kukie API 서버 내부 API 클라이언트 (저장·권한 판단, fail-closed) | `kukie_agent/server_api.py` |
 | 실행 직전 임시 kubeconfig, 개요 응답 정리 | `kukie_agent/clusters/` |
 | ArgoCD 관리 리소스 판별 (가드레일 경고·describe·앱 목록 API) | `kukie_agent/argocd.py` |
+| GitOps PR 길 — 길 판단 · GitHub(브랜치·커밋·PR·머지) · sync 지켜보기, 승인 훅 | `kukie_agent/gitops/`, `kukie_agent/guardrail/gitops_hook.py` |
+| 매니페스트 레포 고칠 곳 찾기 · 렌더 비교 | `kukie_agent/manifests/` |
 | 인증 (kukie-server `/users/me`, fail-closed) | `kukie_agent/auth.py` |
 
 **스택**: Python 3.14+ · [pydantic-ai](https://ai.pydantic.dev/) (에이전트 루프, 승인 훅 `ApprovalRequired`/`DeferredToolRequests`) · FastAPI · httpx · pytest · kind (E2E)

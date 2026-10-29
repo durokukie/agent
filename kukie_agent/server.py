@@ -46,6 +46,7 @@ from kukie_agent import auth, progress, server_api
 from kukie_agent.agent import agent
 from kukie_agent.clusters import runtime
 from kukie_agent.deps import Deps
+from kukie_agent.guardrail.gitops_hook import close_rejected
 from kukie_agent.guardrail.action_plan import ActionPlan
 from kukie_agent.guardrail.approval import ApprovalRequest, build_approval_request
 from kukie_agent.kubectl.config import KubeconfigError, read_kubeconfig
@@ -379,6 +380,8 @@ async def _approve(session: Session, call_id: str, approved: bool) -> tuple[dict
             logger.exception("거절 기록 실패 — 티켓 유지 (call_id=%s, plan_id=%s)",
                              call_id, approval_request.plan_id)
             raise HTTPException(503, f"거절을 기록하지 못했다. 같은 카드를 다시 결정하라: {exc}") from exc
+        # PR 길의 카드면 승인 전에 연 PR 을 닫는다 (DURO-134). 거절 기록이 먼저다 — 닫기 실패는 로그만 남긴다
+        await close_rejected(plan, session.deps.cluster_id)
     session.decisions[call_id] = (
         ToolApproved()
         if approved

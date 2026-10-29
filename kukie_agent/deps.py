@@ -24,3 +24,7 @@ class Deps:
     # 등록된 클러스터로 실행할 때의 임시 kubeconfig 경로 (기획 04 §8). 요청이 끝나면 파일이 지워진다.
     # None 이면 서버 컴퓨터의 기본 kubeconfig 를 쓴다 — flat 엔드포인트(로컬 개발) 경로다.
     kubeconfig: Path | None = None
+    # 대화 단위 엔드포인트에서만 채운다 (conversations.registry). GitOps 가 연결된 매니페스트 레포·설치 토큰을 클러스터로 묻고
+    # (DURO-134), 대화별 "마지막으로 본 레포 연결 상태" 를 대화로 읽고 쓴다 (DURO-135). flat 엔드포인트는 None — PR 길이 없다
+    cluster_id: str | None = None
+    conversation_id: str | None = None
