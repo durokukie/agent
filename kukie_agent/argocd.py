@@ -152,8 +152,9 @@ def valid_ref(namespace: str, name: str) -> bool:
 
 def detail_failure(stderr: str, *, namespace: str, name: str) -> str:
     """앱 상세의 kubectl 실패 — failure_kind 의 셋에 not_found(그 Application 이 없다)를 더한다.
+    namespace 가 없을 때도(지워졌거나 오래된 URL) kubectl 은 `namespaces "<ns>" not found` 를 낸다 — 앱이 없는 것과 같다 (agent#125 리뷰).
     kubectl 은 이름·namespace 를 따옴표로 찍는다 — 앱 이름이 "forbidden"·"unauthorized" 여도 갈래가 바뀌지 않게 지우고 본다."""
-    if f'{APPLICATIONS} "{name}" not found' in stderr:
+    if f'{APPLICATIONS} "{name}" not found' in stderr or f'namespaces "{namespace}" not found' in stderr:
         return "not_found"
     return failure_kind(stderr.replace(f'"{name}"', '""').replace(f'"{namespace}"', '""'))
 

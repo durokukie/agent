@@ -594,6 +594,7 @@ def test_URL_의_namespace_와_이름은_쿠버네티스_이름_꼴이어야_한
 @pytest.mark.parametrize(("name", "stderr", "kind"), [
     ("guestbook", 'Error from server (NotFound): applications.argoproj.io "guestbook" not found', "not_found"),
     ("forbidden", 'Error from server (NotFound): applications.argoproj.io "forbidden" not found', "not_found"),
+    ("guestbook", 'Error from server (NotFound): namespaces "argocd" not found', "not_found"),     # namespace 가 없다
     ("unauthorized", 'Error from server (Forbidden): applications.argoproj.io "unauthorized" is forbidden: User "kukie" '
                      'cannot get resource "applications" in API group "argoproj.io" in the namespace "argocd"', "forbidden"),
     ("guestbook", ABSENT, "absent"),
@@ -631,9 +632,13 @@ def test_앱_상세도_ArgoCD_없음과_권한_없음은_200으로_가른다(cli
     assert (r.json()["status"], r.json()["application"]) == (status, None)
 
 
-def test_없는_앱은_404_ARGOCD_APP_NOT_FOUND(client, fake_server, monkeypatch):
+@pytest.mark.parametrize("stderr", [
+    'Error from server (NotFound): applications.argoproj.io "guestbook" not found',
+    'Error from server (NotFound): namespaces "argocd" not found',            # 지워졌거나 없는 namespace
+])
+def test_없는_앱은_404_ARGOCD_APP_NOT_FOUND(client, fake_server, monkeypatch, stderr):
     cluster = fake_server.add_cluster(owner="u-1")
-    _api(monkeypatch, _fail('Error from server (NotFound): applications.argoproj.io "guestbook" not found'))
+    _api(monkeypatch, _fail(stderr))
     r = client.get(_detail_url(cluster), headers=USER)
     assert r.status_code == 404 and r.json()["detail"]["code"] == "ARGOCD_APP_NOT_FOUND"
 
