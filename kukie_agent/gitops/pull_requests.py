@@ -173,12 +173,17 @@ async def _busy_files(gh: github.GitHub, paths: set[str]) -> str:
         why = await _abandoned(pull)
         if why is not None:
             try:
-                await gh.comment(pull.number, f"이 PR 의 {why} Kukie 가 닫았어요.")
-                await gh.close_pull(pull.number)
-                await gh.delete_branch(pull.head_ref)
-                continue
-            except (GitHubError, ValueError):
+                await gh.close_pull(pull.number)        # 닫은 뒤에 "닫았어요" 를 단다 — 닫기가 실패하면 말도 안 남긴다
+            except GitHubError:
                 logger.warning("만료된 카드의 PR 을 닫지 못했다: %s #%s", gh.repository, pull.number)
+            else:
+                # 잠금을 푸는 것은 닫기 하나다 — 코멘트·브랜치 삭제가 실패해도 이 PR 때문에 막지 않는다 (agent#126 리뷰)
+                try:
+                    await gh.comment(pull.number, f"이 PR 의 {why} Kukie 가 닫았어요.")
+                    await gh.delete_branch(pull.head_ref)
+                except (GitHubError, ValueError):
+                    logger.warning("닫은 PR 의 코멘트·브랜치 정리를 못 했다: %s #%s", gh.repository, pull.number)
+                continue
         found.append(f"#{pull.number} {pull.url}")
     return ", ".join(found)
 
@@ -233,7 +238,8 @@ async def recheck(gitops: dict[str, Any], pull_request: dict[str, Any], token: s
             # 누가 GitHub 에서 먼저 머지했다. 승인한 내용 그대로, 승인 카드를 만든 base 위에 머지됐으면 변경은 이미 들어갔다 —
             # STALE("실행 안 함")은 사실과 다르다. 다른 커밋 위에 머지됐으면 렌더 결과가 다를 수 있어 반영으로 보지 않는다 (agent#126 리뷰)
             same = (pull.merge_commit and await gh.pull_files(pull.number) == approved
-                    and await gh.commit_parents(pull.merge_commit) == [gitops["base_sha"]])
+                    # 첫 부모만 본다 — squash·rebase 는 부모가 하나, 머지 커밋은 [base, PR head] 둘이다 (agent#126 리뷰)
+                    and (await gh.commit_parents(pull.merge_commit))[:1] == [gitops["base_sha"]])
             if same:
                 return Recheck(pull, merged=True)
             return Recheck(pull, f"PR #{pull.number} 이 승인 카드와 다른 내용·다른 base 로 GitHub 에서 이미 머지됐어요 — "

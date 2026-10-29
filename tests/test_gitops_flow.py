@@ -355,10 +355,11 @@ def test_승인_순간_조회가_실패하면_STALE이_아니라_다시_시도�
     assert _plan(fake_server, room)["status"] == "APPLIED" and len(gh.merges) == 1
 
 
-def test_GitHub에서_먼저_머지됐으면_반영된_것으로_보고한다(client, fake_server, room, gh, cluster):
-    """승인한 내용 그대로 머지됐다 — STALE("실행 안 함")은 사실과 다르다 (agent#126 리뷰)."""
+@pytest.mark.parametrize("method", ["squash", "rebase", "merge"])
+def test_GitHub에서_먼저_머지됐으면_반영된_것으로_보고한다(client, fake_server, room, gh, cluster, method):
+    """승인한 내용 그대로 머지됐다 — STALE("실행 안 함")은 사실과 다르다. 머지 방식 셋 다 (agent#126 리뷰)."""
     _card(client, room)
-    sha = gh.merge_elsewhere(1)
+    sha = gh.merge_elsewhere(1, method=method)
     _decide(client, room)
 
     plan = _plan(fake_server, room)
@@ -404,7 +405,7 @@ def test_먼저_머지됐어도_다른_base_위면_반영으로_보지_않는다
     """그 사이 base 에 다른 커밋이 들어왔으면 렌더 결과가 승인 카드와 다를 수 있다 (agent#126 리뷰)."""
     _card(client, room)
     gh.push_to_base("apps/plain/service.yaml", "kind: Service\n")
-    gh.merge_elsewhere(1, on=gh.branches["main"])
+    gh.merge_elsewhere(1, on=gh.branches["main"], method="merge")
     _decide(client, room)
 
     plan = _plan(fake_server, room)
@@ -427,3 +428,39 @@ def test_고아_PR은_승인_없이_끝난_계획의_것만_닫는다(client, fa
 
     assert (gh.pull_of(1)["state"] == "closed") is closed
     assert len(gh.pulls) == (2 if closed else 1)
+
+
+def test_고아_PR을_닫은_뒤_정리가_실패해도_막지_않는다(client, fake_server, room, gh, cluster, monkeypatch):
+    """잠금을 푸는 것은 닫기 하나다 — 코멘트·브랜치 삭제 실패로 "이미 열려 있어요" 가 되면 안 된다 (agent#126 리뷰)."""
+    from kukie_agent.gitops.github import GitHubError
+
+    _card(client, room)
+    first = _plan(fake_server, room)
+    fake_server.plans[first["id"]]["status"] = "EXPIRED"
+
+    async def broken(number, body):
+        raise GitHubError(502, "Bad Gateway")
+
+    monkeypatch.setattr(gh, "comment", broken)
+    other = new_room(fake_server, shared=True, cluster_id=fake_server.conversation(room)["clusterId"])
+    body = _chat(client, other)
+
+    assert gh.pull_of(1)["state"] == "closed"
+    assert body["kind"] == "approval" and gh.pull_of(2)["state"] == "open"
+
+
+def test_고아_PR을_닫지_못하면_막는다(client, fake_server, room, gh, cluster, monkeypatch):
+    from kukie_agent.gitops.github import GitHubError
+
+    _card(client, room)
+    fake_server.plans[_plan(fake_server, room)["id"]]["status"] = "EXPIRED"
+
+    async def broken(number):
+        raise GitHubError(502, "Bad Gateway")
+
+    monkeypatch.setattr(gh, "close_pull", broken)
+    other = new_room(fake_server, shared=True, cluster_id=fake_server.conversation(room)["clusterId"])
+    seen: list = []
+    _chat(client, other, seen=seen)
+
+    assert "같은 파일을 고치는 Kukie PR" in str(seen[0].content) and len(gh.pulls) == 1

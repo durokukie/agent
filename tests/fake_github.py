@@ -69,11 +69,12 @@ class FakeGitHub:
         self.commits[sha] = files
         self.branches[branch] = sha
 
-    def merge_elsewhere(self, number: int = 1, *, on: str | None = None) -> str:
-        """누가 GitHub 화면에서 먼저 머지했다. on 을 주면 그 커밋 위에 (그 사이 base 가 앞섰다)."""
+    def merge_elsewhere(self, number: int = 1, *, on: str | None = None, method: str = "squash") -> str:
+        """누가 GitHub 화면에서 먼저 머지했다. on 을 주면 그 커밋 위에 (그 사이 base 가 앞섰다).
+        method 가 merge 면 머지 커밋(부모 둘: base, PR head), squash·rebase 면 부모 하나."""
         p = self.pulls[number]
         sha = f"web{number}{'0' * 36}"
-        self.parents[sha] = [on or p["base_sha"]]
+        self.parents[sha] = [on or p["base_sha"], *([p["head_sha"]] if method == "merge" else [])]
         self.commits[sha] = self.commits[p["head_sha"]]
         self.branches[p["base"]] = sha
         p.update(state="closed", merged=True, merge_commit=sha)
