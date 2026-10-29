@@ -350,15 +350,26 @@ def test_레플리카가_PR_범위_밖이면_run이_실패하지_않고_kubectl_
     assert body["kind"] == "approval" and body["approvals"][0]["tool"] == "scale_resource"
 
 
-def test_PR_길_판단이_예산을_넘으면_kubectl_길로_둔다(client, fake_server, room, cluster, monkeypatch):
-    import anyio
+def test_PR_길_판단은_스레드_안의_kubectl_까지_예산을_지킨다(client, fake_server, room, cluster, monkeypatch):
+    """move_on_after 는 스레드 안의 kubectl 을 멈추지 못한다 — 남은 시간을 kubectl 제한으로 넘긴다 (agent#127 리뷰)."""
+    import time
+
     from kukie_agent.guardrail import hook
+    from kukie_agent.kubectl import KubectlResult
 
-    async def slow(**kwargs):
-        await anyio.sleep(5)
+    timeouts: list[float] = []
 
-    monkeypatch.setattr(hook, "PR_PATH_BUDGET", 0.05)
-    monkeypatch.setattr(route, "decide", slow)
+    def hanging(args, *, timeout, **kwargs):
+        timeouts.append(timeout)
+        time.sleep(timeout)                                          # API 서버가 답하지 않아 제한까지 기다린다
+        return KubectlResult(command="kubectl", stdout="", stderr="timed out", success=False)
+
+    monkeypatch.setattr(hook, "PR_PATH_BUDGET", 0.3)
+    monkeypatch.setattr(route, "run_kubectl", hanging)
+    started = time.monotonic()
     body = _chat(client, room, Script(("scale_resource", SCALE)), "3개")
+    elapsed = time.monotonic() - started
 
     assert body["approvals"][0]["tool"] == "scale_resource" and "route" not in body["approvals"][0]["argocd"]
+    assert timeouts and all(t <= 0.3 for t in timeouts) and sum(timeouts) <= 0.3 + 0.05
+    assert elapsed < 2

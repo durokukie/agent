@@ -130,7 +130,8 @@ async def _pr_path(ctx, tool_name: str, managed: dict, normalized_args: dict) ->
     """ArgoCD 가 관리하는 대상이 PR 길이면 그 판단 (DURO-135). 아니거나 모르면 None — kubectl 길 그대로.
 
     조회 예산을 지킨다 (agent#127 리뷰): 판별(argocd.inspect)이 이미 읽은 Application 으로 연결된 레포의 앱인지 먼저 보고
-    (아니면 kubectl 을 더 부르지 않는다), 길은 그 앱의 **첫 리소스 하나**만 판단하고, 전체를 PR_PATH_BUDGET 초로 끊는다.
+    (아니면 kubectl 을 더 부르지 않는다), 길은 그 앱의 **첫 리소스 하나**만 판단하고, 판단 전체를 PR_PATH_BUDGET 초로 끊는다
+    (argocd.inspect 의 판별은 따로 LOOKUP_BUDGET 을 쓴다).
     한 리소스로 충분하다 — 돌려보내는 말은 "이 변경은 PR 로" 하나이고, 나머지 리소스는 propose_git_change 가 다시 본다.
     """
     if tool_name == "scale_resource":
@@ -140,27 +141,35 @@ async def _pr_path(ctx, tool_name: str, managed: dict, normalized_args: dict) ->
             return None        # PR 로는 못 하는 값(0..1000 밖) — 판단할 것 없이 kubectl 길이다 (범위는 kubectl 이 본다)
     else:
         change = None
+    # 예산은 두 자리에서 지킨다: server 호출은 취소할 수 있어 move_on_after 로, 스레드 안의 kubectl 은 취소할 수 없어
+    # 남은 시간을 decide 에 넘겨 한 번의 제한을 줄인다 (agent#127 리뷰 — move_on_after 는 스레드를 멈추지 못한다)
+    started = anyio.current_time()
+    connected = None
     with anyio.move_on_after(PR_PATH_BUDGET):
         try:
             connected = {repo.repository for repo in await server_api.manifest_repos(ctx.deps.cluster_id)}
         except Exception:
             logger.exception("연결된 레포 목록을 읽지 못해 PR 길 판단을 건너뛴다")
             return None
-        linked_apps = {
-            app["name"] for app in managed.get("applications") or []
-            if repo_name(app.get("repo_url")) in connected
-        }
-        resource = next((r for r in managed.get("resources") or [] if r.get("application") in linked_apps), None)
-        if resource is None:
-            return None
-        found = await gitops_route.decide(
-            kind=str(resource["kind"]), name=str(resource["name"]), namespace=resource.get("namespace") or None,
-            context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig, cluster_id=ctx.deps.cluster_id,
-            change=change, connected=connected,
-        )
-        return found if found.path == "pr" else None
-    logger.warning("PR 길 판단이 %s초를 넘어 kubectl 길로 둔다", PR_PATH_BUDGET)
-    return None
+    if connected is None:
+        logger.warning("PR 길 판단이 %s초를 넘어 kubectl 길로 둔다", PR_PATH_BUDGET)
+        return None
+    linked_apps = {
+        app["name"] for app in managed.get("applications") or []
+        if repo_name(app.get("repo_url")) in connected
+    }
+    resource = next((r for r in managed.get("resources") or [] if r.get("application") in linked_apps), None)
+    if resource is None:
+        return None
+    left = PR_PATH_BUDGET - (anyio.current_time() - started)
+    if left <= 0:
+        return None
+    found = await gitops_route.decide(
+        kind=str(resource["kind"]), name=str(resource["name"]), namespace=resource.get("namespace") or None,
+        context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig, cluster_id=ctx.deps.cluster_id,
+        change=change, connected=connected, budget=left,
+    )
+    return found if found.path == "pr" else None
 
 
 def _manifest_resources(manifest_yaml: str) -> list[dict[str, str]]:
