@@ -195,12 +195,17 @@ def _scaler_in_git(objects: dict[Key, dict], key: Key) -> str | None:
 
 
 def _pick_container(obj: dict, kind: str, wanted: str | None) -> str | Refused:
-    names = [c.get("name") for c in containers(obj, kind)]
+    found = containers(obj, kind)
+    # 이름 없는 컨테이너는 고를 수도, 렌더 결과에서 다시 찾을 수도 없다 — 쿠버네티스도 받지 않는 모양이다
+    names = [c["name"] for c in found if isinstance(c.get("name"), str) and c["name"]]
+    if len(names) != len(found):
+        return Refused(code="unsupported_change",
+                       message="이름(name)이 없는 컨테이너가 있어요 — 매니페스트를 먼저 고쳐야 해요.")
     if wanted:
         if wanted in names:
             return wanted
         return Refused(code="ambiguous", retry=True,
-                       message=f"컨테이너 '{wanted}' 가 없어요. 있는 것: {', '.join(map(str, names)) or '없음'}.")
+                       message=f"컨테이너 '{wanted}' 가 없어요. 있는 것: {', '.join(names) or '없음'}.")
     if len(names) == 1:
         return names[0]
     return Refused(code="ambiguous", retry=True,
@@ -362,17 +367,17 @@ def expected_after(ctx: Context) -> dict:
     obj = copy.deepcopy(ctx.obj)
     change = ctx.change
     if isinstance(change, Replicas):
-        obj.setdefault("spec", {})["replicas"] = change.count
+        _child(obj, "spec")["replicas"] = change.count
         return obj
     target = container(obj, ctx.target.kind, ctx.container or "")
     assert target is not None   # prepare 가 이미 찾았다
     if isinstance(change, ImageTag):
         target["image"] = with_tag(str(target.get("image", "")), change.tag)
     elif isinstance(change, Resources):
-        resources = target.setdefault("resources", {})
+        resources = _child(target, "resources")
         for section, values in (("requests", change.requests), ("limits", change.limits)):
             if values:
-                resources.setdefault(section, {}).update(values)
+                _child(resources, section).update(values)
     else:
         assert isinstance(change, Env)
         env = [e for e in target.get("env") or [] if e.get("name") not in change.remove]
@@ -385,6 +390,13 @@ def expected_after(ctx: Context) -> dict:
                 found["value"] = value
         target["env"] = env
     return obj
+
+
+def _child(parent: dict, key: str) -> dict:
+    """`resources:` 처럼 키만 있고 값이 비어(None) 있어도 빈 dict 로 시작한다."""
+    if not isinstance(parent.get(key), dict):
+        parent[key] = {}
+    return parent[key]
 
 
 def _normalized(obj: dict, kind: str) -> dict:

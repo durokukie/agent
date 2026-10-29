@@ -86,7 +86,9 @@ def _set_image_tag(kustomization: Any, image: str, tag: str) -> None:
 def _patch(ctx: Context, existing: str | None) -> str:
     """Kukie 의 strategic merge patch — 요청한 컨테이너의 resources 나 env 만 담는다."""
     parsed = YamlFile(existing) if existing is not None else None
-    doc = parsed.docs[0] if parsed is not None else CommentedMap([
+    # 파일이 비었거나 주석만 남았으면 새로 쓴다
+    keep = parsed is not None and bool(parsed.docs) and isinstance(parsed.docs[0], dict)
+    doc = parsed.docs[0] if keep else CommentedMap([
         ("apiVersion", ctx.target.api_version), ("kind", ctx.target.kind),
         ("metadata", CommentedMap([("name", ctx.target.name)]))])
     patch_container = _ensure_container(doc, ctx.target.kind, ctx.container or "")
@@ -98,7 +100,7 @@ def _patch(ctx: Context, existing: str | None) -> str:
     plain.edit(doc, ctx)
     if isinstance(ctx.change, Env):
         _mark_deletes(patch_container, ctx.change.remove)
-    if parsed is not None:
+    if keep:
         return parsed.dump()
     what = "CPU·메모리" if isinstance(ctx.change, Resources) else "환경변수"
     header = (f"# Kukie 가 더한 patch — {ctx.target.kind} {ctx.target.name} 의 {what}.\n"
@@ -109,7 +111,8 @@ def _patch(ctx: Context, existing: str | None) -> str:
 def _ensure_container(doc: Any, kind: str, name: str) -> Any:
     here = doc
     for part in (*POD_SPEC[kind], "containers"):
-        if part not in here or here[part] is None:
+        wanted = list if part == "containers" else dict
+        if not isinstance(here.get(part), wanted):
             here[part] = CommentedSeq() if part == "containers" else CommentedMap()
         here = here[part]
     found = next((c for c in here if c.get("name") == name), None)

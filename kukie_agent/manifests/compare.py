@@ -11,6 +11,7 @@ from typing import Any
 import yaml
 
 from kukie_agent.manifests.models import Target
+from kukie_agent.manifests.render import RenderError
 
 Key = tuple[str, str, str, str]
 FieldPath = tuple[str | int, ...]
@@ -23,7 +24,14 @@ def key_of(obj: dict) -> Key:
 
 
 def index(objects: list[dict]) -> dict[Key, dict]:
-    return {key_of(obj): obj for obj in objects}
+    """같은 리소스가 두 번 나오면 렌더링 실패로 본다 — 덮어쓰면 하나가 안 보여 비교를 빠져나가고, ArgoCD 도 sync 하지 못한다."""
+    found: dict[Key, dict] = {}
+    for obj in objects:
+        key = key_of(obj)
+        if key in found:
+            raise RenderError(f"같은 리소스가 두 번 나와요: {label(key)}")
+        found[key] = obj
+    return found
 
 
 def matches(key: Key, target: Target) -> bool:
@@ -121,7 +129,8 @@ def under(path: FieldPath, prefix: FieldPath) -> bool:
 def pointer_path(pointer: str, obj: Any) -> FieldPath | None:
     """ignoreDifferences 의 JSON Pointer(/spec/template/spec/containers/0/env) 를 이 모듈의 경로로.
 
-    숫자 조각은 그 자리 항목에 이름이 있으면 `[이름]` 으로 바꾼다. 객체에 없는 곳까지 가면 그 앞까지만 돌려준다.
+    숫자 조각은 그 자리 항목에 이름이 있으면 `[이름]` 으로 바꾼다. 없는 항목 번호를 가리키면 None — 아무 칸도 가리지 않는다
+    (그 앞까지로 자르면 경로가 넓어져, 고치려는 칸을 덮는다고 잘못 볼 수 있다).
     """
     parts = [p.replace("~1", "/").replace("~0", "~") for p in pointer.split("/")[1:]]
     path: list[str | int] = []
@@ -130,7 +139,7 @@ def pointer_path(pointer: str, obj: Any) -> FieldPath | None:
         if isinstance(here, list) and part.isdigit():
             index_ = int(part)
             if index_ >= len(here):
-                return tuple(path)
+                return None
             here = here[index_]
             path.append(item(here["name"]) if isinstance(here, dict) and isinstance(here.get("name"), str)
                         else index_)

@@ -458,3 +458,56 @@ def test_레포_밖을_가리키는_링크는_읽지_않는다(repo, tmp_path):
     result = refused(plan_change(repo, PLAIN, WEB, Replicas(count=3)), "render_failed")
 
     assert "레포 밖" in result.message
+
+
+# ── 리뷰에서 나온 모양 (PR #124) ─────────────────────────
+
+
+def test_이름_없는_컨테이너는_고르지_않는다(repo):
+    (repo / "apps/plain/deployment.yaml").write_text((repo / "apps/plain/deployment.yaml").read_text().replace(
+        "        - name: web\n          image:", "        - image:"))
+
+    refused(plan_change(repo, PLAIN, WEB, ImageTag(tag="1.29-alpine")), "unsupported_change")
+
+
+def test_값이_빈_resources_칸에도_자원을_넣는다(repo):
+    path = repo / "apps/plain/deployment.yaml"
+    path.write_text(path.read_text().replace(
+        "          resources:\n            requests: {cpu: 10m, memory: 16Mi}\n            limits: {memory: 64Mi}\n",
+        "          resources:\n"))
+
+    result = ready(plan_change(repo, PLAIN, WEB, Resources(requests={"cpu": "50m"})))
+
+    assert changed_lines(result.file_diff) == ([], ["            requests:", "              cpu: 50m"])
+
+
+@needs_kustomize
+@pytest.mark.parametrize("content", ["", "# 다 지웠다\n"])
+def test_비었거나_주석만_남은_Kukie_patch_파일은_새로_쓴다(repo, content):
+    patch = repo / "apps/kustomize/overlays/prod/kukie-deployment-api-env.yaml"
+    write(repo, ready(plan_change(repo, PROD, API, Env(values={"LOG_LEVEL": "debug"}))).files)
+    patch.write_text(content)
+
+    result = ready(plan_change(repo, PROD, API, Env(values={"LOG_LEVEL": "info"})))
+
+    rewritten = yaml.safe_load(result.files["apps/kustomize/overlays/prod/kukie-deployment-api-env.yaml"])
+    assert rewritten["spec"]["template"]["spec"]["containers"] == [
+        {"name": "api", "env": [{"name": "LOG_LEVEL", "value": "info"}]}]
+
+
+def test_같은_리소스를_두_번_만드는_edits_는_걸린다(repo):
+    fixed = (repo / "apps/plain/deployment.yaml").read_text().replace("replicas: 1", "replicas: 3")
+    edits = {"apps/plain/deployment.yaml": fixed, "apps/plain/aaa-web.yaml": fixed.replace("replicas: 3", "replicas: 99")}
+
+    result = refused(verify_change(repo, PLAIN, WEB, Replicas(count=3), edits), "render_failed")
+
+    assert "두 번" in result.message
+
+
+def test_없는_컨테이너_번호를_가리키는_ignoreDifferences_는_아무_칸도_덮지_않는다(repo):
+    app = PLAIN.model_copy(update={"respect_ignore_differences": True, "ignore_differences": [
+        {"group": "apps", "kind": "Deployment", "jsonPointers": ["/spec/template/spec/containers/1/resources"]}]})
+
+    result = ready(plan_change(repo, app, WEB, Resources(requests={"cpu": "50m"})))
+
+    assert result.warnings == []

@@ -39,7 +39,7 @@ def edit(doc: Any, ctx: Context) -> None:
     """ruamel 문서 하나를 요청대로 고친다 (Kustomize patch 파일에도 쓴다)."""
     change = ctx.change
     if isinstance(change, Replicas):
-        doc["spec"]["replicas"] = change.count
+        _child(doc, "spec")["replicas"] = change.count
         return
     container = _container(doc, ctx)
     if isinstance(change, ImageTag):
