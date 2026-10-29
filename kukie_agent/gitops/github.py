@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import re
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,6 +85,14 @@ def blob_sha(content: str) -> str:
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
+#: git check-ref-format 이 막는 모양 — 경로에 그대로 넣기 전에 본다 (`..` 로 다른 API 경로를 만들지 못하게)
+_BAD_REF = re.compile(r"\.\.|//|@\{|[\x00-\x20\x7f~^:?*\[\\]|^/|/$|\.lock$|^\.|/\.|\.$")
+
+
+def branch_name_ok(branch: str) -> bool:
+    return bool(branch) and len(branch) <= 255 and not _BAD_REF.search(branch)
+
+
 def _safe_branch(branch: str) -> str:
     if not branch.startswith(BRANCH_PREFIX) or ".." in branch or branch.endswith((".lock", "/")):
         raise ValueError(f"Kukie 가 쓰는 브랜치가 아니다: {branch}")
@@ -147,7 +156,10 @@ class GitHub:
 
     async def branch_head(self, branch: str) -> str | None:
         """브랜치 끝 커밋. 그런 브랜치가 없으면(태그·커밋 해시를 targetRevision 으로 쓴 앱) None."""
-        # `env/prod` 같은 브랜치 이름의 `/` 는 그대로 보낸다 — `%2F` 로 보내면 GitHub 가 못 찾는다 (agent#126 리뷰)
+        # `env/prod` 같은 브랜치 이름의 `/` 는 그대로 보낸다 — `%2F` 로 보내면 GitHub 가 못 찾는다 (agent#126 리뷰).
+        # 그래서 이름은 부르기 전에 본다 — targetRevision 은 고객 Application 에서 온 값이다
+        if not branch_name_ok(branch):
+            return None
         data = await self._request("GET", self._repo_path("branches", quote(branch, safe="/")), not_found_is_none=True)
         return str(data["commit"]["sha"]) if data else None
 
@@ -168,6 +180,10 @@ class GitHub:
         except httpx.HTTPError as exc:
             raise GitHubError(None, type(exc).__name__) from exc
         return _extract(b"".join(chunks), dest)
+
+    async def commit_parents(self, sha: str) -> list[str]:
+        data = await self._request("GET", self._repo_path("git", "commits", quote(sha, safe="")))
+        return [str(parent.get("sha") or "") for parent in data.get("parents") or []]
 
     async def pull(self, number: int) -> PullRequest:
         return PullRequest.from_json(await self._request("GET", self._repo_path("pulls", str(number))))

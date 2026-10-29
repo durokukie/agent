@@ -140,16 +140,27 @@ async def draft(route: Route, change: Change, token: server_api.RepoToken, *, hp
 _PLAN_MARK = re.compile(r"<!-- kukie-plan: ([0-9A-Za-z-]+) -->")
 
 
-async def _plan_closed(pull: PullRequest) -> bool:
-    """그 PR 을 연 계획이 이미 닫혔나(EXPIRED·FAILED…). 표시가 없거나 못 읽으면 모른다 — 닫히지 않은 것으로 본다."""
+#: 그 PR 을 닫아도 되는 계획 상태 — 승인 없이 끝났다(만료·전제 바뀜·거절). 허용 목록이다: FAILED(브랜치 보호로 일부러
+#: 남긴 PR)·UNKNOWN(머지 여부 모름)·APPLIED 등 나머지는 손대지 않는다 — 승인된 변경을 지우면 안 된다 (agent#126 리뷰)
+_ABANDONED = {
+    "EXPIRED": "승인 카드가 결정 없이 만료돼",
+    "STALE": "승인 순간 전제가 바뀌어",
+    "REJECTED": "채팅에서 거절돼",
+}
+
+
+async def _abandoned(pull: PullRequest) -> str | None:
+    """그 PR 을 연 계획이 승인 없이 끝났으면 그 까닭. 표시가 없거나 못 읽으면 None — 닫지 않는다."""
     found = _PLAN_MARK.search(pull.body)
     if not found:
-        return False
+        return None
     try:
         plan = await server_api.get_plan(found.group(1))
     except Exception:
-        return False
-    return plan.status not in ("DRAFT", "WAITING_APPROVAL", "APPROVED", "EXECUTING")
+        return None
+    if plan.decision is not None and plan.decision.get("approved"):
+        return None
+    return _ABANDONED.get(plan.status)
 
 
 async def _busy_files(gh: github.GitHub, paths: set[str]) -> str:
@@ -159,9 +170,10 @@ async def _busy_files(gh: github.GitHub, paths: set[str]) -> str:
     for pull in await gh.open_kukie_pulls():
         if not paths & set(await gh.pull_files(pull.number)):
             continue
-        if await _plan_closed(pull):
+        why = await _abandoned(pull)
+        if why is not None:
             try:
-                await gh.comment(pull.number, "이 PR 의 승인 카드가 결정 없이 만료돼 Kukie 가 닫았어요.")
+                await gh.comment(pull.number, f"이 PR 의 {why} Kukie 가 닫았어요.")
                 await gh.close_pull(pull.number)
                 await gh.delete_branch(pull.head_ref)
                 continue
@@ -218,10 +230,13 @@ async def recheck(gitops: dict[str, Any], pull_request: dict[str, Any], token: s
     async with github.connect(gitops["repository"], token.token) as gh:
         pull = await gh.pull(int(pull_request["number"]))
         if pull.merged:
-            # 누가 GitHub 에서 먼저 머지했다. 승인한 내용 그대로면 변경은 이미 들어갔다 — STALE("실행 안 함")은 사실과 다르다 (agent#126 리뷰)
-            if await gh.pull_files(pull.number) == approved and pull.merge_commit:
+            # 누가 GitHub 에서 먼저 머지했다. 승인한 내용 그대로, 승인 카드를 만든 base 위에 머지됐으면 변경은 이미 들어갔다 —
+            # STALE("실행 안 함")은 사실과 다르다. 다른 커밋 위에 머지됐으면 렌더 결과가 다를 수 있어 반영으로 보지 않는다 (agent#126 리뷰)
+            same = (pull.merge_commit and await gh.pull_files(pull.number) == approved
+                    and await gh.commit_parents(pull.merge_commit) == [gitops["base_sha"]])
+            if same:
                 return Recheck(pull, merged=True)
-            return Recheck(pull, f"PR #{pull.number} 이 승인 카드와 다른 내용으로 GitHub 에서 이미 머지됐어요 — "
+            return Recheck(pull, f"PR #{pull.number} 이 승인 카드와 다른 내용·다른 base 로 GitHub 에서 이미 머지됐어요 — "
                                  "클러스터 상태를 직접 확인해야 해요.")
         if pull.state != "open":
             return Recheck(pull, f"PR #{pull.number} 이 닫혔어요.")

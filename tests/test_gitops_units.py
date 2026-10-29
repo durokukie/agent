@@ -337,3 +337,20 @@ def test_조회가_실패하면_길을_모른다고_표시한다(monkeypatch):
     assert _decide(monkeypatch, FakeCluster(), repos_error=True).known is False
     found = _decide(monkeypatch, FakeCluster(managed=False))
     assert found.known is True and found.path == "kubectl"
+
+
+@pytest.mark.parametrize("name,ok", [
+    ("main", True), ("env/prod", True), ("release-1.0", True),
+    ("../../pulls", False), ("a//b", False), ("/main", False), ("main/", False), ("a b", False),
+    ("x.lock", False), (".hidden", False), ("a@{1}", False), ("a~1", False), ("", False),
+])
+def test_브랜치_이름은_경로에_넣기_전에_본다(name, ok):
+    assert github.branch_name_ok(name) is ok
+
+
+def test_이상한_targetRevision은_GitHub를_부르지_않고_없는_브랜치다(api):
+    async def go():
+        async with github.GitHub(REPO, "t") as gh:
+            return await gh.branch_head("../../../user")
+
+    assert sync(go()) is None and api[1] == []

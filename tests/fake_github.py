@@ -33,6 +33,7 @@ class FakeGitHub:
     comments: list[tuple[int, str]] = field(default_factory=list)
     merges: list[dict[str, Any]] = field(default_factory=list)
     tokens: list[str] = field(default_factory=list)
+    parents: dict[str, list[str]] = field(default_factory=dict)
     merge_methods: tuple[str, ...] = ("squash", "merge")
     #: 다음 머지에 낼 오류 (status, message) — 브랜치 보호 등
     merge_error: tuple[int, str] | None = None
@@ -64,10 +65,11 @@ class FakeGitHub:
         self.commits[sha] = files
         self.branches[branch] = sha
 
-    def merge_elsewhere(self, number: int = 1) -> str:
-        """누가 GitHub 화면에서 먼저 머지했다."""
+    def merge_elsewhere(self, number: int = 1, *, on: str | None = None) -> str:
+        """누가 GitHub 화면에서 먼저 머지했다. on 을 주면 그 커밋 위에 (그 사이 base 가 앞섰다)."""
         p = self.pulls[number]
         sha = f"web{number}{'0' * 36}"
+        self.parents[sha] = [on or p["base_sha"]]
         self.commits[sha] = self.commits[p["head_sha"]]
         self.branches[p["base"]] = sha
         p.update(state="closed", merged=True, merge_commit=sha)
@@ -106,6 +108,9 @@ class FakeGitHub:
                            merged=p["merged"], head_ref=p["head_ref"], head_sha=p["head_sha"], base_ref=p["base"],
                            mergeable_state=self.mergeable_state, merge_commit=p.get("merge_commit", ""),
                            body=p["body"])
+
+    async def commit_parents(self, sha: str) -> list[str]:
+        return self.parents.get(sha, [])
 
     async def pull(self, number: int) -> PullRequest:
         return self._pull(number)

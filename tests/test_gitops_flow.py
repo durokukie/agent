@@ -398,3 +398,32 @@ def test_판단_가이드에는_렌더_diff_한_벌만_간다(client, fake_serve
     assert text.count("replicas: 3") == 1                          # render_diff 하나
     assert "file_diff" not in text and "base_sha" not in text and "route" not in text
     assert "render_diff" in text
+
+
+def test_먼저_머지됐어도_다른_base_위면_반영으로_보지_않는다(client, fake_server, room, gh, cluster):
+    """그 사이 base 에 다른 커밋이 들어왔으면 렌더 결과가 승인 카드와 다를 수 있다 (agent#126 리뷰)."""
+    _card(client, room)
+    gh.push_to_base("apps/plain/service.yaml", "kind: Service\n")
+    gh.merge_elsewhere(1, on=gh.branches["main"])
+    _decide(client, room)
+
+    plan = _plan(fake_server, room)
+    assert plan["status"] == "STALE" and gh.comments == []           # 이미 머지된 PR 에 "닫았다" 고 남기지 않는다
+    assert "클러스터 상태를 직접 확인" in str(_tool_result(fake_server, room)["content"])
+
+
+@pytest.mark.parametrize("status,closed", [
+    ("EXPIRED", True), ("STALE", True), ("FAILED", False), ("UNKNOWN", False), ("APPLIED", False),
+])
+def test_고아_PR은_승인_없이_끝난_계획의_것만_닫는다(client, fake_server, room, gh, cluster, status, closed):
+    """브랜치 보호로 남긴 PR(FAILED)·머지 여부 모름(UNKNOWN)을 닫으면 승인된 변경이 사라진다 (agent#126 리뷰)."""
+    _card(client, room)
+    first = _plan(fake_server, room)
+    fake_server.plans[first["id"]]["status"] = status
+    if status != "EXPIRED" and status != "STALE":
+        fake_server.plans[first["id"]]["decision"] = {"approved": True, "user_id": "u-1", "at": "…"}
+    other = new_room(fake_server, shared=True, cluster_id=fake_server.conversation(room)["clusterId"])
+    _chat(client, other)
+
+    assert (gh.pull_of(1)["state"] == "closed") is closed
+    assert len(gh.pulls) == (2 if closed else 1)
