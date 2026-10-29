@@ -355,10 +355,11 @@ def test_승인_순간_조회가_실패하면_STALE이_아니라_다시_시도�
     assert _plan(fake_server, room)["status"] == "APPLIED" and len(gh.merges) == 1
 
 
-def test_GitHub에서_먼저_머지됐으면_반영된_것으로_보고한다(client, fake_server, room, gh, cluster):
-    """승인한 내용 그대로 머지됐다 — STALE("실행 안 함")은 사실과 다르다 (agent#126 리뷰)."""
+@pytest.mark.parametrize("method", ["squash", "rebase", "merge"])
+def test_GitHub에서_먼저_머지됐으면_반영된_것으로_보고한다(client, fake_server, room, gh, cluster, method):
+    """승인한 내용 그대로 머지됐다 — STALE("실행 안 함")은 사실과 다르다. 머지 방식 셋 다 (agent#126 리뷰)."""
     _card(client, room)
-    sha = gh.merge_elsewhere(1)
+    sha = gh.merge_elsewhere(1, method=method)
     _decide(client, room)
 
     plan = _plan(fake_server, room)
@@ -404,7 +405,7 @@ def test_먼저_머지됐어도_다른_base_위면_반영으로_보지_않는다
     """그 사이 base 에 다른 커밋이 들어왔으면 렌더 결과가 승인 카드와 다를 수 있다 (agent#126 리뷰)."""
     _card(client, room)
     gh.push_to_base("apps/plain/service.yaml", "kind: Service\n")
-    gh.merge_elsewhere(1, on=gh.branches["main"])
+    gh.merge_elsewhere(1, on=gh.branches["main"], method="merge")
     _decide(client, room)
 
     plan = _plan(fake_server, room)
