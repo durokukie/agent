@@ -174,11 +174,16 @@ async def _busy_files(gh: github.GitHub, paths: set[str]) -> str:
         if why is not None:
             try:
                 await gh.close_pull(pull.number)        # 닫은 뒤에 "닫았어요" 를 단다 — 닫기가 실패하면 말도 안 남긴다
-                await gh.comment(pull.number, f"이 PR 의 {why} Kukie 가 닫았어요.")
-                await gh.delete_branch(pull.head_ref)
-                continue
-            except (GitHubError, ValueError):
+            except GitHubError:
                 logger.warning("만료된 카드의 PR 을 닫지 못했다: %s #%s", gh.repository, pull.number)
+            else:
+                # 잠금을 푸는 것은 닫기 하나다 — 코멘트·브랜치 삭제가 실패해도 이 PR 때문에 막지 않는다 (agent#126 리뷰)
+                try:
+                    await gh.comment(pull.number, f"이 PR 의 {why} Kukie 가 닫았어요.")
+                    await gh.delete_branch(pull.head_ref)
+                except (GitHubError, ValueError):
+                    logger.warning("닫은 PR 의 코멘트·브랜치 정리를 못 했다: %s #%s", gh.repository, pull.number)
+                continue
         found.append(f"#{pull.number} {pull.url}")
     return ", ".join(found)
 
