@@ -37,7 +37,7 @@ class KubectlResult(BaseModel):
 
 
 def run_kubectl(args: list[str], *, context: str, dry_run: bool = False,
-                stdin: str | None = None, timeout: int = 30,
+                stdin: str | None = None, timeout: float = 30,
                 kubeconfig: "Path | None" = None) -> KubectlResult:
     """조립된 args를 실행한다.
 

@@ -5,7 +5,8 @@
 판별 순서
   1. 대상 리소스의 추적 표시 (tracking_of)
        argocd.argoproj.io/tracking-id 어노테이션  ArgoCD v3 기본. `<앱>:<group>/<Kind>:<namespace>/<name>`.
-                                                  표시가 가리키는 kind·name 이 리소스와 다르면(다른 리소스를 복사해 만든 것) 보지 않는다
+                                                  표시가 가리키는 kind·namespace·name 이 리소스와 다르면(다른 리소스를 복사해 만든 것 —
+                                                  다른 namespace 로 옮겨 복사한 것 포함) 보지 않는다
        app.kubernetes.io/instance 라벨            label 추적 설정일 때. Helm 차트도 같은 라벨을 붙이므로 이것만으로는 모른다 —
                                                   그 이름의 Application 이 있고 status.resources 에 이 리소스가 있을 때만 관리로 본다
      앱 이름이 `<namespace>_<name>` 이면 "apps in any namespace" 의 Application 이다 (쿠버네티스 이름에는 `_` 가 없다)
@@ -87,8 +88,13 @@ def tracking_of(resource: dict[str, Any]) -> Tracking | None:
         # rest = "<group>/<Kind>:<namespace>/<name>". 다른 리소스를 가리키면 그 리소스를 복사해 만든 것이다 — ArgoCD 도 제 것으로 안 본다
         group_kind, _, namespaced_name = rest.partition(":")
         kind = group_kind.rpartition("/")[2]
-        name = namespaced_name.rpartition("/")[2]
-        if app and (not kind or kind == resource.get("kind")) and (not name or name == meta.get("name")):
+        namespace, _, name = namespaced_name.rpartition("/")
+        if (
+            app
+            and (not kind or kind == resource.get("kind"))
+            and (not namespace or namespace == meta.get("namespace"))
+            and (not name or name == meta.get("name"))
+        ):
             return Tracking(*_split_app(app), source="annotation")
         return None
     instance = labels.get(INSTANCE_LABEL) if isinstance(labels, dict) else None
@@ -217,7 +223,7 @@ def _app_summary(item: dict[str, Any]) -> dict[str, Any]:
 
 def inspect(
     targets: list[dict[str, str]], *, context: str, kubeconfig: Path | None = None,
-    timeout: int = LOOKUP_TIMEOUT, budget: float = LOOKUP_BUDGET, clock=time.monotonic,
+    timeout: float = LOOKUP_TIMEOUT, budget: float = LOOKUP_BUDGET, clock=time.monotonic,
 ) -> dict[str, Any] | None:
     """대상 리소스 가운데 ArgoCD 가 관리하는 것이 있으면 Plan 의 argocd 칸, 없거나 모르면 None.
 
@@ -232,9 +238,11 @@ def inspect(
     started = clock()
 
     def run(args: list[str]) -> KubectlResult | None:
-        if clock() - started >= budget:
+        # 한 번의 제한도 남은 시간으로 줄인다 — 아니면 끝 무렵에 시작한 한 번이 전체 시간을 timeout 만큼 넘긴다 (agent#123 리뷰)
+        left = budget - (clock() - started)
+        if left <= 0:
             return None
-        return run_kubectl(args, context=context, kubeconfig=kubeconfig, timeout=timeout)
+        return run_kubectl(args, context=context, kubeconfig=kubeconfig, timeout=min(timeout, left))
 
     tracked: list[tuple[dict[str, str], dict[str, Any], Tracking]] = []
     for target in targets[:MAX_RESOURCES]:

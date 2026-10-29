@@ -113,6 +113,8 @@ def test_다른_리소스를_가리키는_tracking_id는_보지_않는다():
     """다른 리소스를 복사해 만들면 어노테이션도 따라온다 — ArgoCD 도 제 것으로 안 본다."""
     assert argocd.tracking_of(_deployment(annotation="guestbook:apps/Deployment:shop/other")) is None
     assert argocd.tracking_of(_deployment(annotation="guestbook:/Service:shop/guestbook-ui")) is None
+    # 같은 이름으로 다른 namespace 에 복사한 것 (agent#123 리뷰)
+    assert argocd.tracking_of(_deployment(annotation="guestbook:apps/Deployment:prod/guestbook-ui")) is None
 
 
 def test_추적_표시가_없으면_None():
@@ -249,6 +251,21 @@ def test_리소스가_여럿이면_가장_센_경고(cluster, monkeypatch):
     assert found["level"] == "self_heal"
     assert [app["name"] for app in found["applications"]] == ["api", "guestbook"]
     assert cluster.calls.count(argocd.LIST_COMMAND) == 1                  # Application 목록은 한 번만
+
+
+def test_한_번의_제한도_남은_시간으로_줄인다(cluster, monkeypatch):
+    """끝 무렵에 시작한 조회가 전체 시간을 넘기지 않게 (agent#123 리뷰)."""
+    timeouts = []
+
+    def run(args, *, timeout, **kwargs):
+        timeouts.append(timeout)
+        return cluster.apps if args == argocd.LIST_COMMAND else cluster.resource
+
+    monkeypatch.setattr(argocd, "run_kubectl", run)
+    ticks = iter([0, 0, 8])            # 시작, 리소스 조회(5초 그대로), Application 목록(남은 2초)
+    argocd.inspect([{"kind": "deployment", "name": "guestbook-ui", "namespace": "shop"}],
+                   context="eks-shop", clock=lambda: next(ticks))
+    assert timeouts == [argocd.LOOKUP_TIMEOUT, argocd.LOOKUP_BUDGET - 8]
 
 
 def test_시간을_다_쓰면_더_묻지_않는다(cluster):
