@@ -160,6 +160,14 @@ def test_automated_enabled_false는_자동_sync가_꺼진_것이다():
      "absent"),
     (FORBIDDEN, "forbidden"),
     ("Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout", "error"),
+    # discovery 가 실패하면 내장 리소스에도 "doesn't have a resource type" 이 난다 — 죽은 클러스터를 ArgoCD 없음으로 보지 않는다
+    ('E1030 memcache.go:265] couldn\'t get current server API group list: Get "https://10.0.0.1/api?timeout=32s": '
+     'dial tcp 10.0.0.1:443: connect: connection refused\n' + ABSENT, "error"),
+    ("E1030 memcache.go:265] couldn't get current server API group list: the server has asked for the client to "
+     "provide credentials\nerror: You must be logged in to the server (Unauthorized)\n" + ABSENT, "error"),
+    # 집계 API 하나가 죽은 것은 클러스터에 닿은 것이다
+    ("E1030 memcache.go:287] couldn't get resource list for metrics.k8s.io/v1beta1: the server is currently unable "
+     "to handle the request\n" + ABSENT, "absent"),
 ])
 def test_kubectl_실패_가르기(stderr, kind):
     assert argocd.failure_kind(stderr) == kind
@@ -418,6 +426,8 @@ def test_ArgoCD_없음과_권한_없음은_200으로_가른다(client, fake_serv
 @pytest.mark.parametrize(("answer", "code"), [
     (_fail("Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout"), "CLUSTER_UNREACHABLE"),
     (_fail("error: You must be logged in to the server (Unauthorized)"), "CLUSTER_AUTH_EXPIRED"),
+    (_fail("E1030 memcache.go:265] couldn't get current server API group list: Get \"https://10.0.0.1/api\": "
+           "dial tcp 10.0.0.1:443: connect: connection refused\n" + ABSENT), "CLUSTER_UNREACHABLE"),
     (KubectlResult(command="kubectl get", stdout="not json", stderr="", success=True), "CLUSTER_BAD_RESPONSE"),
 ])
 def test_그_밖의_실패는_개요와_같이_502(client, fake_server, monkeypatch, answer, code):

@@ -42,6 +42,9 @@ hooks = Hooks()
 #: 동시에 도는 dry-run 상한. 넘치면 다음 dry-run 은 기다린다 — 다른 채팅방의 툴·DNS 는 영향 없다.
 #: probe(4)보다 큰 건 채팅 중에 일어나 여러 방에서 몰리기 때문이다.
 DRY_RUN_WORKERS = 8
+#: 동시에 도는 ArgoCD 판별(argocd.inspect, 읽기 조회 최대 argocd.LOOKUP_BUDGET 초) 상한. dry-run 과 따로 묶는다 —
+#: 같이 묶으면 한 변경 호출이 dry-run 슬롯을 두 번 잡아 판별끼리도 dry-run 앞에서 줄을 선다 (agent#123 리뷰)
+ARGOCD_LOOKUP_WORKERS = 8
 
 
 def _recorded_result(plan: ActionPlan) -> KubectlResult:
@@ -98,10 +101,10 @@ async def _argocd_ownership(ctx, target: PlanTarget) -> dict | None:
         for resource in resources
     ]
     try:
-        # dry-run 과 같은 이유로 스레드로 넘긴다 (아래 rehearsal). 같은 상한을 나눠 쓴다 — 둘 다 승인 카드 전의 조회다
+        # dry-run 과 같은 이유로 스레드로 넘긴다 (아래 rehearsal). 상한은 따로다 (ARGOCD_LOOKUP_WORKERS)
         return await to_thread.run_sync(
             partial(argocd.inspect, targets, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig),
-            limiter=thread_limiter("dry_run", DRY_RUN_WORKERS),
+            limiter=thread_limiter("argocd_lookup", ARGOCD_LOOKUP_WORKERS),
         )
     except Exception:
         logger.exception("ArgoCD 판별을 건너뛴다")

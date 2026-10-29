@@ -106,7 +106,8 @@ class ActionPlan:
     run_id: str | None = None                          # 어느 run 의 계획인가. None 이면 server 에 넣지 않는다 (flat 엔드포인트)
     code: str | None = None                            # server 계획의 표시용 id. 파일 계획은 id 가 곧 표시용이라 None
     # ArgoCD 가 관리하는 리소스를 kubectl 로 바꾸는 계획이면 그 판별(kukie_agent/argocd.py inspect). 아니면 None (DURO-129).
-    # 만들 때 payload 에 한 번 싣고 바꾸지 않는다 — 승인 대조(request_hash·decision 의 call)에는 들어가지 않는다
+    # 만들 때 payload 에 싣는다. 동작(_act)마다 server 가 돌려준 payload 로 다시 맞춰진다 — kukie-server 의 PlanResponse.payload 는
+    # 저장한 Map 을 모르는 키까지 그대로 준다. 승인 대조(request_hash·decision 의 call)에는 들어가지 않는다
     argocd: dict[str, Any] | None = None
 
     @property

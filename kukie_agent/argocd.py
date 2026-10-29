@@ -105,9 +105,26 @@ def tracking_of(resource: dict[str, Any]) -> Tracking | None:
 
 # ── Application ─────────────────────────────────────────
 
+#: API 서버에 못 닿았거나 인증이 안 된 표시. kubectl 은 discovery 가 실패하면 내장 리소스에도 "doesn't have a resource type" 을
+#: 내므로(앞에 memcache.go 의 "couldn't get current server API group list" 를 찍는다) absent 보다 먼저 본다 (agent#123 리뷰).
+#: "unable to retrieve the complete list of server APIs" 는 넣지 않는다 — 집계 API(metrics-server 등) 하나가 죽어도 나고, 그때도 클러스터에는 닿는다
+_UNREACHABLE_MARKERS = (
+    "couldn't get current server api group list",
+    "unable to connect to the server",
+    "unauthorized",
+    "connection refused",
+    "i/o timeout",
+    "no such host",
+    "tls handshake timeout",
+    "context deadline exceeded",
+)
+
+
 def failure_kind(stderr: str) -> str:
-    """kubectl 실패를 absent·forbidden·error 로 가른다 (모듈 설명 "못 읽으면")."""
+    """kubectl 실패를 absent·forbidden·error 로 가른다 (모듈 설명 "못 읽으면"). 닿지 않음·인증 실패는 error 가 먼저다."""
     lowered = stderr.lower()
+    if any(marker in lowered for marker in _UNREACHABLE_MARKERS):
+        return "error"
     if "doesn't have a resource type" in lowered or "no matches for kind" in lowered:
         return "absent"
     if "forbidden" in lowered:
