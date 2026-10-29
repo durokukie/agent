@@ -41,7 +41,7 @@ def cluster(monkeypatch, gh):
     fake = FakeCluster()
 
     def run(args, **kwargs):
-        fake.merged_revision = gh.merges[-1]["sha"] if gh.merges else ""
+        fake.merged_revision = gh.branches["main"]          # 머지되면 base 끝이 머지 커밋이다
         return fake.run(args, **kwargs)
 
     monkeypatch.setattr(route, "run_kubectl", run)
@@ -191,14 +191,13 @@ def test_비밀_값이_든_diff는_PR로_만들지_않는다(client, fake_server
 
 
 def test_같은_파일을_고치는_Kukie_PR이_열려_있으면_기다린다(client, fake_server, room, gh, cluster):
-    _card(client, room)
-    _decide(client, room, approved=False)                   # 카드는 닫혔지만
-    gh.pulls[1]["state"] = "open"                          # 누가 PR 을 다시 열었다
+    _card(client, room)                                    # 이 방의 카드는 아직 결정 전 (PR #1 열림)
+    other = new_room(fake_server, shared=True, cluster_id=fake_server.conversation(room)["clusterId"])
     seen: list = []
-    _chat(client, room, seen=seen)
+    _chat(client, other, seen=seen)
 
     assert "같은 파일을 고치는 Kukie PR" in str(seen[0].content)
-    assert len(gh.pulls) == 1
+    assert len(gh.pulls) == 1 and gh.pull_of(1)["state"] == "open"
 
 
 # ── 승인 · 거절 ───────────────────────────────────────────
@@ -334,3 +333,68 @@ def test_승인하는_사이_base_브랜치가_앞서면_STALE이다(client, fak
     assert _plan(fake_server, room)["status"] == "STALE"
     assert gh.merges == [] and gh.pull_of(1)["state"] == "closed"
     assert "다른 커밋이 들어왔어요" in str(_tool_result(fake_server, room)["content"])
+
+
+
+def _resume(client, room):
+    with agent.override(model=answer_model()):
+        return client.post(f"/conversations/{room}/resume", headers=USER)
+
+
+def test_승인_순간_조회가_실패하면_STALE이_아니라_다시_시도할_수_있다(client, fake_server, room, gh, cluster):
+    """길을 정하지 못한 것은 길이 바뀐 증거가 아니다 — 승인·PR 을 버리지 않는다 (agent#126 리뷰)."""
+    _card(client, room)
+    cluster.unreachable = True
+    with agent.override(model=answer_model()):
+        r = client.post(f"/conversations/{room}/approve", json={"call_id": "call-1", "approved": True}, headers=USER)
+    assert r.status_code == 503 and r.json()["detail"]["code"] == "RESUME_RETRYABLE"
+    assert _plan(fake_server, room)["status"] == "WAITING_APPROVAL" and gh.pull_of(1)["state"] == "open"
+
+    cluster.unreachable = False
+    assert _resume(client, room).status_code == 200
+    assert _plan(fake_server, room)["status"] == "APPLIED" and len(gh.merges) == 1
+
+
+def test_GitHub에서_먼저_머지됐으면_반영된_것으로_보고한다(client, fake_server, room, gh, cluster):
+    """승인한 내용 그대로 머지됐다 — STALE("실행 안 함")은 사실과 다르다 (agent#126 리뷰)."""
+    _card(client, room)
+    sha = gh.merge_elsewhere(1)
+    _decide(client, room)
+
+    plan = _plan(fake_server, room)
+    assert plan["status"] == "APPLIED" and plan["executionResult"]["merge_commit"] == sha
+    assert plan["executionResult"]["sync_result"]["status"] == "healthy"
+    assert gh.merges == [] and gh.comments == []                  # Kukie 는 머지하지도, "닫았다" 고 남기지도 않았다
+    assert "이미 머지됐어요" in plan["executionResult"]["stdout"]
+
+
+def test_결정_없이_만료된_카드의_PR은_다음_제안이_닫는다(client, fake_server, room, gh, cluster):
+    """아무도 안 닫으면 그 파일의 PR 길이 영영 막힌다 (agent#126 리뷰)."""
+    _card(client, room)
+    first = _plan(fake_server, room)
+    assert f"<!-- kukie-plan: {first['id']} -->" in gh.pull_of(1)["body"]
+    fake_server.plans[first["id"]]["status"] = "EXPIRED"          # 카드가 결정 없이 만료됐다
+    fake_server.runs_of(room)[0]["status"] = "interrupted"
+    from kukie_agent import conversations
+    conversations.registry.clear()                                 # 재시작 — 메모리 티켓도 없다
+
+    _card(client, room)
+    assert gh.pull_of(1)["state"] == "closed" and gh.pull_of(1)["head_ref"] not in gh.branches
+    assert "만료" in gh.comments[0][1]
+    assert gh.pull_of(2)["state"] == "open"
+
+
+def test_판단_가이드에는_렌더_diff_한_벌만_간다(client, fake_server, room, gh, cluster, monkeypatch):
+    seen = []
+
+    async def guidance(plan, manifest_preview=None):
+        seen.append(plan.render_markdown(include_decision_guidance=False))
+        return GUIDANCE
+
+    monkeypatch.setattr(gitops_hook, "generate_decision_guidance", guidance)
+    _card(client, room)
+
+    text = seen[0]
+    assert text.count("replicas: 3") == 1                          # render_diff 하나
+    assert "file_diff" not in text and "base_sha" not in text and "route" not in text
+    assert "render_diff" in text

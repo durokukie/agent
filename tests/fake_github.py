@@ -64,6 +64,15 @@ class FakeGitHub:
         self.commits[sha] = files
         self.branches[branch] = sha
 
+    def merge_elsewhere(self, number: int = 1) -> str:
+        """누가 GitHub 화면에서 먼저 머지했다."""
+        p = self.pulls[number]
+        sha = f"web{number}{'0' * 36}"
+        self.commits[sha] = self.commits[p["head_sha"]]
+        self.branches[p["base"]] = sha
+        p.update(state="closed", merged=True, merge_commit=sha)
+        return sha
+
     def connect(self, repository: str, token: str) -> "FakeGitHub":
         assert repository == self.repository, repository
         self.tokens.append(token)
@@ -95,7 +104,8 @@ class FakeGitHub:
         p = self.pulls[number]
         return PullRequest(number=number, url=f"https://github.com/{self.repository}/pull/{number}", state=p["state"],
                            merged=p["merged"], head_ref=p["head_ref"], head_sha=p["head_sha"], base_ref=p["base"],
-                           mergeable_state=self.mergeable_state)
+                           mergeable_state=self.mergeable_state, merge_commit=p.get("merge_commit", ""),
+                           body=p["body"])
 
     async def pull(self, number: int) -> PullRequest:
         return self._pull(number)
@@ -132,7 +142,7 @@ class FakeGitHub:
         sha = f"merge{number}{'0' * 34}"
         self.commits[sha] = self.commits[head_sha]
         self.branches[p["base"]] = sha
-        p.update(state="closed", merged=True)
+        p.update(state="closed", merged=True, merge_commit=sha)
         self.merges.append({"number": number, "head_sha": head_sha, "method": methods[0], "title": title, "sha": sha})
         return sha
 
@@ -168,6 +178,8 @@ class FakeCluster:
     self_heal: bool = True
     auto_sync: bool = True
     hpa: str | None = None
+    #: True 면 API 서버에 닿지 않는다 (일시적 실패)
+    unreachable: bool = False
     #: watch 가 볼 Application 상태 — None 이면 머지 커밋으로 Synced + Healthy
     app_status: dict[str, Any] | None = None
     seen: list[list[str]] = field(default_factory=list)
@@ -197,6 +209,9 @@ class FakeCluster:
 
     def run(self, args: list[str], **kwargs: Any) -> KubectlResult:
         self.seen.append(list(args))
+        if self.unreachable:
+            return KubectlResult(command="kubectl get", stdout="", success=False, exit_code=1,
+                                 stderr="Unable to connect to the server: dial tcp: i/o timeout")
         if args[:2] == ["get", "applications.argoproj.io"]:
             if "-A" in args:
                 return _ok({"items": [self.application()]})

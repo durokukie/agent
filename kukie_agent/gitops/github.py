@@ -63,6 +63,8 @@ class PullRequest:
     head_sha: str
     base_ref: str
     mergeable_state: str        # clean | blocked(브랜치 보호) | dirty(충돌) | behind | unstable | unknown …
+    merge_commit: str = ""      # 머지됐으면 그 커밋 (merge_commit_sha)
+    body: str = ""
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "PullRequest":
@@ -71,6 +73,8 @@ class PullRequest:
             number=int(data["number"]), url=str(data.get("html_url") or ""), state=str(data.get("state") or ""),
             merged=bool(data.get("merged")), head_ref=str(head.get("ref") or ""), head_sha=str(head.get("sha") or ""),
             base_ref=str(base.get("ref") or ""), mergeable_state=str(data.get("mergeable_state") or "unknown"),
+            merge_commit=str(data.get("merge_commit_sha") or "") if data.get("merged") else "",
+            body=str(data.get("body") or ""),
         )
 
 
@@ -143,7 +147,8 @@ class GitHub:
 
     async def branch_head(self, branch: str) -> str | None:
         """브랜치 끝 커밋. 그런 브랜치가 없으면(태그·커밋 해시를 targetRevision 으로 쓴 앱) None."""
-        data = await self._request("GET", self._repo_path("branches", quote(branch, safe="")), not_found_is_none=True)
+        # `env/prod` 같은 브랜치 이름의 `/` 는 그대로 보낸다 — `%2F` 로 보내면 GitHub 가 못 찾는다 (agent#126 리뷰)
+        data = await self._request("GET", self._repo_path("branches", quote(branch, safe="/")), not_found_is_none=True)
         return str(data["commit"]["sha"]) if data else None
 
     async def download(self, ref: str, dest: Path) -> Path:

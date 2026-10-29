@@ -349,6 +349,13 @@ class ActionPlan:
             metadata.pop(field)
         if not include_decision_guidance:
             metadata.pop("decision_guidance")
+        if self.gitops is not None:
+            # 사람·판단 가이드가 읽는 쪽 — 렌더 diff(클러스터에서 바뀔 것) 하나면 된다. git diff 와 승인 순간 대조용
+            # 내부 값은 빼서 가이드 프롬프트가 같은 diff 로 부풀지 않게 한다 (agent#126 리뷰)
+            metadata["gitops"] = {
+                key: value for key, value in self.gitops.items()
+                if key not in ("file_diff", "base_sha", "route", "merge_methods", "conflict_keys")
+            }
         details = yaml.safe_dump(
             metadata, sort_keys=False, allow_unicode=True
         ).rstrip()

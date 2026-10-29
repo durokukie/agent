@@ -48,6 +48,9 @@ class Route:
     target: Target | None = None                   # 고칠 리소스 (apiVersion 포함)
     source: AppSource | None = None
     revision: str = ""                             # spec.source.targetRevision
+    # False 면 길을 **정하지 못했다**(조회 실패·시간 초과·권한) — kubectl 길은 "모르니 지금처럼" 이라는 뜻일 뿐, 길이 바뀐
+    # 증거가 아니다. 승인 순간 다시 판단할 때 이걸 STALE 로 읽으면 일시적 실패로 승인한 변경을 버린다 (agent#126 리뷰)
+    known: bool = True
 
     @property
     def app_key(self) -> dict[str, str] | None:
@@ -75,6 +78,8 @@ def _kubectl(args: list[str], *, context: str, kubeconfig: Path | None) -> Kubec
 def _read(args: list[str], *, context: str, kubeconfig: Path | None) -> dict[str, Any] | None:
     result = _kubectl(args, context=context, kubeconfig=kubeconfig)
     if not result.success:
+        if "notfound" in (result.stderr or "").lower().replace(" ", ""):
+            return {}                                  # 없다 — 읽기는 됐다
         return None
     try:
         data = json.loads(result.stdout)
@@ -115,8 +120,8 @@ def _locate(kind: str, name: str, namespace: str | None, *, context: str,
     """(리소스, 추적 표시, Application, Application 을 못 읽은 이유). 블로킹 — 스레드에서 돈다."""
     args = ["get", kind, name, "-o", "json", *(["-n", namespace] if namespace else [])]
     resource = _read(args, context=context, kubeconfig=kubeconfig)
-    if resource is None:
-        return None, None, None, ""
+    if not resource:
+        return None, None, None, "missing" if resource == {} else "error"
     tracking = argocd.tracking_of(resource)
     if tracking is None:
         return resource, None, None, ""
@@ -146,15 +151,19 @@ async def decide(
         )
     except Exception:
         logger.exception("PR 길 판단의 조회를 건너뛴다")
-        return Route("kubectl", "리소스를 읽지 못해 PR 길을 정할 수 없어요.")
+        return Route("kubectl", "리소스를 읽지 못해 PR 길을 정할 수 없어요.", known=False)
     label = f"{kind} {namespace + '/' if namespace else ''}{name}"
     if resource is None:
-        return Route("kubectl", f"{label} 를 클러스터에서 읽지 못했어요.")
+        if why == "missing":
+            return Route("kubectl", f"{label} 가 클러스터에 없어요.")
+        return Route("kubectl", f"{label} 를 클러스터에서 읽지 못했어요.", known=False)
     if tracking is None:
         return Route("kubectl", f"{label} 는 ArgoCD 가 관리하지 않아요.")
     if item is None:
         if why == "forbidden":
-            return Route("kubectl", "ArgoCD 앱을 읽을 권한이 없어 PR 길을 정할 수 없어요.", managed=True)
+            return Route("kubectl", "ArgoCD 앱을 읽을 권한이 없어 PR 길을 정할 수 없어요.", managed=True, known=False)
+        if why == "error":
+            return Route("kubectl", "ArgoCD 앱 목록을 읽지 못해 PR 길을 정할 수 없어요.", managed=True, known=False)
         return Route("kubectl", f"{label} 를 관리하는 ArgoCD 앱({tracking.app})을 이 클러스터에서 찾지 못했어요.",
                      managed=True)
 
@@ -178,7 +187,7 @@ async def decide(
             connected = {repo.repository for repo in await server_api.manifest_repos(cluster_id)}
         except Exception:
             logger.exception("연결된 레포 목록을 읽지 못해 kubectl 길로 둔다: cluster=%s", cluster_id)
-            return Route("kubectl", "레포 연결 상태를 확인하지 못해 PR 길을 정할 수 없어요.", **common)
+            return Route("kubectl", "레포 연결 상태를 확인하지 못해 PR 길을 정할 수 없어요.", known=False, **common)
     if repository not in connected:
         return Route("kubectl", f"{app_label} 의 레포 {repository} 가 Kukie 에 연결돼 있지 않아요. "
                                 "레포를 연결하면 PR 로 바꿀 수 있어요.", **common)

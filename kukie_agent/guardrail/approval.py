@@ -255,8 +255,9 @@ class ApprovalRequest(BaseModel):
     )
 
 
-#: 카드에 싣지 않는 Plan 의 gitops 칸 — 승인 순간 다시 볼 때 쓰는 내부 값이다
-_GITOPS_INTERNAL = frozenset({"base_sha", "route", "merge_methods", "conflict_keys"})
+#: 승인 카드에 싣는 Plan 의 gitops 칸 — 여기 없는 칸(base_sha·route·merge_methods·conflict_keys 같은 승인 순간 다시 볼 때
+#: 쓰는 내부 값)은 카드로 나가지 않는다. 칸을 더하는 쪽이 카드에 싣겠다고 명시해야 한다 (fail-closed, agent#126 리뷰)
+_GITOPS_CARD = ("repository", "base", "branch", "application", "file_diff", "render_diff", "warnings", "notice")
 
 
 def gitops_card(plan: ActionPlan) -> dict[str, Any] | None:
@@ -271,7 +272,7 @@ def gitops_card(plan: ActionPlan) -> dict[str, Any] | None:
     """
     if plan.gitops is None:
         return None
-    card = {key: value for key, value in plan.gitops.items() if key not in _GITOPS_INTERNAL}
+    card = {key: plan.gitops[key] for key in _GITOPS_CARD if key in plan.gitops}
     card["files"] = [entry["path"] for entry in plan.gitops.get("files") or []]
     card["pull_request"] = plan.pull_request
     return card

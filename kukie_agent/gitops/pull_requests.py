@@ -129,22 +129,50 @@ async def draft(route: Route, change: Change, token: server_api.RepoToken, *, hp
                          "Sealed Secrets 나 External Secrets 를 쓰세요.")
         busy = await _busy_files(gh, set(result.files))
         if busy:
-            raise Refuse(f"같은 파일을 고치는 Kukie PR 이 이미 열려 있어요 ({busy}). 그 PR 이 머지되거나 닫힌 뒤에 다시 하세요.")
+            raise Refuse(f"같은 파일을 고치는 Kukie PR 이 이미 열려 있어요 ({busy}). 그 PR 이 머지되거나 닫힌 뒤에 다시 하세요 "
+                         "(채팅에서 결정하거나 GitHub 에서 닫으면 돼요).")
     return Draft(repository=route.repository, base=base, base_sha=base_sha, files=result.files,
                  file_diff=_clip(result.file_diff), render_diff=_clip(result.render_diff),
                  warnings=list(result.warnings), merge_methods=info.merge_methods)
 
 
+#: PR 본문에 남기는 계획 표시 — 열린 Kukie PR 의 계획이 이미 닫혔는지(결정 없이 만료) 알아보려고
+_PLAN_MARK = re.compile(r"<!-- kukie-plan: ([0-9A-Za-z-]+) -->")
+
+
+async def _plan_closed(pull: PullRequest) -> bool:
+    """그 PR 을 연 계획이 이미 닫혔나(EXPIRED·FAILED…). 표시가 없거나 못 읽으면 모른다 — 닫히지 않은 것으로 본다."""
+    found = _PLAN_MARK.search(pull.body)
+    if not found:
+        return False
+    try:
+        plan = await server_api.get_plan(found.group(1))
+    except Exception:
+        return False
+    return plan.status not in ("DRAFT", "WAITING_APPROVAL", "APPROVED", "EXECUTING")
+
+
 async def _busy_files(gh: github.GitHub, paths: set[str]) -> str:
+    """같은 파일을 고치는 열린 Kukie PR. 계획이 결정 없이 닫힌 고아 PR 은 여기서 닫는다 — 아무도 안 닫으면 그 파일의
+    PR 길이 영영 막힌다 (agent#126 리뷰. 카드가 결정 없이 만료되면 server 가 계획만 닫고 agent 는 통보받지 않는다)."""
     found = []
     for pull in await gh.open_kukie_pulls():
-        if paths & set(await gh.pull_files(pull.number)):
-            found.append(f"#{pull.number} {pull.url}")
+        if not paths & set(await gh.pull_files(pull.number)):
+            continue
+        if await _plan_closed(pull):
+            try:
+                await gh.comment(pull.number, "이 PR 의 승인 카드가 결정 없이 만료돼 Kukie 가 닫았어요.")
+                await gh.close_pull(pull.number)
+                await gh.delete_branch(pull.head_ref)
+                continue
+            except (GitHubError, ValueError):
+                logger.warning("만료된 카드의 PR 을 닫지 못했다: %s #%s", gh.repository, pull.number)
+        found.append(f"#{pull.number} {pull.url}")
     return ", ".join(found)
 
 
 def pull_body(*, intent: str, expected_effects: list[str], side_effects: list[str], draft: Draft,
-              application: dict[str, Any], plan_code: str) -> str:
+              application: dict[str, Any], plan_code: str, plan_id: str) -> str:
     effects = "\n".join(f"- {item}" for item in expected_effects)
     sides = "\n".join(f"- {item}" for item in side_effects)
     return (
@@ -153,7 +181,8 @@ def pull_body(*, intent: str, expected_effects: list[str], side_effects: list[st
         f"**대상 ArgoCD 앱**: `{application.get('namespace')}/{application.get('name')}` "
         f"({'self-heal 켜짐' if application.get('self_heal') else '자동 sync' if application.get('auto_sync') else '수동 sync'})\n\n"
         "**클러스터에서 바뀔 것 (렌더 비교)**\n\n```diff\n" + draft.render_diff + "\n```\n\n"
-        "채팅에서 승인하면 Kukie 가 이 PR 을 머지하고 ArgoCD sync 를 지켜봐요. 거절하면 닫혀요."
+        "채팅에서 승인하면 Kukie 가 이 PR 을 머지하고 ArgoCD sync 를 지켜봐요. 거절하면 닫혀요.\n\n"
+        f"<!-- kukie-plan: {plan_id} -->"
     )
 
 
@@ -176,27 +205,37 @@ def application_summary(route: Route) -> dict[str, Any]:
     return argocd._app_summary(route.application)
 
 
-async def recheck(gitops: dict[str, Any], pull_request: dict[str, Any], token: server_api.RepoToken) -> tuple[PullRequest | None, str | None]:
-    """(지금 PR, 승인한 것과 달라진 이유). 이유가 있으면 머지하지 않는다(STALE)."""
+@dataclass
+class Recheck:
+    pull: PullRequest
+    stale: str | None = None        # 승인한 것과 달라진 이유 — 있으면 머지하지 않는다(STALE)
+    merged: bool = False            # 승인한 내용 그대로 GitHub 에서 이미 머지됐다 — 반영된 것으로 보고한다
+
+
+async def recheck(gitops: dict[str, Any], pull_request: dict[str, Any], token: server_api.RepoToken) -> Recheck:
+    """승인 순간 PR 을 다시 본다."""
+    approved = {entry["path"]: entry["blob_sha"] for entry in gitops["files"]}
     async with github.connect(gitops["repository"], token.token) as gh:
         pull = await gh.pull(int(pull_request["number"]))
         if pull.merged:
-            return pull, f"PR #{pull.number} 이 이미 머지됐어요."
+            # 누가 GitHub 에서 먼저 머지했다. 승인한 내용 그대로면 변경은 이미 들어갔다 — STALE("실행 안 함")은 사실과 다르다 (agent#126 리뷰)
+            if await gh.pull_files(pull.number) == approved and pull.merge_commit:
+                return Recheck(pull, merged=True)
+            return Recheck(pull, f"PR #{pull.number} 이 승인 카드와 다른 내용으로 GitHub 에서 이미 머지됐어요 — "
+                                 "클러스터 상태를 직접 확인해야 해요.")
         if pull.state != "open":
-            return pull, f"PR #{pull.number} 이 닫혔어요."
+            return Recheck(pull, f"PR #{pull.number} 이 닫혔어요.")
         if pull.base_ref != gitops["base"] or pull.head_ref != gitops["branch"]:
-            return pull, f"PR #{pull.number} 의 브랜치가 바뀌었어요."
+            return Recheck(pull, f"PR #{pull.number} 의 브랜치가 바뀌었어요.")
         # base 가 앞서면 PR 파일이 그대로여도 렌더 결과가 달라질 수 있다 (다른 파일 — kustomization.yaml 등 — 이 바뀌었다).
         # 승인한 렌더 diff 는 base_sha 기준이라, 새 base 로 다시 렌더 비교해 다시 제안하게 한다 (agent#126 리뷰)
         head = await gh.branch_head(gitops["base"])
         if head != gitops["base_sha"]:
-            return pull, (f"승인 카드를 만든 뒤 {gitops['base']} 브랜치에 다른 커밋이 들어왔어요 — "
-                          "지금 레포로 렌더 비교를 다시 해야 해요.")
-        files = await gh.pull_files(pull.number)
-        approved = {entry["path"]: entry["blob_sha"] for entry in gitops["files"]}
-        if files != approved:
-            return pull, f"PR #{pull.number} 의 내용이 승인 카드와 달라졌어요(누가 커밋을 더했어요)."
-        return pull, None
+            return Recheck(pull, f"승인 카드를 만든 뒤 {gitops['base']} 브랜치에 다른 커밋이 들어왔어요 — "
+                                 "지금 레포로 렌더 비교를 다시 해야 해요.")
+        if await gh.pull_files(pull.number) != approved:
+            return Recheck(pull, f"PR #{pull.number} 의 내용이 승인 카드와 달라졌어요(누가 커밋을 더했어요).")
+        return Recheck(pull)
 
 
 async def merge(gitops: dict[str, Any], pull: PullRequest, token: server_api.RepoToken, *, title: str) -> str:

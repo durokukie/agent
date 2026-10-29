@@ -315,3 +315,25 @@ def test_풀었을_때_크기가_한도를_넘으면_풀지_않는다(api, tmp_p
     with pytest.raises(GitHubError, match="너무 크다"):
         sync(go())
     assert not (tmp_path / "repo" / "acme-manifests-abc" / "big.yaml").exists()
+
+
+
+def test_슬래시가_든_브랜치_이름은_그대로_보낸다(api):
+    """`env/prod` 를 `%2F` 로 보내면 GitHub 가 못 찾는다 (agent#126 리뷰)."""
+    handlers, seen = api
+    handlers[("GET", f"/repos/{REPO}/branches/env/prod")] = (200, {"commit": {"sha": "s1"}})
+
+    async def go():
+        async with github.GitHub(REPO, "t") as gh:
+            return await gh.branch_head("env/prod")
+
+    assert sync(go()) == "s1"
+    assert seen[0].url.raw_path == f"/repos/{REPO}/branches/env/prod".encode()
+
+
+def test_조회가_실패하면_길을_모른다고_표시한다(monkeypatch):
+    """모름(known=False)은 길이 바뀐 것과 다르다 — 승인 순간 STALE 로 읽지 않는다 (agent#126 리뷰)."""
+    assert _decide(monkeypatch, FakeCluster(unreachable=True)).known is False
+    assert _decide(monkeypatch, FakeCluster(), repos_error=True).known is False
+    found = _decide(monkeypatch, FakeCluster(managed=False))
+    assert found.known is True and found.path == "kubectl"

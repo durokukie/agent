@@ -183,7 +183,7 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
             draft, token, branch=branch, title=title,
             body=pull_requests.pull_body(intent=intent, expected_effects=args["expected_effects"],
                                          side_effects=args["side_effects"], draft=draft,
-                                         application=application, plan_code=code),
+                                         application=application, plan_code=code, plan_id=plan.id),
         )
     except GitHubError as exc:
         # PR 을 못 열었다 = 승인 전 준비가 떨어졌다. kubectl 의 dry-run 실패와 같은 자리로 닫는다 (FAILED + DRY_RUN_FAILED)
@@ -192,7 +192,8 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
 
     pull_request = {"number": pull.number, "url": pull.url}
     try:
-        await plan.record_dry_run("succeeded", f"렌더 비교 통과 — PR #{pull.number} {pull.url}\n\n{draft.render_diff}", "")
+        # diff 는 gitops 칸 한 곳에만 둔다 — 판단 가이드 프롬프트에 같은 diff 가 여러 벌 들어가지 않게 (agent#126 리뷰)
+        await plan.record_dry_run("succeeded", f"렌더 비교 통과 — PR #{pull.number} {pull.url}", "")
         guidance = "guidance unavailable"
         try:
             guidance = await generate_decision_guidance(plan)
@@ -230,17 +231,22 @@ async def _execute(ctx, call, plan_args, target, risk, kind, name, namespace, ch
 
     # 승인 순간 다시 판단한다 — 길이 달라졌으면 실행하지 않고 다시 제안한다 (Plan STALE, 설계 1절)
     found = await _decide(ctx, kind, name, namespace, change)
+    if not found.known:
+        # 길을 정하지 못했다(조회 실패·시간 초과) — 길이 바뀐 증거가 아니다. 아무것도 안 했으니 재개가 같은 결정으로
+        # 다시 시도하게 올린다 (RESUME_RETRYABLE). STALE 로 닫으면 일시적 실패로 승인한 변경·PR 을 버린다 (agent#126 리뷰)
+        raise RuntimeError(f"승인 순간 PR 길을 다시 판단하지 못했다: {found.reason}")
     stale = None
     if found.path != "pr":
         stale = f"지금은 PR 길이 아니에요: {found.reason}"
     elif found.fingerprint() != gitops.get("route"):
         stale = "대상 ArgoCD 앱이나 레포 설정이 승인 카드를 만든 뒤 바뀌었어요."
     token = None
-    pull = None
+    checked = None
     if stale is None:
         try:
             token = await pull_requests.token_for(ctx.deps.cluster_id, gitops["repository"])
-            pull, stale = await pull_requests.recheck(gitops, pull_request, token)
+            checked = await pull_requests.recheck(gitops, pull_request, token)
+            stale = checked.stale
         except pull_requests.Refuse as refused:
             stale = refused.message
         except GitHubError as exc:
@@ -252,10 +258,12 @@ async def _execute(ctx, call, plan_args, target, risk, kind, name, namespace, ch
         except Exception:
             # server 가 stale 을 모르면(옛 server) 계획은 run 이 닫힐 때 EXPIRED 로 닫힌다 — 실행하지 않은 것은 같다
             logger.exception("STALE 표시 실패: plan_id=%s", plan.id)
-        await pull_requests.close(ctx.deps.cluster_id, gitops, pull_request,
-                                  f"승인하는 사이 전제가 바뀌어 Kukie 가 머지하지 않고 닫았어요: {stale}")
+        if checked is None or not checked.pull.merged:      # 이미 머지된 PR 에 "머지하지 않고 닫았다" 고 남기지 않는다
+            await pull_requests.close(ctx.deps.cluster_id, gitops, pull_request,
+                                      f"승인하는 사이 전제가 바뀌어 Kukie 가 머지하지 않고 닫았어요: {stale}")
         raise ToolFailed(f"실행하지 않았다 — {stale} 지금 상태로 다시 판단해 사용자에게 다시 제안하라 (plan_id={plan.id}).")
-    assert token is not None and pull is not None
+    assert token is not None and checked is not None
+    pull = checked.pull
 
     try:
         await plan.approve_for_execution(
@@ -267,6 +275,10 @@ async def _execute(ctx, call, plan_args, target, risk, kind, name, namespace, ch
         raise ToolFailed(str(exc)) from None
 
     display = _display(gitops["repository"], pull.number)
+    if checked.merged:
+        # 승인한 내용 그대로 GitHub 에서 이미 머지됐다 — 머지는 건너뛰고 sync 만 지켜본다 (agent#126 리뷰)
+        return await _watch_and_record(ctx, plan, gitops, pull, pull_request, token, pull.merge_commit,
+                                       f"PR #{pull.number} 은 GitHub 에서 이미 머지됐어요 ({pull.merge_commit[:12]}).")
     if pull.mergeable_state == "blocked":
         return await _record(plan, GitOpsResult(
             command=display, stdout="", success=False, exit_code=1, pull_request=pull_request,
@@ -284,8 +296,14 @@ async def _execute(ctx, call, plan_args, target, risk, kind, name, namespace, ch
             ))
         # 머지 요청이 닿았는지 모른다 — 결과 없이 두면 재시도가 UNKNOWN 으로 남긴다
         raise
-    await pull_requests.tidy_after_merge(gitops, token)
+    return await _watch_and_record(ctx, plan, gitops, pull, pull_request, token, merge_commit,
+                                   f"PR #{pull.number} 을 머지했어요 ({merge_commit[:12]}).")
 
+
+async def _watch_and_record(ctx, plan, gitops, pull, pull_request, token, merge_commit: str,
+                            merged_line: str) -> GitOpsResult:
+    await pull_requests.tidy_after_merge(gitops, token)
+    display = _display(gitops["repository"], pull.number)
     application = gitops.get("application") or {}
     try:
         sync = await to_thread.run_sync(partial(
@@ -296,7 +314,7 @@ async def _execute(ctx, call, plan_args, target, risk, kind, name, namespace, ch
         logger.exception("sync 지켜보기 실패: plan_id=%s", plan.id)
         sync = {"status": "unreadable", "message": "ArgoCD 앱 상태를 읽지 못했어요.", "sync_status": "Unknown",
                 "health_status": "Unknown", "revision": "", "waited_seconds": 0}
-    stdout = f"PR #{pull.number} 을 머지했어요 ({merge_commit[:12]}). {sync['message']}"
+    stdout = f"{merged_line} {sync['message']}"
     return await _record(plan, GitOpsResult(
         command=display, stdout=stdout, stderr="", success=True, exit_code=0, pull_request=pull_request,
         merge_commit=merge_commit, sync_result=sync, note=_follow_up(sync, plan),
