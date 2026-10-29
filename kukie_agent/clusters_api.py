@@ -63,6 +63,9 @@ GPU_BUDGET = 20
 #: 나눠 쓰려면 응답에 사람마다 다른 값이 없어야 한다 — 지금은 없다. benchmarks 를 Admin 에게만 채우게 되면 나눠 쓴 뒤에 거른다.
 #: ArgoCD 앱 목록·상세(DURO-145)도 같은 시간·같은 헬퍼로 나눠 쓴다 — 화면을 켜 두고 여러 사람이 볼 때 같다
 OVERVIEW_SHARE_TTL = 10
+#: `?fresh=true`(화면의 "다시 읽기")여도 이보다 덜 된 결과(초)는 나눠 쓴다. 사람이 누른 다시 읽기는 늘 새로 읽은 것처럼 보이고,
+#: 화면이 fresh 로 폴링해도 kubectl 이 이 간격보다 자주 돌지 않는다 — 나눠 쓰기를 부르는 쪽만 믿지 않게 (agent#125 리뷰)
+FRESH_MIN_AGE = 2
 #: 지표를 동시에 읽는 수. 개요 슬롯(OVERVIEW_WORKERS) 하나 안에서 잠깐 쓰는 스레드라 limiter 밖이다 — 많아야 4 × 4
 GPU_METRICS_WORKERS = 4
 #: GPU 노드가 없고 server 값이 GPU 클러스터(true)가 아닌 연결은 이 간격(초)마다 한 번만 GPU 를 기다리는 파드를 찾는다.
@@ -333,8 +336,9 @@ async def _shared_overview(key: str | None, compute, *, fresh: bool = False, clo
     기다리던 요청이 끊겨도(브라우저 탭 닫힘) 그 한 번은 끝까지 돈다 — 다른 요청이 같이 기다릴 수 있다.
     끝나면 결과만 남기고 task 를 놓는다. 결과도 OVERVIEW_SHARE_TTL 뒤에 치운다 — 다음 요청이 안 와도 (agent#122 리뷰).
     TTL 이 0 이면 나눠 쓰지 않는다.
-    fresh 면 막 끝난 결과는 쓰지 않고 새로 읽는다 — 사람이 누른 "다시 읽기" 가 같은 몸통을 받지 않게. 진행 중인 한 번에는 같이
-    붙는다(누르기 전에 시작한 한 번이라도 kubectl 한 번 시간만큼만 앞선다). 새로 읽은 결과가 다음 요청들이 나눠 쓸 값이 된다.
+    fresh 면 FRESH_MIN_AGE 초보다 오래된 결과는 쓰지 않고 새로 읽는다 — 사람이 누른 "다시 읽기" 가 같은 몸통을 받지 않게.
+    진행 중인 한 번에는 같이 붙는다(누르기 전에 시작한 한 번이라도 kubectl 한 번 시간만큼만 앞선다). 새로 읽은 결과가 다음
+    요청들이 나눠 쓸 값이 된다.
     """
     if key is None or OVERVIEW_SHARE_TTL <= 0:
         return await compute()
@@ -343,7 +347,8 @@ async def _shared_overview(key: str | None, compute, *, fresh: bool = False, clo
                   if e.finished_at is not None and now - e.finished_at >= OVERVIEW_SHARE_TTL]:
         del _shared_overviews[stale]
     entry = _shared_overviews.get(key)
-    if entry is not None and entry.body is not None and not fresh:
+    if entry is not None and entry.body is not None and (
+            not fresh or entry.finished_at is None or now - entry.finished_at < FRESH_MIN_AGE):
         return entry.body
     task = entry.task if entry is not None else None
     if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):

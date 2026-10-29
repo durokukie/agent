@@ -725,6 +725,7 @@ def test_나눠_쓴_결과도_볼_수_없는_사람에게는_404(client, fake_se
 
 @pytest.mark.parametrize("url", ["list", "detail"])
 def test_fresh_는_막_끝난_결과를_건너뛰고_새로_읽은_것을_다시_나눠_쓴다(client, fake_server, monkeypatch, share_on, url):
+    monkeypatch.setattr(clusters_api, "FRESH_MIN_AGE", 0)      # 아래끝은 따로 본다 (시각을 정해 두고)
     cluster = fake_server.add_cluster(owner="u-1")
     ran = _api(monkeypatch, _ok(_detailed() if url == "detail" else {"items": []}))
     path = _detail_url(cluster) if url == "detail" else f"/clusters/{cluster}/argocd/applications"
@@ -746,3 +747,27 @@ def test_fresh_도_진행_중인_한_번에는_같이_붙는다(share_on):
                                     clusters_api._shared_overview("k", compute, fresh=True))
 
     assert asyncio.run(main()) == [{"n": 1}, {"n": 1}] and calls["n"] == 1
+
+
+def test_fresh_여도_FRESH_MIN_AGE_보다_덜_된_결과는_나눠_쓴다(share_on):
+    calls = {"n": 0}
+    now = [0.0]
+
+    async def compute():
+        calls["n"] += 1
+        return {"n": calls["n"]}
+
+    async def main():
+        def read(fresh):
+            return clusters_api._shared_overview("k", compute, fresh=fresh, clock=lambda: now[0])
+
+        first = await read(False)
+        await asyncio.sleep(0)                                   # 끝난 시각을 적는 콜백이 돈다
+        now[0] = clusters_api.FRESH_MIN_AGE - 0.5
+        polled = await read(True)                                # fresh 로 폴링해도 아래끝 안이면 같은 것
+        now[0] = clusters_api.FRESH_MIN_AGE
+        refreshed = await read(True)
+        return first, polled, refreshed
+
+    assert asyncio.run(main()) == ({"n": 1}, {"n": 1}, {"n": 2})
+    assert 0 < clusters_api.FRESH_MIN_AGE < clusters_api.OVERVIEW_SHARE_TTL
