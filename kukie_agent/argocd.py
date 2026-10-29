@@ -1,4 +1,4 @@
-"""ArgoCD 관리 리소스 판별 — 가드레일 경고(DURO-129)와 ArgoCD 앱 목록 API(DURO-140)가 같이 쓴다.
+"""ArgoCD 관리 리소스 판별 — 가드레일 경고(DURO-129)와 ArgoCD 앱 목록·상세 API(DURO-140·DURO-145)가 같이 쓴다.
 
 설계: Linear 문서 "[GitOps] PR 길 판단 · kubectl 경고" 1·2절. kubectl 조회만으로 판단한다 — ArgoCD API 토큰은 쓰지 않는다.
 
@@ -21,12 +21,14 @@
 못 찾으면(허브형 ArgoCD 가 다른 클러스터에 있거나 CRD 가 없다) 관리 리소스로 보되 정책을 모른다(unknown)고 경고한다 —
 어노테이션은 ArgoCD 만 붙이기 때문이다. 권한이 없을 때(forbidden)는 그래도 건너뛴다.
 
-kubectl 은 이 모듈의 run_kubectl 로 돈다 (inspect·note). 목록 API 는 clusters_api 가 LIST_COMMAND 를 돌리고 여기 순수 함수로 정리한다.
+kubectl 은 이 모듈의 run_kubectl 로 돈다 (inspect·note). 목록·상세 API 는 clusters_api 가 LIST_COMMAND·get_command 를 돌리고
+여기 순수 함수로 정리한다.
 """
 from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +43,12 @@ INSTANCE_LABEL = "app.kubernetes.io/instance"
 APPLICATIONS = "applications.argoproj.io"
 #: 모든 namespace 의 Application (클러스터 범위). 부르는 쪽이 `-n` 을 붙이지 않는다
 LIST_COMMAND: list[str] = ["get", APPLICATIONS, "-A", "-o", "json"]
+
+#: 앱 상세의 배포 기록 수 — ArgoCD 기본 revisionHistoryLimit 과 같다
+HISTORY_LIMIT = 10
+#: Application 이름(DNS subdomain)과 namespace(DNS label). URL 에서 받은 값을 kubectl 인자로 넘기기 전에 본다
+_APP_NAME = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
+_NAMESPACE = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
 
 #: 판별(inspect)의 kubectl 한 번 시간 제한(초)과 전체 시간(초). 변경 툴마다 돌아 승인 카드가 그만큼 늦게 뜬다 — 짧게 끊는다
 LOOKUP_TIMEOUT = 5
@@ -132,6 +140,24 @@ def failure_kind(stderr: str) -> str:
     return "error"
 
 
+def get_command(namespace: str, name: str) -> list[str]:
+    """앱 상세의 Application 하나 읽기. 부르기 전에 valid_ref 로 본다."""
+    return ["get", APPLICATIONS, name, "-n", namespace, "-o", "json"]
+
+
+def valid_ref(namespace: str, name: str) -> bool:
+    """URL 의 namespace·이름이 쿠버네티스 이름 꼴인가 — 아니면 그런 Application 은 없다. `-` 로 시작하는 값이 kubectl 옵션이 되지 않게도 막는다."""
+    return bool(_NAMESPACE.fullmatch(namespace) and _APP_NAME.fullmatch(name))
+
+
+def detail_failure(stderr: str, *, namespace: str, name: str) -> str:
+    """앱 상세의 kubectl 실패 — failure_kind 의 셋에 not_found(그 Application 이 없다)를 더한다.
+    kubectl 은 이름·namespace 를 따옴표로 찍는다 — 앱 이름이 "forbidden"·"unauthorized" 여도 갈래가 바뀌지 않게 지우고 본다."""
+    if f'{APPLICATIONS} "{name}" not found' in stderr:
+        return "not_found"
+    return failure_kind(stderr.replace(f'"{name}"', '""').replace(f'"{namespace}"', '""'))
+
+
 def parse_applications(stdout: str) -> list[dict[str, Any]]:
     """Application 목록(kubectl -o json)의 items. 모양이 다르면 ValueError (json.JSONDecodeError 도 ValueError)."""
     data = json.loads(stdout or "")
@@ -142,14 +168,12 @@ def parse_applications(stdout: str) -> list[dict[str, Any]]:
 
 
 def _source(spec: dict[str, Any]) -> dict[str, Any]:
-    """spec.source, 여러 소스(spec.sources)면 첫 것."""
-    source = spec.get("source")
-    if isinstance(source, dict):
-        return source
+    """여러 소스(spec.sources)면 첫 것, 아니면 spec.source. ArgoCD 도 sources 가 비어 있지 않으면 그것을 쓴다."""
     sources = spec.get("sources")
     if isinstance(sources, list) and sources and isinstance(sources[0], dict):
         return sources[0]
-    return {}
+    source = spec.get("source")
+    return source if isinstance(source, dict) else {}
 
 
 def sync_policy(item: dict[str, Any]) -> tuple[bool, bool, bool]:
@@ -161,6 +185,10 @@ def sync_policy(item: dict[str, Any]) -> tuple[bool, bool, bool]:
     return True, automated.get("selfHeal") is True, automated.get("prune") is True
 
 
+def _text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 def application_row(item: dict[str, Any]) -> dict[str, Any]:
     """Application 하나 → 앱 목록 API 의 한 줄 (kukie-electron docs/api-spec.md `ArgoApplication`)."""
     meta = item.get("metadata") or {}
@@ -169,23 +197,20 @@ def application_row(item: dict[str, Any]) -> dict[str, Any]:
     source = _source(spec)
     auto_sync, self_heal, _ = sync_policy(item)
 
-    def text(value: Any) -> str | None:
-        return value if isinstance(value, str) and value else None
-
     return {
         "name": meta.get("name", ""),
         "namespace": meta.get("namespace", ""),
         "project": spec.get("project") or "default",
         "repo_url": source.get("repoURL") or "",
-        "path": text(source.get("path")),
-        "chart": text(source.get("chart")),
+        "path": _text(source.get("path")),
+        "chart": _text(source.get("chart")),
         "target_revision": source.get("targetRevision") or "",
-        "source_type": text(status.get("sourceType")),
+        "source_type": _text(status.get("sourceType")),
         "sync_status": (status.get("sync") or {}).get("status") or "Unknown",
         "health_status": (status.get("health") or {}).get("status") or "Unknown",
         "auto_sync": auto_sync,
         "self_heal": self_heal,
-        "destination_namespace": text((spec.get("destination") or {}).get("namespace")),
+        "destination_namespace": _text((spec.get("destination") or {}).get("namespace")),
     }
 
 
@@ -194,6 +219,141 @@ def applications_response(stdout: str) -> list[dict[str, Any]]:
     rows = [application_row(item) for item in parse_applications(stdout)]
     rows.sort(key=lambda row: (row["namespace"], row["name"]))
     return rows
+
+
+# ── 앱 상세 (DURO-145) ─────────────────────────────────────
+
+def _dicts(value: Any) -> list[dict[str, Any]]:
+    return [entry for entry in value if isinstance(entry, dict)] if isinstance(value, list) else []
+
+
+def _strings(value: Any) -> list[str]:
+    return [entry for entry in value if isinstance(entry, str) and entry] if isinstance(value, list) else []
+
+
+def _revisions(obj: Any) -> list[str]:
+    """revision(소스 하나)·revisions(여러 소스) → 목록. git 소스면 커밋 sha, Helm 저장소 차트면 차트 버전이다."""
+    if not isinstance(obj, dict):
+        return []
+    revisions = _strings(obj.get("revisions"))
+    if revisions:
+        return revisions
+    revision = _text(obj.get("revision"))
+    return [revision] if revision else []
+
+
+def _initiator(obj: dict[str, Any]) -> dict[str, Any]:
+    """initiatedBy → automated(ArgoCD 자동 sync)·initiated_by(사람이 눌렀으면 사용자 이름)."""
+    initiated = obj.get("initiatedBy") if isinstance(obj.get("initiatedBy"), dict) else {}
+    return {"automated": initiated.get("automated") is True, "initiated_by": _text(initiated.get("username"))}
+
+
+def _detail_sources(spec: dict[str, Any], status: dict[str, Any]) -> list[dict[str, Any]]:
+    """spec.sources(여러 소스) 또는 spec.source → 목록. source_type 은 status.sourceTypes[i]·status.sourceType."""
+    multi = _dicts(spec.get("sources"))
+    sources = multi or _dicts([spec.get("source")])
+    types = status.get("sourceTypes") if multi else [status.get("sourceType")]
+    types = types if isinstance(types, list) else []
+    return [{
+        "repo_url": source.get("repoURL") or "",
+        "path": _text(source.get("path")),
+        "chart": _text(source.get("chart")),
+        "target_revision": source.get("targetRevision") or "",
+        "ref": _text(source.get("ref")),
+        "source_type": _text(types[index]) if index < len(types) else None,
+    } for index, source in enumerate(sources)]
+
+
+def _resource(entry: dict[str, Any]) -> dict[str, Any]:
+    health = entry.get("health") if isinstance(entry.get("health"), dict) else {}
+    return {
+        "group": _text(entry.get("group")),
+        "kind": entry.get("kind") or "",
+        "namespace": _text(entry.get("namespace")),
+        "name": entry.get("name") or "",
+        "sync_status": entry.get("status") or "Unknown",
+        "health_status": _text(health.get("status")),
+        "health_message": _text(health.get("message")),
+        "requires_pruning": entry.get("requiresPruning") is True,
+    }
+
+
+def _last_sync(state: Any) -> dict[str, Any] | None:
+    """status.operationState → 마지막(또는 진행 중인) sync. 실패한 리소스는 syncResult 에서 SyncFailed·훅 실패만 고른다."""
+    if not isinstance(state, dict) or not state:
+        return None
+    operation = state.get("operation") if isinstance(state.get("operation"), dict) else {}
+    result = state.get("syncResult") if isinstance(state.get("syncResult"), dict) else {}
+    sync = operation.get("sync") if isinstance(operation.get("sync"), dict) else {}
+    failed = [{
+        "group": _text(entry.get("group")),
+        "kind": entry.get("kind") or "",
+        "namespace": _text(entry.get("namespace")),
+        "name": entry.get("name") or "",
+        "status": _text(entry.get("status")),
+        "message": _text(entry.get("message")),
+    } for entry in _dicts(result.get("resources"))
+        if entry.get("status") == "SyncFailed" or entry.get("hookPhase") in ("Failed", "Error")]
+    return {
+        "phase": state.get("phase") or "Unknown",
+        "started_at": _text(state.get("startedAt")),
+        "finished_at": _text(state.get("finishedAt")),
+        "message": _text(state.get("message")),
+        "revisions": _revisions(result) or _revisions(sync),    # 끝나기 전에는 syncResult 가 없다 — 요청한 revision
+        "retry_count": state.get("retryCount") if isinstance(state.get("retryCount"), int) else 0,
+        **_initiator(operation),
+        "failed_resources": failed,
+    }
+
+
+def application_detail(item: dict[str, Any]) -> dict[str, Any]:
+    """Application 하나 → 앱 상세 API 의 application. 목록 API 의 한 줄(application_row)에 상세 칸을 더한다.
+
+    Application CR 에 있는 것만 싣는다 — ArgoCD API·라이브 리소스는 읽지 않는다. 그래서:
+      - ArgoCD 3 은 리소스별 health 를 CR 이 아니라 app tree 에 둔다(status.resourceHealthSource = "appTree").
+        그때 resources[].health_status 는 null 이고 resource_health 가 false 다 — 앱 전체 health 는 health_status 에 있다
+      - revisions 는 sha 그대로다. 커밋 링크는 앱이 sources[i].repo_url 로 만든다 (Helm 저장소 차트면 차트 버전이라 링크가 아니다)
+    아직 sync 하지 않아 status 가 비어 있으면 목록 칸은 Unknown·null, 나머지는 빈 목록·null 이다.
+    """
+    spec = item.get("spec") or {}
+    status = item.get("status") or {}
+    _, _, prune = sync_policy(item)
+    resources = [_resource(entry) for entry in _dicts(status.get("resources"))]
+    history = _dicts(status.get("history"))[-HISTORY_LIMIT:]
+    summary = status.get("summary") if isinstance(status.get("summary"), dict) else {}
+    return {
+        **application_row(item),
+        "prune": prune,
+        "health_message": _text((status.get("health") or {}).get("message")),
+        "revisions": _revisions(status.get("sync")),
+        "reconciled_at": _text(status.get("reconciledAt")),
+        "sources": _detail_sources(spec, status),
+        "resource_health": status.get("resourceHealthSource") != "appTree",
+        "resources": resources,
+        "out_of_sync": [entry for entry in resources if entry["sync_status"] == "OutOfSync"],
+        "last_sync": _last_sync(status.get("operationState")),
+        "history": [{
+            "id": entry.get("id") if isinstance(entry.get("id"), int) else None,
+            "revisions": _revisions(entry),
+            "deploy_started_at": _text(entry.get("deployStartedAt")),
+            "deployed_at": _text(entry.get("deployedAt")),
+            **_initiator(entry),
+        } for entry in reversed(history)],
+        "images": _strings(summary.get("images")),
+        "conditions": [{
+            "type": entry.get("type") or "",
+            "message": _text(entry.get("message")),
+            "last_transition_time": _text(entry.get("lastTransitionTime")),
+        } for entry in _dicts(status.get("conditions"))],
+    }
+
+
+def application_detail_response(stdout: str) -> dict[str, Any]:
+    """상세 API 의 application (kubectl get <이름> -o json). 모양이 다르면 ValueError."""
+    item = json.loads(stdout or "")
+    if not isinstance(item, dict) or not isinstance(item.get("metadata"), dict) or not item["metadata"].get("name"):
+        raise ValueError("Application 모양이 아니다")
+    return application_detail(item)
 
 
 def find_application(items: list[dict[str, Any]], tracking: Tracking) -> dict[str, Any] | None:

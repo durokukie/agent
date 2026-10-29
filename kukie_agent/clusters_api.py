@@ -3,6 +3,7 @@
   POST /clusters/{id}/test       연결 확인 (kubectl version + auth can-i)
   GET  /clusters/{id}/overview   개요 — 웹 대시보드의 클러스터 지도·통계 (issue #102, kubectl get × 3 + CNI 조회 1 + GPU 조회)
   GET  /clusters/{id}/argocd/applications   ArgoCD 화면의 Application 목록 (DURO-140, kubectl get × 1)
+  GET  /clusters/{id}/argocd/applications/{namespace}/{name}   ArgoCD 화면의 앱 상세 패널 (DURO-145, kubectl get × 1)
 
 등록·목록·수정·삭제는 Kukie API 서버(kukie-server)의 공개 API 다 (DURO-113) — kubeconfig 검사와 자격증명
 암호화도 그쪽에 있다. 연결 확인만 agent 에 남은 이유는 kubectl 이 여기서 돌기 때문이다.
@@ -42,7 +43,7 @@ router = APIRouter(prefix="/clusters", tags=["clusters"])
 #: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적, 이유는 thread_limiter).
 #: kubectl 은 30초씩 잡는다.
 PROBE_WORKERS = 4            # 연결 확인 (kubectl × 3 — version·can-i 30초씩 + 노드 OVERVIEW_TIMEOUT, 최대 75초)
-ARGOCD_WORKERS = 4           # ArgoCD 앱 목록 (kubectl × 1, OVERVIEW_TIMEOUT). ArgoCD 화면이 띄울 때 부른다 — 개요와 따로 묶는다
+ARGOCD_WORKERS = 4           # ArgoCD 앱 목록·상세 (kubectl × 1, OVERVIEW_TIMEOUT). ArgoCD 화면이 띄울 때 부른다 — 개요와 따로 묶는다
 OVERVIEW_WORKERS = 4         # 개요 (kubectl × 5, 노드를 읽고 GPU 가 없다고 이미 안 클러스터가 아니면 GPU_BUDGET 안에서 몇 번 더). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
 #: 개요의 kubectl 한 번 시간 제한(초). 기본 30초 × 4 면 한 요청이 슬롯을 2분 잡는다 — 닿지 않으면 첫 번째에서 15초로 끝난다 (자동 리뷰 지적)
 OVERVIEW_TIMEOUT = 15
@@ -232,6 +233,56 @@ async def argocd_applications(
 
     # 개요와 같은 이유로 스레드로 넘긴다 — kubectl 이 도는 동안 서버 전체가 멈추지 않게
     return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+
+
+@router.get("/{cluster_id}/argocd/applications/{namespace}/{name}")
+async def argocd_application(
+    cluster_id: str,
+    namespace: str,
+    name: str,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """ArgoCD 화면의 앱 상세 패널 (DURO-145). namespace 는 Application 이 있는 곳(목록의 namespace, 보통 argocd)이다.
+
+    권한·자격증명·갈래는 목록 API 와 같다 — `get applications.argoproj.io <name> -n <namespace>` 한 번이다.
+    응답 {status, at, application} 의 application 모양은 argocd.application_detail (목록의 한 줄 + 상세 칸).
+      ok         읽었다
+      absent     applications.argoproj.io CRD 가 없다 — ArgoCD 없음 (application null)
+      forbidden  읽을 권한이 없다 (application null)
+    그 Application 이 없으면 404 ARGOCD_APP_NOT_FOUND — 클러스터를 못 볼 때의 404 NOT_FOUND 와 code 로 가른다.
+    그 밖의 실패는 목록과 같이 502 CLUSTER_AUTH_EXPIRED·CLUSTER_UNREACHABLE·CLUSTER_BAD_RESPONSE.
+    """
+    conn = await access.connection(cluster_id, user)
+    if not argocd.valid_ref(namespace, name):
+        raise _app_not_found(namespace, name)
+
+    def collect() -> dict[str, Any]:
+        with access.kubeconfig(conn) as path:
+            result = run_kubectl(argocd.get_command(namespace, name), context=conn.context_name, kubeconfig=path,
+                                 timeout=OVERVIEW_TIMEOUT)
+        now = overview.iso(datetime.now(timezone.utc))
+        if not result.success:
+            stderr = result.stderr or result.stdout
+            kind = argocd.detail_failure(stderr, namespace=namespace, name=name)
+            if kind == "not_found":
+                raise _app_not_found(namespace, name)
+            if kind == "error":
+                _raise_kubectl_failure(stderr)
+            return {"status": kind, "at": now, "application": None}
+        try:
+            application = argocd.application_detail_response(result.stdout)
+        except ValueError as exc:
+            logger.warning("ArgoCD 앱 상세를 읽지 못했다: %s", type(exc).__name__)
+            raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
+                                      "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
+        return {"status": "ok", "at": now, "application": application}
+
+    return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+
+
+def _app_not_found(namespace: str, name: str) -> HTTPException:
+    return HTTPException(404, {"code": "ARGOCD_APP_NOT_FOUND",
+                               "message": f"ArgoCD 앱 {namespace}/{name} 이 없다"})
 
 
 def _connection_key(cluster_id: str, conn: server_api.ClusterConnection) -> str | None:
