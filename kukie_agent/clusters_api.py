@@ -4,6 +4,8 @@
   GET  /clusters/{id}/overview   개요 — 웹 대시보드의 클러스터 지도·통계 (issue #102, kubectl get × 3 + CNI 조회 1 + GPU 조회)
   GET  /clusters/{id}/argocd/applications   ArgoCD 화면의 Application 목록 (DURO-140, kubectl get × 1)
   GET  /clusters/{id}/argocd/applications/{namespace}/{name}   ArgoCD 화면의 앱 상세 패널 (DURO-145, kubectl get × 1)
+  GET  /clusters/{id}/argocd/applications/{namespace}/{name}/rendered   앱 path 를 렌더한 결과 (DURO-148)
+  GET  /clusters/{id}/gitops/repos/{owner}/{repo}/tree · /file   ArgoCD 화면 "레포" 탭의 폴더·파일 (DURO-148)
 
 등록·목록·수정·삭제는 Kukie API 서버(kukie-server)의 공개 API 다 (DURO-113) — kubeconfig 검사와 자격증명
 암호화도 그쪽에 있다. 연결 확인만 agent 에 남은 이유는 kubectl 이 여기서 돌기 때문이다.
@@ -19,6 +21,7 @@ GPU 노드 유무(hasGpu)도 같은 까닭으로 연결 확인·개요가 노드
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -34,6 +37,7 @@ import kukie_agent.server as _server   # 순환 import: 이름은 호출 시점�
 from kukie_agent import argocd, server_api
 from kukie_agent.auth import User, current_user
 from kukie_agent.clusters import access, gpu, overview
+from kukie_agent.gitops import browse, github
 from kukie_agent.kubectl import KubectlResult, run_kubectl, thread_limiter
 
 logger = logging.getLogger(__name__)
@@ -43,7 +47,7 @@ router = APIRouter(prefix="/clusters", tags=["clusters"])
 #: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적, 이유는 thread_limiter).
 #: kubectl 은 30초씩 잡는다.
 PROBE_WORKERS = 4            # 연결 확인 (kubectl × 3 — version·can-i 30초씩 + 노드 OVERVIEW_TIMEOUT, 최대 75초)
-ARGOCD_WORKERS = 4           # ArgoCD 앱 목록·상세 (kubectl × 1, OVERVIEW_TIMEOUT). ArgoCD 화면이 띄울 때 부른다 — 개요와 따로 묶는다
+ARGOCD_WORKERS = 4           # ArgoCD 앱 목록·상세·레포 보기의 앱 목록 (kubectl × 1, OVERVIEW_TIMEOUT). ArgoCD 화면이 띄울 때 부른다 — 개요와 따로 묶는다
 OVERVIEW_WORKERS = 4         # 개요 (kubectl × 5, 노드를 읽고 GPU 가 없다고 이미 안 클러스터가 아니면 GPU_BUDGET 안에서 몇 번 더). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
 #: 개요의 kubectl 한 번 시간 제한(초). 기본 30초 × 4 면 한 요청이 슬롯을 2분 잡는다 — 닿지 않으면 첫 번째에서 15초로 끝난다 (자동 리뷰 지적)
 OVERVIEW_TIMEOUT = 15
@@ -296,6 +300,258 @@ async def argocd_application(
 
     key = _share_key(_connection_key(cluster_id, conn), "argocd", namespace, name)
     return await _shared_overview(key, compute, fresh=fresh)
+
+
+@router.get("/{cluster_id}/argocd/applications/{namespace}/{name}/rendered")
+async def argocd_application_rendered(
+    cluster_id: str,
+    namespace: str,
+    name: str,
+    ref: str = "",
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """앱 path 를 ArgoCD 처럼 렌더한 결과 — "클러스터에 실제로 들어가는 것" (DURO-148). 렌더는 gitops/browse.py.
+
+    Application 을 읽는 길·갈래는 앱 상세와 같다(absent·forbidden 200, 없는 앱 404 ARGOCD_APP_NOT_FOUND, 502).
+    ref 를 주지 않으면 Application 의 targetRevision 을 렌더한다 — 클러스터가 맞춰 있는 커밋을 보려면 sync_revision 을 ref 로 준다.
+      ok             렌더했다. resources 는 객체마다 kind·name·namespace·yaml, Secret 은 값을 가린다
+      unsupported    Helm·Plugin·여러 소스·GitHub 가 아닌 소스 — message 에 까닭 (레포를 읽지 않는다)
+      render_failed  레포를 읽었는데 렌더가 안 된다 (kustomize 오류·path 가 없다) — message 에 까닭
+    레포 쪽 실패는 레포 보기(tree·file)와 같은 코드다 — 409 GITOPS_REPO_NOT_CONNECTED, 404 GITOPS_REF_NOT_FOUND, 502 GITHUB_UNAVAILABLE.
+    같은 커밋·같은 path 의 렌더는 기억해 다시 하지 않는다 (browse.render).
+    """
+    conn = await access.connection(cluster_id, user)
+    if not argocd.valid_ref(namespace, name):
+        raise _app_not_found(namespace, name)
+
+    def collect() -> dict[str, Any]:
+        with access.kubeconfig(conn) as path:
+            result = run_kubectl(argocd.get_command(namespace, name), context=conn.context_name, kubeconfig=path,
+                                 timeout=OVERVIEW_TIMEOUT)
+        if not result.success:
+            stderr = result.stderr or result.stdout
+            kind = argocd.detail_failure(stderr, namespace=namespace, name=name)
+            if kind == "not_found":
+                raise _app_not_found(namespace, name)
+            if kind == "error":
+                _raise_kubectl_failure(stderr)
+            return {"status": kind}
+        try:
+            item = json.loads(result.stdout or "")
+            if not isinstance(item, dict) or not isinstance(item.get("metadata"), dict):
+                raise ValueError("Application 모양이 아니다")
+            return {"status": "ok", "item": item, "source": browse.render_source(item)}
+        except (ValueError, AttributeError, TypeError) as exc:
+            logger.warning("렌더할 ArgoCD 앱을 읽지 못했다: %s", type(exc).__name__)
+            raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
+                                      "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
+
+    read = await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+    body: dict[str, Any] = {
+        "status": read["status"], "application": {"namespace": namespace, "name": name}, "message": None,
+        "repository": None, "repo_url": None, "path": None, "source_type": None, "target_revision": None,
+        "ref": None, "sha": None, "sync_revision": None, "destination_namespace": None, "html_url": None,
+        "notes": [], "resources": [], "total": 0, "truncated": False,
+    }
+    if read["status"] != "ok":
+        return body
+    item, source = read["item"], read["source"]
+    status = item.get("status") if isinstance(item.get("status"), dict) else {}
+    spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
+    sync = status.get("sync") if isinstance(status.get("sync"), dict) else {}
+    destination = spec.get("destination") if isinstance(spec.get("destination"), dict) else {}
+    body.update(
+        repository=source.repository, repo_url=source.repo_url or None, path=source.path,
+        source_type=source.source_type or None, target_revision=source.target_revision,
+        sync_revision=sync.get("revision") if isinstance(sync.get("revision"), str) else None,
+        destination_namespace=destination.get("namespace") if isinstance(destination.get("namespace"), str) else None,
+        notes=list(source.notes),
+    )
+    if source.unsupported:
+        return {**body, "status": "unsupported", "message": source.unsupported}
+    wanted = browse.clean_ref(ref or source.target_revision)
+    if wanted is None:
+        raise _ref_not_found(ref or source.target_revision)
+    assert source.repository is not None
+    token = await _repo_token(cluster_id, source.repository)
+    try:
+        async with github.connect(source.repository, token.token) as gh:
+            revision = await browse.resolve(gh, source.repository, wanted)
+        result = await browse.render(source.repository, token.token, revision.sha, source)
+    except browse.NotFound as exc:
+        raise _browse_not_found(exc) from None
+    except github.GitHubError as exc:
+        raise _github_failed(exc) from None
+    return {**body, **result, "ref": revision.ref, "sha": revision.sha,
+            "html_url": browse.html_url(source.repository, revision.sha, source.path or "", folder=True)}
+
+
+@router.get("/{cluster_id}/gitops/repos/{owner}/{repo}/tree")
+async def gitops_repo_tree(
+    cluster_id: str,
+    owner: str,
+    repo: str,
+    ref: str = "",
+    path: str = "",
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """연결된 매니페스트 레포의 폴더 하나 (DURO-148). 앱이 폴더를 펼칠 때마다 부른다 — 아래 폴더까지 읽지 않는다.
+
+    ref 는 브랜치·태그·커밋(빈 값이면 기본 브랜치), path 는 레포 루트 기준(빈 값이면 루트). 응답의 sha 를 다음 폴더·파일의 ref 로
+    주면 같은 커밋을 계속 본다. 항목은 폴더 먼저·이름순, browse.MAX_ENTRIES 개까지(넘으면 truncated).
+    폴더 항목과 지금 폴더에 그 경로를 쓰는 ArgoCD Application 을 붙인다 (browse.apps_for_folder·apps_around).
+    Application 을 못 읽어도 폴더는 준다 — applications_status 가 ok 가 아니고 앱 배지가 빈다.
+
+    권한은 개요와 같다(못 보는 클러스터 404). 레포는 그 클러스터에 연결된 것만 — 토큰은 server 가 주는 레포 범위 설치 토큰이다.
+      409 GITOPS_REPO_NOT_CONNECTED   이 클러스터에 연결된 레포가 아니다 — 앱은 "레포를 연결하면 볼 수 있어요"
+      409 GITHUB_APP_NOT_INSTALLED·GITHUB_APP_SUSPENDED   server 가 토큰을 못 줬다 (그대로 전한다)
+      404 GITOPS_REF_NOT_FOUND·GITOPS_PATH_NOT_FOUND       그 ref·경로가 레포에 없다 (폴더가 아닌 경로도)
+      502 GITHUB_UNAVAILABLE         GitHub 가 거절했거나 닿지 않았다 (호출 한도 포함)
+    """
+    conn = await access.connection(cluster_id, user)
+    repository, wanted, folder = _repo_request(owner, repo, ref, path)
+    token = await _repo_token(cluster_id, repository)
+
+    async def read() -> tuple[browse.Revision, dict[str, Any]]:
+        async with github.connect(repository, token.token) as gh:
+            revision = await browse.resolve(gh, repository, wanted)
+            return revision, await browse.folder(gh, repository, revision, folder)
+
+    (revision, listing), (apps_status, items) = await _with_apps(read(), cluster_id, conn)
+    apps = browse.app_paths(items, repository)
+    for entry in listing["entries"]:
+        entry["applications"] = browse.apps_for_folder(apps, entry["path"], revision) if entry["type"] == "dir" else []
+    return {
+        **_revision_body(repository, revision, folder),
+        "html_url": browse.html_url(repository, revision.sha, folder, folder=True),
+        **listing,
+        "applications": browse.apps_around(apps, folder, revision, is_file=False),
+        "applications_status": apps_status,
+    }
+
+
+@router.get("/{cluster_id}/gitops/repos/{owner}/{repo}/file")
+async def gitops_repo_file(
+    cluster_id: str,
+    owner: str,
+    repo: str,
+    path: str,
+    ref: str = "",
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """연결된 매니페스트 레포의 파일 하나 — 읽기 전용 (DURO-148). 권한·ref·오류 코드는 tree 와 같다.
+
+    status
+      ok           content 에 내용 (UTF-8 글자)
+      masked       Secret 처럼 보여 내용 대신 가림 — masked_reason 에 까닭 (kind: Secret · stringData · sops · *.enc …)
+      too_large    browse.MAX_FILE_BYTES 를 넘는다 — html_url 로 GitHub 에서 본다
+      binary       글자 파일이 아니다
+      unsupported  심볼릭 링크·서브모듈
+    objects 는 YAML 문서마다 api_version·kind·name·namespace (가린 파일도 준다 — 이름은 비밀이 아니다). 그 파일을 쓰는 앱을 붙인다.
+    """
+    conn = await access.connection(cluster_id, user)
+    repository, wanted, file_path = _repo_request(owner, repo, ref, path)
+    token = await _repo_token(cluster_id, repository)
+
+    async def read() -> tuple[browse.Revision, dict[str, Any]]:
+        async with github.connect(repository, token.token) as gh:
+            revision = await browse.resolve(gh, repository, wanted)
+            return revision, await browse.file(gh, repository, revision, file_path)
+
+    (revision, view), (apps_status, items) = await _with_apps(read(), cluster_id, conn)
+    apps = browse.app_paths(items, repository)
+    return {
+        **_revision_body(repository, revision, file_path),
+        "name": file_path.rsplit("/", 1)[-1],
+        "html_url": browse.html_url(repository, revision.sha, file_path, folder=False),
+        **view,
+        "applications": browse.apps_around(apps, file_path, revision, is_file=True),
+        "applications_status": apps_status,
+    }
+
+
+def _repo_request(owner: str, repo: str, ref: str, path: str) -> tuple[str, str, str]:
+    """URL 의 레포·ref·경로를 본다 — GitHub 경로에 넣기 전에. (소문자 owner/repo, ref, 경로)."""
+    repository = browse.repository_of(owner, repo)
+    if repository is None:
+        raise _repo_not_connected(f"{owner}/{repo}")
+    wanted = browse.clean_ref(ref)
+    if wanted is None:
+        raise _ref_not_found(ref)
+    cleaned = browse.clean_path(path)
+    if cleaned is None:
+        raise HTTPException(404, {"code": "GITOPS_PATH_NOT_FOUND", "message": f"레포 안 경로가 아니에요: {path}"})
+    return repository, wanted, cleaned
+
+
+async def _repo_token(cluster_id: str, repository: str) -> server_api.RepoToken:
+    """그 레포의 설치 토큰 — 이 클러스터에 연결된 레포인지도 여기서 본다. 토큰은 응답·로그에 싣지 않는다.
+    server 의 404 MANIFEST_REPO_NOT_CONNECTED 만 409 로 바꾼다 — 클러스터를 못 볼 때의 404 와 가르려고. 나머지는 그대로 전한다."""
+    try:
+        return await server_api.repo_token(cluster_id, repository)
+    except server_api.ServerError as exc:
+        if exc.code == "MANIFEST_REPO_NOT_CONNECTED":
+            raise _repo_not_connected(repository) from None
+        raise
+
+
+async def _with_apps(read, cluster_id: str, conn: server_api.ClusterConnection) -> tuple[Any, tuple[str, list]]:
+    """GitHub 읽기와 클러스터의 Application 목록을 나란히 기다린다. GitHub 쪽 실패만 오류로 올린다."""
+    try:
+        result, apps = await asyncio.gather(read, _gitops_apps(cluster_id, conn))
+    except browse.NotFound as exc:
+        raise _browse_not_found(exc) from None
+    except github.GitHubError as exc:
+        raise _github_failed(exc) from None
+    return result, (apps["status"], apps["items"])
+
+
+async def _gitops_apps(cluster_id: str, conn: server_api.ClusterConnection) -> dict[str, Any]:
+    """레포 보기에 붙일 Application 들 — {status, items}. 실패해도 올리지 않는다 (status: absent·forbidden·error).
+    앱 목록처럼 같은 연결이면 OVERVIEW_SHARE_TTL 초 나눠 쓴다 — 폴더를 펼칠 때마다 kubectl 이 돌지 않게."""
+    def collect() -> dict[str, Any]:
+        with access.kubeconfig(conn) as path:
+            result = run_kubectl(argocd.LIST_COMMAND, context=conn.context_name, kubeconfig=path,
+                                 timeout=OVERVIEW_TIMEOUT)
+        if not result.success:
+            kind = argocd.failure_kind(result.stderr or result.stdout)
+            logger.debug("레포 보기의 ArgoCD 앱 목록을 건너뛴다: %s", kind)
+            return {"status": kind, "items": []}
+        try:
+            return {"status": "ok", "items": argocd.parse_applications(result.stdout)}
+        except ValueError:
+            logger.debug("레포 보기의 ArgoCD 앱 목록을 읽지 못했다")
+            return {"status": "error", "items": []}
+
+    async def compute() -> dict[str, Any]:
+        return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+
+    return await _shared_overview(_share_key(_connection_key(cluster_id, conn), "gitops-apps"), compute)
+
+
+def _revision_body(repository: str, revision: browse.Revision, path: str) -> dict[str, Any]:
+    return {"repository": repository, "ref": revision.ref, "sha": revision.sha,
+            "default_branch": revision.default_branch, "path": path}
+
+
+def _repo_not_connected(repository: str) -> HTTPException:
+    return HTTPException(409, {"code": "GITOPS_REPO_NOT_CONNECTED",
+                               "message": f"레포 {repository} 가 이 클러스터에 연결돼 있지 않아요. 레포를 연결하면 볼 수 있어요."})
+
+
+def _ref_not_found(ref: str) -> HTTPException:
+    return HTTPException(404, {"code": "GITOPS_REF_NOT_FOUND", "message": f"브랜치·태그·커밋 이름이 아니에요: {ref}"})
+
+
+def _browse_not_found(exc: browse.NotFound) -> HTTPException:
+    code = "GITOPS_REF_NOT_FOUND" if exc.what == "ref" else "GITOPS_PATH_NOT_FOUND"
+    return HTTPException(404, {"code": code, "message": exc.message})
+
+
+def _github_failed(exc: github.GitHubError) -> HTTPException:
+    """GitHub 실패 → 502 GITHUB_UNAVAILABLE (server 의 토큰 발급 실패와 같은 코드). 문구는 HTTP 상태와 GitHub 의 message 뿐이다."""
+    logger.warning("레포 보기의 GitHub 호출이 실패했다: %s", exc)
+    return HTTPException(502, {"code": "GITHUB_UNAVAILABLE", "message": f"GitHub 를 읽지 못했어요 — {exc}"})
 
 
 def _share_key(key: str | None, *parts: str) -> str | None:
