@@ -64,12 +64,18 @@ def _display(repository: str, number: int | None) -> str:
     return f"github pr merge {repository}#{number}" if number else f"github pr merge {repository}"
 
 
-def _kubectl_retry(reason: str) -> ModelRetry:
-    return ModelRetry(
+def _again(ctx, message: str) -> Exception:
+    """모델에게 다시 하게 한다. 이 툴의 재시도를 이미 썼으면 ToolFailed — 또 ModelRetry 를 던지면 재시도 한도(1)를
+    넘어 run 이 통째로 실패한다. ToolFailed 도 같은 문구를 모델에게 보여 주고 한도를 쓰지 않는다."""
+    return ToolFailed(message) if getattr(ctx, "retry", 0) >= 1 else ModelRetry(message)
+
+
+def _kubectl_retry(ctx, reason: str) -> Exception:
+    return _again(ctx, (
         f"이 리소스는 지금 kubectl 길이다. 이유: {reason} "
         "propose_git_change 대신 kubectl 변경 툴(scale_resource·apply_manifest 등)로 다시 하라 — "
         "ArgoCD 관리 리소스면 승인 카드에 경고가 같이 뜬다."
-    )
+    ))
 
 
 def _result(plan: ActionPlan) -> GitOpsResult:
@@ -127,7 +133,7 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
 
     found = await _decide(ctx, kind, name, namespace, change)
     if found.path != "pr":
-        raise _kubectl_retry(found.reason)
+        raise _kubectl_retry(ctx, found.reason)
     assert found.repository and found.target
     try:
         token = await pull_requests.token_for(ctx.deps.cluster_id, found.repository)
@@ -140,9 +146,9 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
         draft = await pull_requests.draft(found, change, token, hpa=hpa)
     except pull_requests.Refuse as refused:
         if refused.kubectl:
-            raise _kubectl_retry(refused.message) from None
+            raise _kubectl_retry(ctx, refused.message) from None
         if refused.retry:
-            raise ModelRetry(refused.message) from None
+            raise _again(ctx, refused.message) from None
         raise ToolFailed(refused.message) from None
     except GitHubError as exc:
         raise ToolFailed(f"매니페스트 레포를 읽지 못했다 ({exc}). 잠시 뒤 다시 하거나 kubectl 변경 툴로 하라.") from None

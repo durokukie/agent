@@ -306,3 +306,20 @@ def test_승인하는_사이_ArgoCD_앱의_경로가_바뀌면_STALE이다(clien
     _decide(client, room)
 
     assert _plan(fake_server, room)["status"] == "STALE" and gh.merges == []
+
+
+def test_PR_길이_아닌데_propose_git_change를_고집해도_run이_실패하지_않는다(client, fake_server, room, gh, cluster):
+    """재시도 한도(1)를 쓴 뒤에는 ToolFailed 로 알린다 — 또 ModelRetry 면 run 이 500 으로 끝난다."""
+    cluster.managed = False
+
+    def stubborn(messages, info):
+        calls = sum(isinstance(p, ToolCallPart) and p.tool_name == "propose_git_change"
+                    for m in messages for p in getattr(m, "parts", []))
+        if calls < 2:
+            return ModelResponse(parts=[ToolCallPart(tool_name="propose_git_change", args=dict(CHANGE_ARGS),
+                                                     tool_call_id=f"call-{calls}")])
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"narration": "네."})])
+
+    with agent.override(model=FunctionModel(stubborn)):
+        r = client.post(f"/conversations/{room}/chat", json={"text": "web 3개로"}, headers=USER)
+    assert r.status_code == 200 and r.json()["kind"] == "answer"
