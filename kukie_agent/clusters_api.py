@@ -198,6 +198,7 @@ async def cluster_overview(
 @router.get("/{cluster_id}/argocd/applications")
 async def argocd_applications(
     cluster_id: str,
+    fresh: bool = False,
     user: User = Depends(current_user),
 ) -> dict[str, Any]:
     """ArgoCD 화면의 Application 목록 (DURO-140). 응답 모양은 kukie-electron docs/api-spec.md `ArgoApplications`.
@@ -211,6 +212,7 @@ async def argocd_applications(
       forbidden  읽을 권한이 없다 — 있는지 알 수 없다 (v4 제한 권한인 고객 클러스터)
     그 밖의 kubectl 실패는 개요와 같이 502 CLUSTER_AUTH_EXPIRED·CLUSTER_UNREACHABLE, 출력을 못 읽으면 502 CLUSTER_BAD_RESPONSE.
     같은 연결의 목록은 개요처럼 OVERVIEW_SHARE_TTL 초 동안 나눠 쓴다 (_shared_overview, 실패는 나눠 쓰지 않는다).
+    `?fresh=true` 는 화면의 "다시 읽기" 용이다 — 막 끝난 결과는 건너뛰고 새로 읽는다(진행 중인 한 번에는 같이 붙는다).
     """
     conn = await access.connection(cluster_id, user)
 
@@ -226,8 +228,8 @@ async def argocd_applications(
             return {"status": kind, "at": now, "applications": []}
         try:
             applications = argocd.applications_response(result.stdout)
-        except ValueError as exc:
-            # 원문은 클러스터 내용이라 남기지 않는다 (개요와 같다)
+        except (ValueError, AttributeError, TypeError) as exc:
+            # 원문은 클러스터 내용이라 남기지 않는다 (개요와 같다). spec·status 가 객체가 아닌 응답도 모양이 다른 것이다 (agent#125 리뷰)
             logger.warning("ArgoCD 앱 목록을 읽지 못했다: %s", type(exc).__name__)
             raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
                                       "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
@@ -238,7 +240,7 @@ async def argocd_applications(
         return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
 
     # 권한은 위에서 요청마다 본다. 응답에 사람마다 다른 값이 없어 나눠 써도 된다 (개요와 같다)
-    return await _shared_overview(_share_key(_connection_key(cluster_id, conn), "argocd"), compute)
+    return await _shared_overview(_share_key(_connection_key(cluster_id, conn), "argocd"), compute, fresh=fresh)
 
 
 @router.get("/{cluster_id}/argocd/applications/{namespace}/{name}")
@@ -246,6 +248,7 @@ async def argocd_application(
     cluster_id: str,
     namespace: str,
     name: str,
+    fresh: bool = False,
     user: User = Depends(current_user),
 ) -> dict[str, Any]:
     """ArgoCD 화면의 앱 상세 패널 (DURO-145). namespace 는 Application 이 있는 곳(목록의 namespace, 보통 argocd)이다.
@@ -258,6 +261,7 @@ async def argocd_application(
     그 Application 이 없으면 404 ARGOCD_APP_NOT_FOUND — 클러스터를 못 볼 때의 404 NOT_FOUND 와 code 로 가른다.
     그 밖의 실패는 목록과 같이 502 CLUSTER_AUTH_EXPIRED·CLUSTER_UNREACHABLE·CLUSTER_BAD_RESPONSE.
     같은 연결·같은 앱의 상세는 목록처럼 OVERVIEW_SHARE_TTL 초 동안 나눠 쓴다. 404·502 는 나눠 쓰지 않는다 — 다음 요청이 새로 읽는다.
+    `?fresh=true` 도 목록과 같다 — 패널을 열 때·"다시 읽기" 를 누를 때 쓴다 (agent#125 리뷰).
     """
     conn = await access.connection(cluster_id, user)
     if not argocd.valid_ref(namespace, name):
@@ -278,7 +282,7 @@ async def argocd_application(
             return {"status": kind, "at": now, "application": None}
         try:
             application = argocd.application_detail_response(result.stdout)
-        except ValueError as exc:
+        except (ValueError, AttributeError, TypeError) as exc:
             logger.warning("ArgoCD 앱 상세를 읽지 못했다: %s", type(exc).__name__)
             raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
                                       "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
@@ -288,7 +292,7 @@ async def argocd_application(
         return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
 
     key = _share_key(_connection_key(cluster_id, conn), "argocd", namespace, name)
-    return await _shared_overview(key, compute)
+    return await _shared_overview(key, compute, fresh=fresh)
 
 
 def _share_key(key: str | None, *parts: str) -> str | None:
@@ -321,7 +325,7 @@ class _SharedOverview:
 _shared_overviews: dict[str, _SharedOverview] = {}
 
 
-async def _shared_overview(key: str | None, compute, *, clock=time.monotonic) -> dict[str, Any]:
+async def _shared_overview(key: str | None, compute, *, fresh: bool = False, clock=time.monotonic) -> dict[str, Any]:
     """같은 연결의 개요를 OVERVIEW_SHARE_TTL 초 동안 나눠 쓴다 — 진행 중이면 그 한 번을 같이 기다리고, 막 끝났으면 그 결과.
 
     실패(502 등)는 나눠 쓰지 않는다 — 같이 기다리던 요청은 같은 실패를 받고, 다음 요청은 새로 읽는다. 실패한 한 번이
@@ -329,6 +333,8 @@ async def _shared_overview(key: str | None, compute, *, clock=time.monotonic) ->
     기다리던 요청이 끊겨도(브라우저 탭 닫힘) 그 한 번은 끝까지 돈다 — 다른 요청이 같이 기다릴 수 있다.
     끝나면 결과만 남기고 task 를 놓는다. 결과도 OVERVIEW_SHARE_TTL 뒤에 치운다 — 다음 요청이 안 와도 (agent#122 리뷰).
     TTL 이 0 이면 나눠 쓰지 않는다.
+    fresh 면 막 끝난 결과는 쓰지 않고 새로 읽는다 — 사람이 누른 "다시 읽기" 가 같은 몸통을 받지 않게. 진행 중인 한 번에는 같이
+    붙는다(누르기 전에 시작한 한 번이라도 kubectl 한 번 시간만큼만 앞선다). 새로 읽은 결과가 다음 요청들이 나눠 쓸 값이 된다.
     """
     if key is None or OVERVIEW_SHARE_TTL <= 0:
         return await compute()
@@ -337,7 +343,7 @@ async def _shared_overview(key: str | None, compute, *, clock=time.monotonic) ->
                   if e.finished_at is not None and now - e.finished_at >= OVERVIEW_SHARE_TTL]:
         del _shared_overviews[stale]
     entry = _shared_overviews.get(key)
-    if entry is not None and entry.body is not None:
+    if entry is not None and entry.body is not None and not fresh:
         return entry.body
     task = entry.task if entry is not None else None
     if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):

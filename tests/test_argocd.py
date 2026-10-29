@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -429,6 +430,7 @@ def test_ArgoCD_없음과_권한_없음은_200으로_가른다(client, fake_serv
     (_fail("E1030 memcache.go:265] couldn't get current server API group list: Get \"https://10.0.0.1/api\": "
            "dial tcp 10.0.0.1:443: connect: connection refused\n" + ABSENT), "CLUSTER_UNREACHABLE"),
     (KubectlResult(command="kubectl get", stdout="not json", stderr="", success=True), "CLUSTER_BAD_RESPONSE"),
+    (_ok({"items": [{**_application(), "status": ["x"]}]}), "CLUSTER_BAD_RESPONSE"),
 ])
 def test_그_밖의_실패는_개요와_같이_502(client, fake_server, monkeypatch, answer, code):
     cluster = fake_server.add_cluster(owner="u-1")
@@ -656,6 +658,8 @@ def test_이름_꼴이_아니면_kubectl_없이_404(client, fake_server, monkeyp
     (_fail("error: You must be logged in to the server (Unauthorized)"), "CLUSTER_AUTH_EXPIRED"),
     (KubectlResult(command="kubectl get", stdout="not json", stderr="", success=True), "CLUSTER_BAD_RESPONSE"),
     (_ok({"items": []}), "CLUSTER_BAD_RESPONSE"),
+    (_ok({**_application(), "spec": "x"}), "CLUSTER_BAD_RESPONSE"),        # CRD 스키마를 어긴 응답 — 500 이 아니다
+    (_ok({**_application(), "status": ["x"]}), "CLUSTER_BAD_RESPONSE"),
 ])
 def test_앱_상세의_그_밖의_실패는_목록과_같이_502(client, fake_server, monkeypatch, answer, code):
     cluster = fake_server.add_cluster(owner="u-1")
@@ -717,3 +721,28 @@ def test_나눠_쓴_결과도_볼_수_없는_사람에게는_404(client, fake_se
     _api(monkeypatch, _ok(_detailed()))
     assert client.get(_detail_url(cluster), headers=USER).status_code == 200
     assert client.get(_detail_url(cluster), headers=OTHER).status_code == 404
+
+
+@pytest.mark.parametrize("url", ["list", "detail"])
+def test_fresh_는_막_끝난_결과를_건너뛰고_새로_읽은_것을_다시_나눠_쓴다(client, fake_server, monkeypatch, share_on, url):
+    cluster = fake_server.add_cluster(owner="u-1")
+    ran = _api(monkeypatch, _ok(_detailed() if url == "detail" else {"items": []}))
+    path = _detail_url(cluster) if url == "detail" else f"/clusters/{cluster}/argocd/applications"
+    for query in ("", "?fresh=true", "", "?fresh=false"):
+        assert client.get(path + query, headers=USER).status_code == 200
+    assert len(ran) == 2          # 처음 한 번 + fresh 한 번. 그 뒤 둘은 fresh 가 읽은 것을 쓴다
+
+
+def test_fresh_도_진행_중인_한_번에는_같이_붙는다(share_on):
+    calls = {"n": 0}
+
+    async def compute():
+        calls["n"] += 1
+        await asyncio.sleep(0)
+        return {"n": calls["n"]}
+
+    async def main():
+        return await asyncio.gather(clusters_api._shared_overview("k", compute),
+                                    clusters_api._shared_overview("k", compute, fresh=True))
+
+    assert asyncio.run(main()) == [{"n": 1}, {"n": 1}] and calls["n"] == 1
