@@ -293,3 +293,72 @@ def test_연결된_레포의_앱이_아니면_PR_길_판단에_kubectl을_더_�
     assert body["approvals"][0]["tool"] == "scale_resource"
     assert cluster.seen == [["get", "deployment", "web", "-o", "json", "-n", "shop"],
                             ["get", "applications.argoproj.io", "-A", "-o", "json"]]     # 판별 두 번뿐
+
+
+@pytest.fixture(autouse=True)
+def _forget_unsaved(monkeypatch):
+    monkeypatch.setattr(memo, "_unsaved", {})
+    monkeypatch.setattr(memo, "_pending", {})
+
+
+def test_칸_쓰기가_실패한_뒤_연결이_원래대로_돌아오면_바로잡는_메모를_넣는다(client, fake_server, room, cluster, monkeypatch):
+    """칸이 뒤처진 채 연결이 돌아오면 칸과 지금이 같아 보인다 — 기록 끝의 "끊겼다" 가 그대로 남으면 안 된다 (agent#127 리뷰)."""
+    from kukie_agent import server_api
+
+    _chat(client, room, Script())                                    # 칸: 연결됨
+    cluster_id = _cluster_of(fake_server, room)
+    fake_server.unlink_repo(cluster_id, REPO)
+    real = server_api.update_repo_link_state
+
+    async def down(conversation_id, state):
+        raise server_api.ServerError(503, "SERVER_UNAVAILABLE", "down")
+
+    monkeypatch.setattr(server_api, "update_repo_link_state", down)
+    _chat(client, room, Script())                                    # "끊겼다" 메모는 저장, 칸 쓰기 실패
+    monkeypatch.setattr(server_api, "update_repo_link_state", real)
+    fake_server.link_repo(cluster_id, REPO)                          # 다음 턴 전에 다시 연결됐다
+    _chat(client, room, Script())
+
+    saved = _saved_memos(fake_server, room)
+    assert [len(found) for found in saved] == [0, 1, 1]
+    assert "끊겼다" in saved[1][0] and "새로 연결됐다" in saved[2][0]
+    assert fake_server.repo_link_states[room] == {"repos": [REPO]}
+
+
+def test_run_도중_연결이_되돌아가면_그것도_알리고_칸은_마지막_값이다(client, fake_server, room, cluster):
+    fake_server.repo_link_states[room] = {"repos": [REPO]}
+    cluster_id = _cluster_of(fake_server, room)
+    fake_server.unlink_repo(cluster_id, REPO)
+
+    class Flip(Script):
+        def __call__(self, messages, info):
+            if not self.views:
+                fake_server.link_repo(cluster_id, REPO)              # 첫 AI 호출 동안(툴 호출 전) 다시 연결됐다
+            return super().__call__(messages, info)
+
+    _chat(client, room, Flip(("list_resources", {"kind": "pods"})))
+
+    found = _saved_memos(fake_server, room)[0]
+    assert len(found) == 2 and "끊겼다" in found[0] and "새로 연결됐다" in found[1]
+    assert fake_server.repo_link_states[room] == {"repos": [REPO]}
+
+
+def test_레플리카가_PR_범위_밖이면_run이_실패하지_않고_kubectl_카드로_간다(client, fake_server, room, cluster):
+    """Replicas(0..1000) 밖의 값으로 PR 길 판단이 터지면 안 된다 (agent#127 리뷰)."""
+    body = _chat(client, room, Script(("scale_resource", {**SCALE, "replicas": 5000})), "5000개")
+
+    assert body["kind"] == "approval" and body["approvals"][0]["tool"] == "scale_resource"
+
+
+def test_PR_길_판단이_예산을_넘으면_kubectl_길로_둔다(client, fake_server, room, cluster, monkeypatch):
+    import anyio
+    from kukie_agent.guardrail import hook
+
+    async def slow(**kwargs):
+        await anyio.sleep(5)
+
+    monkeypatch.setattr(hook, "PR_PATH_BUDGET", 0.05)
+    monkeypatch.setattr(route, "decide", slow)
+    body = _chat(client, room, Script(("scale_resource", SCALE)), "3개")
+
+    assert body["approvals"][0]["tool"] == "scale_resource" and "route" not in body["approvals"][0]["argocd"]

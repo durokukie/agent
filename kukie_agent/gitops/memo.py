@@ -43,6 +43,10 @@ MARK_CHAR = "\ue000"
 MARK = f"{MARK_CHAR}[Kukie 알림]"
 #: run id → 저장이 끝나면 숨은 칸에 쓸 값
 _pending: dict[str, dict[str, Any]] = {}
+#: conversation id → 기록(메모)에는 남았는데 칸 쓰기만 실패한 값. 칸 대신 이걸로 비교한다 — 칸이 뒤처진 채 연결이 원래대로
+#: 돌아오면 칸과 지금이 같아 보여, 기록 끝의 틀린 메모를 바로잡지 못한다 (agent#127 리뷰). 프로세스가 다시 뜨면 잊는다
+#: (그때는 칸 + 기록 끝 메모 대조로 중복만 막는다)
+_unsaved: dict[str, dict[str, Any]] = {}
 
 
 def strip_mark(text: str) -> str:
@@ -86,11 +90,19 @@ async def repo_link_memo(ctx: RunContext[Deps], messages: list[ModelMessage]) ->
         logger.exception("레포 연결 상태를 읽지 못해 메모를 건너뛴다: conversation=%s", deps.conversation_id)
         return messages
     state = {"repos": now}
-    if seen == state or _pending.get(deps.run_id) == state:
-        return messages        # 같다, 또는 이 run 의 앞 요청이 이미 판단했다(칸은 저장 뒤에 바뀐다)
+    # AI 가 마지막으로 들은 상태와 비교한다: 이 run 의 앞 요청이 정한 값 → 칸 쓰기만 실패한 값 → 칸.
+    # run 도중 연결이 되돌아가도(툴 호출 사이) 앞 요청의 메모를 바로잡는 메모가 들어간다 (agent#127 리뷰)
+    if deps.run_id in _pending:
+        noted = _pending[deps.run_id]
+    else:
+        noted = _unsaved.get(deps.conversation_id, seen)
+    if noted == state:
+        if seen != state:
+            _pending[deps.run_id] = state     # AI 는 이미 안다 — 뒤처진 칸만 저장 뒤에 따라잡게 한다
+        return messages
     _pending[deps.run_id] = state
     # 처음 보는 대화(칸이 빔)는 칸만 채운다 — 새 대화든, 이 기능 전부터 있던 대화든 "그 전" 을 모르니 바뀌었다고 말할 수 없다
-    before = seen.get("repos") if seen is not None else None
+    before = noted.get("repos") if isinstance(noted, dict) else None
     if not isinstance(before, list) or set(before) == set(now):
         return messages        # 순서·중복만 다르면 알릴 것이 없다
     text = memo_text(before, now)
@@ -110,8 +122,11 @@ async def settle(deps: Deps, *, saved: bool) -> None:
     try:
         await server_api.update_repo_link_state(deps.conversation_id, state)
     except Exception:
-        # 다음 run 이 다시 비교한다. 메모는 기록에 이미 있으니 같은 메모를 또 넣지 않는다 (_last_memo)
+        # 기록에는 이 값의 메모가 있다 — 다음 run 은 칸 대신 이 값으로 비교한다
         logger.exception("숨은 칸을 쓰지 못했다: conversation=%s", deps.conversation_id)
+        _unsaved[deps.conversation_id] = state
+        return
+    _unsaved.pop(deps.conversation_id, None)
 
 
 capability = ProcessHistory(repo_link_memo)
