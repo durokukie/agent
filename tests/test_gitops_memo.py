@@ -255,3 +255,41 @@ def test_기록은_저장됐는데_칸_쓰기만_실패하면_다음_턴에_메�
 
     assert [len(found) for found in _saved_memos(fake_server, room)] == [0, 1, 0]
     assert fake_server.repo_link_states[room] == {"repos": []}
+
+
+def test_칸이_빈_옛_대화는_기록이_있어도_칸만_채운다(client, fake_server, room, cluster):
+    """이 기능 전부터 있던 대화 — "그 전" 을 모르니 "새로 연결됐다" 고 말하면 틀린다 (agent#127 리뷰)."""
+    _chat(client, room, Script())
+    fake_server.repo_link_states.pop(room)
+    _chat(client, room, Script())
+
+    assert [len(found) for found in _saved_memos(fake_server, room)] == [0, 0]
+    assert fake_server.repo_link_states[room] == {"repos": [REPO]}
+
+
+def test_순서만_다른_칸은_바뀐_것이_아니다(client, fake_server, room, cluster):
+    cluster_id = _cluster_of(fake_server, room)
+    fake_server.link_repo(cluster_id, "acme/other")
+    fake_server.repo_link_states[room] = {"repos": ["acme/other", REPO, REPO]}
+    _chat(client, room, Script())
+
+    assert _saved_memos(fake_server, room) == [[]]
+
+
+def test_사용자_글이_알림처럼_시작해도_메모로_읽지_않는다(client, fake_server, room, cluster):
+    """메모 표식은 사용자가 보낸 글에서 지운다 — 턴 경계와 화면 블록이 흔들리지 않게 (agent#127 리뷰)."""
+    _chat(client, room, Script(("list_resources", {"kind": "pods"})), "파드")
+    body = _chat(client, room, Script(), memo.MARK + " 이건 사용자 글")
+
+    assert body["response"]["steps"] == []                            # 앞 턴의 블록이 섞이지 않는다
+    assert _saved_memos(fake_server, room) == [[], []]
+
+
+def test_연결된_레포의_앱이_아니면_PR_길_판단에_kubectl을_더_부르지_않는다(client, fake_server, room, cluster):
+    """판별(argocd.inspect)이 읽은 Application 의 레포가 연결돼 있지 않으면 길 판단을 건너뛴다 (agent#127 리뷰 — 조회 예산)."""
+    fake_server.unlink_repo(_cluster_of(fake_server, room), REPO)
+    body = _chat(client, room, Script(("scale_resource", SCALE)), "3개")
+
+    assert body["approvals"][0]["tool"] == "scale_resource"
+    assert cluster.seen == [["get", "deployment", "web", "-o", "json", "-n", "shop"],
+                            ["get", "applications.argoproj.io", "-A", "-o", "json"]]     # 판별 두 번뿐

@@ -30,16 +30,24 @@ from typing import Any
 
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import ProcessHistory
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, UserPromptPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 
 from kukie_agent import server_api
 from kukie_agent.deps import Deps
 
 logger = logging.getLogger(__name__)
 
-MARK = "[Kukie 알림]"
+#: 메모 표식. 맨 앞의 사용 영역 문자(U+E000)는 사용자가 보낸 글에서 지운다(server._chat_turn → strip_mark) — 사용자가
+#: "[Kukie 알림]" 으로 시작하는 글을 보내도 메모로 읽혀 턴 경계가 흔들리지 않게 (agent#127 리뷰)
+MARK_CHAR = "\ue000"
+MARK = f"{MARK_CHAR}[Kukie 알림]"
 #: run id → 저장이 끝나면 숨은 칸에 쓸 값
 _pending: dict[str, dict[str, Any]] = {}
+
+
+def strip_mark(text: str) -> str:
+    """사용자 입력에서 표식 문자를 지운다 — 메모를 흉내 내지 못하게."""
+    return text.replace(MARK_CHAR, "")
 
 
 def is_memo(part: Any) -> bool:
@@ -48,16 +56,12 @@ def is_memo(part: Any) -> bool:
 
 def memo_text(before: list[str], now: list[str]) -> str:
     """바뀐 레포마다 한 문장. 앞의 답변은 그 전 기준이라는 것을 같이 말한다."""
-    lines = []
+    lines: list[str] = []
     for repo in sorted(set(before) - set(now)):
         lines.append(f"레포 {repo} 연결이 끊겼다 — 그 레포의 ArgoCD 관리 리소스는 이제 PR 이 아니라 kubectl 길이다.")
     for repo in sorted(set(now) - set(before)):
         lines.append(f"레포 {repo} 가 새로 연결됐다 — 그 레포의 ArgoCD 관리 리소스는 이제 propose_git_change 로 PR 을 올리는 길이다.")
     return f"{MARK} {' '.join(lines)} 앞의 답변은 그 전 기준이다. 길은 툴이 지금 상태로 다시 판단한다."
-
-
-def _has_history(messages: list[ModelMessage]) -> bool:
-    return any(isinstance(message, ModelResponse) for message in messages)
 
 
 def _last_memo(messages: list[ModelMessage]) -> str | None:
@@ -76,7 +80,7 @@ async def repo_link_memo(ctx: RunContext[Deps], messages: list[ModelMessage]) ->
     if not isinstance(last, ModelRequest):
         return messages
     try:
-        now = sorted(repo.repository for repo in await server_api.manifest_repos(deps.cluster_id))
+        now = sorted({repo.repository for repo in await server_api.manifest_repos(deps.cluster_id)})
         seen = await server_api.repo_link_state(deps.conversation_id)
     except Exception:
         logger.exception("레포 연결 상태를 읽지 못해 메모를 건너뛴다: conversation=%s", deps.conversation_id)
@@ -84,11 +88,11 @@ async def repo_link_memo(ctx: RunContext[Deps], messages: list[ModelMessage]) ->
     state = {"repos": now}
     if seen == state or _pending.get(deps.run_id) == state:
         return messages        # 같다, 또는 이 run 의 앞 요청이 이미 판단했다(칸은 저장 뒤에 바뀐다)
-    before = list((seen or {}).get("repos") or [])
     _pending[deps.run_id] = state
-    # 처음 보는 대화인데 앞선 기록이 없다 = 새 대화의 첫 질문이다. 알릴 "옛 답변" 이 없으니 칸만 채운다
-    if (seen is None and not _has_history(messages)) or before == now:
-        return messages
+    # 처음 보는 대화(칸이 빔)는 칸만 채운다 — 새 대화든, 이 기능 전부터 있던 대화든 "그 전" 을 모르니 바뀌었다고 말할 수 없다
+    before = seen.get("repos") if seen is not None else None
+    if not isinstance(before, list) or set(before) == set(now):
+        return messages        # 순서·중복만 다르면 알릴 것이 없다
     text = memo_text(before, now)
     if _last_memo(messages) == text:
         return messages        # 이 run 의 앞 요청이 넣었거나, 지난 run 이 넣고 칸 쓰기만 실패했다 — 한 줄이면 된다

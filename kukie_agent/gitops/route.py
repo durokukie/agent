@@ -141,7 +141,7 @@ def _locate(kind: str, name: str, namespace: str | None, *, context: str,
 
 async def decide(
     *, kind: str, name: str, namespace: str | None, context: str, kubeconfig: Path | None,
-    cluster_id: str | None, change: Change | None = None,
+    cluster_id: str | None, change: Change | None = None, connected: set[str] | None = None,
 ) -> Route:
     """그 리소스를 지금 어느 길로 바꿀지. 어떤 실패도 올리지 않는다 — 모르면 kubectl 길(지금과 같음)이다."""
     try:
@@ -180,15 +180,14 @@ async def decide(
     if repository is None:
         return Route("kubectl", f"{app_label} 의 소스가 GitHub 레포가 아니라 PR 로 못 바꿔요.", **common)
 
-    if cluster_id is None:
-        connected: set[str] = set()
-    else:
+    # connected 를 주면 그걸 쓴다 — 한 호출에서 리소스 여럿을 볼 때 연결 목록을 한 번만 읽으려고 (kubectl 훅의 _pr_path)
+    if connected is None and cluster_id is not None:
         try:
             connected = {repo.repository for repo in await server_api.manifest_repos(cluster_id)}
         except Exception:
             logger.exception("연결된 레포 목록을 읽지 못해 kubectl 길로 둔다: cluster=%s", cluster_id)
             return Route("kubectl", "레포 연결 상태를 확인하지 못해 PR 길을 정할 수 없어요.", known=False, **common)
-    if repository not in connected:
+    if repository not in (connected or set()):
         return Route("kubectl", f"{app_label} 의 레포 {repository} 가 Kukie 에 연결돼 있지 않아요. "
                                 "레포를 연결하면 PR 로 바꿀 수 있어요.", **common)
     source_type = common["source"].source_type
