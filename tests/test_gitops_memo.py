@@ -217,3 +217,41 @@ def test_propose_git_change를_고집해도_run이_실패하지_않는다(client
     assert body["kind"] == "answer"
     last = [p for p in script.views[-1] if isinstance(p, ToolReturnPart) and p.tool_name == "propose_git_change"]
     assert last and "kubectl 길" in str(last[-1].content)
+
+
+def test_메모가_든_run이_실패하면_숨은_칸은_그대로고_다음_턴에_다시_넣는다(client, fake_server, room, cluster):
+    """칸을 처리기에서 바로 쓰면 메모는 버려졌는데 칸만 앞서 가서 영영 알리지 못한다 (agent#127 리뷰)."""
+    _chat(client, room, Script())
+    fake_server.unlink_repo(_cluster_of(fake_server, room), REPO)
+
+    def boom(messages, info):
+        assert len(_memos([p for m in messages for p in m.parts])) == 1      # 메모는 넣었지만
+        raise RuntimeError("모델 오류")
+
+    with agent.override(model=FunctionModel(boom)):
+        r = client.post(f"/conversations/{room}/chat", json={"text": "실패"}, headers=USER)
+    assert r.status_code == 500
+    assert fake_server.repo_link_states[room] == {"repos": [REPO]}           # run 이 실패해 칸은 그대로
+
+    _chat(client, room, Script())
+    assert [len(found) for found in _saved_memos(fake_server, room)] == [0, 0, 1]
+    assert fake_server.repo_link_states[room] == {"repos": []}
+
+
+def test_기록은_저장됐는데_칸_쓰기만_실패하면_다음_턴에_메모를_또_넣지_않는다(client, fake_server, room, cluster, monkeypatch):
+    from kukie_agent import server_api
+
+    _chat(client, room, Script())
+    fake_server.unlink_repo(_cluster_of(fake_server, room), REPO)
+    real = server_api.update_repo_link_state
+
+    async def down(conversation_id, state):
+        raise server_api.ServerError(503, "SERVER_UNAVAILABLE", "down")
+
+    monkeypatch.setattr(server_api, "update_repo_link_state", down)
+    _chat(client, room, Script())                                            # 메모는 저장, 칸 쓰기 실패
+    monkeypatch.setattr(server_api, "update_repo_link_state", real)
+    _chat(client, room, Script())
+
+    assert [len(found) for found in _saved_memos(fake_server, room)] == [0, 1, 0]
+    assert fake_server.repo_link_states[room] == {"repos": []}

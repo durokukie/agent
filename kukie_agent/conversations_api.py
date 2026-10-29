@@ -43,6 +43,7 @@ from kukie_agent import progress, server_api
 from kukie_agent.auth import User, current_user
 from kukie_agent.clusters import access
 from kukie_agent.conversations import Conversation, registry
+from kukie_agent.gitops import memo as repo_link_memo
 
 logger = logging.getLogger(__name__)
 
@@ -240,10 +241,12 @@ async def chat(
             with _with_cluster(session, conn):
                 payload, result = await _server._chat_turn(session, body.text)
         except HTTPException as exc:
+            await repo_link_memo.settle(session.deps, saved=False)
             wrapped = _wrap(exc)
             await _fail_run(run, wrapped)
             raise wrapped
         except Exception as exc:                 # 모델·툴 예외 — run 은 실패로 남기고 세션은 유지
+            await repo_link_memo.settle(session.deps, saved=False)
             logger.exception("run 실패 (conversation=%s, run=%s)", conversation_id, run.id)
             failed = _error(500, "RUN_FAILED", f"요청 처리에 실패했다 ({type(exc).__name__}) — 서버 로그 참고")
             await _fail_run(run, failed)
@@ -299,6 +302,8 @@ async def _save_or_fail(
         await server_api.update_run(run.id, **fields)
     except Exception as exc:
         logger.exception("실행 결과 저장 실패 (conversation=%s, run=%s)", conversation_id, run.id)
+        if session is not None:
+            await repo_link_memo.settle(session.deps, saved=False)   # 메모가 든 기록이 저장되지 않았다 — 칸도 그대로
         try:
             if keep_payload:
                 await server_api.update_run(run.id, status=failure_status)
@@ -314,6 +319,9 @@ async def _save_or_fail(
             if history_before is not None:
                 session.history = history_before
         raise on_failure from exc
+    if session is not None:
+        # 메모가 든 이 run 의 기록이 server 에 남았다 — 이제 숨은 칸을 지금 상태로 바꾼다 (DURO-135, gitops/memo.py)
+        await repo_link_memo.settle(session.deps, saved=True)
 
 
 def _approved_plan_ids(session: Any, also_approved: str | None = None) -> list[str]:
@@ -406,6 +414,7 @@ async def approve(
             with _with_cluster(session, conn):
                 outcome, result = await _server._approve(session, body.call_id, body.approved)
         except HTTPException as exc:
+            await repo_link_memo.settle(session.deps, saved=False)
             raise await _record_failure(run, _wrap(exc))
         return await _continue_run(conversation, run, outcome, result, plan_ids)
 
@@ -432,6 +441,7 @@ async def resume(
             with _with_cluster(session, conn):
                 outcome, result = await _server._resume(session)
         except HTTPException as exc:
+            await repo_link_memo.settle(session.deps, saved=False)
             raise await _record_failure(run, _wrap(exc))
         return await _continue_run(conversation, run, outcome, result, plan_ids)
 
@@ -465,11 +475,13 @@ async def _continue_run(
         if result is None
         else dict(on_failure=_resume_store_failure(plan_ids), failure_status="recovery_required")
     )
+    # session 은 숨은 칸 정리(repo_link_memo.settle)에만 쓰인다 — 실패 상태가 둘 다 활성이라 티켓·기록은 건드리지 않는다
+    session = conversation.session
     if outcome.get("kind") == "approval":
-        await _save_or_fail(conversation.id, run, **failure, status="awaiting_approval", **fields)
+        await _save_or_fail(conversation.id, run, **failure, session=session, status="awaiting_approval", **fields)
         return outcome
     # completed 는 종료 상태다 — 남은 계획이 있으면 server 가 같이 닫는다
-    await _save_or_fail(conversation.id, run, **failure, status="completed", **fields)
+    await _save_or_fail(conversation.id, run, **failure, session=session, status="completed", **fields)
     return outcome
 
 

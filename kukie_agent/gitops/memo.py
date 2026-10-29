@@ -15,8 +15,12 @@ ProcessHistory 가 고친 기록은 ctx.messages 를 덮어써 그 run 의 new_m
 SystemPromptPart 가 아니라 UserPromptPart 다 — 공급자 어댑터가 system 조각을 시스템 프롬프트로 모으면 캐시가 깨진다.
 화면 블록이 "이번 턴" 을 찾을 때 메모를 새 질문으로 보지 않게 MARK 로 시작한다 (response._current_turn).
 
-어떤 실패도 올리지 않는다 — 메모는 길 강제(ModelRetry)를 돕는 것이지 대신하지 않는다. 숨은 칸을 못 쓰면 메모도 넣지 않는다
-(넣고 못 쓰면 다음 요청이 또 넣는다).
+숨은 칸은 **run 의 기록이 server 에 저장된 뒤에** 쓴다 (settle — conversations_api._save_or_fail). 처리기에서 바로 쓰면 run 이 실패해
+메모가 든 기록이 버려졌을 때 칸만 앞서 가서, 다음 run 이 "같다" 고 보고 메모를 영영 넣지 않는다 (agent#127 리뷰).
+그래서 처리기는 쓸 값을 run 별로 맡겨 두고(_pending), 같은 run 의 다음 요청은 기록에 이미 든 같은 메모를 보고 다시 넣지 않는다.
+저장이 실패하면 맡긴 값을 버린다 — 다음 run 이 다시 비교해 메모를 다시 넣는다.
+
+어떤 실패도 올리지 않는다 — 메모는 길 강제(ModelRetry)를 돕는 것이지 대신하지 않는다.
 """
 from __future__ import annotations
 
@@ -34,6 +38,8 @@ from kukie_agent.deps import Deps
 logger = logging.getLogger(__name__)
 
 MARK = "[Kukie 알림]"
+#: run id → 저장이 끝나면 숨은 칸에 쓸 값
+_pending: dict[str, dict[str, Any]] = {}
 
 
 def is_memo(part: Any) -> bool:
@@ -54,9 +60,17 @@ def _has_history(messages: list[ModelMessage]) -> bool:
     return any(isinstance(message, ModelResponse) for message in messages)
 
 
+def _last_memo(messages: list[ModelMessage]) -> str | None:
+    for message in reversed(messages):
+        for part in getattr(message, "parts", ()):
+            if is_memo(part):
+                return part.content
+    return None
+
+
 async def repo_link_memo(ctx: RunContext[Deps], messages: list[ModelMessage]) -> list[ModelMessage]:
     deps = ctx.deps
-    if deps.conversation_id is None or deps.cluster_id is None or not messages:
+    if deps.conversation_id is None or deps.cluster_id is None or deps.run_id is None or not messages:
         return messages                          # flat 엔드포인트 — 레포 연결이 없다
     last = messages[-1]
     if not isinstance(last, ModelRequest):
@@ -68,20 +82,32 @@ async def repo_link_memo(ctx: RunContext[Deps], messages: list[ModelMessage]) ->
         logger.exception("레포 연결 상태를 읽지 못해 메모를 건너뛴다: conversation=%s", deps.conversation_id)
         return messages
     state = {"repos": now}
-    if seen == state:
-        return messages
+    if seen == state or _pending.get(deps.run_id) == state:
+        return messages        # 같다, 또는 이 run 의 앞 요청이 이미 판단했다(칸은 저장 뒤에 바뀐다)
     before = list((seen or {}).get("repos") or [])
+    _pending[deps.run_id] = state
     # 처음 보는 대화인데 앞선 기록이 없다 = 새 대화의 첫 질문이다. 알릴 "옛 답변" 이 없으니 칸만 채운다
-    write_memo = (seen is not None or _has_history(messages)) and before != now
+    if (seen is None and not _has_history(messages)) or before == now:
+        return messages
+    text = memo_text(before, now)
+    if _last_memo(messages) == text:
+        return messages        # 이 run 의 앞 요청이 넣었거나, 지난 run 이 넣고 칸 쓰기만 실패했다 — 한 줄이면 된다
+    memo = UserPromptPart(content=text)
+    return [*messages[:-1], dataclasses.replace(last, parts=[memo, *last.parts])]
+
+
+async def settle(deps: Deps, *, saved: bool) -> None:
+    """run 의 기록 저장이 끝났다(saved) — 맡겨 둔 값을 숨은 칸에 쓴다. 저장이 실패했으면 버린다. 실패해도 올리지 않는다."""
+    if deps.run_id is None:
+        return
+    state = _pending.pop(deps.run_id, None)
+    if not saved or state is None or deps.conversation_id is None:
+        return
     try:
         await server_api.update_repo_link_state(deps.conversation_id, state)
     except Exception:
-        logger.exception("숨은 칸을 쓰지 못해 메모를 건너뛴다: conversation=%s", deps.conversation_id)
-        return messages
-    if not write_memo:
-        return messages
-    memo = UserPromptPart(content=memo_text(before, now))
-    return [*messages[:-1], dataclasses.replace(last, parts=[memo, *last.parts])]
+        # 다음 run 이 다시 비교한다. 메모는 기록에 이미 있으니 같은 메모를 또 넣지 않는다 (_last_memo)
+        logger.exception("숨은 칸을 쓰지 못했다: conversation=%s", deps.conversation_id)
 
 
 capability = ProcessHistory(repo_link_memo)
