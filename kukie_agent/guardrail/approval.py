@@ -242,6 +242,12 @@ class ApprovalRequest(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    # ArgoCD 가 관리하는 리소스면 경고 (DURO-129) — {summary, level, warning, applications, resources}, 모양은
+    # kukie_agent/argocd.py inspect. 아니거나 판별을 못 했으면 칸이 없다 (옛 카드와 같은 모양)
+    argocd: dict[str, Any] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 async def build_approval_request(
@@ -301,4 +307,5 @@ async def build_approval_request(
             if call.tool_name == "apply_manifest"
             else None
         ),
+        argocd=plan.argocd,
     )

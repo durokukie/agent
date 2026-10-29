@@ -105,6 +105,10 @@ class ActionPlan:
     applied_at: str | None = None                      # kubectl 이 실제로 적용된 시각 — 검증이 실패해도 남는다 (DURO-83)
     run_id: str | None = None                          # 어느 run 의 계획인가. None 이면 server 에 넣지 않는다 (flat 엔드포인트)
     code: str | None = None                            # server 계획의 표시용 id. 파일 계획은 id 가 곧 표시용이라 None
+    # ArgoCD 가 관리하는 리소스를 kubectl 로 바꾸는 계획이면 그 판별(kukie_agent/argocd.py inspect). 아니면 None (DURO-129).
+    # 만들 때 payload 에 싣는다. 동작(_act)마다 server 가 돌려준 payload 로 다시 맞춰진다 — kukie-server 의 PlanResponse.payload 는
+    # 저장한 Map 을 모르는 키까지 그대로 준다. 승인 대조(request_hash·decision 의 call)에는 들어가지 않는다
+    argocd: dict[str, Any] | None = None
 
     @property
     def remote(self) -> bool:
@@ -126,6 +130,7 @@ class ActionPlan:
         expected_effects: list[str],
         side_effects: list[str],
         run_id: str | None = None,
+        argocd: dict[str, Any] | None = None,
     ) -> "ActionPlan":
         if not isinstance(args, dict):
             raise TypeError("args must be a dict")
@@ -149,6 +154,8 @@ class ActionPlan:
                     "intent": intent,
                     "expected_effects": list(expected_effects),
                     "side_effects": list(side_effects),
+                    # 관리 리소스일 때만 칸이 생긴다 — 아닌 계획의 payload 는 예전과 같다
+                    **({"argocd": argocd} if argocd is not None else {}),
                 },
             )
             return cls.from_response(created)
@@ -176,6 +183,7 @@ class ActionPlan:
                 intent=intent,
                 expected_effects=list(expected_effects),
                 side_effects=list(side_effects),
+                argocd=argocd,
             )
             try:
                 plan._write(exclusive=True)
@@ -224,6 +232,7 @@ class ActionPlan:
                 failure_reason=metadata.get("failure_reason"),
                 applied_at=metadata.get("applied_at"),
                 run_id=metadata.get("run_id"),
+                argocd=metadata.get("argocd"),
             )
         except (KeyError, TypeError) as exc:
             raise ValueError(f"invalid Action Plan frontmatter: {path}") from exc
@@ -255,6 +264,7 @@ class ActionPlan:
             applied_at=plan.applied_at,
             run_id=plan.run_id,
             code=plan.code,
+            argocd=payload.get("argocd"),
         )
 
     @classmethod
@@ -301,6 +311,8 @@ class ActionPlan:
             "failure_reason": self.failure_reason,
             "applied_at": self.applied_at,
             "run_id": self.run_id,
+            # 판단 가이드(render_markdown)도 이 칸을 본다. 관리 리소스가 아니면 칸 자체가 없다 — 예전 계획서와 같은 모양
+            **({"argocd": self.argocd} if self.argocd is not None else {}),
         }
 
     def _serialize(self) -> str:

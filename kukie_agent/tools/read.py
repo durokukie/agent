@@ -8,10 +8,15 @@ docstring이 모델의 툴 선택 근거다. 사람에게 설명하듯 명확하
 """
 from __future__ import annotations
 
+import logging
+
 from pydantic_ai import RunContext
 
+from kukie_agent import argocd
 from kukie_agent.deps import Deps
 from kukie_agent.kubectl import KubectlResult, run_kubectl
+
+logger = logging.getLogger(__name__)
 
 
 def _ns(ctx: RunContext[Deps], namespace: str | None) -> list[str]:
@@ -45,7 +50,17 @@ def describe_resource(ctx: RunContext[Deps], kind: str, name: str,
     앱이 찍은 로그가 필요하면 get_logs를 쓴다.
     """
     args = ["describe", kind, name, *_ns(ctx, namespace)]
-    return run_kubectl(args, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig)
+    result = run_kubectl(args, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig)
+    if not result.success:
+        return result
+    # ArgoCD 가 관리하면 그 사실을 같이 싣는다 (DURO-129) — 바꾸자고 하기 전에 모델이 알게. 못 알아보면 그대로 둔다
+    try:
+        found = argocd.inspect([{"kind": kind, "name": name, "namespace": namespace or ctx.deps.namespace}],
+                               context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig)
+    except Exception:
+        logger.exception("describe 의 ArgoCD 판별을 건너뛴다")
+        found = None
+    return result.model_copy(update={"note": argocd.note(found)}) if found else result
 
 
 def get_events(ctx: RunContext[Deps], namespace: str | None = None,

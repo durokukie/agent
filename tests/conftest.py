@@ -32,6 +32,19 @@ def _forget_readable_namespaces(monkeypatch):
     monkeypatch.setattr(clusters_api, "OVERVIEW_SHARE_TTL", 0)
 
 
+#: ArgoCD 가 없는 클러스터의 kubectl 답 — 리소스도 Application 도 못 읽는다
+NO_ARGOCD = KubectlResult(command="kubectl get", stdout="", success=False, exit_code=1,
+                          stderr='error: the server doesn\'t have a resource type "applications"')
+
+
+@pytest.fixture(autouse=True)
+def _no_argocd_by_default(monkeypatch):
+    """ArgoCD 판별(kukie_agent/argocd.py)의 kubectl 은 늘 실패한다 — 진짜 kubectl 을 부르지 않고, 다른 테스트는 지금처럼
+    ArgoCD 없는 클러스터로 돈다. 판별을 보는 테스트(test_argocd.py)가 직접 바꿔 끼운다."""
+    from kukie_agent import argocd
+    monkeypatch.setattr(argocd, "run_kubectl", lambda *a, **k: NO_ARGOCD)
+
+
 @pytest.fixture(autouse=True)
 def _server_off_by_default(monkeypatch):
     """kukie_agent 를 import 하면 load_dotenv(".env") 가 개발자 .env 의 KUKIE_SERVER_URL 을 환경에 올린다.

@@ -13,6 +13,9 @@ LLM은 발동 여부에 관여할 수 없다. wrap 훅 하나가 전 단계를 �
 대화 경로의 Plan 은 Kukie API 서버가 원본이다 (DURO-113, guardrail/action_plan.py). 각 단계는 server 의
 상태 전이(dry-run·offer·decision·start·result …)가 기록된 뒤에야 다음으로 넘어간다. 특히 kubectl 직전의
 decision·start 가 server 에 닿지 못하면 실행하지 않는다 — 기록 없이 돈 변경은 재시도에서 두 번 적용될 수 있다.
+
+ArgoCD 가 관리하는 리소스면 (DURO-129, kukie_agent/argocd.py) Plan 을 만들기 전에 판별해 Plan·승인 카드에 경고를 싣는다.
+막지는 않는다(결정: 경고 후 허용). 판별을 못 하면(권한 없음·ArgoCD 없음·시간 초과) 지금처럼 경고 없이 간다.
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ from anyio import to_thread
 from pydantic_ai import ApprovalRequired, ModelRetry, ToolFailed
 from pydantic_ai.capabilities.hooks import Hooks
 
+from kukie_agent import argocd
 from kukie_agent.guardrail.action_plan import ActionPlan, PlanTarget
 from kukie_agent.guardrail.approval import _manifest_preview
 from kukie_agent.guardrail.decision_guidance import generate_decision_guidance
@@ -38,6 +42,9 @@ hooks = Hooks()
 #: 동시에 도는 dry-run 상한. 넘치면 다음 dry-run 은 기다린다 — 다른 채팅방의 툴·DNS 는 영향 없다.
 #: probe(4)보다 큰 건 채팅 중에 일어나 여러 방에서 몰리기 때문이다.
 DRY_RUN_WORKERS = 8
+#: 동시에 도는 ArgoCD 판별(argocd.inspect, 읽기 조회 최대 argocd.LOOKUP_BUDGET 초) 상한. dry-run 과 따로 묶는다 —
+#: 같이 묶으면 한 변경 호출이 dry-run 슬롯을 두 번 잡아 판별끼리도 dry-run 앞에서 줄을 선다 (agent#123 리뷰)
+ARGOCD_LOOKUP_WORKERS = 8
 
 
 def _recorded_result(plan: ActionPlan) -> KubectlResult:
@@ -79,6 +86,29 @@ def _guidance_manifest(manifest_yaml: str | None) -> list[dict] | None:
     모델을 한 번 더 부르지 않는 편이 낫다.
     """
     return _manifest_preview(manifest_yaml) if manifest_yaml else None
+
+
+async def _argocd_ownership(ctx, target: PlanTarget) -> dict | None:
+    """대상 리소스가 ArgoCD 관리인지 (argocd.inspect). 무슨 일이 있어도 올리지 않는다 — 경고를 못 붙일 뿐 승인 카드는 뜬다."""
+    namespace = target.get("namespace")
+    resources = target.get("resources") or [target]
+    targets = [
+        {
+            "kind": resource["kind"],
+            "name": resource["name"],
+            **({"namespace": resource.get("namespace") or namespace} if resource.get("namespace") or namespace else {}),
+        }
+        for resource in resources
+    ]
+    try:
+        # dry-run 과 같은 이유로 스레드로 넘긴다 (아래 rehearsal). 상한은 따로다 (ARGOCD_LOOKUP_WORKERS)
+        return await to_thread.run_sync(
+            partial(argocd.inspect, targets, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig),
+            limiter=thread_limiter("argocd_lookup", ARGOCD_LOOKUP_WORKERS),
+        )
+    except Exception:
+        logger.exception("ArgoCD 판별을 건너뛴다")
+        return None
 
 
 def _manifest_resources(manifest_yaml: str) -> list[dict[str, str]]:
@@ -235,6 +265,9 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
             return result.model_copy(update={"stderr": stderr})
         return result
 
+    # 승인 뒤(위 분기)에는 다시 보지 않는다 — 카드에 실린 경고를 보고 승인한 것이다.
+    # 승인 순간 다시 판단해 길이 바뀌면 STALE 로 돌리는 것은 PR 길(DURO-134)과 함께 한다 (설계 1절)
+    managed = await _argocd_ownership(ctx, target)
     plan = await ActionPlan.create_draft(
         run_id=ctx.deps.run_id,
         call_id=call.tool_call_id,
@@ -247,6 +280,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
         intent=intent,
         expected_effects=args["expected_effects"],
         side_effects=args["side_effects"],
+        argocd=managed,
     )
 
     stdin = (
