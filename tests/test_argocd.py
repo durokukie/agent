@@ -1,10 +1,11 @@
-"""ArgoCD 관리 리소스 판별 — kukie_agent/argocd.py (DURO-129 가드레일 경고, DURO-140 앱 목록 API).
+"""ArgoCD 관리 리소스 판별 — kukie_agent/argocd.py (DURO-129 가드레일 경고, DURO-140 앱 목록 API, DURO-145 앱 상세 API).
 
 판별은 순수 함수와 가짜 kubectl(argocd.run_kubectl)로 본다. 다른 테스트는 conftest 의 _no_argocd_by_default 로
 "ArgoCD 없는 클러스터" 에서 돈다 — 여기서만 ArgoCD 가 있는 클러스터를 바꿔 끼운다.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -14,8 +15,8 @@ from fastapi.testclient import TestClient
 from pydantic_ai import ApprovalRequired
 from pydantic_ai.messages import ToolCallPart
 
-from helpers import USER
-from kukie_agent import argocd, server
+from helpers import OTHER, USER
+from kukie_agent import argocd, clusters_api, server
 from kukie_agent.guardrail import hook
 from kukie_agent.guardrail.action_plan import ActionPlan
 from kukie_agent.guardrail.approval import build_approval_request
@@ -429,6 +430,7 @@ def test_ArgoCD_없음과_권한_없음은_200으로_가른다(client, fake_serv
     (_fail("E1030 memcache.go:265] couldn't get current server API group list: Get \"https://10.0.0.1/api\": "
            "dial tcp 10.0.0.1:443: connect: connection refused\n" + ABSENT), "CLUSTER_UNREACHABLE"),
     (KubectlResult(command="kubectl get", stdout="not json", stderr="", success=True), "CLUSTER_BAD_RESPONSE"),
+    (_ok({"items": [{**_application(), "status": ["x"]}]}), "CLUSTER_BAD_RESPONSE"),
 ])
 def test_그_밖의_실패는_개요와_같이_502(client, fake_server, monkeypatch, answer, code):
     cluster = fake_server.add_cluster(owner="u-1")
@@ -442,3 +444,330 @@ def test_볼_수_없는_클러스터는_404이고_kubectl은_돌지_않는다(cl
     ran = _api(monkeypatch, _ok({"items": []}))
     r = client.get(f"/clusters/{cluster}/argocd/applications", headers=USER)
     assert r.status_code == 404 and ran == []
+
+
+# ── 앱 상세 API (DURO-145) ─────────────────────────────────
+
+SHA = "f24edf8215a75239819c0a0cbbf9334e4ee444dc"
+OLD_SHA = "0d1c2b3a4f5e6d7c8b9a0f1e2d3c4b5a69788776"
+
+
+def _detailed(**status) -> dict:
+    """OutOfSync 하나·지울 것 하나·실패한 sync·조건이 있는 Application (ArgoCD 2 처럼 리소스 health 를 CR 에 둔다)."""
+    return _application("guestbook", automated={"prune": True}, status={
+        "sourceType": "Kustomize",
+        "sync": {"status": "OutOfSync", "revision": SHA},
+        "health": {"status": "Degraded", "message": "1 개 파드가 준비되지 않았다"},
+        "reconciledAt": "2026-10-30T01:00:00Z",
+        "resources": [
+            {"version": "v1", "kind": "Service", "namespace": "shop", "name": "guestbook-ui", "status": "Synced",
+             "health": {"status": "Healthy"}},
+            {"group": "apps", "version": "v1", "kind": "Deployment", "namespace": "shop", "name": "guestbook-ui",
+             "status": "OutOfSync", "health": {"status": "Degraded", "message": "ImagePullBackOff"}},
+            {"version": "v1", "kind": "ConfigMap", "namespace": "shop", "name": "old", "status": "OutOfSync",
+             "requiresPruning": True},
+            {"version": "v1", "kind": "Namespace", "name": "shop", "status": "Synced"},
+        ],
+        "operationState": {
+            "phase": "Failed", "startedAt": "2026-10-30T00:59:00Z", "finishedAt": "2026-10-30T00:59:05Z",
+            "message": "one or more objects failed to apply", "retryCount": 2,
+            "operation": {"initiatedBy": {"username": "pty"}, "sync": {"revision": SHA}},
+            "syncResult": {"revision": SHA, "resources": [
+                {"group": "", "kind": "Service", "namespace": "shop", "name": "guestbook-ui", "status": "Synced",
+                 "message": "service/guestbook-ui unchanged"},
+                {"group": "apps", "kind": "Deployment", "namespace": "shop", "name": "guestbook-ui",
+                 "status": "SyncFailed", "message": "admission webhook denied the request"},
+                {"group": "batch", "kind": "Job", "namespace": "shop", "name": "migrate", "status": "Synced",
+                 "hookPhase": "Failed", "message": "Job has reached the specified backoff limit"},
+            ]},
+        },
+        "history": [{"id": i, "revision": f"{i:040x}", "deployStartedAt": f"2026-10-{i + 10}T00:00:00Z",
+                     "deployedAt": f"2026-10-{i + 10}T00:00:01Z", "initiatedBy": {"automated": True}}
+                    for i in range(12)],
+        "summary": {"images": ["nginx:1.28", "busybox:1.36"]},
+        "conditions": [{"type": "SyncError", "message": "Failed sync attempt", "lastTransitionTime": "2026-10-30T00:59:05Z"},
+                       {"type": "OrphanedResourceWarning", "message": "1 orphaned resource"}],
+        **status,
+    })
+
+
+def test_상세는_목록의_한_줄에_리소스_마지막_sync_기록_이미지_오류를_더한다():
+    app = argocd.application_detail(_detailed())
+    assert {key: app[key] for key in argocd.application_row(_detailed())} == argocd.application_row(_detailed())
+    assert (app["auto_sync"], app["self_heal"], app["prune"]) == (True, False, True)
+    assert (app["health_status"], app["health_message"]) == ("Degraded", "1 개 파드가 준비되지 않았다")
+    assert (app["revisions"], app["reconciled_at"]) == ([SHA], "2026-10-30T01:00:00Z")
+    assert app["sources"] == [{"repo_url": "https://github.com/acme/manifests", "path": "guestbook", "chart": None,
+                               "target_revision": "main", "ref": None, "source_type": "Kustomize"}]
+
+    assert app["resource_health"] is True
+    assert app["resources"][0] == {"group": None, "kind": "Service", "namespace": "shop", "name": "guestbook-ui",
+                                   "sync_status": "Synced", "health_status": "Healthy", "health_message": None,
+                                   "requires_pruning": False}
+    assert app["resources"][3]["namespace"] is None              # 클러스터 범위
+    assert [(r["kind"], r["health_message"], r["requires_pruning"]) for r in app["out_of_sync"]] == [
+        ("Deployment", "ImagePullBackOff", False), ("ConfigMap", None, True)]
+
+    assert app["last_sync"] == {
+        "phase": "Failed", "started_at": "2026-10-30T00:59:00Z", "finished_at": "2026-10-30T00:59:05Z",
+        "message": "one or more objects failed to apply", "revisions": [SHA], "retry_count": 2,
+        "automated": False, "initiated_by": "pty",
+        "failed_resources": [
+            {"group": "apps", "kind": "Deployment", "namespace": "shop", "name": "guestbook-ui",
+             "status": "SyncFailed", "message": "admission webhook denied the request"},
+            {"group": "batch", "kind": "Job", "namespace": "shop", "name": "migrate", "status": "Synced",
+             "message": "Job has reached the specified backoff limit"}]}
+
+    assert len(app["history"]) == argocd.HISTORY_LIMIT
+    assert [entry["id"] for entry in app["history"]][:2] == [11, 10]       # 최근 것이 먼저
+    assert app["history"][0] == {"id": 11, "revisions": [f"{11:040x}"], "deploy_started_at": "2026-10-21T00:00:00Z",
+                                 "deployed_at": "2026-10-21T00:00:01Z", "automated": True, "initiated_by": None}
+    assert app["images"] == ["nginx:1.28", "busybox:1.36"]
+    assert app["conditions"] == [
+        {"type": "SyncError", "message": "Failed sync attempt", "last_transition_time": "2026-10-30T00:59:05Z"},
+        {"type": "OrphanedResourceWarning", "message": "1 orphaned resource", "last_transition_time": None}]
+
+
+def test_ArgoCD_3_은_리소스_health_를_CR_에_두지_않는다():
+    app = argocd.application_detail(_detailed(resourceHealthSource="appTree", resources=[
+        {"group": "apps", "kind": "Deployment", "namespace": "shop", "name": "guestbook-ui", "status": "Synced"}]))
+    assert app["resource_health"] is False
+    assert app["resources"][0]["health_status"] is None and app["health_status"] == "Degraded"
+
+
+def test_sync_진행_중이면_요청한_revision_을_싣는다():
+    app = argocd.application_detail(_detailed(operationState={
+        "phase": "Running", "startedAt": "2026-10-30T01:00:00Z", "message": "waiting for healthy state",
+        "operation": {"initiatedBy": {"automated": True}, "sync": {"revision": SHA}}}))
+    assert app["last_sync"] == {"phase": "Running", "started_at": "2026-10-30T01:00:00Z", "finished_at": None,
+                                "message": "waiting for healthy state", "revisions": [SHA], "retry_count": 0,
+                                "automated": True, "initiated_by": None, "failed_resources": []}
+
+
+def test_아직_sync_안_한_앱은_빈_칸이다():
+    app = argocd.application_detail(_application("fresh", status={}))
+    assert (app["sync_status"], app["health_status"], app["source_type"]) == ("Unknown", "Unknown", None)
+    assert app["sources"][0]["source_type"] is None
+    assert (app["revisions"], app["resources"], app["out_of_sync"], app["history"], app["images"],
+            app["conditions"]) == ([], [], [], [], [], [])
+    assert (app["last_sync"], app["reconciled_at"], app["health_message"]) == (None, None, None)
+    assert app["resource_health"] is True
+    item = _application("bare")
+    del item["status"]
+    assert argocd.application_detail(item)["last_sync"] is None
+
+
+def test_여러_소스는_목록이고_revision_도_소스마다다():
+    item = _application("multi", status={
+        "sourceTypes": ["Helm", "Directory"],
+        "sync": {"status": "Synced", "revisions": ["1.2.3", SHA]},
+        "operationState": {"phase": "Succeeded", "operation": {"sync": {"revisions": ["1.2.3", SHA]}},
+                           "syncResult": {"revisions": ["1.2.3", SHA]}},
+        "history": [{"id": 0, "revisions": ["1.2.2", OLD_SHA]}, {"id": 1, "revisions": ["1.2.3", SHA]}],
+    })
+    del item["spec"]["source"]
+    item["spec"]["sources"] = [
+        {"repoURL": "https://charts.acme.io", "chart": "web", "targetRevision": "1.2.3",
+         "helm": {"valueFiles": ["$values/web/values.yaml"]}},
+        {"repoURL": "https://github.com/acme/values", "targetRevision": "main", "ref": "values"},
+    ]
+    app = argocd.application_detail(item)
+    assert app["sources"] == [
+        {"repo_url": "https://charts.acme.io", "path": None, "chart": "web", "target_revision": "1.2.3", "ref": None,
+         "source_type": "Helm"},
+        {"repo_url": "https://github.com/acme/values", "path": None, "chart": None, "target_revision": "main",
+         "ref": "values", "source_type": "Directory"}]
+    assert app["revisions"] == ["1.2.3", SHA] and app["last_sync"]["revisions"] == ["1.2.3", SHA]
+    assert [entry["revisions"] for entry in app["history"]] == [["1.2.3", SHA], ["1.2.2", OLD_SHA]]
+    assert (app["repo_url"], app["chart"]) == ("https://charts.acme.io", "web")      # 목록 칸은 첫 소스
+    item["spec"]["source"] = {"repoURL": "https://github.com/acme/ignored", "path": "x"}    # ArgoCD 는 sources 를 쓴다
+    app = argocd.application_detail(item)
+    assert app["repo_url"] == app["sources"][0]["repo_url"] == "https://charts.acme.io" and len(app["sources"]) == 2
+
+
+@pytest.mark.parametrize(("namespace", "name", "ok"), [
+    ("argocd", "guestbook", True), ("team-a", "web.v2", True), ("argocd", "-o", False), ("-n", "web", False),
+    ("argocd", "Web", False), ("argo.cd", "web", False), ("argocd", "a" * 254, False), ("a" * 64, "web", False),
+])
+def test_URL_의_namespace_와_이름은_쿠버네티스_이름_꼴이어야_한다(namespace, name, ok):
+    assert argocd.valid_ref(namespace, name) is ok
+
+
+@pytest.mark.parametrize(("name", "stderr", "kind"), [
+    ("guestbook", 'Error from server (NotFound): applications.argoproj.io "guestbook" not found', "not_found"),
+    ("forbidden", 'Error from server (NotFound): applications.argoproj.io "forbidden" not found', "not_found"),
+    ("guestbook", 'Error from server (NotFound): namespaces "argocd" not found', "not_found"),     # namespace 가 없다
+    ("unauthorized", 'Error from server (Forbidden): applications.argoproj.io "unauthorized" is forbidden: User "kukie" '
+                     'cannot get resource "applications" in API group "argoproj.io" in the namespace "argocd"', "forbidden"),
+    ("guestbook", ABSENT, "absent"),
+    ("guestbook", "Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout", "error"),
+])
+def test_상세_실패_가르기는_이름에_흔들리지_않는다(name, stderr, kind):
+    assert argocd.detail_failure(stderr, namespace="argocd", name=name) == kind
+
+
+def _detail_url(cluster: str, namespace: str = "argocd", name: str = "guestbook") -> str:
+    return f"/clusters/{cluster}/argocd/applications/{namespace}/{name}"
+
+
+def test_앱_상세는_Application_하나를_읽는다(client, fake_server, monkeypatch):
+    cluster = fake_server.add_cluster(owner="u-1")
+    ran = _api(monkeypatch, _ok(_detailed()))
+    r = client.get(_detail_url(cluster), headers=USER)
+    assert r.status_code == 200
+    body = r.json()
+    assert (body["status"], body["at"].endswith("Z")) == ("ok", True)
+    assert set(body["application"]) == {
+        "name", "namespace", "project", "repo_url", "path", "chart", "target_revision", "source_type",
+        "sync_status", "health_status", "auto_sync", "self_heal", "destination_namespace",
+        "prune", "health_message", "revisions", "reconciled_at", "sources", "resource_health", "resources",
+        "out_of_sync", "last_sync", "history", "images", "conditions"}
+    assert ran == [["get", "applications.argoproj.io", "guestbook", "-n", "argocd", "-o", "json"]]
+
+
+@pytest.mark.parametrize(("stderr", "status"), [(ABSENT, "absent"), (FORBIDDEN, "forbidden")])
+def test_앱_상세도_ArgoCD_없음과_권한_없음은_200으로_가른다(client, fake_server, monkeypatch, stderr, status):
+    cluster = fake_server.add_cluster(owner="u-1")
+    _api(monkeypatch, _fail(stderr))
+    r = client.get(_detail_url(cluster), headers=USER)
+    assert r.status_code == 200
+    assert (r.json()["status"], r.json()["application"]) == (status, None)
+
+
+@pytest.mark.parametrize("stderr", [
+    'Error from server (NotFound): applications.argoproj.io "guestbook" not found',
+    'Error from server (NotFound): namespaces "argocd" not found',            # 지워졌거나 없는 namespace
+])
+def test_없는_앱은_404_ARGOCD_APP_NOT_FOUND(client, fake_server, monkeypatch, stderr):
+    cluster = fake_server.add_cluster(owner="u-1")
+    _api(monkeypatch, _fail(stderr))
+    r = client.get(_detail_url(cluster), headers=USER)
+    assert r.status_code == 404 and r.json()["detail"]["code"] == "ARGOCD_APP_NOT_FOUND"
+
+
+@pytest.mark.parametrize(("namespace", "name"), [("argocd", "-o"), ("argocd", "Guestbook"), ("--all-namespaces", "x")])
+def test_이름_꼴이_아니면_kubectl_없이_404(client, fake_server, monkeypatch, namespace, name):
+    cluster = fake_server.add_cluster(owner="u-1")
+    ran = _api(monkeypatch, _ok(_detailed()))
+    r = client.get(_detail_url(cluster, namespace, name), headers=USER)
+    assert r.status_code == 404 and r.json()["detail"]["code"] == "ARGOCD_APP_NOT_FOUND" and ran == []
+
+
+@pytest.mark.parametrize(("answer", "code"), [
+    (_fail("Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout"), "CLUSTER_UNREACHABLE"),
+    (_fail("error: You must be logged in to the server (Unauthorized)"), "CLUSTER_AUTH_EXPIRED"),
+    (KubectlResult(command="kubectl get", stdout="not json", stderr="", success=True), "CLUSTER_BAD_RESPONSE"),
+    (_ok({"items": []}), "CLUSTER_BAD_RESPONSE"),
+    (_ok({**_application(), "spec": "x"}), "CLUSTER_BAD_RESPONSE"),        # CRD 스키마를 어긴 응답 — 500 이 아니다
+    (_ok({**_application(), "status": ["x"]}), "CLUSTER_BAD_RESPONSE"),
+])
+def test_앱_상세의_그_밖의_실패는_목록과_같이_502(client, fake_server, monkeypatch, answer, code):
+    cluster = fake_server.add_cluster(owner="u-1")
+    _api(monkeypatch, answer)
+    r = client.get(_detail_url(cluster), headers=USER)
+    assert r.status_code == 502 and r.json()["detail"]["code"] == code
+
+
+def test_볼_수_없는_클러스터의_앱_상세는_404이고_kubectl은_돌지_않는다(client, fake_server, monkeypatch):
+    cluster = fake_server.add_cluster(owner="u-2")
+    ran = _api(monkeypatch, _ok(_detailed()))
+    r = client.get(_detail_url(cluster), headers=USER)
+    assert r.status_code == 404 and r.json()["detail"]["code"] != "ARGOCD_APP_NOT_FOUND" and ran == []
+
+
+# ── 나눠 쓰기 — 목록·상세도 개요처럼 (clusters_api._shared_overview) ─────────
+
+@pytest.fixture
+def share_on(monkeypatch):
+    monkeypatch.setattr(clusters_api, "OVERVIEW_SHARE_TTL", 10)
+
+
+def test_같은_연결의_목록은_나눠_쓴다(client, fake_server, monkeypatch, share_on):
+    cluster = fake_server.add_cluster(owner="u-1")
+    ran = _api(monkeypatch, _ok({"items": [_application()]}))
+    first = client.get(f"/clusters/{cluster}/argocd/applications", headers=USER).json()
+    again = client.get(f"/clusters/{cluster}/argocd/applications", headers=USER).json()
+    assert first == again and ran == [argocd.LIST_COMMAND]
+
+
+def test_같은_앱의_상세는_나눠_쓰고_다른_앱_목록과는_따로다(client, fake_server, monkeypatch, share_on):
+    cluster = fake_server.add_cluster(owner="u-1")
+    ran = _api(monkeypatch, _ok(_detailed()))
+    for _ in range(2):
+        assert client.get(_detail_url(cluster), headers=USER).status_code == 200
+    assert len(ran) == 1
+    client.get(_detail_url(cluster, name="other"), headers=USER)
+    client.get(_detail_url(cluster, namespace="team-a"), headers=USER)
+    assert [args[2:5] for args in ran] == [["guestbook", "-n", "argocd"], ["other", "-n", "argocd"],
+                                           ["guestbook", "-n", "team-a"]]
+    _api(monkeypatch, _ok({"items": []}))
+    assert client.get(f"/clusters/{cluster}/argocd/applications", headers=USER).json()["applications"] == []
+
+
+@pytest.mark.parametrize(("url", "stderr", "code"), [
+    ("detail", 'Error from server (NotFound): applications.argoproj.io "guestbook" not found', 404),
+    ("list", "Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout", 502),
+])
+def test_없는_앱과_502는_나눠_쓰지_않는다(client, fake_server, monkeypatch, share_on, url, stderr, code):
+    cluster = fake_server.add_cluster(owner="u-1")
+    ran = _api(monkeypatch, _fail(stderr))
+    path = _detail_url(cluster) if url == "detail" else f"/clusters/{cluster}/argocd/applications"
+    assert [client.get(path, headers=USER).status_code for _ in range(2)] == [code, code]
+    assert len(ran) == 2
+
+
+def test_나눠_쓴_결과도_볼_수_없는_사람에게는_404(client, fake_server, monkeypatch, share_on):
+    cluster = fake_server.add_cluster(owner="u-1")
+    _api(monkeypatch, _ok(_detailed()))
+    assert client.get(_detail_url(cluster), headers=USER).status_code == 200
+    assert client.get(_detail_url(cluster), headers=OTHER).status_code == 404
+
+
+@pytest.mark.parametrize("url", ["list", "detail"])
+def test_fresh_는_막_끝난_결과를_건너뛰고_새로_읽은_것을_다시_나눠_쓴다(client, fake_server, monkeypatch, share_on, url):
+    monkeypatch.setattr(clusters_api, "FRESH_MIN_AGE", 0)      # 아래끝은 따로 본다 (시각을 정해 두고)
+    cluster = fake_server.add_cluster(owner="u-1")
+    ran = _api(monkeypatch, _ok(_detailed() if url == "detail" else {"items": []}))
+    path = _detail_url(cluster) if url == "detail" else f"/clusters/{cluster}/argocd/applications"
+    for query in ("", "?fresh=true", "", "?fresh=false"):
+        assert client.get(path + query, headers=USER).status_code == 200
+    assert len(ran) == 2          # 처음 한 번 + fresh 한 번. 그 뒤 둘은 fresh 가 읽은 것을 쓴다
+
+
+def test_fresh_도_진행_중인_한_번에는_같이_붙는다(share_on):
+    calls = {"n": 0}
+
+    async def compute():
+        calls["n"] += 1
+        await asyncio.sleep(0)
+        return {"n": calls["n"]}
+
+    async def main():
+        return await asyncio.gather(clusters_api._shared_overview("k", compute),
+                                    clusters_api._shared_overview("k", compute, fresh=True))
+
+    assert asyncio.run(main()) == [{"n": 1}, {"n": 1}] and calls["n"] == 1
+
+
+def test_fresh_여도_FRESH_MIN_AGE_보다_덜_된_결과는_나눠_쓴다(share_on):
+    calls = {"n": 0}
+    now = [0.0]
+
+    async def compute():
+        calls["n"] += 1
+        return {"n": calls["n"]}
+
+    async def main():
+        def read(fresh):
+            return clusters_api._shared_overview("k", compute, fresh=fresh, clock=lambda: now[0])
+
+        first = await read(False)
+        await asyncio.sleep(0)                                   # 끝난 시각을 적는 콜백이 돈다
+        now[0] = clusters_api.FRESH_MIN_AGE - 0.5
+        polled = await read(True)                                # fresh 로 폴링해도 아래끝 안이면 같은 것
+        now[0] = clusters_api.FRESH_MIN_AGE
+        refreshed = await read(True)
+        return first, polled, refreshed
+
+    assert asyncio.run(main()) == ({"n": 1}, {"n": 1}, {"n": 2})
+    assert 0 < clusters_api.FRESH_MIN_AGE < clusters_api.OVERVIEW_SHARE_TTL
