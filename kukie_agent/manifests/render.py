@@ -14,6 +14,7 @@ remote_reference(칸 검사)는 막는 데 기대지 않는다 — 왜 렌더하
 """
 from __future__ import annotations
 
+import codecs
 import ipaddress
 import os
 import re
@@ -21,6 +22,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Iterator
 from pathlib import Path
@@ -174,30 +176,48 @@ def _strings(docs: list[Any]) -> Iterator[str]:
             stack.extend([*node.keys(), *node.values()] if isinstance(node, dict) else node)
 
 
+def _redact(address: str) -> str:
+    """문구에 실을 주소 — `scheme://host[:port]` 만. userinfo(`svc:pw@`)·경로는 뺀다 (agent#128 리뷰)."""
+    scheme, sep, rest = address.partition("://")
+    if not sep:
+        return address
+    authority = re.split(r"[/?#\s]", rest, maxsplit=1)[0]
+    return f"{scheme}://{authority.rpartition('@')[2]}"
+
+
 def _loopback_in(text: str) -> str | None:
     for found in _URL_AUTHORITY.finditer(text):
         if _local_host(found.group(1)):
-            return found.group(0)
+            return _redact(found.group(0))
     return None
 
 
-#: 이 컴퓨터 안 주소 검사가 YAML 로 읽어 보는 파일 크기 상한. 넘는 글자 파일이 있으면 렌더하지 않는다 (fail-closed —
-#: 크기로 건너뛰면 큰 플러그인 설정 파일이 빠져나간다). 바이너리는 건너뛴다
+#: 이 크기까지는 YAML 로 읽어 풀린 문자열을 본다. 넘는 글자 파일(CRD 꾸러미 등)은 원시 글자로 흘려 읽으며 주소만 찾는다 —
+#: 이 크기의 파일에 사람이 이스케이프로 주소를 숨긴 설정일 가능성은 낮고, 막아 버리면 그 레포의 렌더가 통째로 안 된다
 MAX_SCAN_BYTES = 5 * 1024 * 1024
+#: 레포 하나의 검사 시간(초). 넘으면 렌더하지 않는다 (fail-closed) — 파일이 아주 많거나 무거운 레포
+SCAN_BUDGET = 10.0
+_STREAM_CHUNK = 1024 * 1024
+_STREAM_OVERLAP = 4096
 
 
-class _TooLarge(Exception):
-    pass
+class ScanTimeout(Exception):
+    """레포 검사가 SCAN_BUDGET 을 넘었다."""
 
 
 def _parse(data: bytes) -> list[Any] | None:
-    """YAML 문서들 — PyYAML(빠르다) 다음 ruamel(YAML 1.2, go-yaml 과 같은 판). 둘 다 못 읽으면 None.
-    bytes 로 넘긴다 — UTF-16(BOM) 도 kustomize(go-yaml)처럼 읽는다."""
+    """YAML 문서들. 둘 다 못 읽으면 None. bytes 로 넘긴다 — UTF-16(BOM) 도 kustomize(go-yaml)처럼 읽는다.
+
+    PyYAML(빠르다)이 YAML 문법으로 거절한 파일만 ruamel(YAML 1.2, go-yaml 과 같은 판 — 순수 파이썬이라 느리다)로 다시 읽는다.
+    그 밖의 실패(깊은 중첩의 RecursionError 등)는 못 읽은 것으로 본다 — 검사가 500 으로 새지 않게 (agent#128 리뷰).
+    """
     loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
     try:
         return list(yaml.load_all(data, Loader=loader))
     except yaml.YAMLError:
         pass
+    except Exception:                                   # RecursionError·MemoryError 등 — 다시 읽어도 같다
+        return None
     try:
         return list(_RuamelYAML(typ="safe", pure=True).load_all(data))
     except Exception:                                   # ruamel 은 오류 종류가 여럿이다 — 못 읽은 것은 다 같다
@@ -210,24 +230,44 @@ def _binary(head: bytes) -> bool:
     return b"\0" in head
 
 
-def _loopback_in_file(file: Path) -> str | None:
-    """파일 하나를 YAML 로 읽어 **풀린** 문자열(키·값)에서 이 컴퓨터 안 주소를 찾는다. 확장자·이름은 보지 않는다 —
-    kustomize 는 generators 등이 가리키는 파일을 이름과 상관없이 YAML 로 읽는다. 원시 글자로 먼저 거르지 않는다 —
-    겹따옴표 이스케이프(`\\/`·`\\u002f`)·줄 이음은 읽어야 `://` 가 된다 (agent#128 리뷰). 주석은 보지 않는다.
+def _encoding(head: bytes) -> str:
+    if head.startswith(b"\xff\xfe"):
+        return "utf-16-le"
+    if head.startswith(b"\xfe\xff"):
+        return "utf-16-be"
+    return "utf-8"
 
-    YAML 로 못 읽는 파일은 건너뛴다 — kustomize 도 설정으로 못 쓴다. 글자로 보면 Helm 템플릿의 localhost 같은 오탐만 는다.
+
+def _stream_loopback(file: Path, head: bytes) -> str | None:
+    """큰 글자 파일을 원시 글자로 흘려 읽으며 이 컴퓨터 안 주소를 찾는다 — 조각 사이에 걸친 주소도 보게 겹쳐 읽는다."""
+    decoder = codecs.getincrementaldecoder(_encoding(head))(errors="replace")
+    tail = ""
+    with file.open("rb") as stream:
+        while chunk := stream.read(_STREAM_CHUNK):
+            text = tail + decoder.decode(chunk)
+            if found := _loopback_in(text):
+                return found
+            tail = text[-_STREAM_OVERLAP:]
+    return None
+
+
+def _loopback_in_file(file: Path) -> str | None:
+    """파일 하나에서 이 컴퓨터 안 주소를 찾는다. 확장자·이름은 보지 않는다 — kustomize 는 generators 등이 가리키는 파일을
+    이름과 상관없이 YAML 로 읽는다. 바이너리는 앞 8KB 만 보고 건너뛴다.
+
+    MAX_SCAN_BYTES 까지는 YAML 로 읽어 **풀린** 문자열(키·값)을 본다 — 원시 글자로 먼저 거르지 않는다. 겹따옴표
+    이스케이프(`\\/`·`\\u002f`)·줄 이음은 읽어야 `://` 가 된다. 주석은 보지 않는다. YAML 로 못 읽는 파일은 건너뛴다 —
+    kustomize 도 설정으로 못 쓴다(글자로 보면 Helm 템플릿의 localhost 같은 오탐만 는다). 넘는 파일은 _stream_loopback.
     """
     try:
-        size = file.stat().st_size
-        if size > MAX_SCAN_BYTES:
-            with file.open("rb") as stream:
-                if _binary(stream.read(8192)):
-                    return None
-            raise _TooLarge(file.name)
-        data = file.read_bytes()
+        with file.open("rb") as stream:
+            head = stream.read(8192)
+            if _binary(head):
+                return None
+            if file.stat().st_size > MAX_SCAN_BYTES:
+                return _stream_loopback(file, head)
+            data = head + stream.read()
     except OSError:
-        return None
-    if _binary(data[:8192]):
         return None
     docs = _parse(data)
     return next((found for value in _strings(docs or []) if (found := _loopback_in(value))), None)
@@ -241,7 +281,8 @@ def _repo_files(root: Path) -> list[Path]:
 
 #: 레포마다 훑은 결과. 열쇠는 부르는 쪽이 준 것(레포 보기는 `<레포>@<커밋 sha>` — tarball 은 커밋마다 같다), 없으면 레포
 #: 폴더의 (경로, inode, ctime) — PR 길은 받은 레포·고친 사본을 각각 한 번 만들고 고친 뒤에 렌더한다.
-#: PR 길의 렌더 비교는 같은 레포로 render() 를 kustomize 루트마다 전·후로 부른다 — 레포 전체를 그만큼 걷지 않게
+#: PR 길의 렌더 비교는 같은 레포로 render() 를 kustomize 루트마다 전·후로 부른다 — 레포 전체를 그만큼 걷지 않게.
+#: 시간 초과는 기억하지 않는다 — 그때의 부하 탓일 수 있다
 _loopback_scans: OrderedDict[str, str | None] = OrderedDict()
 _loopback_lock = threading.Lock()
 _LOOPBACK_SCANS = 64
@@ -253,26 +294,35 @@ def _scan_key(root: Path) -> str:
 
 
 def loopback_reference(root: Path, *, scan_key: str | None = None) -> str | None:
-    """레포의 파일 어디에든 이 컴퓨터 안 주소가 있으면 그 주소 하나. 프록시로 막지 못하는 곳이라 build 전에 본다.
+    """레포의 파일 어디에든 이 컴퓨터 안 주소가 있으면 그 주소 하나(`scheme://host[:port]`). 프록시로 막지 못하는 곳이라
+    build 전에 본다. SCAN_BUDGET 을 넘으면 ScanTimeout.
 
     kustomize 가 가져오는 주소는 반드시 kustomize 가 YAML 로 읽는 어떤 파일 안에 있다. 그래서 고르지 않고 레포의 모든 파일을
-    YAML 로 읽어 본다 — 고르는 규칙(이름·확장자·칸)이 새면 그대로 뚫린다. 가져오지 않는 자리(commonAnnotations·인라인 patch
-    값)의 주소도 거절한다 — 안전 쪽 오탐이다. 검사하지 못한 큰 글자 파일이 있어도 거절한다.
+    본다 — 고르는 규칙(이름·확장자·칸)이 새면 그대로 뚫린다. 가져오지 않는 자리(commonAnnotations·인라인 patch 값)의
+    주소도 거절한다 — 안전 쪽 오탐이다.
     """
     key = scan_key or _scan_key(root)
     with _loopback_lock:
         if key in _loopback_scans:
             _loopback_scans.move_to_end(key)
             return _loopback_scans[key]
-    try:
-        found = next((hit for file in _repo_files(root) if (hit := _loopback_in_file(file))), None)
-    except _TooLarge as exc:
-        found = f"검사하지 못한 큰 파일 {exc}"
+    deadline = _scan_clock() + SCAN_BUDGET
+    found = None
+    for file in _repo_files(root):
+        if _scan_clock() > deadline:
+            raise ScanTimeout(f"{SCAN_BUDGET:g}초")
+        if found := _loopback_in_file(file):
+            break
     with _loopback_lock:
         _loopback_scans[key] = found
         while len(_loopback_scans) > _LOOPBACK_SCANS:
             _loopback_scans.popitem(last=False)
     return found
+
+
+def _scan_clock() -> float:
+    """시각(초) — 테스트가 바꿔 끼운다."""
+    return time.monotonic()
 
 
 def _offline_env(home: str) -> dict[str, str]:
@@ -315,11 +365,14 @@ def render(source_type: str, folder: Path, *, root: Path, recurse: bool = False,
     if source_type == "Directory":
         return render_plain(folder, recurse=recurse, root=root)
     if source_type == "Kustomize":
-        local = loopback_reference(root, scan_key=scan_key)
+        try:
+            local = loopback_reference(root, scan_key=scan_key)
+        except ScanTimeout as exc:
+            raise RenderError(f"레포 검사 시간({exc})이 넘어 렌더하지 않아요 — 이 컴퓨터 안 주소를 다 확인하지 못했어요") from None
         if local is not None:
             raise RenderError(f"레포 안 파일에 이 컴퓨터 안 주소({local})가 있어 렌더하지 않아요")
         remote = remote_reference(folder, root)
         if remote is not None:
-            raise RenderError(f"레포 밖 주소({remote})를 가져오는 Kustomize 는 렌더하지 않아요 — 렌더할 때는 네트워크를 쓰지 않아요")
+            raise RenderError(f"레포 밖 주소({_redact(remote)})를 가져오는 Kustomize 는 렌더하지 않아요 — 렌더할 때는 네트워크를 쓰지 않아요")
         return render_kustomize(folder)
     raise RenderError(f"{source_type} 형식은 아직 렌더링하지 못해요")

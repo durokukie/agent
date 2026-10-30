@@ -514,7 +514,7 @@ def test_레포_밖_주소를_가져오는_Kustomize_는_돌리지_않는다(cli
     ran: list = []
     monkeypatch.setattr("kukie_agent.manifests.render.subprocess.run", lambda *a, **k: ran.append(a))
     body = _rendered(client, cluster, "remote").json()
-    assert body["status"] == "render_failed" and remote in body["message"] and ran == []
+    assert body["status"] == "render_failed" and renderer._redact(remote) in body["message"] and ran == []
 
 
 # ── 렌더는 네트워크 없이 (manifests/render.py, agent#128 리뷰) ─────────────
@@ -649,12 +649,50 @@ def test_YAML_로_못_읽는_파일과_바이너리는_건너뛴다(tmp_path):
     assert renderer.loopback_reference(tmp_path) is None
 
 
-def test_검사하지_못한_큰_글자_파일이_있으면_거절한다(tmp_path, monkeypatch):
+def test_큰_글자_파일은_막지_않고_흘려_읽으며_주소만_찾는다(tmp_path, monkeypatch):
     monkeypatch.setattr(renderer, "MAX_SCAN_BYTES", 100)
+    monkeypatch.setattr(renderer, "_STREAM_CHUNK", 64)
     _kustomization(tmp_path, "resources: []\n")
-    (tmp_path / "big.yaml").write_text("a: " + "x" * 200 + "\n")
-    (tmp_path / "big.bin").write_bytes(b"\x00" * 200)                # 큰 바이너리는 건너뛴다
-    assert renderer.loopback_reference(tmp_path) == "검사하지 못한 큰 파일 big.yaml"
+    (tmp_path / "crds.yaml").write_text("a: " + "x" * 500 + "\n")           # CRD 꾸러미 같은 큰 파일
+    (tmp_path / "big.bin").write_bytes(b"\x00" + b"http://localhost:1/" * 20)  # 큰 바이너리는 건너뛴다
+    assert renderer.loopback_reference(tmp_path, scan_key="1") is None
+    # 조각(64바이트) 경계에 걸친 주소도 찾는다
+    (tmp_path / "crds.yaml").write_text("a: " + "x" * 50 + " see http://127.0.0.1:15000/config_dump " + "y" * 300)
+    assert renderer.loopback_reference(tmp_path, scan_key="2") == "http://127.0.0.1:15000"
+
+
+def test_깊은_중첩도_500_이_아니라_못_읽은_파일(tmp_path, monkeypatch):
+    _kustomization(tmp_path, "resources: []\n")
+    (tmp_path / "deep.yaml").write_text("a: " + "[" * 50_000 + "]" * 50_000 + "\n")   # 실제 파서가 RecursionError 를 낸다
+    assert renderer.loopback_reference(tmp_path, scan_key="1") is None
+    tried: list = []
+    monkeypatch.setattr(renderer.yaml, "load_all", lambda *a, **k: (_ for _ in ()).throw(RecursionError()))
+    monkeypatch.setattr(renderer, "_RuamelYAML", lambda **k: tried.append(k))     # YAMLError 가 아니면 다시 읽지 않는다
+    assert renderer._parse(b"a: b\n") is None and tried == []
+
+
+def test_검사_시간이_넘으면_렌더하지_않고_기억하지도_않는다(tmp_path, monkeypatch):
+    app = _kustomization(tmp_path, "resources: []\n")
+    ticks = iter(range(0, 1000, 20))
+    monkeypatch.setattr(renderer, "_scan_clock", lambda: next(ticks))
+    with pytest.raises(renderer.RenderError, match="레포 검사 시간"):
+        renderer.render("Kustomize", app, root=tmp_path, scan_key="slow")
+    monkeypatch.setattr(renderer, "_scan_clock", lambda: 0.0)
+    assert renderer.loopback_reference(tmp_path, scan_key="slow") is None
+
+
+def test_문구의_주소에는_userinfo_와_경로를_싣지_않는다(tmp_path, monkeypatch):
+    monkeypatch.setattr(renderer.subprocess, "run", lambda *a, **k: None)
+    app = _kustomization(tmp_path, "resources: []\n")
+    (tmp_path / "values.dev.yaml").write_text("db: postgres://svc:hunter2@localhost:5432/app?sslmode=off\n")
+    with pytest.raises(renderer.RenderError) as caught:
+        renderer.render("Kustomize", app, root=tmp_path)
+    assert "postgres://localhost:5432" in str(caught.value) and "hunter2" not in str(caught.value)
+    (tmp_path / "values.dev.yaml").unlink()
+    (app / "kustomization.yaml").write_text("resources:\n- https://bot:ghp_secret@github.com/acme/x//base\n")
+    with pytest.raises(renderer.RenderError) as caught:
+        renderer.render("Kustomize", app, root=tmp_path, scan_key="2")
+    assert "https://github.com" in str(caught.value) and "ghp_secret" not in str(caught.value)
 
 
 def test_별칭으로_부풀린_YAML_에_묶이지_않는다(tmp_path):
