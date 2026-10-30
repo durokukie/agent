@@ -464,6 +464,18 @@ def test_같은_커밋의_렌더는_기억한다(client, cluster, gh, monkeypatc
     assert [call for call in gh.reads if call[0] == "download"] == [("download", "c0")]
 
 
+def test_렌더할_Application_조회도_상세처럼_나눠_쓴다(client, cluster, gh, monkeypatch):
+    monkeypatch.setattr(clusters_api, "OVERVIEW_SHARE_TTL", 10)
+    ran = _cluster_apps(monkeypatch)
+    for _ in range(2):
+        assert _rendered(client, cluster, "shop-web").json()["status"] == "ok"
+    _rendered(client, cluster, "shop-prod")
+    gets = [args[:3] for args in ran if "-A" not in args]
+    assert gets == [["get", "applications.argoproj.io", "shop-web"], ["get", "applications.argoproj.io", "shop-prod"]]
+    assert _rendered(client, cluster, "nope").status_code == 404
+    assert _rendered(client, cluster, "nope").status_code == 404 and len(ran) == 4       # 404 는 나눠 쓰지 않는다
+
+
 def test_ref_를_주면_그_커밋을_렌더한다(client, cluster, gh, monkeypatch):
     _cluster_apps(monkeypatch)
     gh.push_to_base("apps/plain/service.yaml", "apiVersion: v1\nkind: Service\nmetadata: {name: renamed}\n")

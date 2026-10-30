@@ -318,7 +318,7 @@ async def argocd_application_rendered(
       unsupported    Helm·Plugin·여러 소스·GitHub 가 아닌 소스 — message 에 까닭 (레포를 읽지 않는다)
       render_failed  레포를 읽었는데 렌더가 안 된다 (kustomize 오류·path 가 없다) — message 에 까닭
     레포 쪽 실패는 레포 보기(tree·file)와 같은 코드다 — 409 GITOPS_REPO_NOT_CONNECTED, 404 GITOPS_REF_NOT_FOUND, 502 GITHUB_UNAVAILABLE.
-    같은 커밋·같은 path 의 렌더는 기억해 다시 하지 않는다 (browse.render).
+    Application 조회는 상세처럼 OVERVIEW_SHARE_TTL 초 나눠 쓰고, 같은 커밋·같은 path 의 렌더는 기억해 다시 하지 않는다 (browse.render).
     """
     conn = await access.connection(cluster_id, user)
     if not argocd.valid_ref(namespace, name):
@@ -346,7 +346,13 @@ async def argocd_application_rendered(
             raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
                                       "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
 
-    read = await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+    async def compute() -> dict[str, Any]:
+        return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+
+    # 상세처럼 같은 연결·같은 앱의 Application 조회는 나눠 쓴다 — 패널을 다시 열 때마다 kubectl 이 돌지 않게 (agent#128 리뷰).
+    # 404·502 는 _shared_overview 가 나눠 쓰지 않는다. 나눠 쓰는 값은 고치지 않고 읽기만 한다
+    read = await _shared_overview(_share_key(_connection_key(cluster_id, conn), "argocd-rendered", namespace, name),
+                                  compute)
     body: dict[str, Any] = {
         "status": read["status"], "application": {"namespace": namespace, "name": name}, "message": None,
         "repository": None, "repo_url": None, "path": None, "source_type": None, "target_revision": None,
