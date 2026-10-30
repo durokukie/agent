@@ -107,8 +107,9 @@ flowchart LR
 | 렌더링 | — | 앱 (2단계) | ❌ |
 | 스킬 결정 | `skill_for(room.shared)` | `skills/__init__.py`, `conversations.py` | ✅ DURO-100 (공개 범위로 고정, 모드 없음) |
 | 에이전트 설정 | `Agent(...)`, `add_target()`, `add_skill_prompt()` | `agent.py` | ✅ |
-| 툴 등록 | `FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS, *GITOPS_TOOLS]).filtered(_only_skill_tools)` | `agent.py` | ✅ 스킬별 필터; 변경 4종·PR 길 1종은 Shared 만 + Hook |
+| 툴 등록 | `FunctionToolset([*READ_TOOLS, *REPO_TOOLS, *MUTATE_TOOLS, *GITOPS_TOOLS]).filtered(_only_skill_tools)` | `agent.py` | ✅ 스킬별 필터; 변경 4종·PR 길 1종은 Shared 만 + Hook |
 | 읽기 툴 5종 | `list_resources` 등 | `tools/read.py` | ✅ |
+| 레포 읽기 툴 3종 | `list_repo_dir`·`read_repo_file`·`render_app` — 대화의 클러스터에 연결된 매니페스트 레포만, 가림·상한·렌더 안전장치는 `gitops/browse.py` 그대로 | `tools/repo.py` | ✅ DURO-151, Private·Shared 모두, 훅 없음 |
 | 변경 툴 4종 | `delete_resource` 등 | `tools/mutate.py` | ✅ Shared 대화에만 노출, 가드레일 훅 대상 |
 | PR 길 변경 툴 | `propose_git_change` — 승인 전 PR, 승인 = 머지, sync·health 지켜보기, 승인 순간 STALE 판단 | `tools/gitops.py`, `guardrail/gitops_hook.py`, `gitops/` | ✅ DURO-134 |
 | 옛 답변 끌림 막기 | kubectl 훅이 PR 길 리소스면 한 번 `ModelRetry`(같은 호출을 다시 하면 경고 카드), `ProcessHistory` 가 레포 연결이 바뀐 때만 기록 끝에 메모 한 줄 + 숨은 칸 갱신 | `guardrail/hook.py`, `gitops/memo.py` | ✅ DURO-135 |
@@ -140,7 +141,7 @@ flowchart LR
 추가 행동이 필요하지 않으면 `null`이다. 제안 자체는 작업을 실행하거나 사용자 승인을 대신하지 않는다.
 변경 작업의 승인·거절은 기존 `/approve` 절차를 따른다.
 
-학습/진단/실습 모드는 없앴다 (DURO-100). Private 대화는 읽기 5종만, Shared 대화는 읽기 5종 + 변경 4종을 받는다.
+학습/진단/실습 모드는 없앴다 (DURO-100). Private 대화는 읽기(kubectl 5종 + 레포 3종)만, Shared 대화는 읽기 + 변경 4종 + PR 길 1종을 받는다.
 공개 범위는 대화 안에서 바뀌지 않으므로 한 대화의 툴 목록·응답 스키마·지시문은 턴마다 같다 (프롬프트 캐시).
 `/mode …` 입력은 모드 버튼이 남은 옛 앱을 위해서만 받아 `{kind: "mode", known: false}` 로 답하고 아무것도 바꾸지 않는다.
 

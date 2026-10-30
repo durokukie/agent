@@ -27,12 +27,13 @@ from kukie_agent.glossary import explain_command
 from kukie_agent.kubectl import KubectlResult
 from kukie_agent.skills.base import KukieResponse, ToolStep
 from kukie_agent.tools.read import READ_TOOLS
+from kukie_agent.tools.repo import REPO_TOOLS
 from kukie_agent.validators import log_unregistered_flags
 
 # access 판정 기준 — 읽기 툴 목록에 있어야만 read-only. 모르는 툴은 mutating 으로 본다.
 # 안전 표시는 보수적으로 (DURO-44 결정 · fail-closed): 틀렸을 때 "읽기"로 잘못 표시하면
 # 사용자가 안심하고 넘기지만, "변경"으로 잘못 표시하면 한 번 더 확인할 뿐이다.
-READ_TOOL_NAMES: frozenset[str] = frozenset(tool.__name__ for tool in READ_TOOLS)
+READ_TOOL_NAMES: frozenset[str] = frozenset(tool.__name__ for tool in [*READ_TOOLS, *REPO_TOOLS])
 
 # 화면 블록 제목 — 툴 이름을 사람 말로. 미등록 툴은 이름 그대로.
 STEP_LABELS: dict[str, str] = {
@@ -41,6 +42,9 @@ STEP_LABELS: dict[str, str] = {
     "get_events": "이벤트 조회",
     "get_logs": "로그 조회",
     "explain_command": "스키마 설명 조회",
+    "list_repo_dir": "레포 폴더 보기",
+    "read_repo_file": "레포 파일 읽기",
+    "render_app": "ArgoCD 앱 렌더 결과",
     "apply_manifest": "매니페스트 적용",
     "scale_resource": "레플리카 조정",
     "rollout_restart": "재시작",

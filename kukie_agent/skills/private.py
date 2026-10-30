@@ -1,4 +1,4 @@
-"""Private 스킬 — 혼자 보는 대화. 읽기 5종만, 변경 툴은 아예 노출하지 않는다 (DURO-100)."""
+"""Private 스킬 — 혼자 보는 대화. 읽기 툴(kubectl 5종 + 레포 3종)만, 변경 툴은 아예 노출하지 않는다 (DURO-100)."""
 from kukie_agent.skills.base import Skill
 
 PROMPT = """이 대화는 Private 대화다. 클러스터를 읽을 수만 있고 바꿀 수는 없다.

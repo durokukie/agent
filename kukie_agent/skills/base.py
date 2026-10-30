@@ -49,14 +49,18 @@ class KukieResponse(BaseModel):
 
 # ── 스킬 정의 ────────────────────────────────────────────────
 
-# 공통 베이스 툴 — 읽기 5종. Private·Shared 어느 대화든 항상 포함
+# 공통 베이스 툴 — 읽기 5종 + 매니페스트 레포 읽기 3종(DURO-151). Private·Shared 어느 대화든 항상 포함
 # (탈출구 run_readonly_kubectl은 팀 결정으로 제거 — 안내 폴백으로 대체)
+# 레포 읽기 툴은 레포가 연결되지 않은 클러스터에서도 노출한다 — 툴 목록이 연결 상태로 바뀌면 프롬프트 캐시가 깨진다 (DURO-135)
 COMMON_TOOLS: frozenset[str] = frozenset({
     "list_resources",
     "explain_command",
     "describe_resource",
     "get_events",
     "get_logs",
+    "list_repo_dir",
+    "read_repo_file",
+    "render_app",
 })
 
 
