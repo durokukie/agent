@@ -218,6 +218,22 @@ def test_앱이_많은_루트_폴더도_전체_출력이_상한_안이다(cluste
     assert "줄 더 있음 — 전체는 GitHub 에서" in apps.stdout and apps.stdout.endswith("/tree/c0/apps")
 
 
+def test_레포_값이_아주_길어도_전체_출력이_상한_안이다(cluster, gh, monkeypatch):
+    """머리 줄 수는 상한 안이어도 줄마다 아주 길면(긴 앱 path·targetRevision·객체 이름) 머리 줄만으로 넘을 수 있다 (agent#129 리뷰)."""
+    long_apps = [_app(f"app-{i}", f"apps/{'p' * 1000}{i}", revision="r" * 1000) for i in range(30)]
+    _cluster_apps(monkeypatch, long_apps)
+    root = sync(list_repo_dir(_ctx(cluster), ""))
+    assert root.success, root.stderr
+    _within_limits(root.stdout)
+    assert root.stdout.endswith(repo_tools.CUT) and "(줄이 길어 잘림)" in root.stdout
+    gh.commits["c0"]["apps/plain/long.yaml"] = "\n---\n".join(
+        f"apiVersion: v1\nkind: ConfigMap\nmetadata: {{name: {'n' * 5000}{i}}}" for i in range(20))
+    long_file = sync(read_repo_file(_ctx(cluster), "apps/plain/long.yaml"))
+    assert long_file.success
+    _within_limits(long_file.stdout)
+    assert "쿠버네티스 객체 20개: " in long_file.stdout and "외 " in long_file.stdout   # 긴 이름은 줄이고 몇 개 더인지는 남긴다
+
+
 def test_객체가_많은_파일도_전체_출력이_상한_안이다(cluster, gh, monkeypatch):
     _cluster_apps(monkeypatch)
     gh.commits["c0"]["apps/plain/many.yaml"] = "\n---\n".join(
@@ -226,7 +242,9 @@ def test_객체가_많은_파일도_전체_출력이_상한_안이다(cluster, g
     result = sync(read_repo_file(_ctx(cluster), "apps/plain/many.yaml"))
     assert result.success
     _within_limits(result.stdout)
-    assert f"쿠버네티스 객체 2000개:" in result.stdout and f"외 {2000 - repo_tools.MAX_HEAD_ITEMS}개" in result.stdout
+    line = next(line for line in result.stdout.splitlines() if line.startswith("쿠버네티스 객체 2000개: "))
+    shown = line.count("ConfigMap ")
+    assert 0 < shown <= repo_tools.MAX_HEAD_ITEMS and line.endswith(f" 외 {2000 - shown}개")
 
 
 def test_한_줄이_길어도_글자_상한을_넘지_않는다(cluster, gh, monkeypatch):

@@ -48,10 +48,13 @@ class _Stop(Exception):
 
 # ── 결과 모양 ─────────────────────────────────────────────
 
+def _line(line: str) -> str:
+    return line if len(line) <= MAX_LINE_CHARS else line[:MAX_LINE_CHARS] + " …(줄이 길어 잘림)"
+
+
 def clip(text: str, *, more: str = "", max_lines: int = MAX_LINES, max_chars: int = MAX_CHARS) -> str:
     """모델 문맥에 넣을 만큼 — 앞에서 max_lines 줄·max_chars 자까지, 넘으면 "… N줄 더 있음" 한 줄. more 는 그 뒤에 붙일 안내."""
-    lines = [line if len(line) <= MAX_LINE_CHARS else line[:MAX_LINE_CHARS] + " …(줄이 길어 잘림)"
-             for line in text.splitlines()]
+    lines = [_line(line) for line in text.splitlines()]
     kept: list[str] = []
     used = 0
     for line in lines:
@@ -65,14 +68,22 @@ def clip(text: str, *, more: str = "", max_lines: int = MAX_LINES, max_chars: in
     return "\n".join(kept)
 
 
+#: 조립한 전체가 그래도 MAX_CHARS 를 넘을 때 끝에 붙인다 — 머리 줄이 모두 길 때(긴 앱 path·revision·객체 이름)
+CUT = "\n… 결과가 길어 여기서 잘랐어요"
+
+
 def compose(head: list[str], body: str, *, more: str, tail: list[str] | None = None) -> str:
     """머리 줄 + 본문 + 꼬리 줄 — 전체가 MAX_LINES 줄·MAX_CHARS 자 안에 들게, 본문은 머리·꼬리를 뺀 남은 만큼만 싣는다.
-    머리 줄은 _app_lines·_objects_line 이 MAX_HEAD_ITEMS 로 줄여 둔다."""
-    fixed = [*head, *(tail or [])]
+    머리 줄은 _app_lines·_objects_line 이 MAX_HEAD_ITEMS 로 줄여 두고, 줄마다 MAX_LINE_CHARS 로 자른다.
+    레포 값이 모두 길어 머리 줄만으로 넘으면 마지막에 조립한 전체를 MAX_CHARS 로 한 번 더 자른다 (agent#129 리뷰)."""
+    head = [_line(line) for line in head]
+    tail = [_line(line) for line in tail or []]
+    fixed = [*head, *tail]
     room_lines = MAX_LINES - len(fixed) - 1                           # 1: "… N줄 더 있음"
     room_chars = MAX_CHARS - sum(len(line) + 1 for line in fixed) - len(more) - 40
     clipped = clip(body, more=more, max_lines=max(room_lines, 1), max_chars=max(room_chars, 0))
-    return "\n".join([*head, clipped, *(tail or [])])
+    text = "\n".join([*head, clipped, *tail])
+    return text if len(text) <= MAX_CHARS else text[:MAX_CHARS - len(CUT)] + CUT
 
 
 def _done(command: str, stdout: str) -> KubectlResult:
@@ -112,11 +123,24 @@ def _app_lines(badges: list[dict[str, Any]], apps_status: str) -> list[str]:
     return lines
 
 
+def _names(names: list[str]) -> str:
+    """이름들을 한 줄로 — MAX_HEAD_ITEMS 개·MAX_LINE_CHARS 자 안에서 앞에서부터, 나머지는 "외 N개" (줄 자르기에 잘리지 않게)."""
+    kept: list[str] = []
+    used = 0
+    for name in names[:MAX_HEAD_ITEMS]:
+        name = name if len(name) <= 200 else name[:200] + "…"
+        if kept and used + len(name) + 2 > MAX_LINE_CHARS - 200:
+            break
+        kept.append(name)
+        used += len(name) + 2
+    rest = f" 외 {len(names) - len(kept)}개" if len(names) > len(kept) else ""
+    return ", ".join(kept) + rest
+
+
 def _objects_line(objects: list[dict[str, Any]]) -> str:
-    names = [f"{obj['kind']} {obj['namespace'] + '/' if obj['namespace'] else ''}{obj['name'] or '(이름 없음)'}"
-             for obj in objects[:MAX_HEAD_ITEMS]]
-    rest = f" 외 {len(objects) - MAX_HEAD_ITEMS}개" if len(objects) > MAX_HEAD_ITEMS else ""
-    return f"쿠버네티스 객체 {len(objects)}개: {', '.join(names)}{rest}"
+    return f"쿠버네티스 객체 {len(objects)}개: " + _names(
+        [f"{obj['kind']} {obj['namespace'] + '/' if obj['namespace'] else ''}{obj['name'] or '(이름 없음)'}"
+         for obj in objects])
 
 
 # ── 대상 정하기 ───────────────────────────────────────────
@@ -245,8 +269,7 @@ async def list_repo_dir(ctx: RunContext[Deps], path: str = "", ref: str | None =
     for entry in listing["entries"]:
         if entry["type"] == "dir":
             used = browse.apps_for_folder(apps, entry["path"], revision)
-            rest = f" 외 {len(used) - MAX_HEAD_ITEMS}개" if len(used) > MAX_HEAD_ITEMS else ""
-            badge = f"  ← ArgoCD 앱 {', '.join(app['name'] for app in used[:MAX_HEAD_ITEMS])}{rest}" if used else ""
+            badge = f"  ← ArgoCD 앱 {_names([app['name'] for app in used])}" if used else ""
             entries.append(f"[폴더] {entry['name']}/{badge}")
         else:
             size = _size(entry["size"])
