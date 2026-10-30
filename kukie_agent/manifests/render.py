@@ -15,6 +15,7 @@ remote_reference(칸 검사)는 막는 데 기대지 않는다 — 왜 렌더하
 from __future__ import annotations
 
 import codecs
+import logging
 import ipaddress
 import os
 import re
@@ -32,6 +33,8 @@ import yaml
 from ruamel.yaml import YAML as _RuamelYAML
 from ruamel.yaml.error import YAMLError as _RuamelYAMLError
 
+logger = logging.getLogger(__name__)
+
 KUSTOMIZATION_FILES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
 #: kustomize 가 레포 밖에서 가져오는 주소 — http(s) 파일·git 레포 (`https://…`, `git@…`, `github.com/o/r//path`, `ssh://…`,
 #: `git::…`, `gh:o/r`). 문구용이다 — 막는 것은 네트워크 없는 실행 환경이다 (모듈 설명)
@@ -42,8 +45,12 @@ _REFERENCE_KEYS = ("resources", "bases", "components", "generators", "transforme
                    "configurations")
 #: kustomize 가 바깥에 닿지 못하게 프록시로 주는 주소 — 아무도 듣지 않는 포트(discard)
 OFFLINE_PROXY = "http://127.0.0.1:9"
-#: kustomization 안의 주소의 호스트 칸 (`scheme://[userinfo@]host[:port]`)
-_URL_AUTHORITY = re.compile(r"[a-z][a-z0-9+.-]*://([^/\s'\"?#]*)", re.I)
+#: 주소 찾기 — `://` 를 str.find 로 찾고 그 앞 _SCHEME_WINDOW 글자에서만 scheme 을 본다. 정규식으로 scheme 부터 찾으면
+#: `://` 없는 긴 영숫자 덩어리에서 시작 자리마다 끝까지 되돌아가 O(n²) 이 된다 (agent#128 리뷰) — 이 방식은 선형이다
+_SCHEME_WINDOW = 32
+_SCHEME_TAIL = re.compile(r"[a-z][a-z0-9+.-]*$", re.I)
+#: 호스트 칸(userinfo·host·port)이 끝나는 글자
+_AUTHORITY = re.compile(r"[^/\s'\"?#]*")
 _PLAIN_SUFFIXES = (".yaml", ".yml", ".json")
 _STDERR_LIMIT = 800
 
@@ -94,7 +101,10 @@ def parse_objects(text: str, where: str) -> list[dict]:
     try:
         docs = list(yaml.safe_load_all(text))
     except yaml.YAMLError as exc:
-        raise RenderError(f"{where} 를 YAML 로 읽지 못했어요: {exc}") from exc
+        # 오류 문구에는 레포 값 조각이 실린다(Secret 값일 수 있다) — 줄 번호만 준다 (agent#128 리뷰)
+        mark = getattr(exc, "problem_mark", None)
+        where_line = f" ({mark.line + 1}번째 줄)" if mark is not None else ""
+        raise RenderError(f"{where} 를 YAML 로 읽지 못했어요{where_line}") from None
     # 빈 문서와 쿠버네티스 객체가 아닌 것(apiVersion·kind 가 없는 것)은 ArgoCD 도 올리지 않는다
     return [d for d in docs if isinstance(d, dict) and d.get("apiVersion") and d.get("kind")]
 
@@ -186,15 +196,34 @@ def _redact(address: str) -> str:
     return f"{scheme}://{authority.rpartition('@')[2]}"
 
 
-#: 글자 속 주소의 userinfo (`scheme://svc:pw@`) — 문구에 싣기 전에 뺀다
-_USERINFO = re.compile(r"([a-z][a-z0-9+.-]*://)[^/\s@'\"]*@", re.I)
+def _addresses(text: str) -> Iterator[tuple[int, int, str, str]]:
+    """글자 속 주소마다 (시작, 호스트 칸 끝, scheme, 호스트 칸). 선형이다 — `://` 마다 앞 32글자·뒤 호스트 칸만 본다."""
+    at = text.find("://")
+    while at != -1:
+        window = text[max(0, at - _SCHEME_WINDOW):at]
+        scheme_found = _SCHEME_TAIL.search(window)
+        scheme = scheme_found.group(0) if scheme_found else ""
+        authority = _AUTHORITY.match(text, at + 3)
+        end = authority.end() if authority else at + 3
+        yield at - len(scheme), end, scheme, text[at + 3:end]
+        at = text.find("://", at + 3)
 
 
 def _loopback_in(text: str) -> str | None:
-    for found in _URL_AUTHORITY.finditer(text):
-        if _local_host(found.group(1)):
-            return _redact(found.group(0))
+    for _, _, scheme, authority in _addresses(text):
+        if _local_host(authority):
+            return _redact(f"{scheme}://{authority}")
     return None
+
+
+def _redact_text(text: str) -> str:
+    """글자 속 주소들의 userinfo(`scheme://svc:pw@`)를 뺀다 — 서버 로그에 남기기 전에."""
+    out, last = [], 0
+    for start, end, scheme, authority in _addresses(text):
+        if "@" in authority:
+            out += [text[last:start], f"{scheme}://{authority.rpartition('@')[2]}"]
+            last = end
+    return "".join(out) + text[last:]
 
 
 #: 이 크기까지는 YAML 로 읽어 풀린 문자열을 본다. 넘는 글자 파일(CRD 꾸러미 등)은 원시 글자로 흘려 읽으며 주소만 찾는다 —
@@ -270,13 +299,15 @@ def _unescaped(text: str) -> str:
     return _ESCAPE.sub(one, text)
 
 
-def _stream_loopback(file: Path, head: bytes) -> str | None:
+def _stream_loopback(file: Path, head: bytes, deadline: float) -> str | None:
     """글자 파일을 원시 글자로 흘려 읽으며 이 컴퓨터 안 주소를 찾는다 — 조각 사이에 걸친 주소도 보게 겹쳐 읽는다.
     이스케이프를 푼 사본도 본다 — YAML 로 읽지 않아도 `\\u002f`·`\\/`·줄 이음으로 숨긴 주소가 빠지지 않게 (agent#128 리뷰)."""
     decoder = codecs.getincrementaldecoder(_encoding(head))(errors="replace")
     tail = ""
     with file.open("rb") as stream:
         while chunk := stream.read(_STREAM_CHUNK):
+            if _scan_clock() > deadline:
+                raise ScanTimeout(f"{SCAN_BUDGET:g}초")          # 파일 하나도 상한 안에서 끊는다
             text = tail + decoder.decode(chunk)
             if found := _loopback_in(text) or _loopback_in(_unescaped(text)):
                 return found
@@ -284,7 +315,7 @@ def _stream_loopback(file: Path, head: bytes) -> str | None:
     return None
 
 
-def _loopback_in_file(file: Path) -> str | None:
+def _loopback_in_file(file: Path, deadline: float) -> str | None:
     """파일 하나에서 이 컴퓨터 안 주소를 찾는다. 확장자·이름은 보지 않는다 — kustomize 는 generators 등이 가리키는 파일을
     이름과 상관없이 YAML 로 읽는다. 바이너리는 앞 8KB 만 보고 건너뛴다.
 
@@ -298,14 +329,14 @@ def _loopback_in_file(file: Path) -> str | None:
             if _binary(head):
                 return None
             if file.stat().st_size > MAX_SCAN_BYTES:
-                return _stream_loopback(file, head)
+                return _stream_loopback(file, head, deadline)
             data = head + stream.read()
     except OSError:
         return None
     try:
         docs = _parse(data)
     except _ParserLimit:
-        return _stream_loopback(file, head)
+        return _stream_loopback(file, head, deadline)
     return next((found for value in _strings(docs or []) if (found := _loopback_in(value))), None)
 
 
@@ -347,7 +378,7 @@ def loopback_reference(root: Path, *, scan_key: str | None = None) -> str | None
     for file in _repo_files(root):
         if _scan_clock() > deadline:
             raise ScanTimeout(f"{SCAN_BUDGET:g}초")
-        if found := _loopback_in_file(file):
+        if found := _loopback_in_file(file, deadline):
             break
     with _loopback_lock:
         _loopback_scans[key] = found
@@ -372,7 +403,30 @@ def _offline_env(home: str) -> dict[str, str]:
     }
 
 
-def render_kustomize(folder: Path, *, timeout: int = 60) -> list[dict]:
+#: kustomize 오류의 까닭 — stderr 원문은 레포 값(patch·생성기 설정의 Secret 값 등)을 그대로 싣는다. 사용자 문구에는 이 분류만
+#: 싣고 원문은 서버 로그에만 남긴다 (agent#128 리뷰). 위에 있는 것이 먼저다
+_KUSTOMIZE_REASONS = (
+    (("security; file", "is not in or below"), "kustomization 폴더 밖의 파일을 가리켜요"),
+    (("no such file or directory", "must build at directory", "evalsymlink", "not a valid directory",
+      "unable to find one of"), "가리키는 파일·폴더가 레포에 없어요"),
+    (("yaml:", "malformedyaml", "could not parse", "error converting yaml", "invalid document"),
+     "YAML 모양이 맞지 않아요"),
+    (("already registered id", "found multiple"), "같은 리소스가 두 번 들어가요"),
+    (("no matches for", "failed to find unique target", "unable to find patch target"),
+     "patch 가 가리키는 리소스를 찾지 못했어요"),
+)
+
+
+def _kustomize_reason(stderr: str) -> str:
+    lowered = stderr.lower()
+    for markers, reason in _KUSTOMIZE_REASONS:
+        if any(marker in lowered for marker in markers):
+            return reason
+    return "kustomize 오류예요 (자세한 내용은 서버 로그)"
+
+
+def render_kustomize(folder: Path, *, timeout: int = 60, label: str = "") -> list[dict]:
+    """label 은 문구에 싣는 폴더 이름(레포 기준)."""
     # 실행 파일은 에이전트의 PATH 로 찾고, kustomize 에게는 비운 PATH 를 준다 (_offline_env)
     binary = shutil.which(kustomize_bin())
     if binary is None:
@@ -386,11 +440,13 @@ def render_kustomize(folder: Path, *, timeout: int = 60) -> list[dict]:
         except (subprocess.TimeoutExpired, OSError) as exc:
             raise RenderError(f"kustomize build 를 돌리지 못했어요: {exc}") from exc
     if proc.returncode != 0:
-        stderr = _USERINFO.sub(r"\1", proc.stderr.strip())     # kustomize 는 가져오려던 주소를 그대로 찍는다 — userinfo 는 뺀다
+        stderr = proc.stderr.strip()[:_STDERR_LIMIT]
+        # 원문은 서버 로그에만 — 가져오려던 주소의 userinfo 는 빼고
+        logger.warning("kustomize build 가 실패했다 (%s): %s", label or folder.name, _redact_text(stderr))
+        where = f" ({label})" if label else ""
         if OFFLINE_PROXY.removeprefix("http://") in stderr or "executable file not found" in stderr:
-            raise RenderError("레포 밖 주소를 가져오려 해서 렌더하지 못했어요 — 렌더할 때는 네트워크를 쓰지 않아요. "
-                              f"kustomize: {stderr[:_STDERR_LIMIT]}")
-        raise RenderError(f"kustomize build 가 실패했어요: {stderr[:_STDERR_LIMIT]}")
+            raise RenderError(f"레포 밖 주소를 가져오려 해서 렌더하지 못했어요{where} — 렌더할 때는 네트워크를 쓰지 않아요")
+        raise RenderError(f"kustomize build 가 실패했어요{where}: {_kustomize_reason(stderr)}")
     return parse_objects(proc.stdout, "kustomize build 결과")
 
 
@@ -410,5 +466,7 @@ def render(source_type: str, folder: Path, *, root: Path, recurse: bool = False,
         remote = remote_reference(folder, root)
         if remote is not None:
             raise RenderError(f"레포 밖 주소({_redact(remote)})를 가져오는 Kustomize 는 렌더하지 않아요 — 렌더할 때는 네트워크를 쓰지 않아요")
-        return render_kustomize(folder)
+        label = folder.resolve().relative_to(root.resolve()).as_posix() if folder.resolve().is_relative_to(
+            root.resolve()) else folder.name
+        return render_kustomize(folder, label=label)
     raise RenderError(f"{source_type} 형식은 아직 렌더링하지 못해요")

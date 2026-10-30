@@ -123,6 +123,8 @@ async def draft(route: Route, change: Change, token: server_api.RepoToken, *, hp
                 limiter=thread_limiter("gitops_render", RENDER_WORKERS),
             )
         if isinstance(result, Refused):
+            if result.code == "busy":
+                raise Refuse(result.message)                # 툴 실패로 끝낸다 — 잠시 뒤 같은 요청이면 된다
             raise Refuse(result.message, kubectl=not result.retry, retry=result.retry)
         if secret_in(result.file_diff):
             raise Refuse("바뀔 내용에 비밀 값(키·토큰·Secret)이 보여 PR 을 만들지 않았어요 — git 에 평문으로 남아요. "

@@ -716,15 +716,127 @@ def test_파서_한도에_걸린_파일은_건너뛰지_않고_글자로_본다(
     assert renderer.loopback_reference(tmp_path) == "http://localhost:1"
 
 
-def test_kustomize_오류_문구에도_userinfo_를_싣지_않는다(tmp_path, monkeypatch):
+def test_kustomize_오류_문구에는_stderr_를_싣지_않고_로그에만_가려서_남긴다(tmp_path, monkeypatch, caplog):
     app = _kustomization(tmp_path, "resources: []\n")
     failed = type("P", (), {"returncode": 1, "stdout": "",
                             "stderr": 'Error: Get "https://bot:ghp_secret@example.com/a": proxyconnect tcp: '
                                       'dial tcp 127.0.0.1:9: connect: connection refused'})()
     monkeypatch.setattr(renderer.subprocess, "run", lambda *a, **k: failed)
+    with caplog.at_level("WARNING", logger="kukie_agent.manifests.render"), \
+            pytest.raises(renderer.RenderError) as caught:
+        renderer.render("Kustomize", app, root=tmp_path)
+    assert str(caught.value) == "레포 밖 주소를 가져오려 해서 렌더하지 못했어요 (app) — 렌더할 때는 네트워크를 쓰지 않아요"
+    assert "https://example.com/a" in caplog.text and "ghp_secret" not in caplog.text
+
+
+@pytest.mark.parametrize(("stderr", "reason"), [
+    ("Error: map[string]interface {}{\"stringData\":map[string]interface {}{\"password\":\"hunter2\"}}: "
+     "yaml: line 3: could not find expected ':'", "YAML 모양이 맞지 않아요"),
+    ("Error: accumulating resources: accumulation err='accumulating resources from '../nope': "
+     "evalsymlink failure on '/tmp/x/nope' : lstat /tmp/x/nope: no such file or directory'",
+     "가리키는 파일·폴더가 레포에 없어요"),
+    ("Error: security; file '/etc/passwd' is not in or below '/tmp/x'", "kustomization 폴더 밖의 파일을 가리켜요"),
+    ("Error: something new hunter2", "kustomize 오류예요 (자세한 내용은 서버 로그)"),
+])
+def test_kustomize_오류는_까닭만_싣는다(tmp_path, monkeypatch, stderr, reason):
+    app = _kustomization(tmp_path, "resources: []\n")
+    failed = type("P", (), {"returncode": 1, "stdout": "", "stderr": stderr})()
+    monkeypatch.setattr(renderer.subprocess, "run", lambda *a, **k: failed)
     with pytest.raises(renderer.RenderError) as caught:
         renderer.render("Kustomize", app, root=tmp_path)
-    assert "ghp_secret" not in str(caught.value) and "https://example.com/a" in str(caught.value)
+    assert str(caught.value) == f"kustomize build 가 실패했어요 (app): {reason}" and "hunter2" not in str(caught.value)
+
+
+def test_YAML_오류_문구에는_레포_값_조각_대신_줄_번호만(tmp_path):
+    (tmp_path / "s.yaml").write_text("apiVersion: v1\nkind: Secret\nstringData: {password: hunter2\n")
+    with pytest.raises(renderer.RenderError) as caught:
+        renderer.render("Directory", tmp_path, root=tmp_path)
+    assert "hunter2" not in str(caught.value) and "번째 줄" in str(caught.value)
+
+
+def test_주소_찾기는_선형이다(tmp_path):
+    import time as _time
+    started = _time.monotonic()
+    assert renderer._loopback_in("a" * 100_000) is None
+    assert renderer._loopback_in("a" * 50_000 + ":/" * 25_000) is None
+    assert renderer._loopback_in(("x" * 40 + "://") * 3_000) is None
+    (tmp_path / "blob.yaml").write_text("k: " + "a" * 100_000 + "\n")
+    assert renderer.loopback_reference(tmp_path) is None
+    assert _time.monotonic() - started < 2
+
+
+def test_긴_scheme_앞부분이_있어도_주소를_찾는다():
+    assert renderer._loopback_in("x" * 100 + "http://localhost:1/a").endswith("http://localhost:1")
+    assert renderer._loopback_in("files: x=http://svc:pw@[::1]:8/a") == "http://[::1]:8"
+
+
+def test_파일_하나도_검사_시간_상한_안에서_끊는다(tmp_path, monkeypatch):
+    monkeypatch.setattr(renderer, "MAX_SCAN_BYTES", 100)
+    monkeypatch.setattr(renderer, "_STREAM_CHUNK", 64)
+    (tmp_path / "huge.yaml").write_text("a: " + "x" * 10_000 + "\n")
+    ticks = iter(range(0, 10_000, 3))                 # 조각 하나에 3초 — 파일 하나 안에서 10초를 넘는다
+    monkeypatch.setattr(renderer, "_scan_clock", lambda: next(ticks))
+    with pytest.raises(renderer.ScanTimeout):
+        renderer.loopback_reference(tmp_path)
+
+
+# ── PR 길도 시간 초과는 "잠시 뒤 다시" (manifests/change.py · gitops/pull_requests.py) ──
+
+def _fixture_repo(tmp_path):
+    from fake_github import FIXTURE
+    repo = tmp_path / "repo"
+    shutil.copytree(FIXTURE, repo)
+    return repo
+
+
+def test_PR_길에서_렌더_시간_초과는_busy(tmp_path, monkeypatch):
+    from kukie_agent.manifests import AppSource, Refused, Replicas, Target, change, plan_change
+
+    def slow(*args, **kwargs):
+        raise renderer.RenderTimeout("레포 검사 시간(10초)이 넘어 렌더하지 않아요")
+
+    monkeypatch.setattr(change, "render", slow)
+    result = plan_change(_fixture_repo(tmp_path), AppSource(source_type="Directory", path="apps/plain"),
+                         Target(api_version="apps/v1", kind="Deployment", name="web"), Replicas(count=3))
+    assert isinstance(result, Refused) and result.code == "busy" and not result.retry
+    assert "잠시 뒤 다시" in result.message
+
+
+@needs_kustomize
+def test_다른_환경_비교에서_한쪽만_시간_초과면_비교를_포기한다(tmp_path, monkeypatch):
+    from kukie_agent.manifests import AppSource, Refused, Replicas, Target, change, plan_change
+    original = change.render
+    repo = _fixture_repo(tmp_path)
+
+    def render(kind, folder, *, root, **kwargs):
+        if "overlays/dev" in folder.as_posix() and root != repo:            # 고친 사본의 dev 만 시간 초과
+            raise renderer.RenderTimeout("레포 검사 시간(10초)이 넘어 렌더하지 않아요")
+        return original(kind, folder, root=root, **kwargs)
+
+    monkeypatch.setattr(change, "render", render)
+    result = plan_change(repo, AppSource(source_type="Kustomize", path="apps/kustomize/overlays/prod"),
+                         Target(api_version="apps/v1", kind="Deployment", name="api", namespace="shop-prod"),
+                         Replicas(count=4))
+    assert isinstance(result, Refused) and result.code == "busy" and result.message.startswith("다른 환경과 비교하다")
+    assert "다른 환경도 같이 바뀌어요" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_PR_길의_busy_는_kubectl_로도_다시_고르기로도_보내지_않는다(monkeypatch):
+    from kukie_agent.gitops import pull_requests
+    from kukie_agent.gitops.route import Route
+    from kukie_agent.manifests import AppSource, Refused, Replicas, Target
+    from kukie_agent.server_api import RepoToken
+
+    monkeypatch.setattr(github, "connect", FakeGitHub().connect)
+    monkeypatch.setattr(pull_requests, "plan_change",
+                        lambda *a, **k: Refused(code="busy", message="레포 검사 시간이 넘었어요. 잠시 뒤 다시 해 주세요."))
+    route = Route("pr", "", repository=REPO, source=AppSource(source_type="Directory", path="apps/plain"),
+                  target=Target(api_version="apps/v1", kind="Deployment", name="web"), revision="HEAD")
+    token = RepoToken(repository=REPO, repository_id=1, expires_at="", token=TOKEN)
+    with pytest.raises(pull_requests.Refuse) as caught:
+        await pull_requests.draft(route, Replicas(count=2), token, hpa=None)
+    assert (caught.value.kubectl, caught.value.retry) == (False, False) and "잠시 뒤 다시" in caught.value.message
 
 
 def test_검사_시간_초과는_렌더_결과로_기억하지_않는다(client, cluster, gh, monkeypatch):
