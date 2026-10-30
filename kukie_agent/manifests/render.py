@@ -30,6 +30,7 @@ from typing import Any
 
 import yaml
 from ruamel.yaml import YAML as _RuamelYAML
+from ruamel.yaml.error import YAMLError as _RuamelYAMLError
 
 KUSTOMIZATION_FILES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
 #: kustomize 가 레포 밖에서 가져오는 주소 — http(s) 파일·git 레포 (`https://…`, `git@…`, `github.com/o/r//path`, `ssh://…`,
@@ -185,6 +186,10 @@ def _redact(address: str) -> str:
     return f"{scheme}://{authority.rpartition('@')[2]}"
 
 
+#: 글자 속 주소의 userinfo (`scheme://svc:pw@`) — 문구에 싣기 전에 뺀다
+_USERINFO = re.compile(r"([a-z][a-z0-9+.-]*://)[^/\s@'\"]*@", re.I)
+
+
 def _loopback_in(text: str) -> str | None:
     for found in _URL_AUTHORITY.finditer(text):
         if _local_host(found.group(1)):
@@ -205,23 +210,34 @@ class ScanTimeout(Exception):
     """레포 검사가 SCAN_BUDGET 을 넘었다."""
 
 
+class RenderTimeout(RenderError):
+    """레포 검사 시간이 넘어 렌더하지 않았다 — RenderError 와 같은 뜻이지만 그때의 부하 탓일 수 있어 결과를 기억하지 않는다."""
+
+
+class _ParserLimit(Exception):
+    """YAML 문법이 틀린 게 아니라 우리 파서의 한도(깊은 중첩의 RecursionError 등)에 걸렸다 — kustomize(go-yaml)는 읽을 수 있다."""
+
+
 def _parse(data: bytes) -> list[Any] | None:
-    """YAML 문서들. 둘 다 못 읽으면 None. bytes 로 넘긴다 — UTF-16(BOM) 도 kustomize(go-yaml)처럼 읽는다.
+    """YAML 문서들. YAML 문법으로 못 읽으면 None. bytes 로 넘긴다 — UTF-16(BOM) 도 kustomize(go-yaml)처럼 읽는다.
 
     PyYAML(빠르다)이 YAML 문법으로 거절한 파일만 ruamel(YAML 1.2, go-yaml 과 같은 판 — 순수 파이썬이라 느리다)로 다시 읽는다.
-    그 밖의 실패(깊은 중첩의 RecursionError 등)는 못 읽은 것으로 본다 — 검사가 500 으로 새지 않게 (agent#128 리뷰).
+    그 밖의 실패(RecursionError·MemoryError …)는 _ParserLimit — 부르는 쪽이 원시 글자 검사로 보낸다. 건너뛰면 그 파일이
+    검사에서 통째로 빠진다 (agent#128 리뷰).
     """
     loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
     try:
         return list(yaml.load_all(data, Loader=loader))
     except yaml.YAMLError:
         pass
-    except Exception:                                   # RecursionError·MemoryError 등 — 다시 읽어도 같다
-        return None
+    except Exception as exc:
+        raise _ParserLimit(type(exc).__name__) from None
     try:
         return list(_RuamelYAML(typ="safe", pure=True).load_all(data))
-    except Exception:                                   # ruamel 은 오류 종류가 여럿이다 — 못 읽은 것은 다 같다
+    except _RuamelYAMLError:
         return None
+    except Exception as exc:
+        raise _ParserLimit(type(exc).__name__) from None
 
 
 def _binary(head: bytes) -> bool:
@@ -238,14 +254,31 @@ def _encoding(head: bytes) -> str:
     return "utf-8"
 
 
+#: YAML 겹따옴표 이스케이프 — 원시 글자 검사에서도 풀어 본다: 줄 이음(`\` + 개행 + 들여쓰기), `\/`, `\xXX`·`\uXXXX`·`\UXXXXXXXX`
+_ESCAPE = re.compile(r"\\\r?\n[ \t]*|\\/|\\x([0-9A-Fa-f]{2})|\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})")
+
+
+def _unescaped(text: str) -> str:
+    def one(found: re.Match[str]) -> str:
+        code = found.group(1) or found.group(2) or found.group(3)
+        if code is None:
+            return "/" if found.group(0) == "\\/" else ""          # `\\/` 는 `/`, 줄 이음은 없앤다
+        try:
+            return chr(int(code, 16))
+        except (ValueError, OverflowError):
+            return found.group(0)
+    return _ESCAPE.sub(one, text)
+
+
 def _stream_loopback(file: Path, head: bytes) -> str | None:
-    """큰 글자 파일을 원시 글자로 흘려 읽으며 이 컴퓨터 안 주소를 찾는다 — 조각 사이에 걸친 주소도 보게 겹쳐 읽는다."""
+    """글자 파일을 원시 글자로 흘려 읽으며 이 컴퓨터 안 주소를 찾는다 — 조각 사이에 걸친 주소도 보게 겹쳐 읽는다.
+    이스케이프를 푼 사본도 본다 — YAML 로 읽지 않아도 `\\u002f`·`\\/`·줄 이음으로 숨긴 주소가 빠지지 않게 (agent#128 리뷰)."""
     decoder = codecs.getincrementaldecoder(_encoding(head))(errors="replace")
     tail = ""
     with file.open("rb") as stream:
         while chunk := stream.read(_STREAM_CHUNK):
             text = tail + decoder.decode(chunk)
-            if found := _loopback_in(text):
+            if found := _loopback_in(text) or _loopback_in(_unescaped(text)):
                 return found
             tail = text[-_STREAM_OVERLAP:]
     return None
@@ -269,7 +302,10 @@ def _loopback_in_file(file: Path) -> str | None:
             data = head + stream.read()
     except OSError:
         return None
-    docs = _parse(data)
+    try:
+        docs = _parse(data)
+    except _ParserLimit:
+        return _stream_loopback(file, head)
     return next((found for value in _strings(docs or []) if (found := _loopback_in(value))), None)
 
 
@@ -350,7 +386,7 @@ def render_kustomize(folder: Path, *, timeout: int = 60) -> list[dict]:
         except (subprocess.TimeoutExpired, OSError) as exc:
             raise RenderError(f"kustomize build 를 돌리지 못했어요: {exc}") from exc
     if proc.returncode != 0:
-        stderr = proc.stderr.strip()
+        stderr = _USERINFO.sub(r"\1", proc.stderr.strip())     # kustomize 는 가져오려던 주소를 그대로 찍는다 — userinfo 는 뺀다
         if OFFLINE_PROXY.removeprefix("http://") in stderr or "executable file not found" in stderr:
             raise RenderError("레포 밖 주소를 가져오려 해서 렌더하지 못했어요 — 렌더할 때는 네트워크를 쓰지 않아요. "
                               f"kustomize: {stderr[:_STDERR_LIMIT]}")
@@ -368,7 +404,7 @@ def render(source_type: str, folder: Path, *, root: Path, recurse: bool = False,
         try:
             local = loopback_reference(root, scan_key=scan_key)
         except ScanTimeout as exc:
-            raise RenderError(f"레포 검사 시간({exc})이 넘어 렌더하지 않아요 — 이 컴퓨터 안 주소를 다 확인하지 못했어요") from None
+            raise RenderTimeout(f"레포 검사 시간({exc})이 넘어 렌더하지 않아요 — 이 컴퓨터 안 주소를 다 확인하지 못했어요") from None
         if local is not None:
             raise RenderError(f"레포 안 파일에 이 컴퓨터 안 주소({local})가 있어 렌더하지 않아요")
         remote = remote_reference(folder, root)

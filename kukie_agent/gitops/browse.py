@@ -609,6 +609,8 @@ def _render_folder(root: Path, source: RenderSource, scan_key: str) -> dict[str,
                 "resources": [], "total": 0, "truncated": False}
     try:
         objects = renderer.render(source.source_type, folder, root=root, recurse=source.recurse, scan_key=scan_key)
+    except renderer.RenderTimeout:
+        raise                       # 결과로 돌려주면 _renders 에 기억된다 — 그때의 부하 탓일 수 있어 다시 할 수 있게 올린다
     except renderer.RenderError as exc:
         # kustomize 오류에는 레포를 푼 임시 경로가 찍힌다 — 레포 기준으로 바꿔 싣는다
         message = str(exc).replace(str(root.resolve()) + "/", "").replace(str(root) + "/", "")

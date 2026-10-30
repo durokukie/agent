@@ -38,6 +38,7 @@ from kukie_agent import argocd, server_api
 from kukie_agent.auth import User, current_user
 from kukie_agent.clusters import access, gpu, overview
 from kukie_agent.gitops import browse, github
+from kukie_agent.manifests import render as renderer
 from kukie_agent.kubectl import KubectlResult, run_kubectl, thread_limiter
 
 logger = logging.getLogger(__name__)
@@ -386,6 +387,9 @@ async def argocd_application_rendered(
         async with github.connect(source.repository, token.token) as gh:
             revision = await browse.resolve(gh, source.repository, wanted)
         result = await browse.render(source.repository, token.token, revision.sha, source)
+    except renderer.RenderTimeout as exc:
+        # 렌더 기억(browse._renders)에 남지 않는 실패 — 다음 요청이 다시 해 본다 (agent#128 리뷰)
+        result = {"status": "render_failed", "message": str(exc), "resources": [], "total": 0, "truncated": False}
     except browse.NotFound as exc:
         raise _browse_not_found(exc) from None
     except github.GitHubError as exc:

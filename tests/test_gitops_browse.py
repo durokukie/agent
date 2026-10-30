@@ -661,14 +661,16 @@ def test_큰_글자_파일은_막지_않고_흘려_읽으며_주소만_찾는다
     assert renderer.loopback_reference(tmp_path, scan_key="2") == "http://127.0.0.1:15000"
 
 
-def test_깊은_중첩도_500_이_아니라_못_읽은_파일(tmp_path, monkeypatch):
+def test_깊은_중첩도_500_이_아니라_글자_검사로_간다(tmp_path, monkeypatch):
     _kustomization(tmp_path, "resources: []\n")
     (tmp_path / "deep.yaml").write_text("a: " + "[" * 50_000 + "]" * 50_000 + "\n")   # 실제 파서가 RecursionError 를 낸다
     assert renderer.loopback_reference(tmp_path, scan_key="1") is None
     tried: list = []
     monkeypatch.setattr(renderer.yaml, "load_all", lambda *a, **k: (_ for _ in ()).throw(RecursionError()))
     monkeypatch.setattr(renderer, "_RuamelYAML", lambda **k: tried.append(k))     # YAMLError 가 아니면 다시 읽지 않는다
-    assert renderer._parse(b"a: b\n") is None and tried == []
+    with pytest.raises(renderer._ParserLimit):                                    # 부르는 쪽이 글자 검사로 보낸다
+        renderer._parse(b"a: b\n")
+    assert tried == []
 
 
 def test_검사_시간이_넘으면_렌더하지_않고_기억하지도_않는다(tmp_path, monkeypatch):
@@ -693,6 +695,54 @@ def test_문구의_주소에는_userinfo_와_경로를_싣지_않는다(tmp_path
     with pytest.raises(renderer.RenderError) as caught:
         renderer.render("Kustomize", app, root=tmp_path, scan_key="2")
     assert "https://github.com" in str(caught.value) and "ghp_secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize("text", [
+    'files:\n- "x=http:\\u002f/127.0.0.1:15000/config_dump"\n',
+    'files:\n- "x=http:\\/\\/localhost:15000/a"\n',
+    'files:\n- "x=http:\\\n  //localhost:9999/a"\n',
+    'files:\n- "x=http\\x3a//[::1]:1/a"\n',
+])
+def test_큰_파일의_원시_글자_검사도_이스케이프를_풀어_본다(tmp_path, monkeypatch, text):
+    monkeypatch.setattr(renderer, "MAX_SCAN_BYTES", 100)
+    _kustomization(tmp_path, "generators:\n- gen.yaml\n")
+    (tmp_path / "app" / "gen.yaml").write_text("# " + "x" * 200 + "\nkind: ConfigMapGenerator\n" + text)
+    assert renderer.loopback_reference(tmp_path) is not None
+
+
+def test_파서_한도에_걸린_파일은_건너뛰지_않고_글자로_본다(tmp_path):
+    _kustomization(tmp_path, "resources: []\n")
+    (tmp_path / "deep.yaml").write_text("b: http://localhost:1/x\na: " + "[" * 50_000 + "]" * 50_000 + "\n")
+    assert renderer.loopback_reference(tmp_path) == "http://localhost:1"
+
+
+def test_kustomize_오류_문구에도_userinfo_를_싣지_않는다(tmp_path, monkeypatch):
+    app = _kustomization(tmp_path, "resources: []\n")
+    failed = type("P", (), {"returncode": 1, "stdout": "",
+                            "stderr": 'Error: Get "https://bot:ghp_secret@example.com/a": proxyconnect tcp: '
+                                      'dial tcp 127.0.0.1:9: connect: connection refused'})()
+    monkeypatch.setattr(renderer.subprocess, "run", lambda *a, **k: failed)
+    with pytest.raises(renderer.RenderError) as caught:
+        renderer.render("Kustomize", app, root=tmp_path)
+    assert "ghp_secret" not in str(caught.value) and "https://example.com/a" in str(caught.value)
+
+
+def test_검사_시간_초과는_렌더_결과로_기억하지_않는다(client, cluster, gh, monkeypatch):
+    _cluster_apps(monkeypatch, [_app("a", "apps/kustomize/overlays/prod", source_type="Kustomize")])
+    answers = iter([renderer.ScanTimeout("10초"), None])
+
+    def scan(root, **kwargs):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(renderer, "loopback_reference", scan)
+    monkeypatch.setattr(renderer, "render_kustomize", lambda folder, **k: [])
+    first = _rendered(client, cluster, "a").json()
+    assert first["status"] == "render_failed" and "레포 검사 시간" in first["message"] and first["sha"] == "c0"
+    assert _rendered(client, cluster, "a").json()["status"] == "ok"             # 다시 하면 된다
+    assert [read for read in gh.reads if read[0] == "download"] == [("download", "c0")] * 2
 
 
 def test_별칭으로_부풀린_YAML_에_묶이지_않는다(tmp_path):
