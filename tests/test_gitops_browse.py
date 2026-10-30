@@ -399,12 +399,41 @@ def test_plain_앱은_폴더의_YAML_을_그대로_렌더하고_Secret_값은_�
         "ok", REPO, "apps/secret", "Directory")
     assert (body["ref"], body["sha"], body["target_revision"], body["sync_revision"]) == ("main", "c0", "HEAD", "c0")
     assert body["destination_namespace"] == "shop" and body["application"] == {"namespace": "argocd", "name": "shop-secret"}
-    assert [(x["kind"], x["name"], x["namespace"], x["masked"]) for x in body["resources"]] == [
-        ("Secret", "web-db", "shop", True), ("ConfigMap", "web", None, False)]
+    assert [(x["kind"], x["name"], x["namespace"], x["masked"], x["masked_reason"]) for x in body["resources"]] == [
+        ("Secret", "web-db", "shop", True, "kind: Secret"), ("ConfigMap", "web", None, False, None)]
     secret = body["resources"][0]["yaml"]
     assert "url: (가림)" in secret and "cG9zdGdyZXM6Ly8=" not in r.text and "last-applied" not in secret
     assert (body["total"], body["truncated"]) == (2, False)
     assert TOKEN not in r.text
+
+
+def test_렌더_결과도_파일과_같은_규칙으로_가린다(client, cluster, gh, monkeypatch):
+    _cluster_apps(monkeypatch, [_app("leaky", "apps/leaky")])
+    gh.commits["c0"].update({
+        "apps/leaky/key.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: tls}\n"
+                               "data: {key: \"-----BEGIN RSA PRIVATE KEY-----\\nMIIabc\"}\n",
+        "apps/leaky/token.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: gh}\n"
+                                 "data: {token: ghp_abcdefghijklmnopqrstuvwxyz0123}\n",
+        "apps/leaky/aws.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: aws}\ndata: {id: AKIAABCDEFGHIJKLMNOP}\n",
+        "apps/leaky/sops.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: enc}\n"
+                                "data: {k: \"ENC[AES256_GCM,data:abc]\"}\nsops: {mac: x}\n",
+        "apps/leaky/odd.yaml": "apiVersion: example.com/v1\nkind: Thing\nmetadata: {name: odd}\n"
+                               "stringData: {password: hunter2}\n",
+        "apps/leaky/fine.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: fine}\ndata: {a: b}\n",
+        "apps/leaky/secret.yaml": SECRET,
+        "apps/leaky/secret-note.yaml": SECRET.replace("name: web-db", "name: web-key").replace(
+            "  annotations:\n", "  annotations:\n    note: AKIAABCDEFGHIJKLMNOP\n"),       # 값 밖에 키가 샌 Secret
+    })
+    r = _rendered(client, cluster, "leaky")
+    body = r.json()
+    got = {x["name"]: (x["masked"], x["masked_reason"], x["yaml"] is None) for x in body["resources"]}
+    assert got == {
+        "aws": (True, "비밀 키", True), "enc": (True, "sops", True), "fine": (False, None, False),
+        "gh": (True, "비밀 키", True), "odd": (True, "stringData", True), "tls": (True, "비밀 키", True),
+        "web-db": (True, "kind: Secret", False), "web-key": (True, "비밀 키", True),
+    }
+    for leaked in ("MIIabc", "ghp_abcdef", "AKIAABCDEFGHIJKLMNOP", "hunter2", "cG9zdGdyZXM6Ly8="):
+        assert leaked not in r.text
 
 
 @needs_kustomize

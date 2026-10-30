@@ -548,19 +548,40 @@ def _dump(obj: dict[str, Any]) -> str:
     return yaml.safe_dump(obj, sort_keys=False, allow_unicode=True, default_flow_style=False, width=4096)
 
 
+def _rendered_secret(obj: dict[str, Any], text: str) -> str | None:
+    """렌더한 객체 하나가 비밀 값을 그대로 드러내는 까닭 — 파일 가림(secret_reason)과 같은 규칙이다 (agent#128 리뷰).
+    Secret 은 mask_secret 이 값을 이미 가렸으니 그 밖의 글자(비밀 키·토큰·sops)만 본다."""
+    if obj.get("kind") == "Secret":
+        return next((reason for reason, pattern in _SECRET_TEXT
+                     if reason in ("sops", "비밀 키") and pattern.search(text)), None)
+    return secret_reason("", text, [obj])
+
+
 def rendered_view(objects: list[dict[str, Any]]) -> dict[str, Any]:
-    """렌더한 객체들 → 응답의 resources (객체마다 kind·name·namespace 와 YAML). 상한을 넘는 것은 뺀다."""
+    """렌더한 객체들 → 응답의 resources (객체마다 kind·name·namespace 와 YAML). 상한을 넘는 것은 뺀다.
+
+    Secret 은 값만 가리고(yaml 에 MASKED) masked_reason 이 "kind: Secret" 이다. 그 밖에 비밀처럼 보이는 객체(stringData·sops·
+    비밀 키·토큰이 든 ConfigMap 등)는 yaml 을 통째로 싣지 않는다(null) — kind·name·namespace 는 준다.
+    """
     resources: list[dict[str, Any]] = []
     used = 0
     truncated = False
     for obj in objects:
         masked = mask_secret(obj)
         text = _dump(masked)
-        if len(resources) >= MAX_RENDER_RESOURCES or used + len(text) > MAX_RENDER_BYTES:
+        reason = _rendered_secret(masked, text)
+        if reason is not None:
+            text_out: str | None = None
+        else:
+            text_out = text
+            reason = "kind: Secret" if masked is not obj else None
+        size = len(text_out or "")
+        if len(resources) >= MAX_RENDER_RESOURCES or used + size > MAX_RENDER_BYTES:
             truncated = True
             break
-        used += len(text)
-        resources.append({**(describe(masked) or {}), "masked": masked is not obj, "yaml": text})
+        used += size
+        resources.append({**(describe(masked) or {}), "masked": reason is not None, "masked_reason": reason,
+                          "yaml": text_out})
     return {"status": "ok", "message": None, "resources": resources, "total": len(objects), "truncated": truncated}
 
 
@@ -605,7 +626,7 @@ async def render(repository: str, token: str, sha: str, source: RenderSource) ->
             if not done.cancelled() and done.exception() is None:
                 body = done.result()
                 # 렌더 실패도 같은 커밋이면 다시 해도 같다 — 기억한다. GitHub 실패(예외)는 기억하지 않는다
-                _renders.put(key, body, sum(len(r["yaml"]) for r in body["resources"]) + 1000)
+                _renders.put(key, body, sum(len(r["yaml"] or "") for r in body["resources"]) + 1000)
 
         task.add_done_callback(finished)
     return await asyncio.shield(task)
