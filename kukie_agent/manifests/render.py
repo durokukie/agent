@@ -25,8 +25,10 @@ from pathlib import Path
 import yaml
 
 KUSTOMIZATION_FILES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
-#: kustomize 가 레포 밖에서 가져오는 주소 — http(s) 파일·git 레포 (`https://…`, `git@…`, `github.com/o/r//path`, `ssh://…`)
-_REMOTE = re.compile(r"^(?:[a-z][a-z0-9+.-]*://|[\w.-]+@[\w.-]+:|(?:github\.com|gitlab\.com|bitbucket\.org)/)", re.I)
+#: kustomize 가 레포 밖에서 가져오는 주소 — http(s) 파일·git 레포 (`https://…`, `git@…`, `github.com/o/r//path`, `ssh://…`,
+#: `git::…`, `gh:o/r`). 문구용이다 — 막는 것은 네트워크 없는 실행 환경이다 (모듈 설명)
+_REMOTE = re.compile(r"^(?:git::|gh:|[a-z][a-z0-9+.-]*://|[\w.-]+@[\w.-]+:|(?:github\.com|gitlab\.com|bitbucket\.org)/)",
+                     re.I)
 #: 원격 주소를 받을 수 있는 kustomization 칸. resources·bases·components 의 로컬 폴더는 따라가서 그 안도 본다
 _REFERENCE_KEYS = ("resources", "bases", "components", "generators", "transformers", "validators", "crds",
                    "configurations")

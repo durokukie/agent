@@ -499,6 +499,8 @@ def test_kustomize_가_실패하면_render_failed_이고_임시_경로는_싣지
     "github.com/kubernetes-sigs/kustomize//examples/multibases?ref=v5.8.1",
     "git@github.com:acme/x.git//base",
     "ssh://git@github.com/acme/x.git",
+    "git::https://github.com/acme/x.git//base",
+    "gh:acme/x//base",
 ])
 def test_레포_밖_주소를_가져오는_Kustomize_는_돌리지_않는다(client, cluster, gh, monkeypatch, remote):
     _cluster_apps(monkeypatch, [_app("remote", "apps/remote/overlay", source_type="Kustomize")])
