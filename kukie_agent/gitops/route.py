@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -71,12 +72,23 @@ class Route:
         }
 
 
-def _kubectl(args: list[str], *, context: str, kubeconfig: Path | None) -> KubectlResult:
-    return run_kubectl(args, context=context, kubeconfig=kubeconfig, timeout=LOOKUP_TIMEOUT)
+_TIMED_OUT = KubectlResult(command="", stdout="", stderr="PR 길 판단 시간이 다 됐다", success=False)
 
 
-def _read(args: list[str], *, context: str, kubeconfig: Path | None) -> dict[str, Any] | None:
-    result = _kubectl(args, context=context, kubeconfig=kubeconfig)
+def _kubectl(args: list[str], *, context: str, kubeconfig: Path | None, deadline: float | None = None) -> KubectlResult:
+    """한 번의 제한을 남은 시간으로 줄인다 — 스레드 안의 kubectl 은 밖에서 취소할 수 없어 예산은 여기서 지킨다."""
+    timeout: float = LOOKUP_TIMEOUT
+    if deadline is not None:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return _TIMED_OUT
+        timeout = min(timeout, left)
+    return run_kubectl(args, context=context, kubeconfig=kubeconfig, timeout=timeout)
+
+
+def _read(args: list[str], *, context: str, kubeconfig: Path | None,
+          deadline: float | None = None) -> dict[str, Any] | None:
+    result = _kubectl(args, context=context, kubeconfig=kubeconfig, deadline=deadline)
     if not result.success:
         if "notfound" in (result.stderr or "").lower().replace(" ", ""):
             return {}                                  # 없다 — 읽기는 됐다
@@ -116,16 +128,16 @@ def app_source(item: dict[str, Any], source: dict[str, Any]) -> AppSource:
 
 
 def _locate(kind: str, name: str, namespace: str | None, *, context: str,
-            kubeconfig: Path | None) -> tuple[dict | None, argocd.Tracking | None, dict | None, str]:
+            kubeconfig: Path | None, deadline: float | None = None) -> tuple[dict | None, argocd.Tracking | None, dict | None, str]:
     """(리소스, 추적 표시, Application, Application 을 못 읽은 이유). 블로킹 — 스레드에서 돈다."""
     args = ["get", kind, name, "-o", "json", *(["-n", namespace] if namespace else [])]
-    resource = _read(args, context=context, kubeconfig=kubeconfig)
+    resource = _read(args, context=context, kubeconfig=kubeconfig, deadline=deadline)
     if not resource:
         return None, None, None, "missing" if resource == {} else "error"
     tracking = argocd.tracking_of(resource)
     if tracking is None:
         return resource, None, None, ""
-    listed = _kubectl(argocd.LIST_COMMAND, context=context, kubeconfig=kubeconfig)
+    listed = _kubectl(argocd.LIST_COMMAND, context=context, kubeconfig=kubeconfig, deadline=deadline)
     if not listed.success:
         why = argocd.failure_kind(listed.stderr or listed.stdout)
         return resource, tracking, None, why
@@ -141,12 +153,17 @@ def _locate(kind: str, name: str, namespace: str | None, *, context: str,
 
 async def decide(
     *, kind: str, name: str, namespace: str | None, context: str, kubeconfig: Path | None,
-    cluster_id: str | None, change: Change | None = None,
+    cluster_id: str | None, change: Change | None = None, connected: set[str] | None = None,
+    budget: float | None = None,
 ) -> Route:
-    """그 리소스를 지금 어느 길로 바꿀지. 어떤 실패도 올리지 않는다 — 모르면 kubectl 길(지금과 같음)이다."""
+    """그 리소스를 지금 어느 길로 바꿀지. 어떤 실패도 올리지 않는다 — 모르면 kubectl 길(지금과 같음)이다.
+
+    budget 을 주면 kubectl 조회 전체를 그 초 안에 끝낸다(남은 시간으로 한 번의 제한을 줄인다). 넘으면 모름(known=False).
+    """
+    deadline = time.monotonic() + budget if budget is not None else None
     try:
         resource, tracking, item, why = await to_thread.run_sync(
-            partial(_locate, kind, name, namespace, context=context, kubeconfig=kubeconfig),
+            partial(_locate, kind, name, namespace, context=context, kubeconfig=kubeconfig, deadline=deadline),
             limiter=thread_limiter("gitops_route", LOOKUP_WORKERS),
         )
     except Exception:
@@ -180,15 +197,14 @@ async def decide(
     if repository is None:
         return Route("kubectl", f"{app_label} 의 소스가 GitHub 레포가 아니라 PR 로 못 바꿔요.", **common)
 
-    if cluster_id is None:
-        connected: set[str] = set()
-    else:
+    # connected 를 주면 그걸 쓴다 — 한 호출에서 리소스 여럿을 볼 때 연결 목록을 한 번만 읽으려고 (kubectl 훅의 _pr_path)
+    if connected is None and cluster_id is not None:
         try:
             connected = {repo.repository for repo in await server_api.manifest_repos(cluster_id)}
         except Exception:
             logger.exception("연결된 레포 목록을 읽지 못해 kubectl 길로 둔다: cluster=%s", cluster_id)
             return Route("kubectl", "레포 연결 상태를 확인하지 못해 PR 길을 정할 수 없어요.", known=False, **common)
-    if repository not in connected:
+    if repository not in (connected or set()):
         return Route("kubectl", f"{app_label} 의 레포 {repository} 가 Kukie 에 연결돼 있지 않아요. "
                                 "레포를 연결하면 PR 로 바꿀 수 있어요.", **common)
     source_type = common["source"].source_type

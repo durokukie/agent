@@ -23,17 +23,22 @@ import logging
 import shlex
 from functools import partial
 
+import anyio
 import yaml
 from anyio import to_thread
+from pydantic import ValidationError
 from pydantic_ai import ApprovalRequired, ModelRetry, ToolFailed
 from pydantic_ai.capabilities.hooks import Hooks
 
-from kukie_agent import argocd
+from kukie_agent import argocd, server_api
+from kukie_agent.gitops import route as gitops_route
+from kukie_agent.gitops.repo import repo_name
 from kukie_agent.guardrail.action_plan import ActionPlan, PlanTarget
 from kukie_agent.guardrail.approval import _manifest_preview
 from kukie_agent.guardrail.decision_guidance import generate_decision_guidance
 from kukie_agent.guardrail.mutation_request import canonicalize_mutation_args
 from kukie_agent.kubectl import KubectlResult, assemble, run_kubectl, thread_limiter
+from kukie_agent.manifests import Replicas
 from kukie_agent.tools.mutate import MUTATING_TOOLS, RISK_STICKERS
 
 logger = logging.getLogger(__name__)
@@ -109,6 +114,69 @@ async def _argocd_ownership(ctx, target: PlanTarget) -> dict | None:
     except Exception:
         logger.exception("ArgoCD 판별을 건너뛴다")
         return None
+
+
+#: PR 길 리소스에 kubectl 을 부르면 한 번 돌려보낼 때 쓰는 머리말 (DURO-135)
+PR_PATH_RETRY = "이 리소스는 지금 PR 길이다."
+#: 같은 일을 PR 로도 할 수 있는 kubectl 툴 — restart·delete 는 PR 로 하는 변경이 아니다
+_PR_ALTERNATIVE = frozenset({"scale_resource", "apply_manifest"})
+
+
+#: PR 길 판단(_pr_path) 전체 시간(초). 넘으면 모르는 것으로 보고 kubectl 길 그대로 간다 — 승인 카드가 그만큼만 늦는다
+PR_PATH_BUDGET = argocd.LOOKUP_BUDGET
+
+
+async def _pr_path(ctx, tool_name: str, managed: dict, normalized_args: dict) -> gitops_route.Route | None:
+    """ArgoCD 가 관리하는 대상이 PR 길이면 그 판단 (DURO-135). 아니거나 모르면 None — kubectl 길 그대로.
+
+    조회 예산을 지킨다 (agent#127 리뷰): 판별(argocd.inspect)이 이미 읽은 Application 으로 연결된 레포의 앱인지 먼저 보고
+    (아니면 kubectl 을 더 부르지 않는다), 길은 그 앱의 **첫 리소스 하나**만 판단하고, 판단 전체를 PR_PATH_BUDGET 초로 끊는다
+    (argocd.inspect 의 판별은 따로 LOOKUP_BUDGET 을 쓴다).
+    한 리소스로 충분하다 — 돌려보내는 말은 "이 변경은 PR 로" 하나이고, 나머지 리소스는 propose_git_change 가 다시 본다.
+    """
+    if tool_name == "scale_resource":
+        try:
+            change = Replicas(count=normalized_args["replicas"])
+        except ValidationError:
+            return None        # PR 로는 못 하는 값(0..1000 밖) — 판단할 것 없이 kubectl 길이다 (범위는 kubectl 이 본다)
+    else:
+        change = None
+    # 예산은 두 겹으로 지킨다: 취소할 수 있는 await(server 호출·스레드 슬롯 대기)는 move_on_after 로, 이미 도는 스레드 안의
+    # kubectl 은 취소할 수 없어 남은 시간을 decide 에 넘겨 한 번의 제한을 줄인다 (agent#127 리뷰)
+    started = anyio.current_time()
+    connected = None
+    with anyio.move_on_after(PR_PATH_BUDGET):
+        try:
+            connected = {repo.repository for repo in await server_api.manifest_repos(ctx.deps.cluster_id)}
+        except Exception:
+            logger.exception("연결된 레포 목록을 읽지 못해 PR 길 판단을 건너뛴다")
+            return None
+    if connected is None:
+        logger.warning("PR 길 판단이 %s초를 넘어 kubectl 길로 둔다", PR_PATH_BUDGET)
+        return None
+    linked_apps = {
+        app["name"] for app in managed.get("applications") or []
+        if repo_name(app.get("repo_url")) in connected
+    }
+    resource = next((r for r in managed.get("resources") or [] if r.get("application") in linked_apps), None)
+    if resource is None:
+        return None
+    left = PR_PATH_BUDGET - (anyio.current_time() - started)
+    if left <= 0:
+        return None
+    found = None
+    # move_on_after 는 스레드 슬롯(thread_limiter) 대기를 끊고, 슬롯을 받은 뒤의 kubectl 은 budget 이 끊는다.
+    # budget 의 끝은 지금 기준 절대 시각이라 슬롯을 기다린 만큼 kubectl 몫이 줄어 전체가 left 안에 든다 (agent#127 리뷰)
+    with anyio.move_on_after(left):
+        found = await gitops_route.decide(
+            kind=str(resource["kind"]), name=str(resource["name"]), namespace=resource.get("namespace") or None,
+            context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig, cluster_id=ctx.deps.cluster_id,
+            change=change, connected=connected, budget=left,
+        )
+    if found is None:
+        logger.warning("PR 길 판단이 %s초를 넘어 kubectl 길로 둔다", PR_PATH_BUDGET)
+        return None
+    return found if found.path == "pr" else None
 
 
 def _manifest_resources(manifest_yaml: str) -> list[dict[str, str]]:
@@ -268,6 +336,20 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
     # 승인 뒤(위 분기)에는 다시 보지 않는다 — 카드에 실린 경고를 보고 승인한 것이다.
     # 승인 순간 다시 판단해 길이 바뀌면 STALE 로 돌리는 것은 PR 길(DURO-134)과 함께 한다 (설계 1절)
     managed = await _argocd_ownership(ctx, target)
+    if managed is not None and tool_name in _PR_ALTERNATIVE and getattr(ctx.deps, "cluster_id", None) is not None:
+        # 길을 코드가 강제한다 (DURO-135): PR 길 리소스에 경고 없이 kubectl 을 부르면 이유를 붙여 한 번 돌려보낸다.
+        # 옛 답변("kubectl 로 바꿀게요")에 끌려간 호출이 여기서 걸린다. 같은 호출을 다시 하면 경고 카드와 함께 간다(경고 후 허용)
+        pr = await _pr_path(ctx, tool_name, managed, normalized_args)
+        if pr is not None:
+            managed = {**managed, "route": {"path": "pr", "repository": pr.repository, "reason": pr.reason}}
+            # 한 번만 돌려보낸다: 이 툴의 재시도를 이미 썼으면(같은 run 에서 돌려받고 다시 부름 = 사용자가 kubectl 을 골랐거나
+            # 다른 리소스다) 진행한다. 또 ModelRetry 면 한도(1)를 넘어 run 이 실패한다. 카드의 route 칸이 대신 알린다
+            if getattr(ctx, "retry", 0) < 1:
+                raise ModelRetry(
+                    f"{PR_PATH_RETRY} 이유: {pr.reason} 레플리카·이미지 태그·resources·환경변수 변경이면 "
+                    "propose_git_change 로 다시 하라. 그 밖의 변경이거나 사용자가 kubectl 로 바로 바꾸길 원하면"
+                    "(장애 대응 등) 같은 호출을 한 번 더 하라 — ArgoCD 경고 카드와 함께 승인을 받는다."
+                )
     plan = await ActionPlan.create_draft(
         run_id=ctx.deps.run_id,
         call_id=call.tool_call_id,

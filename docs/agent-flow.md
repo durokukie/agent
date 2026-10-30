@@ -111,6 +111,7 @@ flowchart LR
 | 읽기 툴 5종 | `list_resources` 등 | `tools/read.py` | ✅ |
 | 변경 툴 4종 | `delete_resource` 등 | `tools/mutate.py` | ✅ Shared 대화에만 노출, 가드레일 훅 대상 |
 | PR 길 변경 툴 | `propose_git_change` — 승인 전 PR, 승인 = 머지, sync·health 지켜보기, 승인 순간 STALE 판단 | `tools/gitops.py`, `guardrail/gitops_hook.py`, `gitops/` | ✅ DURO-134 |
+| 옛 답변 끌림 막기 | kubectl 훅이 PR 길 리소스면 한 번 `ModelRetry`(같은 호출을 다시 하면 경고 카드), `ProcessHistory` 가 레포 연결이 바뀐 때만 기록 끝에 메모 한 줄 + 숨은 칸 갱신 | `guardrail/hook.py`, `gitops/memo.py` | ✅ DURO-135 |
 | 명령 조립 | `assemble()` | `kubectl/assemble.py` | 부분 (apply TODO) |
 | 실행 | `run_kubectl()` | `kubectl/runner.py` | ✅ |
 | 훅 파이프라인 | `guardrail()` | `guardrail/hook.py` | ✅ 2-pass 승인·실행·기록 |

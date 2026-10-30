@@ -43,6 +43,8 @@ LLM 이 delete_resource(...) 호출
 ArgoCD 가 관리하고 매니페스트 레포가 연결된 리소스는 kubectl 대신 **PR 길**로 간다 (`propose_git_change`, DURO-134).
 같은 틀에서 ③ dry-run 자리가 "고칠 곳 찾기 + 렌더 비교 + 승인 전 PR 열기" 로, ⑥ 실행이 "PR 머지 → ArgoCD sync·health 지켜보기" 로
 바뀐다. 승인 순간 길을 다시 판단해 레포 연결·Application·PR 이 바뀌었으면 실행하지 않고 STALE 로 닫는다.
+레포 연결이 대화 도중 바뀌어도 AI 가 옛 답변을 따라가지 않게, 틀린 길의 호출은 훅이 `ModelRetry` 로 돌려보내고
+연결이 바뀐 때만 기록 끝에 메모 한 줄을 넣는다 (DURO-135, `kukie_agent/gitops/memo.py`). instructions·툴 목록은 그대로다.
 
 설계에서 지킨 원칙:
 

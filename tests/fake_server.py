@@ -65,6 +65,7 @@ class FakeServer:
         self.teams: dict[str, dict[str, str]] = {}     # team_id → {user_id: "ADMIN" | "MEMBER"}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.manifest_repo_links: dict[str, set[str]] = {}      # cluster_id → 연결된 `owner/repo` (DURO-131)
+        self.repo_link_states: dict[str, dict[str, Any]] = {}   # conversation_id → 숨은 칸 (DURO-135)
         self._codes: dict[str, itertools.count] = {}
 
     # ── 테스트가 상태를 만들고 읽는 도구 (server_api 에는 없다) ─────────────
@@ -385,6 +386,18 @@ class FakeServer:
             raise ServerError(404, "MANIFEST_REPO_NOT_CONNECTED", f"연결된 레포가 아니다: {name}")
         return server_api.RepoToken.from_json({"repository": name, "repositoryId": 42, "token": "ghs_fake-token",
                                                "expiresAt": "2026-10-30T10:00:00Z"})
+
+    async def repo_link_state(self, conversation_id: str):
+        self.calls.append(("repo_link_state", {"id": conversation_id}))
+        if conversation_id not in self.conversations:
+            raise _not_found(conversation_id)
+        return copy.deepcopy(self.repo_link_states.get(conversation_id))
+
+    async def update_repo_link_state(self, conversation_id: str, state: dict[str, Any]) -> None:
+        self.calls.append(("update_repo_link_state", {"id": conversation_id, "state": state}))
+        if conversation_id not in self.conversations:
+            raise _not_found(conversation_id)
+        self.repo_link_states[conversation_id] = copy.deepcopy(state)
 
     # ── Action Plan (contract 3절 상태 머신) ─────────────────
 

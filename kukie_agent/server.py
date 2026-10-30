@@ -46,6 +46,7 @@ from kukie_agent import auth, progress, server_api
 from kukie_agent.agent import agent
 from kukie_agent.clusters import runtime
 from kukie_agent.deps import Deps
+from kukie_agent.gitops.memo import strip_mark
 from kukie_agent.guardrail.gitops_hook import close_rejected
 from kukie_agent.guardrail.action_plan import ActionPlan
 from kukie_agent.guardrail.approval import ApprovalRequest, build_approval_request
@@ -319,7 +320,8 @@ async def _chat_turn(session: Session, text: str) -> tuple[dict[str, Any], Any]:
 
     session.processing = True
     try:
-        result = await _run_agent(session, user_prompt=text)
+        # 메모 표식 문자는 지운다 — 사용자 글이 레포 연결 메모로 읽히지 않게 (DURO-135, gitops/memo.py)
+        result = await _run_agent(session, user_prompt=strip_mark(text))
         return await _to_payload(session, result), result
     finally:
         session.processing = False

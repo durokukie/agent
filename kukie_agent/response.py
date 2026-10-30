@@ -22,6 +22,7 @@ from pydantic_ai import RunContext
 from pydantic_ai.messages import ModelMessage, ModelRequest, ToolReturnPart, UserPromptPart
 
 from kukie_agent.deps import Deps
+from kukie_agent.gitops.memo import is_memo
 from kukie_agent.glossary import explain_command
 from kukie_agent.kubectl import KubectlResult
 from kukie_agent.skills.base import KukieResponse, ToolStep
@@ -52,7 +53,10 @@ def _current_turn(messages: Sequence[ModelMessage]) -> Sequence[ModelMessage]:
     """이번 턴의 메시지만 — 마지막 사용자 발화부터. 이전 턴의 툴 기록이 steps 에 섞이지 않게."""
     start = 0
     for i, msg in enumerate(messages):
-        if isinstance(msg, ModelRequest) and any(isinstance(p, UserPromptPart) for p in msg.parts):
+        # 레포 연결 메모(DURO-135)도 UserPromptPart 지만 새 질문이 아니다 — 툴 결과 요청에 붙어도 턴을 끊지 않는다
+        if isinstance(msg, ModelRequest) and any(
+            isinstance(p, UserPromptPart) and not is_memo(p) for p in msg.parts
+        ):
             start = i
     return messages[start:]
 
