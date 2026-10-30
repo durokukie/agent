@@ -490,6 +490,37 @@ def test_kustomize_가_실패하면_render_failed_이고_임시_경로는_싣지
     assert "kukie-repo-view-" not in body["message"]
 
 
+@pytest.mark.parametrize("remote", [
+    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+    "https://raw.githubusercontent.com/acme/x/main/deploy.yaml",
+    "github.com/kubernetes-sigs/kustomize//examples/multibases?ref=v5.8.1",
+    "git@github.com:acme/x.git//base",
+    "ssh://git@github.com/acme/x.git",
+])
+def test_레포_밖_주소를_가져오는_Kustomize_는_돌리지_않는다(client, cluster, gh, monkeypatch, remote):
+    _cluster_apps(monkeypatch, [_app("remote", "apps/remote/overlay", source_type="Kustomize")])
+    # overlay 는 로컬 base 만 쓰고, 원격 주소는 base 안에 숨어 있다 — 따라가서 본다
+    gh.commits["c0"].update({
+        "apps/remote/overlay/kustomization.yaml": "resources:\n  - ../base\n",
+        "apps/remote/base/kustomization.yaml": f"resources:\n  - deploy.yaml\n  - {remote}\n",
+        "apps/remote/base/deploy.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: x}\n",
+    })
+    ran: list = []
+    monkeypatch.setattr("kukie_agent.manifests.render.subprocess.run", lambda *a, **k: ran.append(a))
+    body = _rendered(client, cluster, "remote").json()
+    assert body["status"] == "render_failed" and remote in body["message"] and ran == []
+
+
+def test_로컬만_쓰는_kustomization_은_원격이_아니다(tmp_path):
+    from kukie_agent.manifests.render import remote_reference
+    (tmp_path / "base").mkdir()
+    (tmp_path / "base" / "kustomization.yaml").write_text("resources: [deploy.yaml]\n")
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "kustomization.yaml").write_text(
+        "resources: [../base, ../base]\ncomponents: [../base]\npatches:\n  - path: p.yaml\n")
+    assert remote_reference(tmp_path / "app", tmp_path) is None
+
+
 def test_같은_커밋의_렌더는_기억한다(client, cluster, gh, monkeypatch):
     _cluster_apps(monkeypatch)
     first = _rendered(client, cluster, "shop-web").json()
