@@ -8,19 +8,24 @@ kustomize 는 에이전트 이미지에 ArgoCD 와 같은 버전을 넣는다 (D
 읽어 렌더 결과로 내보낼 수 있다. 칸을 골라 막으면 새 칸·새 접두사로 샌다. 그래서 막는 것은 실행 환경이 맡는다 (fail-closed):
   - 프록시 환경변수를 닿지 않는 주소(OFFLINE_PROXY)로 — Go 의 http 는 이것을 따라 바깥으로 나가지 못한다
   - PATH 를 비우고 git 프로토콜을 막는다 — 원격 base 를 받는 git 을 못 돌린다
-  - Go 는 이 컴퓨터 안 주소(localhost·127.x·::1)에는 프록시를 쓰지 않는다 — 레포의 kustomization 어디에든 그런 주소가 있으면
-    돌리지 않는다 (loopback_reference)
+  - Go 는 이 컴퓨터 안 주소(localhost·127.x·::1)에는 프록시를 쓰지 않는다 — 레포의 YAML 어디에든(문자열 값) 그런 주소가
+    있으면 돌리지 않는다 (loopback_reference)
 remote_reference(칸 검사)는 막는 데 기대지 않는다 — 왜 렌더하지 않는지 먼저 알려 주는 문구용이다.
 """
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
+from collections import OrderedDict
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -154,19 +159,82 @@ def _local_host(authority: str) -> bool:
     return ip.is_loopback or ip.is_unspecified or (mapped is not None and (mapped.is_loopback or mapped.is_unspecified))
 
 
-def loopback_reference(root: Path) -> str | None:
-    """레포의 kustomization 어디에든 이 컴퓨터 안 주소가 있으면 그 주소 하나. 프록시로 막지 못하는 곳이라 build 전에 본다.
-    build 가 따라갈 것만 고르지 않고 레포 전체를 본다 — 고르는 규칙이 새면 그대로 뚫린다."""
-    for name in KUSTOMIZATION_FILES:
-        for file in root.rglob(name):
-            try:
-                text = file.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+def _strings(docs: list[Any]) -> Iterator[str]:
+    """YAML 문서들의 문자열(키·값) 전부. 같은 객체를 두 번 따라가지 않는다 — 별칭(&·*)으로 부풀린 문서에 묶이지 않게."""
+    seen: set[int] = set()
+    stack: list[Any] = list(docs)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            yield node
+        elif isinstance(node, (dict, list)):
+            if id(node) in seen:
                 continue
-            for found in _URL_AUTHORITY.finditer(text):
-                if _local_host(found.group(1)):
-                    return found.group(0)
+            seen.add(id(node))
+            stack.extend([*node.keys(), *node.values()] if isinstance(node, dict) else node)
+
+
+def _loopback_in(text: str) -> str | None:
+    for found in _URL_AUTHORITY.finditer(text):
+        if _local_host(found.group(1)):
+            return found.group(0)
     return None
+
+
+def _loopback_in_file(file: Path) -> str | None:
+    """YAML 파일 하나의 이 컴퓨터 안 주소. 문자열 값만 본다 — 주석의 주소는 kustomize 가 읽지 않는다.
+    YAML 로 못 읽으면 글자 그대로 본다 (fail-closed)."""
+    try:
+        text = file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if "://" not in text:
+        return None
+    try:
+        docs = list(yaml.safe_load_all(text))
+    except yaml.YAMLError:
+        return _loopback_in(text)
+    return next((found for value in _strings(docs) if "://" in value and (found := _loopback_in(value))), None)
+
+
+def _yaml_files(root: Path) -> list[Path]:
+    """레포 안 YAML·JSON 파일 전부(.git 밖). kustomization 만이 아니다 — generators·transformers·validators 가 가리키는
+    플러그인 설정 파일도 files·envs 를 같은 로더로 읽는다 (v5.8.1 실측: 알파 플래그 없이 builtin 설정이 localhost 를 읽는다)."""
+    return sorted(path for path in root.rglob("*")
+                  if (path.suffix.lower() in _PLAIN_SUFFIXES or path.name in KUSTOMIZATION_FILES)
+                  and ".git" not in path.relative_to(root).parts and path.is_file())
+
+
+#: 레포마다 훑은 결과 — 열쇠는 레포 경로와 YAML 파일들의 (경로, 크기, 수정 시각). 고친 파일이 있으면 다시 훑는다.
+#: PR 길의 렌더 비교는 같은 레포로 render() 를 여러 번(kustomize 루트마다 전·후) 부른다 — 레포 전체를 그만큼 훑지 않게
+_loopback_scans: OrderedDict[str, str | None] = OrderedDict()
+_loopback_lock = threading.Lock()
+_LOOPBACK_SCANS = 64
+
+
+def loopback_reference(root: Path) -> str | None:
+    """레포의 YAML 어디에든 이 컴퓨터 안 주소가 있으면 그 주소 하나. 프록시로 막지 못하는 곳이라 build 전에 본다.
+
+    build 가 따라갈 파일만 고르지 않고 레포 전체를 본다 — 고르는 규칙이 새면 그대로 뚫린다. 그래서 가져오지 않는 자리
+    (commonAnnotations·인라인 patch 값)의 주소도 거절한다 — 안전 쪽 오탐이다. 주석은 보지 않는다.
+    """
+    files = _yaml_files(root)
+    signature = hashlib.sha256()
+    signature.update(str(root.resolve()).encode())
+    for file in files:
+        stat = file.stat()
+        signature.update(f"\0{file.relative_to(root)}\0{stat.st_size}\0{stat.st_mtime_ns}".encode())
+    key = signature.hexdigest()
+    with _loopback_lock:
+        if key in _loopback_scans:
+            _loopback_scans.move_to_end(key)
+            return _loopback_scans[key]
+    found = next((hit for file in files if (hit := _loopback_in_file(file))), None)
+    with _loopback_lock:
+        _loopback_scans[key] = found
+        while len(_loopback_scans) > _LOOPBACK_SCANS:
+            _loopback_scans.popitem(last=False)
+    return found
 
 
 def _offline_env(home: str) -> dict[str, str]:
@@ -209,7 +277,7 @@ def render(source_type: str, folder: Path, *, root: Path, recurse: bool = False)
     if source_type == "Kustomize":
         local = loopback_reference(root)
         if local is not None:
-            raise RenderError(f"레포의 kustomization 에 이 컴퓨터 안 주소({local})가 있어 렌더하지 않아요")
+            raise RenderError(f"레포 안 YAML 에 이 컴퓨터 안 주소({local})가 있어 렌더하지 않아요")
         remote = remote_reference(folder, root)
         if remote is not None:
             raise RenderError(f"레포 밖 주소({remote})를 가져오는 Kustomize 는 렌더하지 않아요 — 렌더할 때는 네트워크를 쓰지 않아요")

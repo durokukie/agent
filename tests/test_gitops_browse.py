@@ -596,6 +596,51 @@ def test_이_컴퓨터_안_주소는_돌리지_않는다(tmp_path, monkeypatch, 
     assert ran == [] and seen == []
 
 
+def test_플러그인_설정_파일의_이_컴퓨터_안_주소도_거절한다(tmp_path, monkeypatch, listener):
+    """generators: 가 가리키는 builtin 설정 파일 — 이름이 kustomization 이 아니어도 files 를 같은 로더로 읽는다 (v5.8.1 실측)."""
+    address, seen = listener
+    ran: list = []
+    monkeypatch.setattr(renderer.subprocess, "run", lambda *a, **k: ran.append(a))
+    app = _kustomization(tmp_path, "generators:\n- gen.yaml\n")
+    (app / "gen.yaml").write_text("apiVersion: builtin\nkind: ConfigMapGenerator\nmetadata: {name: leak}\n"
+                                  f"files:\n- x=http://localhost:{address.rpartition(':')[2]}/internal\n")
+    with pytest.raises(renderer.RenderError, match="이 컴퓨터 안 주소"):
+        renderer.render("Kustomize", app, root=tmp_path)
+    assert ran == [] and seen == []
+
+
+def test_주석의_이_컴퓨터_안_주소는_보지_않는다(tmp_path):
+    app = _kustomization(tmp_path, "# 로컬에서 볼 때: http://localhost:8080\nresources: []  # http://127.0.0.1:3000\n")
+    assert renderer.loopback_reference(tmp_path) is None
+    (app / "patch.yaml").write_text("value: http://localhost:9090\n")          # 값이면 가져오지 않는 자리여도 거절(안전 쪽)
+    assert renderer.loopback_reference(tmp_path) == "http://localhost:9090"
+
+
+def test_YAML_로_못_읽는_파일은_글자로_보고_거절한다(tmp_path):
+    _kustomization(tmp_path, "resources: []\n")
+    (tmp_path / "broken.yaml").write_text("files: [x=http://127.0.0.1:1/a\n  : : {\n")
+    assert renderer.loopback_reference(tmp_path) == "http://127.0.0.1:1"
+
+
+def test_별칭으로_부풀린_YAML_에_묶이지_않는다(tmp_path):
+    lines = ["a0: &a0 [x]"] + [f"a{i}: &a{i} [*a{i - 1}, *a{i - 1}, *a{i - 1}, *a{i - 1}]" for i in range(1, 40)]
+    (tmp_path / "bomb.yaml").write_text("\n".join(lines) + "\n# http://x\n")
+    assert renderer.loopback_reference(tmp_path) is None
+
+
+def test_레포는_한_번만_훑고_고친_파일이_있으면_다시_훑는다(tmp_path, monkeypatch):
+    app = _kustomization(tmp_path, "resources: []\n")
+    (app / "a.yaml").write_text("k: https://example.com/a\n")
+    scanned: list = []
+    original = renderer._loopback_in_file
+    monkeypatch.setattr(renderer, "_loopback_in_file", lambda file: scanned.append(file.name) or original(file))
+    for _ in range(4):                                       # PR 길은 kustomize 루트마다 전·후로 부른다
+        assert renderer.loopback_reference(tmp_path) is None
+    assert sorted(scanned) == ["a.yaml", "kustomization.yaml"]
+    (app / "a.yaml").write_text("k: http://localhost:1/changed\n")
+    assert renderer.loopback_reference(tmp_path) == "http://localhost:1"
+
+
 def test_바깥_주소는_이_컴퓨터_안_주소가_아니다():
     for authority in ("example.com", "169.254.169.254", "10.0.0.1:443", "[2001:db8::1]", "127.0.0.1.nip.io"):
         assert not renderer._local_host(authority), authority

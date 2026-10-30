@@ -317,7 +317,7 @@ async def argocd_application_rendered(
       ok             렌더했다. resources 는 객체마다 kind·name·namespace·yaml, Secret 은 값을 가린다
       unsupported    Helm·Plugin·여러 소스·GitHub 가 아닌 소스 — message 에 까닭 (레포를 읽지 않는다)
       render_failed  레포를 읽었는데 렌더가 안 된다 — message 에 까닭. kustomize 오류·path 가 없음 말고도:
-                     레포 밖 주소(원격 base·http 파일)를 가져오는 Kustomize, kustomization 에 이 컴퓨터 안 주소(localhost 등)가
+                     레포 밖 주소(원격 base·http 파일)를 가져오는 Kustomize, YAML 에 이 컴퓨터 안 주소(localhost 등)가
                      있는 레포 — 렌더는 네트워크 없이 돈다 (manifests/render.py)
     레포 쪽 실패는 레포 보기(tree·file)와 같은 코드다 — 409 GITOPS_REPO_NOT_CONNECTED, 404 GITOPS_REF_NOT_FOUND, 502 GITHUB_UNAVAILABLE.
     Application 조회는 상세처럼 OVERVIEW_SHARE_TTL 초 나눠 쓰고, 같은 커밋·같은 path 의 렌더는 기억해 다시 하지 않는다 (browse.render).
