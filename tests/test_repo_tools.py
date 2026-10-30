@@ -384,6 +384,20 @@ def test_렌더_시간이_넘으면_실패로_돌려주고_다음에_다시_한�
     assert len(calls) == 2
 
 
+def test_실패_까닭이_길어도_상한_안이다(cluster, gh, monkeypatch):
+    """실패 경로(_stopped)도 성공 경로와 같은 상한을 지킨다 (agent#129 리뷰)."""
+    _cluster_apps(monkeypatch)
+
+    async def failed(*args):
+        return {"status": "render_failed", "message": "\n".join("e" * 3000 for _ in range(500)),
+                "resources": [], "total": 0, "truncated": False}
+
+    monkeypatch.setattr(browse, "render", failed)
+    result = sync(render_app(_ctx(cluster), "shop-web"))
+    assert not result.success and "렌더하지 못했어요" in result.stderr
+    _within_limits(result.stderr)
+
+
 @pytest.mark.parametrize("name,namespace,why", [
     ("web-chart", None, "Helm 앱은 아직 렌더 결과를 보여 주지 못해요"),
     ("nope", None, "찾지 못했어요"),

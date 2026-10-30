@@ -91,7 +91,7 @@ def _done(command: str, stdout: str) -> KubectlResult:
 
 
 def _stopped(command: str, why: str) -> KubectlResult:
-    return KubectlResult(command=command, stdout="", stderr=why, success=False, exit_code=1)
+    return KubectlResult(command=command, stdout="", stderr=compose([], why, more=""), success=False, exit_code=1)
 
 
 def _short(sha: str) -> str:
