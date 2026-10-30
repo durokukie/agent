@@ -216,16 +216,6 @@ def _loopback_in(text: str) -> str | None:
     return None
 
 
-def _redact_text(text: str) -> str:
-    """글자 속 주소들의 userinfo(`scheme://svc:pw@`)를 뺀다 — 서버 로그에 남기기 전에."""
-    out, last = [], 0
-    for start, end, scheme, authority in _addresses(text):
-        if "@" in authority:
-            out += [text[last:start], f"{scheme}://{authority.rpartition('@')[2]}"]
-            last = end
-    return "".join(out) + text[last:]
-
-
 #: 이 크기까지는 YAML 로 읽어 풀린 문자열을 본다. 넘는 글자 파일(CRD 꾸러미 등)은 원시 글자로 흘려 읽으며 주소만 찾는다 —
 #: 이 크기의 파일에 사람이 이스케이프로 주소를 숨긴 설정일 가능성은 낮고, 막아 버리면 그 레포의 렌더가 통째로 안 된다
 MAX_SCAN_BYTES = 5 * 1024 * 1024
@@ -247,10 +237,16 @@ class _ParserLimit(Exception):
     """YAML 문법이 틀린 게 아니라 우리 파서의 한도(깊은 중첩의 RecursionError 등)에 걸렸다 — kustomize(go-yaml)는 읽을 수 있다."""
 
 
-def _parse(data: bytes) -> list[Any] | None:
+#: ruamel(순수 파이썬) 재파싱의 크기 상한 — 1MB 에 0.75초쯤(실측). 넘는 파일은 다시 읽지 않고 원시 글자 검사(이스케이프 푼
+#: 사본 포함)로 보낸다. 5MB 를 다시 읽으면 4초 가까이 검사 시간 상한 밖에서 돈다 (agent#128 리뷰)
+RUAMEL_MAX_BYTES = 1024 * 1024
+
+
+def _parse(data: bytes, deadline: float) -> list[Any] | None:
     """YAML 문서들. YAML 문법으로 못 읽으면 None. bytes 로 넘긴다 — UTF-16(BOM) 도 kustomize(go-yaml)처럼 읽는다.
 
-    PyYAML(빠르다)이 YAML 문법으로 거절한 파일만 ruamel(YAML 1.2, go-yaml 과 같은 판 — 순수 파이썬이라 느리다)로 다시 읽는다.
+    PyYAML(빠르다)이 YAML 문법으로 거절한 파일만 ruamel(YAML 1.2, go-yaml 과 같은 판 — 순수 파이썬이라 느리다)로 다시 읽는다 —
+    RUAMEL_MAX_BYTES 까지, 검사 시간이 남았을 때만(아니면 ScanTimeout). 넘는 파일은 _ParserLimit(글자 검사로).
     그 밖의 실패(RecursionError·MemoryError …)는 _ParserLimit — 부르는 쪽이 원시 글자 검사로 보낸다. 건너뛰면 그 파일이
     검사에서 통째로 빠진다 (agent#128 리뷰).
     """
@@ -261,6 +257,10 @@ def _parse(data: bytes) -> list[Any] | None:
         pass
     except Exception as exc:
         raise _ParserLimit(type(exc).__name__) from None
+    if len(data) > RUAMEL_MAX_BYTES:
+        raise _ParserLimit("ruamel 상한")
+    if _scan_clock() > deadline:
+        raise ScanTimeout(f"{SCAN_BUDGET:g}초")
     try:
         return list(_RuamelYAML(typ="safe", pure=True).load_all(data))
     except _RuamelYAMLError:
@@ -334,7 +334,7 @@ def _loopback_in_file(file: Path, deadline: float) -> str | None:
     except OSError:
         return None
     try:
-        docs = _parse(data)
+        docs = _parse(data, deadline)
     except _ParserLimit:
         return _stream_loopback(file, head, deadline)
     return next((found for value in _strings(docs or []) if (found := _loopback_in(value))), None)
@@ -422,7 +422,7 @@ def _kustomize_reason(stderr: str) -> str:
     for markers, reason in _KUSTOMIZE_REASONS:
         if any(marker in lowered for marker in markers):
             return reason
-    return "kustomize 오류예요 (자세한 내용은 서버 로그)"
+    return "kustomize 오류예요"
 
 
 def render_kustomize(folder: Path, *, timeout: int = 60, label: str = "") -> list[dict]:
@@ -440,13 +440,16 @@ def render_kustomize(folder: Path, *, timeout: int = 60, label: str = "") -> lis
         except (subprocess.TimeoutExpired, OSError) as exc:
             raise RenderError(f"kustomize build 를 돌리지 못했어요: {exc}") from exc
     if proc.returncode != 0:
-        stderr = proc.stderr.strip()[:_STDERR_LIMIT]
-        # 원문은 서버 로그에만 — 가져오려던 주소의 userinfo 는 빼고
-        logger.warning("kustomize build 가 실패했다 (%s): %s", label or folder.name, _redact_text(stderr))
+        # stderr 원문은 사용자 문구에도 서버 로그에도 싣지 않는다 — 레포 값(patch·생성기 설정의 Secret 값 등)이 그대로 든다
+        # (agent#128 리뷰). 로그에는 폴더·종료 코드·까닭 분류만 남긴다 (레포의 로그 관례: 원문 대신 종류만)
+        stderr = proc.stderr.strip()
         where = f" ({label})" if label else ""
-        if OFFLINE_PROXY.removeprefix("http://") in stderr or "executable file not found" in stderr:
+        offline = OFFLINE_PROXY.removeprefix("http://") in stderr or "executable file not found" in stderr
+        reason = "레포 밖 주소를 가져오려 함" if offline else _kustomize_reason(stderr)
+        logger.warning("kustomize build 가 실패했다 (%s, 종료 코드 %s): %s", label or folder.name, proc.returncode, reason)
+        if offline:
             raise RenderError(f"레포 밖 주소를 가져오려 해서 렌더하지 못했어요{where} — 렌더할 때는 네트워크를 쓰지 않아요")
-        raise RenderError(f"kustomize build 가 실패했어요{where}: {_kustomize_reason(stderr)}")
+        raise RenderError(f"kustomize build 가 실패했어요{where}: {reason}")
     return parse_objects(proc.stdout, "kustomize build 결과")
 
 

@@ -669,7 +669,7 @@ def test_깊은_중첩도_500_이_아니라_글자_검사로_간다(tmp_path, mo
     monkeypatch.setattr(renderer.yaml, "load_all", lambda *a, **k: (_ for _ in ()).throw(RecursionError()))
     monkeypatch.setattr(renderer, "_RuamelYAML", lambda **k: tried.append(k))     # YAMLError 가 아니면 다시 읽지 않는다
     with pytest.raises(renderer._ParserLimit):                                    # 부르는 쪽이 글자 검사로 보낸다
-        renderer._parse(b"a: b\n")
+        renderer._parse(b"a: b\n", float("inf"))
     assert tried == []
 
 
@@ -716,7 +716,7 @@ def test_파서_한도에_걸린_파일은_건너뛰지_않고_글자로_본다(
     assert renderer.loopback_reference(tmp_path) == "http://localhost:1"
 
 
-def test_kustomize_오류_문구에는_stderr_를_싣지_않고_로그에만_가려서_남긴다(tmp_path, monkeypatch, caplog):
+def test_kustomize_stderr_는_문구에도_로그에도_싣지_않는다(tmp_path, monkeypatch, caplog):
     app = _kustomization(tmp_path, "resources: []\n")
     failed = type("P", (), {"returncode": 1, "stdout": "",
                             "stderr": 'Error: Get "https://bot:ghp_secret@example.com/a": proxyconnect tcp: '
@@ -726,7 +726,7 @@ def test_kustomize_오류_문구에는_stderr_를_싣지_않고_로그에만_가
             pytest.raises(renderer.RenderError) as caught:
         renderer.render("Kustomize", app, root=tmp_path)
     assert str(caught.value) == "레포 밖 주소를 가져오려 해서 렌더하지 못했어요 (app) — 렌더할 때는 네트워크를 쓰지 않아요"
-    assert "https://example.com/a" in caplog.text and "ghp_secret" not in caplog.text
+    assert "종료 코드 1" in caplog.text and "ghp_secret" not in caplog.text and "example.com" not in caplog.text
 
 
 @pytest.mark.parametrize(("stderr", "reason"), [
@@ -736,15 +736,17 @@ def test_kustomize_오류_문구에는_stderr_를_싣지_않고_로그에만_가
      "evalsymlink failure on '/tmp/x/nope' : lstat /tmp/x/nope: no such file or directory'",
      "가리키는 파일·폴더가 레포에 없어요"),
     ("Error: security; file '/etc/passwd' is not in or below '/tmp/x'", "kustomization 폴더 밖의 파일을 가리켜요"),
-    ("Error: something new hunter2", "kustomize 오류예요 (자세한 내용은 서버 로그)"),
+    ("Error: something new hunter2", "kustomize 오류예요"),
 ])
-def test_kustomize_오류는_까닭만_싣는다(tmp_path, monkeypatch, stderr, reason):
+def test_kustomize_오류는_까닭만_싣는다(tmp_path, monkeypatch, caplog, stderr, reason):
     app = _kustomization(tmp_path, "resources: []\n")
     failed = type("P", (), {"returncode": 1, "stdout": "", "stderr": stderr})()
     monkeypatch.setattr(renderer.subprocess, "run", lambda *a, **k: failed)
-    with pytest.raises(renderer.RenderError) as caught:
+    with caplog.at_level("WARNING", logger="kukie_agent.manifests.render"), \
+            pytest.raises(renderer.RenderError) as caught:
         renderer.render("Kustomize", app, root=tmp_path)
     assert str(caught.value) == f"kustomize build 가 실패했어요 (app): {reason}" and "hunter2" not in str(caught.value)
+    assert reason in caplog.text and "hunter2" not in caplog.text            # 로그에도 레포 값이 없다
 
 
 def test_YAML_오류_문구에는_레포_값_조각_대신_줄_번호만(tmp_path):
@@ -763,6 +765,23 @@ def test_주소_찾기는_선형이다(tmp_path):
     (tmp_path / "blob.yaml").write_text("k: " + "a" * 100_000 + "\n")
     assert renderer.loopback_reference(tmp_path) is None
     assert _time.monotonic() - started < 2
+
+
+def test_ruamel_재파싱은_크기_상한을_넘으면_글자_검사로_간다(tmp_path, monkeypatch):
+    monkeypatch.setattr(renderer, "RUAMEL_MAX_BYTES", 100)
+    tried: list = []
+    monkeypatch.setattr(renderer, "_RuamelYAML", lambda **k: tried.append(k))
+    # PyYAML 이 YAML 문법으로 거절하는 파일 — 끝 줄만 틀렸다
+    (tmp_path / "gen.yaml").write_text('files:\n- "x=http:\\u002f/127.0.0.1:1/a"\n' + "k: v\n" * 50 + "bad: [\n")
+    assert renderer.loopback_reference(tmp_path) == "http://127.0.0.1:1" and tried == []
+
+
+def test_ruamel_재파싱_전에_검사_시간을_본다(tmp_path, monkeypatch):
+    tried: list = []
+    monkeypatch.setattr(renderer, "_RuamelYAML", lambda **k: tried.append(k))
+    with pytest.raises(renderer.ScanTimeout):
+        renderer._parse(b"k: v\nbad: [\n", deadline=-1.0)
+    assert tried == []
 
 
 def test_긴_scheme_앞부분이_있어도_주소를_찾는다():
