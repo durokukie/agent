@@ -322,6 +322,18 @@ def apps_around(apps: list[AppPath], path: str, revision: Revision, *, is_file: 
 
 # ── 폴더·파일 ──────────────────────────────────────────
 
+async def _check_commit(gh: github.GitHub, repository: str, sha: str) -> None:
+    """GitHub 가 그 커밋에서 404 를 줬다 — 커밋이 아직 있는지 한 번 더 묻는다. force-push 로 사라졌으면 기억(_commits·_refs)에서
+    빼고 NotFound("ref") 를 올린다 — 경로가 없는 것(404 PATH)이나 GitHub 실패(502)로 보이지 않게 (agent#128 리뷰).
+    기억한 커밋 id 는 TTL 없이, 브랜치는 REF_TTL 동안 확인 없이 쓰므로 404 를 받은 때만 다시 본다."""
+    if await gh.commit_sha(sha) is not None:
+        return
+    _commits.pop((repository, sha), None)
+    for key in [key for key, value in _refs.items() if key[0] == repository and value[0] == sha]:
+        del _refs[key]
+    raise NotFound("ref", f"커밋 {sha[:7]} 이 레포에 더는 없어요 (force-push 등). 다시 읽어 주세요")
+
+
 async def _read(gh: github.GitHub, repository: str, revision: Revision, path: str) -> Any:
     """그 커밋의 경로 — GitHub 가 준 그대로가 아니라 쓸 모양으로 정리해 기억한다 (Secret 내용은 기억에도 남기지 않는다)."""
     key = (repository, revision.sha, path)
@@ -330,6 +342,7 @@ async def _read(gh: github.GitHub, repository: str, revision: Revision, path: st
         return found
     data = await gh.contents(path, revision.sha)
     if data is None:
+        await _check_commit(gh, repository, revision.sha)
         raise NotFound("path", f"{revision.ref} 에 '{path or '/'}' 가 없어요")
     view = _folder_view(data) if isinstance(data, list) else _file_view(path, data)
     _contents.put(key, view, _size(view))
@@ -635,6 +648,11 @@ async def render(repository: str, token: str, sha: str, source: RenderSource) ->
 async def _render_now(repository: str, token: str, sha: str, source: RenderSource) -> dict[str, Any]:
     async with github.connect(repository, token) as gh:
         with tempfile.TemporaryDirectory(prefix="kukie-repo-view-") as work:
-            root = await gh.download(sha, Path(work) / "repo")
+            try:
+                root = await gh.download(sha, Path(work) / "repo")
+            except github.GitHubError as exc:
+                if exc.status == 404:
+                    await _check_commit(gh, repository, sha)
+                raise
             return await to_thread.run_sync(partial(_render_folder, root, source),
                                             limiter=thread_limiter("gitops_render", RENDER_WORKERS))

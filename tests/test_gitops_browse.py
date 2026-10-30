@@ -200,6 +200,40 @@ def test_커밋_id_를_ref_로_주면_있는지_한_번만_묻는다(client, clu
 
 
 @pytest.mark.parametrize("call", [
+    lambda client, cluster, sha: _tree(client, cluster, ref=sha, path="apps/kustomize"),
+    lambda client, cluster, sha: _file(client, cluster, "apps/plain/worker.yaml", ref=sha),
+    lambda client, cluster, sha: _rendered(client, cluster, "shop-web", ref=sha),
+])
+def test_기억한_커밋이_force_push_로_사라지면_404_GITOPS_REF_NOT_FOUND(client, cluster, gh, monkeypatch, call):
+    _cluster_apps(monkeypatch)
+    sha = "a" * 40
+    gh.commits[sha] = gh.commits["c0"]
+    assert _tree(client, cluster, ref=sha).status_code == 200            # 있다고 확인해 기억했다
+    del gh.commits[sha]
+    for _ in range(2):                                                   # 기억에서 빠져 두 번째도 같은 답
+        r = call(client, cluster, sha)
+        assert r.status_code == 404 and r.json()["detail"]["code"] == "GITOPS_REF_NOT_FOUND", r.text
+
+
+def test_브랜치가_TTL_안에_force_push_되어도_ref_없음으로_답하고_새_커밋을_다시_묻는다(client, cluster, gh, monkeypatch):
+    _cluster_apps(monkeypatch)
+    assert _tree(client, cluster, path="apps").json()["sha"] == "c0"
+    gh.push_to_base("apps/plain/new.yaml", "a: b\n")
+    del gh.commits["c0"]                                                 # main 을 force-push — c0 이 사라졌다
+    r = _tree(client, cluster, path="apps/plain")
+    assert r.status_code == 404 and r.json()["detail"]["code"] == "GITOPS_REF_NOT_FOUND"
+    again = _tree(client, cluster, path="apps/plain").json()
+    assert again["sha"] != "c0" and "new.yaml" in [e["name"] for e in again["entries"]]
+
+
+def test_경로만_없으면_커밋을_확인한_뒤_PATH_NOT_FOUND(client, cluster, gh, monkeypatch):
+    _cluster_apps(monkeypatch)
+    r = _tree(client, cluster, path="apps/nope")
+    assert r.status_code == 404 and r.json()["detail"]["code"] == "GITOPS_PATH_NOT_FOUND"
+    assert ("commit_sha", "c0") in gh.reads
+
+
+@pytest.mark.parametrize("call", [
     lambda client, cluster: _tree(client, cluster, ref="b" * 40),
     lambda client, cluster: _file(client, cluster, "apps/plain/service.yaml", ref="b" * 40),
     lambda client, cluster: _rendered(client, cluster, "shop-web", ref="b" * 40),

@@ -101,6 +101,8 @@ class FakeGitHub:
 
     async def download(self, ref: str, dest: Path) -> Path:
         self.reads.append(("download", ref))
+        if ref not in self.commits:
+            raise GitHubError(404, "Not Found")
         root = dest / f"acme-manifests-{ref}"
         for path, content in self.commits[ref].items():
             target = root / path
