@@ -141,8 +141,8 @@ async def _pr_path(ctx, tool_name: str, managed: dict, normalized_args: dict) ->
             return None        # PR 로는 못 하는 값(0..1000 밖) — 판단할 것 없이 kubectl 길이다 (범위는 kubectl 이 본다)
     else:
         change = None
-    # 예산은 두 자리에서 지킨다: server 호출은 취소할 수 있어 move_on_after 로, 스레드 안의 kubectl 은 취소할 수 없어
-    # 남은 시간을 decide 에 넘겨 한 번의 제한을 줄인다 (agent#127 리뷰 — move_on_after 는 스레드를 멈추지 못한다)
+    # 예산은 두 겹으로 지킨다: 취소할 수 있는 await(server 호출·스레드 슬롯 대기)는 move_on_after 로, 이미 도는 스레드 안의
+    # kubectl 은 취소할 수 없어 남은 시간을 decide 에 넘겨 한 번의 제한을 줄인다 (agent#127 리뷰)
     started = anyio.current_time()
     connected = None
     with anyio.move_on_after(PR_PATH_BUDGET):
@@ -164,11 +164,18 @@ async def _pr_path(ctx, tool_name: str, managed: dict, normalized_args: dict) ->
     left = PR_PATH_BUDGET - (anyio.current_time() - started)
     if left <= 0:
         return None
-    found = await gitops_route.decide(
-        kind=str(resource["kind"]), name=str(resource["name"]), namespace=resource.get("namespace") or None,
-        context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig, cluster_id=ctx.deps.cluster_id,
-        change=change, connected=connected, budget=left,
-    )
+    found = None
+    # move_on_after 는 스레드 슬롯(thread_limiter) 대기를 끊고, 슬롯을 받은 뒤의 kubectl 은 budget 이 끊는다.
+    # budget 의 끝은 지금 기준 절대 시각이라 슬롯을 기다린 만큼 kubectl 몫이 줄어 전체가 left 안에 든다 (agent#127 리뷰)
+    with anyio.move_on_after(left):
+        found = await gitops_route.decide(
+            kind=str(resource["kind"]), name=str(resource["name"]), namespace=resource.get("namespace") or None,
+            context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig, cluster_id=ctx.deps.cluster_id,
+            change=change, connected=connected, budget=left,
+        )
+    if found is None:
+        logger.warning("PR 길 판단이 %s초를 넘어 kubectl 길로 둔다", PR_PATH_BUDGET)
+        return None
     return found if found.path == "pr" else None
 
 

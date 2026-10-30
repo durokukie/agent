@@ -373,3 +373,29 @@ def test_PR_길_판단은_스레드_안의_kubectl_까지_예산을_지킨다(cl
     assert body["approvals"][0]["tool"] == "scale_resource" and "route" not in body["approvals"][0]["argocd"]
     assert timeouts and all(t <= 0.3 for t in timeouts) and sum(timeouts) <= 0.3 + 0.05
     assert elapsed < 2
+
+
+def test_PR_길_판단은_스레드_슬롯_대기도_예산_안에서_끊는다(client, fake_server, room, cluster, monkeypatch):
+    """다른 방의 판단이 스레드 슬롯(thread_limiter)을 다 물고 있어도 승인 카드가 예산보다 늦지 않는다 (agent#127 리뷰)."""
+    import time
+
+    import anyio
+
+    from kukie_agent.guardrail import hook
+
+    calls: list = []
+
+    async def busy_slots(func, *args, limiter=None, **kwargs):
+        await anyio.sleep(5)                                         # 슬롯을 기다린다 — 취소할 수 있는 await 다
+        calls.append(func)
+        return func(*args)
+
+    monkeypatch.setattr(hook, "PR_PATH_BUDGET", 0.2)
+    from types import SimpleNamespace
+    monkeypatch.setattr(route, "to_thread", SimpleNamespace(run_sync=busy_slots))   # 판단 조회만 — 다른 스레드 일은 그대로
+    started = time.monotonic()
+    body = _chat(client, room, Script(("scale_resource", SCALE)), "3개")
+    elapsed = time.monotonic() - started
+
+    assert body["approvals"][0]["tool"] == "scale_resource" and "route" not in body["approvals"][0]["argocd"]
+    assert calls == [] and elapsed < 2                              # 슬롯을 못 받은 채 끊었다 — 판단 조회는 돌지 않았다
