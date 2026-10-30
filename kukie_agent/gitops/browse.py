@@ -598,7 +598,7 @@ def rendered_view(objects: list[dict[str, Any]]) -> dict[str, Any]:
     return {"status": "ok", "message": None, "resources": resources, "total": len(objects), "truncated": truncated}
 
 
-def _render_folder(root: Path, source: RenderSource) -> dict[str, Any]:
+def _render_folder(root: Path, source: RenderSource, scan_key: str) -> dict[str, Any]:
     """레포를 푼 곳에서 렌더한다. 블로킹 — 스레드에서 돈다. 실패는 render_failed 로 돌려준다 (예외로 올리지 않는다)."""
     folder = renderer.resolve_inside(root, source.path or "")
     if folder is None or not folder.is_dir():
@@ -608,7 +608,7 @@ def _render_folder(root: Path, source: RenderSource) -> dict[str, Any]:
         return {"status": "render_failed", "message": f"'{source.path}' 에 kustomization 파일이 없어요.",
                 "resources": [], "total": 0, "truncated": False}
     try:
-        objects = renderer.render(source.source_type, folder, root=root, recurse=source.recurse)
+        objects = renderer.render(source.source_type, folder, root=root, recurse=source.recurse, scan_key=scan_key)
     except renderer.RenderError as exc:
         # kustomize 오류에는 레포를 푼 임시 경로가 찍힌다 — 레포 기준으로 바꿔 싣는다
         message = str(exc).replace(str(root.resolve()) + "/", "").replace(str(root) + "/", "")
@@ -654,5 +654,6 @@ async def _render_now(repository: str, token: str, sha: str, source: RenderSourc
                 if exc.status == 404:
                     await _check_commit(gh, repository, sha)
                 raise
-            return await to_thread.run_sync(partial(_render_folder, root, source),
+            # 레포 검사(이 컴퓨터 안 주소)는 커밋마다 한 번 — tarball 은 커밋 sha 마다 같다
+            return await to_thread.run_sync(partial(_render_folder, root, source, f"{repository}@{sha}"),
                                             limiter=thread_limiter("gitops_render", RENDER_WORKERS))

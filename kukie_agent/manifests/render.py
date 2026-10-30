@@ -8,13 +8,12 @@ kustomize 는 에이전트 이미지에 ArgoCD 와 같은 버전을 넣는다 (D
 읽어 렌더 결과로 내보낼 수 있다. 칸을 골라 막으면 새 칸·새 접두사로 샌다. 그래서 막는 것은 실행 환경이 맡는다 (fail-closed):
   - 프록시 환경변수를 닿지 않는 주소(OFFLINE_PROXY)로 — Go 의 http 는 이것을 따라 바깥으로 나가지 못한다
   - PATH 를 비우고 git 프로토콜을 막는다 — 원격 base 를 받는 git 을 못 돌린다
-  - Go 는 이 컴퓨터 안 주소(localhost·127.x·::1)에는 프록시를 쓰지 않는다 — 레포의 YAML 어디에든(문자열 값) 그런 주소가
-    있으면 돌리지 않는다 (loopback_reference)
+  - Go 는 이 컴퓨터 안 주소(localhost·127.x·::1)에는 프록시를 쓰지 않는다 — 레포의 파일 어디에든(YAML 로 읽은 문자열)
+    그런 주소가 있으면 돌리지 않는다 (loopback_reference)
 remote_reference(칸 검사)는 막는 데 기대지 않는다 — 왜 렌더하지 않는지 먼저 알려 주는 문구용이다.
 """
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import os
 import re
@@ -28,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from ruamel.yaml import YAML as _RuamelYAML
 
 KUSTOMIZATION_FILES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
 #: kustomize 가 레포 밖에서 가져오는 주소 — http(s) 파일·git 레포 (`https://…`, `git@…`, `github.com/o/r//path`, `ssh://…`,
@@ -181,55 +181,93 @@ def _loopback_in(text: str) -> str | None:
     return None
 
 
-def _loopback_in_file(file: Path) -> str | None:
-    """YAML 파일 하나의 이 컴퓨터 안 주소. 문자열 값만 본다 — 주석의 주소는 kustomize 가 읽지 않는다.
-    YAML 로 못 읽으면 글자 그대로 본다 (fail-closed)."""
+#: 이 컴퓨터 안 주소 검사가 YAML 로 읽어 보는 파일 크기 상한. 넘는 글자 파일이 있으면 렌더하지 않는다 (fail-closed —
+#: 크기로 건너뛰면 큰 플러그인 설정 파일이 빠져나간다). 바이너리는 건너뛴다
+MAX_SCAN_BYTES = 5 * 1024 * 1024
+
+
+class _TooLarge(Exception):
+    pass
+
+
+def _parse(data: bytes) -> list[Any] | None:
+    """YAML 문서들 — PyYAML(빠르다) 다음 ruamel(YAML 1.2, go-yaml 과 같은 판). 둘 다 못 읽으면 None.
+    bytes 로 넘긴다 — UTF-16(BOM) 도 kustomize(go-yaml)처럼 읽는다."""
+    loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
     try:
-        text = file.read_text(encoding="utf-8", errors="replace")
+        return list(yaml.load_all(data, Loader=loader))
+    except yaml.YAMLError:
+        pass
+    try:
+        return list(_RuamelYAML(typ="safe", pure=True).load_all(data))
+    except Exception:                                   # ruamel 은 오류 종류가 여럿이다 — 못 읽은 것은 다 같다
+        return None
+
+
+def _binary(head: bytes) -> bool:
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return False                                    # UTF-16 글자 파일
+    return b"\0" in head
+
+
+def _loopback_in_file(file: Path) -> str | None:
+    """파일 하나를 YAML 로 읽어 **풀린** 문자열(키·값)에서 이 컴퓨터 안 주소를 찾는다. 확장자·이름은 보지 않는다 —
+    kustomize 는 generators 등이 가리키는 파일을 이름과 상관없이 YAML 로 읽는다. 원시 글자로 먼저 거르지 않는다 —
+    겹따옴표 이스케이프(`\\/`·`\\u002f`)·줄 이음은 읽어야 `://` 가 된다 (agent#128 리뷰). 주석은 보지 않는다.
+
+    YAML 로 못 읽는 파일은 건너뛴다 — kustomize 도 설정으로 못 쓴다. 글자로 보면 Helm 템플릿의 localhost 같은 오탐만 는다.
+    """
+    try:
+        size = file.stat().st_size
+        if size > MAX_SCAN_BYTES:
+            with file.open("rb") as stream:
+                if _binary(stream.read(8192)):
+                    return None
+            raise _TooLarge(file.name)
+        data = file.read_bytes()
     except OSError:
         return None
-    if "://" not in text:
+    if _binary(data[:8192]):
         return None
-    try:
-        docs = list(yaml.safe_load_all(text))
-    except yaml.YAMLError:
-        return _loopback_in(text)
-    return next((found for value in _strings(docs) if "://" in value and (found := _loopback_in(value))), None)
+    docs = _parse(data)
+    return next((found for value in _strings(docs or []) if (found := _loopback_in(value))), None)
 
 
-def _yaml_files(root: Path) -> list[Path]:
-    """레포 안 YAML·JSON 파일 전부(.git 밖). kustomization 만이 아니다 — generators·transformers·validators 가 가리키는
-    플러그인 설정 파일도 files·envs 를 같은 로더로 읽는다 (v5.8.1 실측: 알파 플래그 없이 builtin 설정이 localhost 를 읽는다)."""
+def _repo_files(root: Path) -> list[Path]:
+    """레포 안 파일 전부(.git 밖, 심볼릭 링크는 따라가지 않는다 — 레포 밖을 가리키는 링크는 렌더도 거절한다)."""
     return sorted(path for path in root.rglob("*")
-                  if (path.suffix.lower() in _PLAIN_SUFFIXES or path.name in KUSTOMIZATION_FILES)
-                  and ".git" not in path.relative_to(root).parts and path.is_file())
+                  if ".git" not in path.relative_to(root).parts and path.is_file() and not path.is_symlink())
 
 
-#: 레포마다 훑은 결과 — 열쇠는 레포 경로와 YAML 파일들의 (경로, 크기, 수정 시각). 고친 파일이 있으면 다시 훑는다.
-#: PR 길의 렌더 비교는 같은 레포로 render() 를 여러 번(kustomize 루트마다 전·후) 부른다 — 레포 전체를 그만큼 훑지 않게
+#: 레포마다 훑은 결과. 열쇠는 부르는 쪽이 준 것(레포 보기는 `<레포>@<커밋 sha>` — tarball 은 커밋마다 같다), 없으면 레포
+#: 폴더의 (경로, inode, ctime) — PR 길은 받은 레포·고친 사본을 각각 한 번 만들고 고친 뒤에 렌더한다.
+#: PR 길의 렌더 비교는 같은 레포로 render() 를 kustomize 루트마다 전·후로 부른다 — 레포 전체를 그만큼 걷지 않게
 _loopback_scans: OrderedDict[str, str | None] = OrderedDict()
 _loopback_lock = threading.Lock()
 _LOOPBACK_SCANS = 64
 
 
-def loopback_reference(root: Path) -> str | None:
-    """레포의 YAML 어디에든 이 컴퓨터 안 주소가 있으면 그 주소 하나. 프록시로 막지 못하는 곳이라 build 전에 본다.
+def _scan_key(root: Path) -> str:
+    stat = root.stat()
+    return f"{root.resolve()}|{stat.st_ino}|{stat.st_ctime_ns}"
 
-    build 가 따라갈 파일만 고르지 않고 레포 전체를 본다 — 고르는 규칙이 새면 그대로 뚫린다. 그래서 가져오지 않는 자리
-    (commonAnnotations·인라인 patch 값)의 주소도 거절한다 — 안전 쪽 오탐이다. 주석은 보지 않는다.
+
+def loopback_reference(root: Path, *, scan_key: str | None = None) -> str | None:
+    """레포의 파일 어디에든 이 컴퓨터 안 주소가 있으면 그 주소 하나. 프록시로 막지 못하는 곳이라 build 전에 본다.
+
+    kustomize 가 가져오는 주소는 반드시 kustomize 가 YAML 로 읽는 어떤 파일 안에 있다. 그래서 고르지 않고 레포의 모든 파일을
+    YAML 로 읽어 본다 — 고르는 규칙(이름·확장자·칸)이 새면 그대로 뚫린다. 가져오지 않는 자리(commonAnnotations·인라인 patch
+    값)의 주소도 거절한다 — 안전 쪽 오탐이다. 검사하지 못한 큰 글자 파일이 있어도 거절한다.
     """
-    files = _yaml_files(root)
-    signature = hashlib.sha256()
-    signature.update(str(root.resolve()).encode())
-    for file in files:
-        stat = file.stat()
-        signature.update(f"\0{file.relative_to(root)}\0{stat.st_size}\0{stat.st_mtime_ns}".encode())
-    key = signature.hexdigest()
+    key = scan_key or _scan_key(root)
     with _loopback_lock:
         if key in _loopback_scans:
             _loopback_scans.move_to_end(key)
             return _loopback_scans[key]
-    found = next((hit for file in files if (hit := _loopback_in_file(file))), None)
+    try:
+        found = next((hit for file in _repo_files(root) if (hit := _loopback_in_file(file))), None)
+    except _TooLarge as exc:
+        found = f"검사하지 못한 큰 파일 {exc}"
     with _loopback_lock:
         _loopback_scans[key] = found
         while len(_loopback_scans) > _LOOPBACK_SCANS:
@@ -270,14 +308,16 @@ def render_kustomize(folder: Path, *, timeout: int = 60) -> list[dict]:
     return parse_objects(proc.stdout, "kustomize build 결과")
 
 
-def render(source_type: str, folder: Path, *, root: Path, recurse: bool = False) -> list[dict]:
-    """folder 를 ArgoCD 처럼 렌더링한다. root 는 레포 루트 — folder 가 그 안에 있어야 한다."""
+def render(source_type: str, folder: Path, *, root: Path, recurse: bool = False,
+           scan_key: str | None = None) -> list[dict]:
+    """folder 를 ArgoCD 처럼 렌더링한다. root 는 레포 루트 — folder 가 그 안에 있어야 한다.
+    scan_key 는 레포 내용이 같으면 같은 값(레포·커밋 sha) — 이 컴퓨터 안 주소 검사를 그 값마다 한 번만 한다."""
     if source_type == "Directory":
         return render_plain(folder, recurse=recurse, root=root)
     if source_type == "Kustomize":
-        local = loopback_reference(root)
+        local = loopback_reference(root, scan_key=scan_key)
         if local is not None:
-            raise RenderError(f"레포 안 YAML 에 이 컴퓨터 안 주소({local})가 있어 렌더하지 않아요")
+            raise RenderError(f"레포 안 파일에 이 컴퓨터 안 주소({local})가 있어 렌더하지 않아요")
         remote = remote_reference(folder, root)
         if remote is not None:
             raise RenderError(f"레포 밖 주소({remote})를 가져오는 Kustomize 는 렌더하지 않아요 — 렌더할 때는 네트워크를 쓰지 않아요")

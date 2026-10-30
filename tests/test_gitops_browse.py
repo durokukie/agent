@@ -42,8 +42,9 @@ data:
 
 
 @pytest.fixture(autouse=True)
-def _forget():
+def _forget(monkeypatch):
     browse.forget()
+    monkeypatch.setattr(renderer, "_loopback_scans", renderer.OrderedDict())
     yield
     browse.forget()
 
@@ -610,16 +611,50 @@ def test_플러그인_설정_파일의_이_컴퓨터_안_주소도_거절한다(
 
 
 def test_주석의_이_컴퓨터_안_주소는_보지_않는다(tmp_path):
-    app = _kustomization(tmp_path, "# 로컬에서 볼 때: http://localhost:8080\nresources: []  # http://127.0.0.1:3000\n")
-    assert renderer.loopback_reference(tmp_path) is None
-    (app / "patch.yaml").write_text("value: http://localhost:9090\n")          # 값이면 가져오지 않는 자리여도 거절(안전 쪽)
-    assert renderer.loopback_reference(tmp_path) == "http://localhost:9090"
+    _kustomization(tmp_path, "# 로컬에서 볼 때: http://localhost:8080\nresources: []  # http://127.0.0.1:3000\n")
+    assert renderer.loopback_reference(tmp_path, scan_key="a") is None
+    (tmp_path / "app" / "patch.yaml").write_text("value: http://localhost:9090\n")   # 값이면 가져오지 않는 자리여도 거절(안전 쪽)
+    assert renderer.loopback_reference(tmp_path, scan_key="b") == "http://localhost:9090"
 
 
-def test_YAML_로_못_읽는_파일은_글자로_보고_거절한다(tmp_path):
+@pytest.mark.parametrize(("name", "text"), [
+    ("gen.yaml", 'files:\n- "x=http:\\u002f/127.0.0.1:15000/config_dump"\n'),          # 겹따옴표 \u 이스케이프
+    ("gen.yaml", 'files:\n- "x=http:\\/\\/localhost:15000/a"\n'),                     # \/ 이스케이프
+    ("gen.yaml", 'files:\n- "x=http:\\\n  //localhost:9999/a"\n'),                     # 줄 이음
+    ("gen.conf", "files:\n- x=http://127.0.0.1:15000/config_dump\n"),                  # 확장자 우회
+    ("generator", "files:\n- x=http://[::1]:15000/a\n"),                                # 확장자 없음
+])
+def test_이스케이프_줄이음_확장자로_숨긴_주소도_거절한다(tmp_path, monkeypatch, name, text):
+    ran: list = []
+    monkeypatch.setattr(renderer.subprocess, "run", lambda *a, **k: ran.append(a))
+    app = _kustomization(tmp_path, f"generators:\n- {name}\n")
+    (app / name).write_text("apiVersion: builtin\nkind: ConfigMapGenerator\nmetadata: {name: leak}\n" + text)
+    with pytest.raises(renderer.RenderError, match="이 컴퓨터 안 주소"):
+        renderer.render("Kustomize", app, root=tmp_path)
+    assert ran == []
+
+
+def test_UTF16_파일도_읽어_본다(tmp_path):
     _kustomization(tmp_path, "resources: []\n")
-    (tmp_path / "broken.yaml").write_text("files: [x=http://127.0.0.1:1/a\n  : : {\n")
-    assert renderer.loopback_reference(tmp_path) == "http://127.0.0.1:1"
+    (tmp_path / "app" / "gen.yaml").write_bytes("files:\n- x=http://localhost:1/a\n".encode("utf-16"))
+    assert renderer.loopback_reference(tmp_path) == "http://localhost:1"
+
+
+def test_YAML_로_못_읽는_파일과_바이너리는_건너뛴다(tmp_path):
+    _kustomization(tmp_path, "resources: []\n")
+    (tmp_path / "chart").mkdir()
+    (tmp_path / "chart" / "deployment.yaml").write_text(            # Helm 템플릿 — kustomize 가 설정으로 못 읽는다
+        "{{- if .Values.x }}\nenv:\n  - value: http://localhost:8080\n  {{ end }\n: : [\n")
+    (tmp_path / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00http://localhost:1/")
+    assert renderer.loopback_reference(tmp_path) is None
+
+
+def test_검사하지_못한_큰_글자_파일이_있으면_거절한다(tmp_path, monkeypatch):
+    monkeypatch.setattr(renderer, "MAX_SCAN_BYTES", 100)
+    _kustomization(tmp_path, "resources: []\n")
+    (tmp_path / "big.yaml").write_text("a: " + "x" * 200 + "\n")
+    (tmp_path / "big.bin").write_bytes(b"\x00" * 200)                # 큰 바이너리는 건너뛴다
+    assert renderer.loopback_reference(tmp_path) == "검사하지 못한 큰 파일 big.yaml"
 
 
 def test_별칭으로_부풀린_YAML_에_묶이지_않는다(tmp_path):
@@ -628,17 +663,27 @@ def test_별칭으로_부풀린_YAML_에_묶이지_않는다(tmp_path):
     assert renderer.loopback_reference(tmp_path) is None
 
 
-def test_레포는_한_번만_훑고_고친_파일이_있으면_다시_훑는다(tmp_path, monkeypatch):
+def test_같은_커밋은_한_번만_훑는다(tmp_path, monkeypatch):
     app = _kustomization(tmp_path, "resources: []\n")
     (app / "a.yaml").write_text("k: https://example.com/a\n")
-    scanned: list = []
-    original = renderer._loopback_in_file
-    monkeypatch.setattr(renderer, "_loopback_in_file", lambda file: scanned.append(file.name) or original(file))
+    walked: list = []
+    original = renderer._repo_files
+    monkeypatch.setattr(renderer, "_repo_files", lambda root: walked.append(root) or original(root))
     for _ in range(4):                                       # PR 길은 kustomize 루트마다 전·후로 부른다
-        assert renderer.loopback_reference(tmp_path) is None
-    assert sorted(scanned) == ["a.yaml", "kustomization.yaml"]
-    (app / "a.yaml").write_text("k: http://localhost:1/changed\n")
-    assert renderer.loopback_reference(tmp_path) == "http://localhost:1"
+        assert renderer.loopback_reference(tmp_path, scan_key="acme/manifests@c0") is None
+        assert renderer.loopback_reference(tmp_path) is None             # 열쇠가 없으면 레포 폴더로
+    assert len(walked) == 2
+
+
+def test_렌더_API_는_커밋마다_한_번만_훑는다(client, cluster, gh, monkeypatch):
+    _cluster_apps(monkeypatch, [_app("a", "apps/kustomize/overlays/prod", source_type="Kustomize"),
+                                _app("b", "apps/kustomize/overlays/dev", source_type="Kustomize")])
+    walked: list = []
+    monkeypatch.setattr(renderer, "_repo_files", lambda root: walked.append(root) or [])
+    monkeypatch.setattr(renderer, "render_kustomize", lambda folder, **k: [])
+    for name in ("a", "b"):
+        assert _rendered(client, cluster, name).json()["status"] == "ok"
+    assert len(walked) == 1
 
 
 def test_바깥_주소는_이_컴퓨터_안_주소가_아니다():
