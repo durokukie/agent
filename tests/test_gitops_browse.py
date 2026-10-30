@@ -189,12 +189,26 @@ def test_같은_커밋의_폴더는_GitHub_를_다시_읽지_않고_ref_는_TTL_
     assert moved["sha"] != "c0" and "new.yaml" in [e["name"] for e in moved["entries"]]
 
 
-def test_커밋_id_를_ref_로_주면_묻지_않는다(client, cluster, gh, monkeypatch):
+def test_커밋_id_를_ref_로_주면_있는지_한_번만_묻는다(client, cluster, gh, monkeypatch):
     _cluster_apps(monkeypatch)
     sha = "a" * 40
     gh.commits[sha] = gh.commits["c0"]
-    body = _tree(client, cluster, ref=sha).json()
-    assert body["sha"] == sha and not [call for call in gh.reads if call[0].startswith("commit_sha")]
+    for _ in range(2):
+        assert _tree(client, cluster, ref=sha).json()["sha"] == sha
+        assert _file(client, cluster, "apps/plain/service.yaml", ref=sha).status_code == 200
+    assert [call for call in gh.reads if call[0].startswith("commit_sha")] == [("commit_sha", sha)]
+
+
+@pytest.mark.parametrize("call", [
+    lambda client, cluster: _tree(client, cluster, ref="b" * 40),
+    lambda client, cluster: _file(client, cluster, "apps/plain/service.yaml", ref="b" * 40),
+    lambda client, cluster: _rendered(client, cluster, "shop-web", ref="b" * 40),
+])
+def test_없는_커밋_id_는_404_GITOPS_REF_NOT_FOUND(client, cluster, gh, monkeypatch, call):
+    _cluster_apps(monkeypatch)
+    r = call(client, cluster)
+    assert r.status_code == 404 and r.json()["detail"]["code"] == "GITOPS_REF_NOT_FOUND"
+    assert not [read for read in gh.reads if read[0] in ("contents", "download")]
 
 
 def test_앱_목록을_못_읽어도_폴더는_준다(client, cluster, gh, monkeypatch):

@@ -9,7 +9,8 @@
 토큰은 server 가 주는 그 레포 범위 설치 토큰(server_api.repo_token)이다 — 응답·로그·캐시 키에 싣지 않는다.
 
 비용
-  - 보는 ref(브랜치·태그)는 먼저 커밋 id 로 바꾼다. REF_TTL 초 안에는 다시 묻지 않고, 지나면 ETag 로 묻는다(304 는 한도에 안 센다)
+  - 보는 ref(브랜치·태그)는 먼저 커밋 id 로 바꾼다. REF_TTL 초 안에는 다시 묻지 않고, 지나면 ETag 로 묻는다(304 는 한도에 안 센다).
+    커밋 id 로 주면 있는지 한 번만 묻는다
   - 커밋 id 가 같으면 내용도 같다 — 폴더·파일·렌더 결과를 (레포, 커밋, 경로) 로 기억한다 (바이트 상한 LRU, 프로세스 안)
   - 같은 렌더가 동시에 오면 한 번만 돈다
 """
@@ -139,6 +140,8 @@ _contents = _Cache(CONTENT_CACHE_BYTES)
 _renders = _Cache(RENDER_CACHE_BYTES)
 #: (레포, ref) → (커밋 id, ETag, 물어본 시각)
 _refs: OrderedDict[tuple[str, str], tuple[str, str, float]] = OrderedDict()
+#: 있다고 확인한 (레포, 커밋 id) — 커밋은 바뀌지 않아 TTL 이 없다
+_commits: OrderedDict[tuple[str, str], None] = OrderedDict()
 #: 레포 → (기본 브랜치, 물어본 시각)
 _defaults: dict[str, tuple[str, float]] = {}
 #: 진행 중인 렌더 — 같은 열쇠의 요청은 그 한 번을 같이 기다린다
@@ -150,6 +153,7 @@ def forget() -> None:
     _contents.clear()
     _renders.clear()
     _refs.clear()
+    _commits.clear()
     _defaults.clear()
     _inflight.clear()
 
@@ -173,10 +177,23 @@ async def default_branch(gh: github.GitHub, repository: str) -> str:
 
 
 async def commit_of(gh: github.GitHub, repository: str, ref: str) -> str | None:
-    """ref → 커밋 id. 커밋 id(40자)면 묻지 않는다. 그런 ref 가 없으면 None."""
-    if _SHA.fullmatch(ref):
+    """ref → 커밋 id. 그런 ref 가 없으면 None.
+
+    커밋 id(40자)도 한 번은 묻는다 — 없는 커밋을 그대로 쓰면 폴더·파일은 "경로 없음", 렌더는 GitHub 실패로 엉뚱하게 갈린다
+    (agent#128 리뷰). 있다고 확인한 커밋 id 는 바뀌지 않으니 TTL 없이 기억한다.
+    """
+    if _SHA.fullmatch(ref) and (repository, ref) in _commits:
+        _commits.move_to_end((repository, ref))
         return ref
     key = (repository, ref)
+    if _SHA.fullmatch(ref):
+        found = await gh.commit_sha(ref)
+        if found is None:
+            return None
+        _commits[key] = None
+        while len(_commits) > MAX_REFS:
+            _commits.popitem(last=False)
+        return found[0]
     cached = _refs.get(key)
     now = _now()
     if cached is not None and now - cached[2] < REF_TTL:
