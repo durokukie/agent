@@ -5,9 +5,11 @@ clusters_api.run_kubectl 을 바꿔 끼운다. Kustomize 렌더는 진짜 `kusto
 """
 from __future__ import annotations
 
+import http.server
 import json
 import os
 import shutil
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,6 +19,7 @@ from helpers import OTHER, USER
 from kukie_agent import argocd, clusters_api, server
 from kukie_agent.gitops import browse, github
 from kukie_agent.kubectl import KubectlResult
+from kukie_agent.manifests import render as renderer
 from kukie_agent.manifests.render import kustomize_bin
 from kukie_agent.server_api import ServerError
 
@@ -509,6 +512,110 @@ def test_레포_밖_주소를_가져오는_Kustomize_는_돌리지_않는다(cli
     monkeypatch.setattr("kukie_agent.manifests.render.subprocess.run", lambda *a, **k: ran.append(a))
     body = _rendered(client, cluster, "remote").json()
     assert body["status"] == "render_failed" and remote in body["message"] and ran == []
+
+
+# ── 렌더는 네트워크 없이 (manifests/render.py, agent#128 리뷰) ─────────────
+
+@pytest.fixture
+def listener():
+    """요청을 받으면 적어 두고 403 으로 답하는 로컬 HTTP 서버 — 대상 서버·프록시 둘 다로 쓴다."""
+    seen: list[str] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.path)
+            self.send_response(403)
+            self.end_headers()
+
+        do_CONNECT = do_GET
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    yield f"127.0.0.1:{server.server_address[1]}", seen
+    server.shutdown()
+
+
+def _kustomization(tmp_path, text: str):
+    app = tmp_path / "app"
+    app.mkdir(exist_ok=True)
+    (app / "kustomization.yaml").write_text(text)
+    return app
+
+
+#: 칸 검사(remote_reference)가 보지 않는 칸 — 막는 것이 네트워크 차단인지 본다
+GENERATOR = "configMapGenerator:\n- name: c\n  files:\n  - creds={url}\n"
+
+
+@needs_kustomize
+def test_kustomize_의_바깥_요청은_프록시로만_간다(tmp_path, monkeypatch, listener):
+    address, seen = listener
+    monkeypatch.setattr(renderer, "OFFLINE_PROXY", f"http://{address}")
+    app = _kustomization(tmp_path, GENERATOR.format(url="http://kukie-blocked.invalid/latest/meta-data"))
+    with pytest.raises(renderer.RenderError):
+        renderer.render("Kustomize", app, root=tmp_path)
+    assert seen == ["http://kukie-blocked.invalid/latest/meta-data"]          # 대상이 아니라 프록시가 받았다
+
+
+@needs_kustomize
+@pytest.mark.parametrize("url", ["http://169.254.169.254/latest/meta-data/", "https://example.com/creds"])
+def test_닿지_않는_프록시라_바깥_주소는_렌더_실패(tmp_path, url):
+    app = _kustomization(tmp_path, GENERATOR.format(url=url))
+    with pytest.raises(renderer.RenderError, match="네트워크를 쓰지 않아요"):
+        renderer.render("Kustomize", app, root=tmp_path)
+
+
+@needs_kustomize
+def test_git_원격_base_도_네트워크_없이_실패(tmp_path, monkeypatch):
+    monkeypatch.setattr(renderer, "remote_reference", lambda folder, root: None)    # 칸 검사가 없어도
+    app = _kustomization(tmp_path, "resources:\n- https://github.com/kubernetes-sigs/kustomize//examples/helloWorld"
+                                   "?ref=v5.8.1\n")
+    with pytest.raises(renderer.RenderError):
+        renderer.render("Kustomize", app, root=tmp_path)
+
+
+@pytest.mark.parametrize("host", [
+    "{address}", "localhost:{port}", "LOCALHOST.:{port}", "a.localhost:{port}", "[::1]:{port}",
+    "[::ffff:127.0.0.1]:{port}", "%6cocalhost:{port}", "user@127.0.0.1:{port}", "0.0.0.0:{port}",
+])
+def test_이_컴퓨터_안_주소는_돌리지_않는다(tmp_path, monkeypatch, listener, host):
+    address, seen = listener
+    port = address.rpartition(":")[2]
+    ran: list = []
+    monkeypatch.setattr(renderer.subprocess, "run", lambda *a, **k: ran.append(a))
+    app = _kustomization(tmp_path, "resources: []\n")
+    other = tmp_path / "elsewhere"                         # build 가 따라가지 않는 곳에 있어도 본다
+    other.mkdir()
+    (other / "kustomization.yaml").write_text(GENERATOR.format(url=f"http://{host.format(address=address, port=port)}/x"))
+    with pytest.raises(renderer.RenderError, match="이 컴퓨터 안 주소"):
+        renderer.render("Kustomize", app, root=tmp_path)
+    assert ran == [] and seen == []
+
+
+def test_바깥_주소는_이_컴퓨터_안_주소가_아니다():
+    for authority in ("example.com", "169.254.169.254", "10.0.0.1:443", "[2001:db8::1]", "127.0.0.1.nip.io"):
+        assert not renderer._local_host(authority), authority
+
+
+def test_kustomize_에는_에이전트_환경변수를_넘기지_않는다(monkeypatch):
+    monkeypatch.setenv("KUKIE_INTERNAL_TOKEN", "internal-secret")
+    env = renderer._offline_env("/tmp/home")
+    assert "internal-secret" not in env.values() and env["PATH"] == os.devnull
+    assert env["HTTPS_PROXY"] == env["HTTP_PROXY"] == renderer.OFFLINE_PROXY and env["NO_PROXY"] == ""
+    assert env["GIT_ALLOW_PROTOCOL"] == "none"
+
+
+@needs_kustomize
+def test_렌더_API_도_생성기의_바깥_주소를_가져오지_않는다(client, cluster, gh, monkeypatch, listener):
+    address, seen = listener
+    monkeypatch.setattr(renderer, "OFFLINE_PROXY", f"http://{address}")
+    _cluster_apps(monkeypatch, [_app("gen", "apps/gen", source_type="Kustomize")])
+    gh.commits["c0"]["apps/gen/kustomization.yaml"] = GENERATOR.format(url="http://kukie-blocked.invalid/creds")
+    body = _rendered(client, cluster, "gen").json()
+    assert body["status"] == "render_failed" and body["resources"] == []
+    assert seen == ["http://kukie-blocked.invalid/creds"]
 
 
 def test_로컬만_쓰는_kustomization_은_원격이_아니다(tmp_path):
