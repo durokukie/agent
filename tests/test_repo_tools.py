@@ -188,10 +188,45 @@ def test_큰_파일은_앞부분과_N줄_더_있음만(cluster, gh, monkeypatch)
     _cluster_apps(monkeypatch)
     gh.commits["c0"]["apps/plain/big.txt"] = "".join(f"line {i}\n" for i in range(1000))
     result = sync(read_repo_file(_ctx(cluster), "apps/plain/big.txt"))
-    assert result.success
-    assert "line 0" in result.stdout and "line 299" in result.stdout and "line 300" not in result.stdout
-    assert "… 700줄 더 있음 — 전체는 GitHub 에서: https://github.com/acme/manifests/blob/c0/apps/plain/big.txt" \
+    assert result.success and "line 0" in result.stdout and "line 999" not in result.stdout
+    _within_limits(result.stdout)
+    shown = sum(line.startswith("line ") for line in result.stdout.splitlines())
+    assert f"… {1000 - shown}줄 더 있음 — 전체는 GitHub 에서: https://github.com/acme/manifests/blob/c0/apps/plain/big.txt" \
         in result.stdout
+    assert result.stdout.endswith("GitHub: https://github.com/acme/manifests/blob/c0/apps/plain/big.txt")
+
+
+def _within_limits(out: str) -> None:
+    """머리 줄·꼬리 줄까지 합친 전체가 상한 안이다 (agent#129 리뷰)."""
+    assert len(out.splitlines()) <= repo_tools.MAX_LINES and len(out) <= repo_tools.MAX_CHARS
+
+
+def test_앱이_많은_루트_폴더도_전체_출력이_상한_안이다(cluster, gh, monkeypatch):
+    """루트는 레포의 모든 앱이 "앱 path 가 이 아래" 로 붙는다 — 머리 줄도 상한을 지킨다."""
+    many = [_app(f"app-{i:03d}-{'x' * 50}", f"apps/team-{i:03d}") for i in range(500)]
+    _cluster_apps(monkeypatch, many)
+    for i in range(500):
+        gh.commits["c0"][f"apps/team-{i:03d}/cm.yaml"] = "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: x}\n"
+    root = sync(list_repo_dir(_ctx(cluster), ""))
+    assert root.success, root.stderr
+    _within_limits(root.stdout)
+    assert f"  … 외 {500 - repo_tools.MAX_HEAD_ITEMS}개" in root.stdout                    # 머리 줄
+    assert f"app-019-{'x' * 50} 외 {500 - repo_tools.MAX_HEAD_ITEMS}개" in root.stdout      # apps/ 항목의 배지
+    apps = sync(list_repo_dir(_ctx(cluster), "apps"))                                     # 항목 500개 — 본문이 잘린다
+    assert apps.success, apps.stderr
+    _within_limits(apps.stdout)
+    assert "줄 더 있음 — 전체는 GitHub 에서" in apps.stdout and apps.stdout.endswith("/tree/c0/apps")
+
+
+def test_객체가_많은_파일도_전체_출력이_상한_안이다(cluster, gh, monkeypatch):
+    _cluster_apps(monkeypatch)
+    gh.commits["c0"]["apps/plain/many.yaml"] = "\n---\n".join(
+        f"apiVersion: v1\nkind: ConfigMap\nmetadata: {{name: config-{i}-{'y' * 100}, namespace: shop}}\ndata: {{a: b}}"
+        for i in range(2000))
+    result = sync(read_repo_file(_ctx(cluster), "apps/plain/many.yaml"))
+    assert result.success
+    _within_limits(result.stdout)
+    assert f"쿠버네티스 객체 2000개:" in result.stdout and f"외 {2000 - repo_tools.MAX_HEAD_ITEMS}개" in result.stdout
 
 
 def test_한_줄이_길어도_글자_상한을_넘지_않는다(cluster, gh, monkeypatch):
@@ -199,7 +234,7 @@ def test_한_줄이_길어도_글자_상한을_넘지_않는다(cluster, gh, mon
     gh.commits["c0"]["apps/plain/wide.json"] = "\n".join("x" * 5000 for _ in range(50))
     result = sync(read_repo_file(_ctx(cluster), "apps/plain/wide.json"))
     assert result.success and "(줄이 길어 잘림)" in result.stdout and "줄 더 있음" in result.stdout
-    assert len(result.stdout) < repo_tools.MAX_CHARS + 2000
+    _within_limits(result.stdout)
 
 
 def test_상한을_넘는_파일과_바이너리는_내용_없이_까닭만(cluster, gh, monkeypatch):
@@ -302,7 +337,7 @@ def test_큰_렌더_결과도_앞부분과_N줄_더_있음만(cluster, gh, monke
         f"apiVersion: v1\nkind: ConfigMap\nmetadata: {{name: c{i}}}\ndata: {{a: b}}" for i in range(200))
     result = sync(render_app(_ctx(cluster), "shop-web"))
     assert result.success and "줄 더 있음 — 폴더는 GitHub 에서" in result.stdout
-    assert len(result.stdout.splitlines()) <= repo_tools.MAX_LINES + 5
+    _within_limits(result.stdout)
 
 
 def test_렌더가_실패하면_까닭을_돌려준다(cluster, gh, monkeypatch):

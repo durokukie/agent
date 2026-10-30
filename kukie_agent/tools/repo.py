@@ -33,6 +33,8 @@ MAX_LINES = 300
 MAX_CHARS = 24_000
 #: 한 줄 상한 — 한 줄짜리 큰 JSON·base64 가 상한을 혼자 다 쓰지 않게
 MAX_LINE_CHARS = 2_000
+#: 머리 줄에 싣는 ArgoCD 앱·쿠버네티스 객체 수 — 넘으면 "외 N개". 루트 폴더는 레포의 모든 앱이 붙는다 (agent#129 리뷰)
+MAX_HEAD_ITEMS = 20
 #: ArgoCD 앱 목록 조회 시간(초)·동시 수
 APPS_TIMEOUT = 10
 APPS_WORKERS = 4
@@ -46,14 +48,14 @@ class _Stop(Exception):
 
 # ── 결과 모양 ─────────────────────────────────────────────
 
-def clip(text: str, *, more: str = "") -> str:
-    """모델 문맥에 넣을 만큼 — 앞에서 MAX_LINES 줄·MAX_CHARS 자까지, 넘으면 "… N줄 더 있음" 한 줄. more 는 그 뒤에 붙일 안내."""
+def clip(text: str, *, more: str = "", max_lines: int = MAX_LINES, max_chars: int = MAX_CHARS) -> str:
+    """모델 문맥에 넣을 만큼 — 앞에서 max_lines 줄·max_chars 자까지, 넘으면 "… N줄 더 있음" 한 줄. more 는 그 뒤에 붙일 안내."""
     lines = [line if len(line) <= MAX_LINE_CHARS else line[:MAX_LINE_CHARS] + " …(줄이 길어 잘림)"
              for line in text.splitlines()]
     kept: list[str] = []
     used = 0
     for line in lines:
-        if len(kept) >= MAX_LINES or used + len(line) + 1 > MAX_CHARS:
+        if len(kept) >= max_lines or used + len(line) + 1 > max_chars:
             break
         kept.append(line)
         used += len(line) + 1
@@ -61,6 +63,16 @@ def clip(text: str, *, more: str = "") -> str:
     if rest:
         kept.append(f"… {rest}줄 더 있음{' — ' + more if more else ''}")
     return "\n".join(kept)
+
+
+def compose(head: list[str], body: str, *, more: str, tail: list[str] | None = None) -> str:
+    """머리 줄 + 본문 + 꼬리 줄 — 전체가 MAX_LINES 줄·MAX_CHARS 자 안에 들게, 본문은 머리·꼬리를 뺀 남은 만큼만 싣는다.
+    머리 줄은 _app_lines·_objects_line 이 MAX_HEAD_ITEMS 로 줄여 둔다."""
+    fixed = [*head, *(tail or [])]
+    room_lines = MAX_LINES - len(fixed) - 1                           # 1: "… N줄 더 있음"
+    room_chars = MAX_CHARS - sum(len(line) + 1 for line in fixed) - len(more) - 40
+    clipped = clip(body, more=more, max_lines=max(room_lines, 1), max_chars=max(room_chars, 0))
+    return "\n".join([*head, clipped, *(tail or [])])
 
 
 def _done(command: str, stdout: str) -> KubectlResult:
@@ -91,11 +103,20 @@ def _app_lines(badges: list[dict[str, Any]], apps_status: str) -> list[str]:
     if not badges:
         return ["이 경로를 쓰는 ArgoCD 앱: 없음"]
     lines = ["이 경로를 쓰는 ArgoCD 앱:"]
-    for app in badges:
+    for app in badges[:MAX_HEAD_ITEMS]:
         revision = "" if app["same_revision"] else f" · 이 앱은 다른 revision({app['target_revision'] or 'HEAD'})을 따라가요"
         lines.append(f"  - {app['namespace']}/{app['name']} — path {app['path'] or '/'} · {app['source_type'] or '형식 모름'}"
                      f" · {_RELATION.get(app['relation'], app['relation'])}{revision}")
+    if len(badges) > MAX_HEAD_ITEMS:
+        lines.append(f"  … 외 {len(badges) - MAX_HEAD_ITEMS}개")
     return lines
+
+
+def _objects_line(objects: list[dict[str, Any]]) -> str:
+    names = [f"{obj['kind']} {obj['namespace'] + '/' if obj['namespace'] else ''}{obj['name'] or '(이름 없음)'}"
+             for obj in objects[:MAX_HEAD_ITEMS]]
+    rest = f" 외 {len(objects) - MAX_HEAD_ITEMS}개" if len(objects) > MAX_HEAD_ITEMS else ""
+    return f"쿠버네티스 객체 {len(objects)}개: {', '.join(names)}{rest}"
 
 
 # ── 대상 정하기 ───────────────────────────────────────────
@@ -224,7 +245,8 @@ async def list_repo_dir(ctx: RunContext[Deps], path: str = "", ref: str | None =
     for entry in listing["entries"]:
         if entry["type"] == "dir":
             used = browse.apps_for_folder(apps, entry["path"], revision)
-            badge = f"  ← ArgoCD 앱 {', '.join(app['name'] for app in used)}" if used else ""
+            rest = f" 외 {len(used) - MAX_HEAD_ITEMS}개" if len(used) > MAX_HEAD_ITEMS else ""
+            badge = f"  ← ArgoCD 앱 {', '.join(app['name'] for app in used[:MAX_HEAD_ITEMS])}{rest}" if used else ""
             entries.append(f"[폴더] {entry['name']}/{badge}")
         else:
             size = _size(entry["size"])
@@ -236,8 +258,8 @@ async def list_repo_dir(ctx: RunContext[Deps], path: str = "", ref: str | None =
     head = [f"레포 {name} · ref {revision.ref} (커밋 {_short(revision.sha)}) · 폴더 {folder or '/'}",
             *_app_lines(browse.apps_around(apps, folder, revision, is_file=False), apps_status),
             f"항목 {listing['total']}개:"]
-    body = clip("\n".join(entries) or "(빈 폴더)", more=f"전체는 GitHub 에서: {url}")
-    return _done(command, "\n".join([*head, body, f"GitHub: {url}"]))
+    return _done(command, compose(head, "\n".join(entries) or "(빈 폴더)", more=f"전체는 GitHub 에서: {url}",
+                                  tail=[f"GitHub: {url}"]))
 
 
 async def read_repo_file(ctx: RunContext[Deps], path: str, ref: str | None = None,
@@ -272,14 +294,12 @@ async def read_repo_file(ctx: RunContext[Deps], path: str, ref: str | None = Non
             f"{f' ({_size(view['size'])})' if view['size'] is not None else ''}",
             *_app_lines(browse.apps_around(apps, file_path, revision, is_file=True), apps_status)]
     if view["objects"]:
-        head.append("쿠버네티스 객체: " + ", ".join(
-            f"{obj['kind']} {obj['namespace'] + '/' if obj['namespace'] else ''}{obj['name'] or '(이름 없음)'}"
-            for obj in view["objects"]))
+        head.append(_objects_line(view["objects"]))
     if view["parse_error"]:
         head.append(f"참고: {view['parse_error']}")
     status = view["status"]
     if status == "ok":
-        body = "--- 내용 ---\n" + clip(view["content"] or "(빈 파일)", more=f"전체는 GitHub 에서: {url}")
+        body = "--- 내용 ---\n" + (view["content"] or "(빈 파일)")
     elif status == "masked":
         body = f"내용을 가렸어요 — 비밀 값이 들어 있을 수 있는 파일이에요 ({view['masked_reason']}). 값은 보여 주지 않아요."
     elif status == "too_large":
@@ -288,7 +308,7 @@ async def read_repo_file(ctx: RunContext[Deps], path: str, ref: str | None = Non
         body = "글자 파일이 아니라(바이너리) 내용을 싣지 않았어요."
     else:
         body = "심볼릭 링크·서브모듈이라 따라가지 않았어요."
-    return _done(command, "\n".join([*head, body, f"GitHub: {url}"]))
+    return _done(command, compose(head, body, more=f"전체는 GitHub 에서: {url}", tail=[f"GitHub: {url}"]))
 
 
 async def render_app(ctx: RunContext[Deps], name: str, namespace: str | None = None,
@@ -352,8 +372,7 @@ async def render_app(ctx: RunContext[Deps], name: str, namespace: str | None = N
             prefix = f"# {title} — Secret 값은 가렸어요\n" if resource["masked"] else ""
             parts.append(prefix + resource["yaml"].rstrip("\n"))
     head.append(f"리소스 {result['total']}개" + (f" (상한을 넘어 {len(result['resources'])}개만)" if result["truncated"] else ""))
-    body = clip("\n---\n".join(parts) or "(리소스 없음)", more=f"폴더는 GitHub 에서: {url}")
-    return _done(command, "\n".join([*head, body]))
+    return _done(command, compose(head, "\n---\n".join(parts) or "(리소스 없음)", more=f"폴더는 GitHub 에서: {url}"))
 
 
 REPO_TOOLS = [list_repo_dir, read_repo_file, render_app]
