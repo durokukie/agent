@@ -38,7 +38,6 @@ from kukie_agent import argocd, server_api
 from kukie_agent.auth import User, current_user
 from kukie_agent.clusters import access, gpu, overview
 from kukie_agent.gitops import browse, github
-from kukie_agent.manifests import render as renderer
 from kukie_agent.kubectl import KubectlResult, run_kubectl, thread_limiter
 
 logger = logging.getLogger(__name__)
@@ -384,12 +383,7 @@ async def argocd_application_rendered(
     assert source.repository is not None
     token = await _repo_token(cluster_id, source.repository)
     try:
-        async with github.connect(source.repository, token.token) as gh:
-            revision = await browse.resolve(gh, source.repository, wanted)
-        result = await browse.render(source.repository, token.token, revision.sha, source)
-    except renderer.RenderTimeout as exc:
-        # 렌더 기억(browse._renders)에 남지 않는 실패 — 다음 요청이 다시 해 본다 (agent#128 리뷰)
-        result = {"status": "render_failed", "message": str(exc), "resources": [], "total": 0, "truncated": False}
+        revision, result = await browse.render_at(source.repository, token.token, wanted, source)
     except browse.NotFound as exc:
         raise _browse_not_found(exc) from None
     except github.GitHubError as exc:
@@ -424,12 +418,8 @@ async def gitops_repo_tree(
     repository, wanted, folder = _repo_request(owner, repo, ref, path)
     token = await _repo_token(cluster_id, repository)
 
-    async def read() -> tuple[browse.Revision, dict[str, Any]]:
-        async with github.connect(repository, token.token) as gh:
-            revision = await browse.resolve(gh, repository, wanted)
-            return revision, await browse.folder(gh, repository, revision, folder)
-
-    (revision, listing), (apps_status, items) = await _with_apps(read(), cluster_id, conn)
+    read = browse.open_folder(repository, token.token, wanted, folder)
+    (revision, listing), (apps_status, items) = await _with_apps(read, cluster_id, conn)
     apps = browse.app_paths(items, repository)
     for entry in listing["entries"]:
         entry["applications"] = browse.apps_for_folder(apps, entry["path"], revision) if entry["type"] == "dir" else []
@@ -465,12 +455,8 @@ async def gitops_repo_file(
     repository, wanted, file_path = _repo_request(owner, repo, ref, path)
     token = await _repo_token(cluster_id, repository)
 
-    async def read() -> tuple[browse.Revision, dict[str, Any]]:
-        async with github.connect(repository, token.token) as gh:
-            revision = await browse.resolve(gh, repository, wanted)
-            return revision, await browse.file(gh, repository, revision, file_path)
-
-    (revision, view), (apps_status, items) = await _with_apps(read(), cluster_id, conn)
+    read = browse.open_file(repository, token.token, wanted, file_path)
+    (revision, view), (apps_status, items) = await _with_apps(read, cluster_id, conn)
     apps = browse.app_paths(items, repository)
     return {
         **_revision_body(repository, revision, file_path),

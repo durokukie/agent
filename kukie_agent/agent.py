@@ -38,6 +38,7 @@ from kukie_agent.response import build_response
 from kukie_agent.tools.gitops import GITOPS_TOOLS
 from kukie_agent.tools.mutate import MUTATE_TOOLS
 from kukie_agent.tools.read import READ_TOOLS
+from kukie_agent.tools.repo import REPO_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,8 @@ BASE_PROMPT = """너는 팀의 쿠버네티스 운영을 돕는 조수 Kukie다.
 4. "왜 안 되나요?" 같은 문제 질문에는 추측으로 답하지 않는다.
    describe(리소스 상태) → events(클러스터 차원) → logs(앱 차원) 순서로 확인하고,
    각 단계에서 무엇을 확인했고 무엇을 발견했는지 설명한다.
+   매니페스트 레포(ArgoCD 가 보는 GitHub 레포)의 파일·폴더·렌더 결과를 묻거나 git 쪽 원인을 볼 때는
+   레포 읽기 툴(list_repo_dir·read_repo_file·render_app)로 실제 내용을 읽고 답한다 — 짐작하지 않는다.
    원인을 찾으면 finding에 (a)원인 (b)근거가 된 출력 (c)권장 조치를 구분해 담는다.
 5. 클러스터를 변경하는 툴은 사용자가 무언가를 바꿔 달라고 요청했을 때만 호출한다.
    변경 전에 무엇을/왜/어떤 명령이 나갈지를 먼저 설명하고, 매니페스트를 만들 때는 각 필드가 왜 필요한지 해설한다.
@@ -71,7 +74,7 @@ suggested_next_action에 짧게 작성한다.
 제안은 작업 실행이나 사용자 승인을 의미하지 않는다."""
 
 # ── 툴 등록 ──────────────────────────────────────────────────
-_toolset: FunctionToolset[Deps] = FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS, *GITOPS_TOOLS])
+_toolset: FunctionToolset[Deps] = FunctionToolset([*READ_TOOLS, *REPO_TOOLS, *MUTATE_TOOLS, *GITOPS_TOOLS])
 
 
 def _only_skill_tools(ctx: RunContext[Deps], tool_def: ToolDefinition) -> bool:
@@ -187,7 +190,7 @@ agent = Agent(
 #
 # 이 파일에서 같은 원리로 동작하는 등록형 함수:
 #   @agent.instructions      → 프롬프트 생성기 (아래 둘)
-#   FunctionToolset(...)     → 툴 (READ_TOOLS/MUTATE_TOOLS의 함수들; LLM이 이름으로 호출)
+#   FunctionToolset(...)     → 툴 (READ_TOOLS/REPO_TOOLS/MUTATE_TOOLS의 함수들; LLM이 이름으로 호출)
 #   @hooks.on.tool_execute   → 훅 (guardrail/hook.py의 guardrail())
 #   output_type=build_response → 최종 응답 조립기 (response.py). 함수라서 LLM 스키마는
 #     매개변수(narration, suggested_next_action, finding)뿐이고, steps는 본문에서 코드가 실행 기록으로 채운다.

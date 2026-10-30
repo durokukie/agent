@@ -9,6 +9,7 @@ from kukie_agent.skills import PRIVATE, SHARED, skill_for
 from kukie_agent.skills.base import COMMON_TOOLS
 from kukie_agent.tools.mutate import MUTATE_TOOLS, MUTATING_TOOLS, RISK_STICKERS, Risk
 from kukie_agent.tools.read import READ_TOOLS
+from kukie_agent.tools.repo import REPO_TOOLS
 
 
 def test_훅_대상은_변경_함수_목록에서_자동_파생된다():
@@ -29,7 +30,7 @@ def test_delete만_destructive_나머지_변경은_caution():
 
 def test_LLM이_kubectl_args를_직접_조립하는_툴이_없다():
     """팀 결정: 자유형 args를 받는 툴(탈출구) 없음 — 모든 명령은 코드가 조립."""
-    for tool in [*READ_TOOLS, *MUTATE_TOOLS]:
+    for tool in [*READ_TOOLS, *REPO_TOOLS, *MUTATE_TOOLS]:
         params = tool.__code__.co_varnames[: tool.__code__.co_argcount]
         assert "args" not in params, f"{tool.__name__}이 자유형 args를 받음"
 
@@ -41,9 +42,16 @@ def test_읽기_툴은_5종이다():
     }
 
 
-def test_공통_툴은_읽기_툴_5종_전부다():
-    """Private·Shared 어느 대화든 읽기는 전부 된다 (DURO-100). 이름으로 참조하므로 목록이 어긋나면 여기서 잡힌다."""
-    assert COMMON_TOOLS == {t.__name__ for t in READ_TOOLS}
+def test_공통_툴은_읽기_툴_5종과_레포_읽기_3종_전부다():
+    """Private·Shared 어느 대화든 읽기는 전부 된다 (DURO-100·DURO-151). 이름으로 참조하므로 목록이 어긋나면 여기서 잡힌다."""
+    assert {t.__name__ for t in REPO_TOOLS} == {"list_repo_dir", "read_repo_file", "render_app"}
+    assert COMMON_TOOLS == {t.__name__ for t in [*READ_TOOLS, *REPO_TOOLS]}
+
+
+def test_레포_읽기_툴은_변경_훅을_타지_않는다():
+    """읽기 전용 = SAFE — 승인 카드가 뜨지 않아야 한다. 변경 툴 목록·스티커에 들어가면 훅이 잡는다."""
+    names = {t.__name__ for t in REPO_TOOLS}
+    assert not names & MUTATING_TOOLS and not names & set(RISK_STICKERS)
 
 
 def test_공개_범위가_스킬을_정한다():

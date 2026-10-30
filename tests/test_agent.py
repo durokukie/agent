@@ -45,11 +45,12 @@ GOOD_RESPONSE = {
 
 # ── 툴 등록 + 스킬 필터 ─────────────────────────────────────
 
-READ_ONLY = {"list_resources", "explain_command", "describe_resource", "get_events", "get_logs"}
+READ_ONLY = {"list_resources", "explain_command", "describe_resource", "get_events", "get_logs",
+             "list_repo_dir", "read_repo_file", "render_app"}      # 레포 읽기 3종 (DURO-151) — 연결 여부와 상관없이 늘
 
 
 @pytest.mark.parametrize("shared,expected", [
-    (False, READ_ONLY),                     # Private — 읽기 5종만, 변경 툴은 아예 없다
+    (False, READ_ONLY),                     # Private — 읽기(kubectl 5종 + 레포 3종)만, 변경 툴은 아예 없다
     # Shared — 읽기 + 변경 (변경은 가드레일 훅 → 승인 카드) + PR 길 변경 (DURO-134, 역시 Shared 에만)
     (True, READ_ONLY | MUTATING_TOOLS | {"propose_git_change"}),
 ])

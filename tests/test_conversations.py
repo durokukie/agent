@@ -232,12 +232,13 @@ def _capture_turns(seen: list[dict]):
     (True, {"apply_manifest", "scale_resource", "rollout_restart", "delete_resource", "propose_git_change"}),
 ])
 def test_방의_공개_범위가_노출되는_툴을_정한다(client, fake_server, shared, expected):
-    """Private 는 읽기 5종만, Shared 는 읽기 + 변경 4종 (DURO-100)."""
+    """Private 는 읽기(kubectl 5종 + 레포 3종)만, Shared 는 읽기 + 변경 4종 (DURO-100·DURO-151)."""
     seen: list[dict] = []
     room = new_room(fake_server, shared=shared)
     with agent.override(model=_capture_turns(seen)):
         assert _say(client, room, "파드 보여줘").status_code == 200
-    read = {"list_resources", "explain_command", "describe_resource", "get_events", "get_logs"}
+    read = {"list_resources", "explain_command", "describe_resource", "get_events", "get_logs",
+            "list_repo_dir", "read_repo_file", "render_app"}
     assert {name for name, _ in seen[-1]["tools"]} == read | expected
 
 

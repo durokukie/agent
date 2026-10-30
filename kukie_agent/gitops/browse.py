@@ -481,6 +481,20 @@ async def file(gh: github.GitHub, repository: str, revision: Revision, path: str
     return {key: value for key, value in view.items() if key != "kind"}
 
 
+async def open_folder(repository: str, token: str, ref: str, path: str) -> tuple[Revision, dict[str, Any]]:
+    """ref 를 커밋으로 바꿔 폴더 하나를 읽는다 — 레포 탭 API 와 채팅 툴(tools/repo.py)이 같이 쓴다. NotFound·GitHubError 는 올린다."""
+    async with github.connect(repository, token) as gh:
+        revision = await resolve(gh, repository, ref)
+        return revision, await folder(gh, repository, revision, path)
+
+
+async def open_file(repository: str, token: str, ref: str, path: str) -> tuple[Revision, dict[str, Any]]:
+    """ref 를 커밋으로 바꿔 파일 하나를 읽는다 (가림·상한은 file). open_folder 와 같다."""
+    async with github.connect(repository, token) as gh:
+        revision = await resolve(gh, repository, ref)
+        return revision, await file(gh, repository, revision, path)
+
+
 def html_url(repository: str, sha: str, path: str, *, folder: bool) -> str:
     """GitHub 화면 주소 — 커밋 id 로 고정한다 (나중에 브랜치가 움직여도 같은 내용).
     경로는 조각마다 퍼센트 인코딩한다 — `#`·`?`·`%`·공백·한글 파일 이름도 링크가 깨지지 않게 (`/` 는 그대로)."""
@@ -645,6 +659,18 @@ async def render(repository: str, token: str, sha: str, source: RenderSource) ->
 
         task.add_done_callback(finished)
     return await asyncio.shield(task)
+
+
+async def render_at(repository: str, token: str, ref: str, source: RenderSource) -> tuple[Revision, dict[str, Any]]:
+    """ref 를 커밋으로 바꿔 렌더한다 — 레포 탭 API 와 채팅 툴이 같이 쓴다. NotFound·GitHubError 는 올린다.
+    시간 초과는 render_failed 로 돌려준다 — 렌더 기억(_renders)에 남지 않는 실패라 다음 요청이 다시 해 본다 (agent#128 리뷰)."""
+    async with github.connect(repository, token) as gh:
+        revision = await resolve(gh, repository, ref)
+    try:
+        result = await render(repository, token, revision.sha, source)
+    except renderer.RenderTimeout as exc:
+        result = {"status": "render_failed", "message": str(exc), "resources": [], "total": 0, "truncated": False}
+    return revision, result
 
 
 async def _render_now(repository: str, token: str, sha: str, source: RenderSource) -> dict[str, Any]:

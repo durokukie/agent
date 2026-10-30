@@ -47,6 +47,8 @@ def _no_argocd_by_default(monkeypatch):
     from kukie_agent.gitops import github, route, watch
     monkeypatch.setattr(route, "run_kubectl", lambda *a, **k: NO_ARGOCD)
     monkeypatch.setattr(watch, "run_kubectl", lambda *a, **k: NO_ARGOCD)
+    from kukie_agent.tools import repo as repo_tools
+    monkeypatch.setattr(repo_tools, "run_kubectl", lambda *a, **k: NO_ARGOCD)    # 레포 읽기 툴의 Application 목록 (DURO-151)
 
     def no_github(*a, **k):
         raise AssertionError("테스트가 진짜 GitHub 를 부르려 했다 — tests/fake_github.py 를 끼워라")
