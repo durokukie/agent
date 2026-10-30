@@ -25,7 +25,7 @@ from kukie_agent.manifests.models import (
     AppSource, Change, Env, ImageTag, Other, Ready, Refused, Replicas, Resources, Target,
 )
 from kukie_agent.manifests.render import (
-    RenderError, kustomization_file, kustomize_roots, render, resolve_inside,
+    RenderError, RenderTimeout, kustomization_file, kustomize_roots, render, resolve_inside,
 )
 from kukie_agent.manifests.workload import (
     POD_SPEC, SCALABLE, container, containers, dig, split_image, with_tag,
@@ -110,6 +110,8 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
                        message=f"'{app.path}' 에 kustomization.yaml 이 없어요 — Kustomize 로 렌더링할 수 없어요.")
     try:
         before = compare.index(render(app.source_type, app_dir, root=repo, recurse=app.directory_recurse))
+    except RenderTimeout as exc:
+        return _busy(exc)
     except RenderError as exc:
         return Refused(code="render_failed", message=f"지금 레포를 렌더링하지 못했어요. {exc}")
 
@@ -294,6 +296,8 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
         try:
             after = compare.index(render(ctx.app.source_type, workdir / app_path, root=workdir,
                                          recurse=ctx.app.directory_recurse))
+        except RenderTimeout as exc:
+            return _busy(exc)
         except RenderError as exc:
             return Refused(code="render_failed", retry=True, message=f"고친 뒤 렌더링이 안 돼요. {exc}")
 
@@ -301,7 +305,11 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
         if refused:
             return refused
         if ctx.app.source_type == "Kustomize":
-            changed = _other_environments(ctx, workdir, app_path)
+            try:
+                changed = _other_environments(ctx, workdir, app_path)
+            except RenderTimeout as exc:
+                # 한쪽만 시간이 넘으면 "다른 환경도 바뀐다" 로 잘못 읽힌다 — 비교를 포기하고 그렇다고 알린다 (agent#128 리뷰)
+                return _busy(exc, "다른 환경과 비교하다 ")
             if changed:
                 return Refused(code="render_mismatch", retry=True,
                                message="다른 환경도 같이 바뀌어요: " + ", ".join(changed[:_SHOW_LIMIT])
@@ -413,6 +421,11 @@ def _brief(value: object) -> str:
     return text if len(text) <= 60 else text[:57] + "..."
 
 
+def _busy(exc: RenderTimeout, doing: str = "") -> Refused:
+    """레포 검사 시간이 넘었다 — 레포가 틀린 게 아니라 지금 못 한 것이다. kubectl 길로도, 고칠 곳 다시 고르기로도 보내지 않는다."""
+    return Refused(code="busy", message=f"{doing}{exc} 잠시 뒤 다시 해 주세요.")
+
+
 def _other_environments(ctx: Context, workdir: Path, app_path: str) -> list[str]:
     """레포의 다른 kustomization 폴더 중 고친 뒤 렌더 결과가 달라지는 곳 (전·후 모두 렌더링이 안 되는 곳은 뺀다)."""
     changed = []
@@ -423,6 +436,8 @@ def _other_environments(ctx: Context, workdir: Path, app_path: str) -> list[str]
         for base in (ctx.root, workdir):
             try:
                 results.append(compare.index(render("Kustomize", base / root, root=base)))
+            except RenderTimeout:
+                raise                                       # 렌더가 안 되는 것과 다르다 — 부르는 쪽이 비교를 포기한다
             except RenderError:
                 results.append(None)
         if results[0] is None and results[1] is None:

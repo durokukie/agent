@@ -124,6 +124,7 @@ RefuseCode = Literal[
     "outside_app",          # Application path 밖(base 등)을 고쳤다 — 다른 환경도 같이 바뀐다
     "render_failed",        # 렌더링이 안 된다
     "render_mismatch",      # 렌더 비교에서 요청 밖 변화가 보였다
+    "busy",                 # 레포 검사 시간이 넘었다 — 잠시 뒤 다시 (kubectl 길·다시 고르기 둘 다 아니다)
 ]
 
 

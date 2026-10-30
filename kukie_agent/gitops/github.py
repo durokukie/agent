@@ -137,11 +137,7 @@ class GitHub:
             return None
         if response.is_success:
             return response.json() if response.content else None
-        try:
-            message = str((response.json() or {}).get("message") or "")
-        except ValueError:
-            message = ""
-        raise GitHubError(response.status_code, message or response.reason_phrase)
+        raise GitHubError(response.status_code, _message(response))
 
     # ── 읽기 ──────────────────────────────────────────────
 
@@ -180,6 +176,38 @@ class GitHub:
         except httpx.HTTPError as exc:
             raise GitHubError(None, type(exc).__name__) from exc
         return _extract(b"".join(chunks), dest)
+
+    async def commit_sha(self, ref: str, *, cached: tuple[str, str] | None = None) -> tuple[str, str] | None:
+        """ref(브랜치·태그·커밋·HEAD) → (커밋 id, ETag). 그런 ref 가 없으면 None (레포 보기, DURO-148).
+
+        cached 는 지난번에 받은 (커밋 id, ETag) 다 — 안 바뀌었으면 GitHub 가 304 로 답하고 그것을 그대로 준다.
+        304 는 GitHub 호출 한도에 세지 않는다. 부르기 전에 branch_name_ok 로 본다 (`/` 는 그대로 보낸다 — branch_head 와 같다).
+        """
+        headers = {"Accept": "application/vnd.github.sha"}
+        if cached is not None and cached[1]:
+            headers["If-None-Match"] = cached[1]
+        try:
+            response = await self._client.get(self._repo_path("commits", quote(ref, safe="/")), headers=headers)
+        except httpx.HTTPError as exc:
+            raise GitHubError(None, type(exc).__name__) from exc
+        if response.status_code == 304 and cached is not None:
+            return cached
+        if response.status_code in (404, 422):              # 422 = "No commit found for SHA"
+            return None
+        if not response.is_success:
+            raise GitHubError(response.status_code, _message(response))
+        sha = response.text.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise GitHubError(response.status_code, "커밋 id 모양이 아니다")
+        return sha, response.headers.get("etag", "")
+
+    async def contents(self, path: str, ref: str) -> Any:
+        """그 커밋의 파일(dict — 1MB 까지는 base64 content)이나 폴더 목록(list). 없으면 None (레포 보기, DURO-148).
+
+        path 는 레포 루트 기준이고 빈 값이면 루트다. 부르는 쪽이 `..` 없는 경로인지 먼저 본다. 폴더는 GitHub 가 1000개까지만 준다.
+        """
+        segments = ("contents", quote(path, safe="/")) if path else ("contents",)
+        return await self._request("GET", self._repo_path(*segments), params={"ref": ref}, not_found_is_none=True)
 
     async def commit_parents(self, sha: str) -> list[str]:
         data = await self._request("GET", self._repo_path("git", "commits", quote(sha, safe="")))
@@ -267,6 +295,15 @@ class GitHub:
         """Kukie 브랜치만 지운다. 이미 없으면(GitHub 의 머지 뒤 자동 삭제) 조용히 끝난다."""
         await self._request("DELETE", self._repo_path("git", "refs", "heads", _safe_branch(branch)),
                             not_found_is_none=True)
+
+
+def _message(response: httpx.Response) -> str:
+    """GitHub 가 준 오류 message — 없으면 HTTP 이유 문구."""
+    try:
+        message = str((response.json() or {}).get("message") or "")
+    except (ValueError, AttributeError):
+        message = ""
+    return message or response.reason_phrase
 
 
 def connect(repository: str, token: str) -> GitHub:

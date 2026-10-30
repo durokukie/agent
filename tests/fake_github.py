@@ -5,6 +5,7 @@ FakeCluster 는 route·watch 의 kubectl 을 대신한다 — 리소스 하나(A
 """
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
@@ -38,6 +39,9 @@ class FakeGitHub:
     #: 다음 머지에 낼 오류 (status, message) — 브랜치 보호 등
     merge_error: tuple[int, str] | None = None
     mergeable_state: str = "clean"
+    #: 레포 보기(DURO-148)가 부른 읽기 — (메서드, 인자). 캐시·ETag 를 보는 테스트가 센다
+    reads: list[tuple[str, str]] = field(default_factory=list)
+    tags: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.commits["c0"] = _files(FIXTURE)
@@ -96,11 +100,17 @@ class FakeGitHub:
         return self.branches.get(branch)
 
     async def download(self, ref: str, dest: Path) -> Path:
+        self.reads.append(("download", ref))
+        if ref not in self.commits:
+            raise GitHubError(404, "Not Found")
         root = dest / f"acme-manifests-{ref}"
         for path, content in self.commits[ref].items():
             target = root / path
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            if isinstance(content, bytes):
+                target.write_bytes(content)
+            else:
+                target.write_text(content, encoding="utf-8")
         return root
 
     def _pull(self, number: int) -> PullRequest:
@@ -112,6 +122,37 @@ class FakeGitHub:
 
     async def commit_parents(self, sha: str) -> list[str]:
         return self.parents.get(sha, [])
+
+    async def commit_sha(self, ref: str, *, cached: tuple[str, str] | None = None) -> tuple[str, str] | None:
+        sha = self.branches["main"] if ref == "HEAD" else self.branches.get(ref) or self.tags.get(ref)
+        sha = sha or (ref if ref in self.commits else None)
+        etag = f'W/"{sha}"'
+        if cached is not None and sha is not None and cached[1] == etag:
+            self.reads.append(("commit_sha_304", ref))
+            return cached
+        self.reads.append(("commit_sha", ref))
+        return (sha, etag) if sha is not None else None
+
+    async def contents(self, path: str, ref: str) -> Any:
+        """GitHub Contents API 와 같은 모양 — 파일은 dict(base64), 폴더는 list."""
+        self.reads.append(("contents", path))
+        files = self.commits.get(ref)
+        if files is None:
+            return None
+        if path in files:
+            data = files[path].encode("utf-8") if isinstance(files[path], str) else files[path]
+            return {"type": "file", "name": path.rsplit("/", 1)[-1], "path": path, "size": len(data),
+                    "encoding": "base64", "content": base64.encodebytes(data).decode()}
+        prefix = f"{path}/" if path else ""
+        children: dict[str, str] = {}
+        for name in files:
+            if name.startswith(prefix):
+                head, _, rest = name[len(prefix):].partition("/")
+                children[head] = "dir" if rest else "file"
+        if not children:
+            return None
+        return [{"name": head, "path": prefix + head, "type": kind,
+                 "size": len(files[prefix + head]) if kind == "file" else 0} for head, kind in children.items()]
 
     async def pull(self, number: int) -> PullRequest:
         return self._pull(number)
