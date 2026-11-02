@@ -231,6 +231,16 @@ class FakeCluster:
     app_status: dict[str, Any] | None = None
     seen: list[list[str]] = field(default_factory=list)
     merged_revision: str = ""
+    destination: str = "shop"
+    destination_server: str = "https://kubernetes.default.svc"
+    #: spec.source.directory (recurse·include·exclude)
+    directory: dict[str, Any] | None = None
+    #: 클러스터에 이미 있는 다른 리소스 이름 (새 리소스 경고, DURO-154)
+    live: set[str] = field(default_factory=set)
+    #: 같은 이름의 앱이 또 있는 네임스페이스
+    same_name_in: str | None = None
+    #: True 면 ArgoCD 가 깔려 있지 않다
+    no_argocd: bool = False
 
     def resource(self) -> dict[str, Any]:
         annotations = {"argocd.argoproj.io/tracking-id": "shop-web:apps/Deployment:shop/web"} if self.managed else {}
@@ -249,8 +259,10 @@ class FakeCluster:
         return {
             "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
             "metadata": {"name": "shop-web", "namespace": "argocd"},
-            "spec": {"project": "default", "destination": {"namespace": "shop"}, "syncPolicy": policy,
-                     "source": {"repoURL": self.repo_url, "path": self.path, "targetRevision": self.revision}},
+            "spec": {"project": "default", "syncPolicy": policy,
+                     "destination": {"server": self.destination_server, "namespace": self.destination},
+                     "source": {"repoURL": self.repo_url, "path": self.path, "targetRevision": self.revision,
+                                **({"directory": self.directory} if self.directory else {})}},
             "status": status,
         }
 
@@ -260,12 +272,19 @@ class FakeCluster:
             return KubectlResult(command="kubectl get", stdout="", success=False, exit_code=1,
                                  stderr="Unable to connect to the server: dial tcp: i/o timeout")
         if args[:2] == ["get", "applications.argoproj.io"]:
+            if self.no_argocd:
+                return KubectlResult(command="kubectl get", stdout="", success=False, exit_code=1,
+                                     stderr='error: the server doesn\'t have a resource type "applications"')
             if "-A" in args:
-                return _ok({"items": [self.application()]})
+                other = copy.deepcopy(self.application())
+                other["metadata"]["namespace"] = self.same_name_in
+                return _ok({"items": [self.application(), *([other] if self.same_name_in else [])]})
             return _ok(self.application())
         if args[:2] == ["get", "horizontalpodautoscalers"]:
             items = [{"metadata": {"name": self.hpa}, "spec": {"scaleTargetRef": {"kind": "Deployment", "name": "web"}}}]
             return _ok({"items": items if self.hpa else []})
         if args[:3] in (["get", "deployment", "web"], ["get", "Deployment", "web"]):
             return _ok(self.resource())
+        if args[0] == "get" and len(args) > 2 and args[2] in self.live:
+            return _ok({"metadata": {"name": args[2]}})
         return _missing(" ".join(args[1:3]))

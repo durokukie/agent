@@ -53,6 +53,16 @@ def propose(ctx: Context) -> dict[str, str] | Refused:
     return edits
 
 
+def add_resource(text: str, entry: str) -> tuple[str, bool]:
+    """kustomization 글자에 `resources:` 한 줄을 더한다 (DURO-154) → (새 글자, 모양이 그대로인가). 못 읽으면 ValueError."""
+    parsed = YamlFile(text)
+    kustomization = parsed.docs[0] if parsed.docs and isinstance(parsed.docs[0], dict) else None
+    if kustomization is None:
+        raise ValueError("비어 있어요.")
+    _list(kustomization, "resources").append(entry)
+    return parsed.dump(), parsed.keeps_shape()
+
+
 def _list(kustomization: Any, key: str) -> Any:
     if not isinstance(kustomization.get(key), list):
         kustomization[key] = CommentedSeq()

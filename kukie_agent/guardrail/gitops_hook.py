@@ -15,6 +15,9 @@ kubectl 변경 4종의 훅(guardrail/hook.py)과 같은 틀이다: Plan 은 serv
     → 브랜치 보호로 막히면 PR 을 남기고 FAILED("GitHub 에서 리뷰·머지가 필요해요")
     → sync·health 지켜보기 → result(머지 커밋·sync 결과). 실패면 revert 제안을 툴 결과에 싣는다
 거절은 server.py 의 _approve 가 기록하고 close_rejected 로 PR 을 닫는다 (거절된 호출에는 훅이 돌지 않는다).
+
+새 리소스(change.what == new_resource, DURO-154)도 같은 흐름이다. 다른 곳은 셋이다: 길은 요청이 고른 앱으로 정하고,
+고칠 곳 찾기 대신 새 파일을 만들고, 경고(risk_warnings)를 gitops 칸에 싣는다 — 승인이 곧 "이 경고를 보고 승인함" 의 기록이다.
 """
 from __future__ import annotations
 
@@ -35,7 +38,7 @@ from kukie_agent.guardrail.decision_guidance import generate_decision_guidance
 from kukie_agent.guardrail.hook import hooks
 from kukie_agent.guardrail.mutation_request import canonicalize_mutation_args
 from kukie_agent.kubectl import thread_limiter
-from kukie_agent.manifests import Change, Replicas
+from kukie_agent.manifests import Change, NewResource, Replicas, already_in_cluster, representative
 from kukie_agent.tools.gitops import RISK, TOOL_NAME, GitOpsResult
 
 logger = logging.getLogger(__name__)
@@ -78,6 +81,15 @@ def _kubectl_retry(ctx, reason: str) -> Exception:
     ))
 
 
+def _other_way_retry(ctx, reason: str) -> Exception:
+    """새 리소스를 PR 로 못 더한다 — 이유와 다른 길을 사용자에게 고르게 한다. 고른 길은 사용자의 몫이라 바로 다시 부르지 않게 한다."""
+    return _again(ctx, (
+        f"이 앱에는 새 리소스를 PR 로 더할 수 없다. 이유: {reason} 사용자에게 이유를 쉬운 말로 알리고 다른 길을 고르게 하라 — "
+        "레포가 연결된 plain·Kustomize 앱을 고르거나, 레포를 연결하거나(팀 설정 → 클러스터), Helm 앱이면 차트·values 를 "
+        "GitHub 에서 직접 고치거나, apply_manifest 로 클러스터에 바로 만든다(git 에 안 남아 ArgoCD 가 모르는 리소스가 된다)."
+    ))
+
+
 def _result(plan: ActionPlan) -> GitOpsResult:
     """이미 실행된 계획의 저장 결과 (DURO-66 재시도) — 첫 실행과 같은 결과를 돌려준다."""
     recorded = plan.execution_result or {}
@@ -97,6 +109,10 @@ def _follow_up(sync: dict[str, Any] | None, plan: ActionPlan) -> str | None:
     """sync 가 실패했으면 revert 제안 — 모델이 사용자에게 되돌릴지 묻게 한다. 되돌리기도 새 PR·새 승인이다."""
     if not sync or sync.get("status") not in ("sync_failed", "degraded"):
         return None
+    if (plan.args.get("change") or {}).get("what") == "new_resource":
+        # 파일을 지우는 PR 은 아직 없다 — 없는 길을 제안하지 않는다
+        return ("머지는 됐지만 ArgoCD 반영이 실패했다. 이유를 설명하고, 프로젝트 설정이 막았다면 무엇을 바꿔야 하는지 알려라. "
+                "되돌리려면 GitHub 에서 이 PR 을 revert 해야 한다고 안내하라 — Kukie 는 파일을 지우는 PR 을 만들지 못한다.")
     return ("머지는 됐지만 ArgoCD 반영이 실패했다. 이유를 설명하고, 되돌리려면 같은 칸을 원래 값(렌더 diff 의 - 줄)으로 "
             "propose_git_change 해 revert PR 을 올리자고 제안하라. 사용자가 원하기 전에는 부르지 마라.")
 
@@ -123,7 +139,7 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
 
     canonical = canonicalize_mutation_args(TOOL_NAME, args, ctx.deps.namespace)
     plan_args = canonical.plan
-    change = _CHANGE.validate_python(plan_args["change"])
+    change = _CHANGE.validate_python(canonical.normalized["change"])     # Plan 의 args 에는 새 리소스 내용 대신 해시만 있다
     kind, name, namespace = plan_args["kind"], plan_args["name"], plan_args["namespace"]
     target: PlanTarget = {"context": ctx.deps.context, "namespace": namespace, "kind": kind, "name": name}
     risk = RISK.name.lower()
@@ -131,9 +147,10 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
     if ctx.tool_call_approved:
         return await _execute(ctx, call, plan_args, target, risk, kind, name, namespace, change)
 
+    other_way = _other_way_retry if isinstance(change, NewResource) else _kubectl_retry
     found = await _decide(ctx, kind, name, namespace, change)
     if found.path != "pr":
-        raise _kubectl_retry(ctx, found.reason)
+        raise other_way(ctx, found.reason)
     assert found.repository and found.target
     try:
         token = await pull_requests.token_for(ctx.deps.cluster_id, found.repository)
@@ -146,12 +163,25 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
         draft = await pull_requests.draft(found, change, token, hpa=hpa)
     except pull_requests.Refuse as refused:
         if refused.kubectl:
-            raise _kubectl_retry(ctx, refused.message) from None
+            raise other_way(ctx, refused.message) from None
         if refused.retry:
             raise _again(ctx, refused.message) from None
         raise ToolFailed(refused.message) from None
     except GitHubError as exc:
         raise ToolFailed(f"매니페스트 레포를 읽지 못했다 ({exc}). 잠시 뒤 다시 하거나 kubectl 변경 툴로 하라.") from None
+
+    if isinstance(change, NewResource):
+        try:
+            live = await to_thread.run_sync(partial(
+                routing.live_resources, draft.new_resources, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig,
+            ), limiter=thread_limiter("gitops_route", routing.LOOKUP_WORKERS))
+        except Exception:
+            logger.exception("새 리소스가 클러스터에 있는지 보지 못했다 — 그 경고만 빠진다")
+            live = []
+        draft.add_risks([already_in_cluster(resource) for resource in live])
+        # 카드의 대상은 요청한 네임스페이스가 아니라 실제로 만들어질 곳이다 — 승인 때는 이 칸만 Plan 의 것을 쓴다 (_execute)
+        made = representative(draft.new_resources, kind, name)
+        target = {**target, "namespace": (made or {}).get("namespace") or found.target.namespace or namespace}
 
     application = pull_requests.application_summary(found)
     command = command_of(found.repository)
@@ -171,6 +201,9 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
         "merge_methods": list(draft.merge_methods),
         "notice": NOTICE,
     }
+    if isinstance(change, NewResource):
+        gitops["new_resources"] = draft.new_resources
+        gitops["risk_warnings"] = draft.risk_warnings
     plan = await ActionPlan.create_draft(
         run_id=ctx.deps.run_id, call_id=call.tool_call_id, tool=TOOL_NAME, args=plan_args, command=command,
         risk=risk, skill=ctx.deps.skill.name, target=target, intent=intent,
@@ -267,7 +300,9 @@ async def _execute(ctx, call, plan_args, target, risk, kind, name, namespace, ch
 
     try:
         await plan.approve_for_execution(
-            tool=TOOL_NAME, args=plan_args, command=command_of(gitops["repository"]), risk=risk, target=target,
+            tool=TOOL_NAME, args=plan_args, command=command_of(gitops["repository"]), risk=risk,
+            # 새 리소스의 namespace 만 렌더 결과로 정해 Plan 에 있다 — context·kind·name 은 지금 값으로 대조한다 (agent#132 리뷰)
+            target={**target, "namespace": plan.target["namespace"]} if isinstance(change, NewResource) else target,
             user_id=ctx.deps.user_id,
         )
         await plan.mark_executing()
