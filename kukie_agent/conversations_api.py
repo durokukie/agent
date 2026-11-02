@@ -331,12 +331,16 @@ async def _save_or_fail(
         await repo_link_memo.settle(session.deps, saved=True)
 
 
+def _approved_call_ids(session: Any) -> set[str]:
+    return {call_id for call_id, decision in session.decisions.items() if isinstance(decision, ToolApproved)}
+
+
 def _approved_plan_ids(session: Any, also_approved: str | None = None) -> list[str]:
     """티켓 중 **승인한** 카드의 Plan id 만 — "적용됐을 수 있는 변경" 목록에 거절한 카드가 섞이면 안 된다.
     also_approved 는 지금 처리 중인 결정(아직 session.decisions 에 없다)."""
     if session.pending is None:
         return []
-    approved = {cid for cid, d in session.decisions.items() if isinstance(d, ToolApproved)}
+    approved = _approved_call_ids(session)
     if also_approved:
         approved.add(also_approved)
     return [
@@ -414,8 +418,8 @@ async def approve(
     run = _open_run(context)
     # 재개가 돌면 _to_payload 가 티켓을 지우므로, 저장 실패 안내에 실을 Plan id(승인한 카드만)는 여기서 미리 뽑는다
     plan_ids = _approved_plan_ids(session, body.call_id if body.approved else None)
-    # 지금 결정하는 카드로 본다 — 같은 턴의 다른 카드가 PR 이어도 kubectl 승인·PR 거절은 예전처럼 끝난 뒤 답한다
-    detach = body.approved and _only_merge_cards(session, {body.call_id})
+    # 이 요청에서 함께 돌 승인 카드로 본다 — 먼저 승인한 kubectl 카드가 있거나 지금이 kubectl 승인·PR 거절이면 예전처럼 끝난 뒤 답한다
+    detach = body.approved and _only_merge_cards(session, _approved_call_ids(session) | {body.call_id})
     await conversation.lock.acquire()
 
     async def work() -> dict[str, Any]:
@@ -449,8 +453,7 @@ async def resume(
     run = _open_run(context)
     plan_ids = _approved_plan_ids(session)
     # 새 결정이 없다 — 승인해 둔 카드로 본다. kubectl 카드까지 함께 돌면 그 동작을 바꾸지 않게 끝난 뒤 답한다
-    approved = {call_id for call_id, decision in session.decisions.items() if isinstance(decision, ToolApproved)}
-    detach = _only_merge_cards(session, approved)
+    detach = _only_merge_cards(session, _approved_call_ids(session))
     await conversation.lock.acquire()
 
     async def work() -> dict[str, Any]:

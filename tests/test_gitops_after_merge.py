@@ -20,6 +20,7 @@ import uvicorn
 from pydantic_ai import ModelResponse
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.tools import ToolApproved, ToolDenied
 
 from helpers import USER, answer_model, new_room, scale_call
 from kukie_agent import conversations_api, server, server_api
@@ -365,14 +366,18 @@ async def test_떼어_돌리지_않는_결정은_시간이_넘어도_끝날_때�
     assert reply == {"kind": "answer"} and not conversation.lock.locked()
 
 
-@pytest.mark.parametrize(("call_id", "approved", "status"), [
-    ("call-2", True, 200),      # kubectl 승인 — 옆에 PR 카드가 있어도 끝날 때까지 기다린다
-    ("call-1", False, 200),     # PR 거절
-    ("call-1", True, 202),      # PR 승인만 먼저 답한다
+@pytest.mark.parametrize(("earlier", "call_id", "approved", "status"), [
+    (None, "call-2", True, 200),                # kubectl 승인 — 옆에 PR 카드가 있어도 끝날 때까지 기다린다
+    (None, "call-1", False, 200),               # PR 거절
+    (None, "call-1", True, 202),                # PR 승인만 먼저 답한다
+    (ToolApproved(), "call-1", True, 200),      # 먼저 승인한 kubectl 이 이 요청에서 함께 돈다 — 202 가 아니다
+    (ToolDenied("거절"), "call-1", True, 202),   # 먼저 거절한 kubectl 은 돌지 않는다
 ])
-def test_섞인_턴은_지금_결정하는_카드로_떼어_돌릴지_정한다(client, fake_server, room, gh, cluster, monkeypatch, call_id, approved, status):  # noqa: F811
+def test_섞인_턴은_함께_돌_승인_카드로_떼어_돌릴지_정한다(client, fake_server, room, gh, cluster, monkeypatch, earlier, call_id, approved, status):  # noqa: F811
     monkeypatch.setattr(conversations_api, "APPROVE_WAIT", 0)
-    _with_kubectl_card(client, room)
+    session = _with_kubectl_card(client, room).session
+    if earlier is not None:
+        session.decisions["call-2"] = earlier
 
     async def slow(session, call_id, approved):
         await asyncio.sleep(0.05)
