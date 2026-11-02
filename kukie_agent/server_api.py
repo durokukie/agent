@@ -463,8 +463,9 @@ async def get_plan(plan_id: str) -> Plan:
 
 #: plan 동작 이름 — `POST /internal/plans/{id}/<action>`. 허용 안 되는 상태면 409 PLAN_STATE_CONFLICT,
 #: 승인한 호출과 실행하려는 호출이 다르면 409 PLAN_CALL_MISMATCH.
-#: stale 은 승인 순간 전제가 깨졌다는 알림이다 (기획 08, GitOps 의 PR 길이 바뀜 — DURO-134). 결정 전 계획만 받는다
-PLAN_ACTIONS = frozenset({"dry-run", "offer", "decision", "start", "result", "fail", "unknown", "stale"})
+#: stale 은 승인 순간 전제가 깨졌다는 알림이다 (기획 08, GitOps 의 PR 길이 바뀜 — DURO-134). 결정 전 계획만 받는다.
+#: sync-result 는 머지를 먼저 기록해 둔 PR 길 계획에 지켜본 sync 결과를 얹는다 (DURO-158). 지켜보는 중(syncing)인 계획만 받는다
+PLAN_ACTIONS = frozenset({"dry-run", "offer", "decision", "start", "result", "sync-result", "fail", "unknown", "stale"})
 
 
 async def plan_action(plan_id: str, action: str, body: dict[str, Any] | None = None) -> Plan:
@@ -472,6 +473,22 @@ async def plan_action(plan_id: str, action: str, body: dict[str, Any] | None = N
     if action not in PLAN_ACTIONS:
         raise ValueError(f"unknown plan action: {action}")
     return Plan.from_json(await _call("POST", _path("plans", plan_id, action), body=body or {}))
+
+
+@dataclass(frozen=True)
+class UnsettledPlan:
+    """끝나지 않은 계획 하나와, 재시작 복구가 그 계획을 닫는 데 필요한 것 (DURO-158)."""
+
+    plan: Plan
+    cluster_id: str
+    run_active: bool
+
+
+async def unsettled_plans(tool_name: str) -> list[UnsettledPlan]:
+    """그 도구의 계획 중 결과 없이 APPROVED·EXECUTING 이거나, APPLIED 인데 sync 를 아직 지켜보는 중인 것."""
+    data = await _call("GET", _path("plans", "unsettled"), params={"toolName": tool_name})
+    return [UnsettledPlan(Plan.from_json(item["plan"]), str(item["clusterId"]), bool(item.get("runActive")))
+            for item in data or []]
 
 
 # ── GitOps 매니페스트 레포 (DURO-131) ─────────────────────────
@@ -541,6 +558,6 @@ async def update_repo_link_state(conversation_id: str, state: dict[str, Any]) ->
 #: 테스트의 메모리 가짜가 같은 이름으로 바꿔 끼우는 함수들 (tests/fake_server.py).
 API = (
     "conversation_context", "find_run", "start_run", "update_run", "interrupt", "interrupt_orphaned",
-    "cluster_connection", "update_cluster_status", "update_cluster_gpu", "create_plan", "run_plans", "get_plan", "plan_action",
+    "cluster_connection", "update_cluster_status", "update_cluster_gpu", "create_plan", "run_plans", "get_plan", "plan_action", "unsettled_plans",
     "manifest_repos", "repo_token", "repo_link_state", "update_repo_link_state",
 )

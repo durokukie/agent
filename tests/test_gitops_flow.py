@@ -1,10 +1,11 @@
-"""PR 길 — propose_git_change → PR(승인 전) → PR 머지 승인 카드 → 머지 → sync·health (DURO-134).
+"""PR 길 — propose_git_change → PR(승인 전) → PR 머지 승인 카드 → 머지 → 뒤에서 sync·health (DURO-134, DURO-158).
 
 가드레일 훅을 진짜로 돌린다. 모델은 FunctionModel, server 는 메모리 가짜(tests/fake_server.py),
 GitHub 와 클러스터는 tests/fake_github.py. 레포 내용은 tests/fixtures/manifests (plain YAML 앱 apps/plain).
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 
@@ -19,7 +20,7 @@ from helpers import GUIDANCE, USER, answer_model, new_room
 from kukie_agent import server
 from kukie_agent.agent import agent
 from kukie_agent.gitops import github, route, watch
-from kukie_agent.guardrail import gitops_hook
+from kukie_agent.guardrail import gitops_after_merge, gitops_hook
 from kukie_agent.manifests.render import kustomize_bin
 
 CHANGE_ARGS = {
@@ -60,7 +61,9 @@ def client(dev_auth, fake_server, kubectl_ok, hook_passes, monkeypatch):
         return GUIDANCE
 
     monkeypatch.setattr(gitops_hook, "generate_decision_guidance", guidance)
-    return TestClient(server.app)
+    # with: 요청이 끝나도 이벤트 루프가 살아 있어야 뒤에서 도는 sync 지켜보기가 끝까지 간다
+    with TestClient(server.app) as test_client:
+        yield test_client
 
 
 @pytest.fixture
@@ -105,6 +108,14 @@ def _decide(client, room, approved=True):
                         headers=USER)
     assert r.status_code == 200, r.text
     return r.json()
+
+
+def _settle(client):
+    """뒤에서 도는 sync 지켜보기가 끝나기를 기다린다."""
+    async def wait():
+        while gitops_after_merge._tasks:
+            await asyncio.wait(set(gitops_after_merge._tasks))
+    client.portal.call(wait)
 
 
 def _plan(fake_server, room):
@@ -206,10 +217,11 @@ def test_같은_파일을_고치는_Kukie_PR이_열려_있으면_기다린다(cl
 
 # ── 승인 · 거절 ───────────────────────────────────────────
 
-def test_승인하면_머지하고_sync_health까지_보고한다(client, fake_server, room, gh, cluster):
+def test_승인하면_머지하고_sync_health는_뒤에서_지켜봐_남긴다(client, fake_server, room, gh, cluster):
     _card(client, room)
     head = gh.pull_of(1)["head_sha"]
     body = _decide(client, room)
+    _settle(client)
 
     assert body["kind"] == "answer"
     assert gh.merges == [{"number": 1, "head_sha": head, "method": "squash",
@@ -220,25 +232,27 @@ def test_승인하면_머지하고_sync_health까지_보고한다(client, fake_s
     assert plan["executionResult"]["merge_commit"] == gh.merges[0]["sha"]
     assert plan["executionResult"]["sync_result"]["status"] == "healthy"
     actions = [c["action"] for name, c in fake_server.calls if name == "plan_action"]
-    assert actions == ["dry-run", "offer", "decision", "start", "result"]
+    assert actions == ["dry-run", "offer", "decision", "start", "result", "sync-result"]
 
     step = body["response"]["steps"][0]
     assert step["step_label"] == "PR 머지" and step["access"] == "mutating"
     assert step["command"] == f"github pr merge {REPO}#1"
-    assert "Healthy" in step["output"]
+    assert "머지했어요" in step["output"]
 
 
-def test_sync가_실패하면_이유와_revert_제안을_싣는다(client, fake_server, room, gh, cluster):
+def test_sync가_실패해도_머지는_APPLIED로_남고_이유를_Plan에_얹는다(client, fake_server, room, gh, cluster):
     _card(client, room)
     cluster.app_status = {"sync": {"status": "Synced", "revision": "merge1" + "0" * 34},
                           "health": {"status": "Degraded", "message": "ImagePullBackOff"}}
     _decide(client, room)
+    _settle(client)
 
     plan = _plan(fake_server, room)
     assert plan["status"] == "APPLIED"                      # 머지는 됐다
-    assert plan["executionResult"]["sync_result"]["status"] == "degraded"
-    result = _tool_result(fake_server, room)
-    assert "ImagePullBackOff" in str(result["content"]) and "revert PR" in str(result["content"])
+    assert plan["executionResult"]["merge_commit"] == gh.merges[0]["sha"]
+    sync = plan["executionResult"]["sync_result"]
+    assert sync["status"] == "degraded" and "ImagePullBackOff" in sync["message"]
+    assert "지켜보는 중" in str(_tool_result(fake_server, room)["content"])   # 모델은 끝난 척하지 않는다
 
 
 def test_자동_sync가_꺼진_앱은_기다리지_않고_안내한다(client, fake_server, room, gh, cluster):
@@ -595,25 +609,34 @@ def test_새_리소스를_승인하면_머지하고_sync까지_지켜본다(clie
     _card(client, room, NEW_ARGS)
     head = gh.pull_of(1)["head_sha"]
     _decide(client, room)
+    _settle(client)
 
     assert gh.merges[0]["head_sha"] == head
     assert gh.commits[gh.merges[0]["sha"]]["apps/plain/caddy.yaml"] == CADDY_YAML
     plan = _plan(fake_server, room)
     assert plan["status"] == "APPLIED" and plan["executionResult"]["sync_result"]["status"] == "healthy"
-    assert [c["action"] for name, c in fake_server.calls if name == "plan_action"] == ["dry-run", "offer", "decision", "start", "result"]
+    assert [c["action"] for name, c in fake_server.calls if name == "plan_action"] == ["dry-run", "offer", "decision", "start", "result", "sync-result"]
 
 
-def test_새_리소스의_sync가_실패하면_없는_길을_제안하지_않는다(client, fake_server, room, gh, cluster):
+def test_새_리소스의_sync가_실패하면_이유를_Plan에_남긴다(client, fake_server, room, gh, cluster):
     _card(client, room, NEW_ARGS)
     cluster.app_status = {"sync": {"status": "OutOfSync"},
                           "operationState": {"phase": "Failed", "message": "not permitted in project",
                                              "syncResult": {"revision": "merge1" + "0" * 34}}}
     _decide(client, room)
+    _settle(client)
 
-    assert _plan(fake_server, room)["executionResult"]["sync_result"]["status"] == "sync_failed"
-    content = str(_tool_result(fake_server, room)["content"])
-    assert "not permitted in project" in content                # ArgoCD 프로젝트가 막은 이유가 채팅까지 간다
-    assert "GitHub 에서 이 PR 을 revert" in content and "propose_git_change" not in content
+    sync = _plan(fake_server, room)["executionResult"]["sync_result"]
+    assert sync["status"] == "sync_failed" and "not permitted in project" in sync["message"]
+
+
+def test_새_리소스의_재시도에_실패한_sync가_보이면_없는_길을_제안하지_않는다():
+    plan = gitops_after_merge.ActionPlan(
+        id="p", path=None, created_at="", call_id="c", tool="t", args={"change": {"what": "new_resource"}}, skill="s",
+        target={}, command=[], risk_level="caution", status="APPLIED", intent="i", expected_effects=[], side_effects=[],
+    )
+    note = gitops_hook._follow_up({"status": "sync_failed"}, plan)
+    assert "GitHub 에서 이 PR 을 revert" in note and "propose_git_change" not in note
 
 
 def test_새_리소스도_거절하면_PR을_닫는다(client, fake_server, room, gh, cluster):

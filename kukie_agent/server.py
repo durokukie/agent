@@ -47,6 +47,7 @@ from kukie_agent.agent import agent
 from kukie_agent.clusters import runtime
 from kukie_agent.deps import Deps
 from kukie_agent.gitops.memo import strip_mark
+from kukie_agent.guardrail import gitops_after_merge
 from kukie_agent.guardrail.gitops_hook import close_rejected
 from kukie_agent.guardrail.action_plan import ActionPlan
 from kukie_agent.guardrail.approval import ApprovalRequest, build_approval_request
@@ -210,6 +211,9 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     전 프로세스가 kubectl 을 돌리다 강제 종료(SIGKILL)됐으면 평문 자격증명이 든 임시 kubeconfig 가 /tmp 에 남는다 —
     재시작은 컨테이너 파일시스템을 그대로 쓴다. 요청을 받기 전에 지운다 (clusters/runtime.py remove_orphaned).
     이건 개발 모드에서도 한다.
+
+    PR 머지 뒤 sync 지켜보기는 요청과 떨어져 돈다 (DURO-158). 앞 프로세스가 끝내지 못한 계획을 복구로 닫고,
+    끌 때는 지켜보기를 멈춰 결과를 남긴다.
     """
     try:
         removed = runtime.remove_orphaned()
@@ -218,6 +222,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         logger.exception("기동 시 임시 kubeconfig 정리 실패")
     server_api.start()
+    gitops_after_merge.start()
     if server_api.configured():
         try:
             closed = await server_api.interrupt_orphaned(ORPHANED_MESSAGE)
@@ -225,9 +230,11 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 logger.warning("기동 전에 실행 중이던 run %d 개를 중단으로 닫았다", closed)
         except Exception:
             logger.exception("기동 시 run 정리(interrupt-orphaned) 실패 — 요청이 들어올 때 방마다 복구한다")
+        gitops_after_merge.start_recovery()
     try:
         yield
     finally:
+        await gitops_after_merge.stop()
         await server_api.close()
 
 

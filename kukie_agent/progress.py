@@ -1,6 +1,7 @@
 """대화의 진행 상황 — run 이 도는 동안 "지금 무엇을 하는지" 를 화면에 흘려 보낸다.
 
-`POST /chat`·`/approve`·`/resume` 은 그대로 끝난 뒤 한 번에 답한다 (request_id 재전송·run 상태 규칙을 건드리지 않는다).
+`POST /chat`·`/approve`·`/resume` 은 그대로 끝난 뒤 한 번에 답한다 (request_id 재전송·run 상태 규칙을 건드리지 않는다). PR 머지 승인만 오래 걸리면 202 로 먼저 답한다.
+머지 뒤 sync 결과는 run 밖의 일이라 여기로 오지 않는다 — Plan 의 executionResult.sync_result 를 읽는다 (DURO-158).
 화면은 기다리는 동안 따로 `GET /conversations/{id}/progress` 를 열어 단계를 받는다. 이 모듈은 그 사이의 우체통이다.
 
 - 단계는 도구 실행 훅에서 만든다 (`agent.run(capabilities=[hub.capability(방)])`).

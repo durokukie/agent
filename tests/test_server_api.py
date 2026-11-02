@@ -205,6 +205,23 @@ async def test_설정이_하나라도_없으면_부르지_않고_503(server, mon
 
 
 @pytest.mark.asyncio
+async def test_sync_결과_동작과_끝나지_않은_계획_목록(server):
+    seen = server(lambda request: (
+        httpx.Response(200, json=[{"plan": PLAN, "clusterId": "c-1", "runActive": True}])
+        if request.method == "GET" else httpx.Response(200, json=PLAN)
+    ))
+
+    await server_api.plan_action(PLAN["id"], "sync-result", {"syncResult": {"status": "healthy"}})
+    assert seen[-1].url.path == f"/internal/plans/{PLAN['id']}/sync-result"
+    assert _body(seen[-1]) == {"syncResult": {"status": "healthy"}}
+
+    found = await server_api.unsettled_plans("propose_git_change")
+    assert seen[-1].url.path == "/internal/plans/unsettled"
+    assert seen[-1].url.params["toolName"] == "propose_git_change"
+    assert found[0].plan.id == PLAN["id"] and found[0].cluster_id == "c-1" and found[0].run_active is True
+
+
+@pytest.mark.asyncio
 async def test_plan_동작과_연결_정보(server):
     def respond(request):
         if request.url.path.endswith("/connection"):

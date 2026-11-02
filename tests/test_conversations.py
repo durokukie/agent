@@ -960,11 +960,13 @@ async def test_잠금_검사와_획득_사이에_await_가_없다():
     from kukie_agent import conversations_api
 
     source = inspect.getsource(conversations_api)
+    # 승인·재개는 잠금을 요청 밖까지 쥐므로 acquire 를 직접 부른다 (conversations_api._finish_locked)
     blocks = re.findall(
-        r"if conversation\.lock\.locked\(\):(.*?)async with conversation\.lock:", source, re.S
+        r"if conversation\.lock\.locked\(\):(.*?)(?:async with conversation\.lock:|await conversation\.lock\.acquire\(\))",
+        source, re.S,
     )
     # 정규식이 하나도 안 걸리면 for 문은 검사 없이 통과한다 — 잠그는 자리 수와 맞는지부터 본다 (자동 리뷰 지적)
-    taken = source.count("async with conversation.lock:")
+    taken = source.count("async with conversation.lock:") + source.count("await conversation.lock.acquire()")
     assert taken >= 3, f"잠그는 자리가 {taken} 곳뿐이다 — 감시 대상이 사라졌는지 본다"
     assert len(blocks) == taken, (
         f"잠그는 자리 {taken} 곳 중 {len(blocks)} 곳만 정규식에 걸렸다 — "

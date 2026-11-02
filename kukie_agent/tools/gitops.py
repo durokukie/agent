@@ -1,7 +1,7 @@
 """PR 길 변경 툴 — ArgoCD 가 관리하는 리소스를 매니페스트 레포 PR 로 바꾼다 (DURO-134). 새 리소스도 더한다 (DURO-154).
 
 기존 변경 4종(tools/mutate.py)처럼 Shared 대화에만 열린다. 승인 전 준비(고칠 곳 찾기·렌더 비교·브랜치·커밋·PR)와
-승인 뒤 실행(머지·sync 지켜보기)은 전부 guardrail/gitops_hook.py 가 한다 — 툴 본체는 훅 없이 불리면 거절한다(fail-closed).
+승인 뒤 실행(머지)은 전부 guardrail/gitops_hook.py 가 한다 — 툴 본체는 훅 없이 불리면 거절한다(fail-closed).
 kubectl 툴과 달리 본체가 실행하지 않는 이유: 머지에는 승인 전에 만든 PR(번호·승인한 파일 내용)이 필요하고, 그건 툴 인자가
 아니라 Plan 에 있다.
 """
@@ -24,7 +24,7 @@ class GitOpsResult(KubectlResult):
     """
     pull_request: dict | None = None        # {number, url}
     merge_commit: str | None = None
-    sync_result: dict | None = None         # gitops/watch.py 의 결과 모양
+    sync_result: dict | None = None         # gitops/watch.py 의 결과 모양. 머지 직후에는 status 가 syncing 이다
 
 
 def propose_git_change(ctx: RunContext[Deps], kind: str, name: str, change: Change,
@@ -45,8 +45,8 @@ def propose_git_change(ctx: RunContext[Deps], kind: str, name: str, change: Chan
     기존 파일·기존 리소스는 건드리지 않고, 값이 든 Secret 과 Kustomization 은 못 넣는다. 막히면 이유와 다음 방법을 알려 준다.
     위험해 보이는 설정(클러스터 범위·privileged·latest 이미지 등)은 막지 않고 승인 카드에 경고로 올린다.
 
-    시스템이 고칠 파일을 찾아 렌더링으로 확인하고 PR 을 연 뒤 승인 카드를 띄운다. 승인하면 PR 을 머지하고
-    ArgoCD sync 가 끝날 때까지 지켜본 결과를 돌려준다 — 클러스터는 머지 뒤 ArgoCD 가 sync 해야 바뀐다.
+    시스템이 고칠 파일을 찾아 렌더링으로 확인하고 PR 을 연 뒤 승인 카드를 띄운다. 승인하면 PR 을 머지한 결과를 돌려주고,
+    ArgoCD sync 는 시스템이 뒤에서 지켜봐 승인 카드에 보여 준다 — 클러스터는 머지 뒤 ArgoCD 가 sync 해야 바뀐다.
     intent/expected_effects/side_effects 는 사용자가 이해할 수 있는 말로 채운다 — 승인 카드와 PR 본문에 실린다.
     """
     raise RuntimeError("propose_git_change 는 가드레일 훅(guardrail/gitops_hook.py)을 거쳐서만 실행된다")
