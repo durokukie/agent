@@ -149,10 +149,13 @@ def test_real_pod_that_never_answers(monkeypatch):
         assert render(b"tgz", [], CONDITIONS).reason == "unavailable"
 
 
-def test_fetch_returns_bytes_or_reason(service):
-    service(body=b"chart")
+def test_fetch_never_raises(monkeypatch):
+    monkeypatch.setattr(helm.chart_fetch, "fetch_chart", lambda *a: b"chart")
     assert fetch_chart("https://charts.example.com", "demo", "1.0.0").archive == b"chart"
-    service(status=403, body=b'{"reason": "address_blocked", "message": "internal"}')
+
+    def blocked(*args):
+        raise helm.chart_fetch.FetchFailed("address_blocked", "내부망")
+    monkeypatch.setattr(helm.chart_fetch, "fetch_chart", blocked)
     fetched = fetch_chart("https://10.0.0.1", "demo", "1.0.0")
     assert not fetched.ok and fetched.reason == "address_blocked"
 

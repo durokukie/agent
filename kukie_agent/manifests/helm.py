@@ -24,6 +24,7 @@ from typing import Any
 import httpx
 import yaml
 
+from kukie_agent.manifests import chart_fetch
 from kukie_agent.manifests.render import resolve_inside
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,6 @@ logger = logging.getLogger(__name__)
 RENDER_URL_ENV = "KUKIE_HELM_RENDER_URL"
 #: 연결은 금방 끝나야 한다. 읽기는 서비스의 제한 시간(5초)에 여유를 더했다
 _TIMEOUT = httpx.Timeout(20.0, connect=2.0)
-_FETCH_TIMEOUT = httpx.Timeout(45.0, connect=2.0)
 #: 서비스의 출력 제한(20MB)에 여유를 더했다. 읽는 도중 넘으면 끊는다 — 이 파드의 메모리를 지킨다
 _MAX_RESPONSE_BYTES = 21 * 1024 * 1024
 _MAX_CHART_BYTES = 16 * 1024 * 1024
@@ -184,15 +184,14 @@ def render(chart: bytes, values: list[ValueFile], conditions: RenderConditions) 
 
 
 def fetch_chart(repo_url: str, chart: str, version: str) -> FetchedChart:
-    """저장소에서 차트를 받는다. 받는 일도 렌더링 파드가 한다 — 고객이 정한 주소에 이 파드(접속 정보가 있다)가 나가지 않게."""
-    result = _post("/fetch", {"repo_url": repo_url, "chart": chart, "version": version}, _FETCH_TIMEOUT)
-    if isinstance(result, str):
-        return FetchedChart(reason=result, message=_SERVICE_MESSAGES[result])
-    status, _, body = result
-    if status == 200:
-        return FetchedChart(archive=body)
-    reason, message = _failure(status, body)
-    return FetchedChart(reason=reason, message=message)
+    """저장소에서 차트를 받는다. 렌더링 파드는 나가는 길이 막혀 있어 이 파드가 받는다 — 막는 장치는 chart_fetch 에 있다.
+
+    render() 처럼 예외를 내지 않는다. 블로킹이므로 스레드에서 부른다.
+    """
+    try:
+        return FetchedChart(archive=chart_fetch.fetch_chart(repo_url, chart, version))
+    except chart_fetch.FetchFailed as exc:
+        return FetchedChart(reason=exc.reason, message=exc.message)
 
 
 def pack_chart(folder: Path) -> bytes:

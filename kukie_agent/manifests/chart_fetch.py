@@ -1,0 +1,240 @@
+"""차트 내려받기 (DURO-137). 렌더링 파드는 나가는 길이 막혀 있어 이 파드가 받아 넘긴다. 받기만 하고 풀지 않는다.
+
+주소는 고객이 정한 값인데 이 파드에는 접속 정보가 있고 내부망에 닿는다. 그래서 helm 을 쓰지 않고 코드로 막는다:
+  - https · 443 만, 사용자 정보가 든 주소는 받지 않는다. 인증 헤더를 보내지 않고 환경의 프록시도 쓰지 않는다
+  - 이름을 풀어 나온 주소가 전부 공인 주소일 때만, 검사한 그 주소로 직접 연결한다 (검사 뒤 이름이 바뀌어도 소용없게)
+  - 리다이렉트는 주소마다 같은 검사를 다시 하고 횟수를 제한한다
+  - 크기와 전체 시간을 넘으면 읽는 도중 끊는다
+  - index.yaml 은 통째로 파싱하지 않는다. 원하는 버전의 한 항목만 꺼내 앨리어스 수를 세고 읽는다 (큰 저장소는 수 MB 이상이다)
+인증이 필요한 저장소와 OCI 는 아직 지원하지 않는다. 블로킹이므로 스레드에서 부른다 (kubectl.thread_limiter).
+"""
+from __future__ import annotations
+
+import hashlib
+import http.client
+import ipaddress
+import logging
+import re
+import socket
+import ssl
+import tempfile
+import time
+from collections.abc import Callable, Iterator
+from typing import IO
+from urllib.parse import urljoin, urlsplit
+
+import yaml
+
+logger = logging.getLogger(__name__)
+
+MAX_CHART_BYTES = 16 * 1024 * 1024
+MAX_INDEX_BYTES = 64 * 1024 * 1024
+MAX_ENTRY_BYTES = 1024 * 1024
+MAX_ALIASES = 100
+MAX_REDIRECTS = 3
+#: 버전 글자가 같은 항목을 몇 개까지 읽어 볼지. 나쁜 index 가 파싱을 반복하게 하지 못한다
+MAX_PARSED_ENTRIES = 20
+TIMEOUT_SECONDS = 30.0
+
+_CHUNK = 64 * 1024
+_REDIRECTS = {301, 302, 303, 307, 308}
+_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+_ENTRY_KEY = re.compile(r"""^\s+(?:"([^"]+)"|'([^']+)'|([^\s:#'"]+)):\s*$""")
+CHART_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+CHART_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}$")
+
+
+class FetchFailed(Exception):
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+
+
+def public_address(host: str) -> str:
+    """이름을 풀어 공인 주소 하나를 고른다. 하나라도 공인이 아니면 거절한다 — 섞어 두고 내부로 보내는 길을 막는다."""
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as exc:
+        raise FetchFailed("fetch_failed", "차트 저장소 이름을 찾지 못했어요") from exc
+    addresses = []
+    for info in infos:
+        address = ipaddress.ip_address(info[4][0])
+        mapped = getattr(address, "ipv4_mapped", None)
+        checked = mapped if mapped is not None else address
+        if not checked.is_global or checked.is_multicast:
+            raise FetchFailed("address_blocked", "내부망 주소로는 차트를 받지 않아요")
+        addresses.append(str(address))
+    if not addresses:
+        raise FetchFailed("fetch_failed", "차트 저장소 이름을 찾지 못했어요")
+    return addresses[0]
+
+
+def checked_url(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError as exc:
+        raise FetchFailed("url_rejected", "차트 저장소 주소를 읽지 못했어요") from exc
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or port not in (None, 443):
+        raise FetchFailed("url_rejected", "차트 저장소는 https 주소만 받아요")
+    return url
+
+
+class _PinnedConnection(http.client.HTTPSConnection):
+    """검사한 공인 주소로 연결한다. 인증서는 원래 이름으로 확인한다."""
+
+    def __init__(self, host: str, address: str, timeout: float):
+        self._tls = ssl.create_default_context()
+        super().__init__(host, 443, timeout=timeout, context=self._tls)
+        self._address = address
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self._address, 443), self.timeout)
+        self.sock = self._tls.wrap_socket(sock, server_hostname=self.host)
+
+
+Opener = Callable[[str, str, float], tuple[int, dict[str, str], IO[bytes]]]
+
+
+def _open(url: str, address: str, timeout: float) -> tuple[int, dict[str, str], IO[bytes]]:
+    parts = urlsplit(url)
+    connection = _PinnedConnection(parts.hostname, address, timeout)
+    target = parts.path or "/"
+    if parts.query:
+        target += f"?{parts.query}"
+    connection.request("GET", target, headers={
+        "Accept-Encoding": "identity", "Connection": "close", "User-Agent": "kukie-agent",
+    })
+    response = connection.getresponse()
+    return response.status, {k.lower(): v for k, v in response.getheaders()}, response
+
+
+def download(url: str, sink: IO[bytes], *, limit: int, deadline: float, opener: Opener = _open) -> None:
+    """url 을 sink 로 받는다. limit 이나 deadline 을 넘으면 읽는 도중 끊는다."""
+    for _ in range(MAX_REDIRECTS + 1):
+        checked_url(url)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise FetchFailed("fetch_timeout", "차트를 받는 시간이 제한을 넘었어요")
+        address = public_address(urlsplit(url).hostname)
+        try:
+            status, headers, body = opener(url, address, left)
+            with body:
+                if status in _REDIRECTS and headers.get("location"):
+                    url = urljoin(url, headers["location"])
+                    continue
+                if status != 200:
+                    raise FetchFailed("fetch_failed", f"차트 저장소가 {status} 로 답했어요")
+                received = 0
+                while chunk := body.read(_CHUNK):
+                    received += len(chunk)
+                    if received > limit:
+                        raise FetchFailed("fetch_too_large", "받는 파일이 크기 제한을 넘었어요")
+                    if time.monotonic() > deadline:
+                        raise FetchFailed("fetch_timeout", "차트를 받는 시간이 제한을 넘었어요")
+                    sink.write(chunk)
+                return
+        except (OSError, http.client.HTTPException) as exc:
+            # 문구에 주소가 섞일 수 있어 종류만 남긴다
+            logger.info("차트 받기 실패: %s", type(exc).__name__)
+            raise FetchFailed("fetch_failed", "차트 저장소에 연결하지 못했어요") from exc
+    raise FetchFailed("fetch_failed", "리다이렉트가 너무 많아요")
+
+
+def chart_entries(index: IO[bytes], chart: str) -> Iterator[bytes]:
+    """index.yaml 의 entries 에서 그 차트의 목록 항목을 하나씩 내놓는다. 줄 단위로 읽어 메모리를 쓰지 않는다."""
+    in_entries = capturing = False
+    child_indent: int | None = None
+    item_indent: int | None = None
+    item: list[bytes] = []
+    size = 0
+    for raw in index:
+        line = raw.rstrip(b"\r\n")
+        if not in_entries:
+            in_entries = line.rstrip() == b"entries:"
+            continue
+        stripped = line.lstrip(b" ")
+        if not stripped or stripped.startswith(b"#"):
+            continue
+        indent = len(line) - len(stripped)
+        if indent == 0:
+            break                                       # entries 가 끝났다
+        if child_indent is None:
+            child_indent = indent
+        if indent <= child_indent and not stripped.startswith(b"- "):
+            if capturing:
+                break                                   # 다음 차트가 시작했다
+            match = _ENTRY_KEY.match(line.decode("utf-8", "replace"))
+            capturing = bool(match) and chart in match.groups()
+            continue
+        if not capturing:
+            continue
+        if item_indent is None:
+            item_indent = indent
+        if indent == item_indent and stripped.startswith(b"- "):
+            if item:
+                yield b"".join(item)
+            item, size = [], 0
+        size += len(raw)
+        if size > MAX_ENTRY_BYTES:
+            raise FetchFailed("index_too_large", "차트 저장소 목록의 항목이 크기 제한을 넘어요")
+        item.append(raw)
+    if item:
+        yield b"".join(item)
+
+
+def parse_entry(item: bytes) -> dict | None:
+    """목록 항목 하나를 읽는다. 앨리어스를 먼저 세어 펼쳐서 메모리를 채우는 YAML 을 막는다."""
+    try:
+        aliases = sum(isinstance(event, yaml.AliasEvent) for event in yaml.parse(item, Loader=_LOADER))
+        if aliases > MAX_ALIASES:
+            raise FetchFailed("index_unreadable", "차트 저장소 목록의 앨리어스가 너무 많아요")
+        document = yaml.load(item, Loader=_LOADER)
+    except (yaml.YAMLError, RecursionError) as exc:
+        raise FetchFailed("index_unreadable", "차트 저장소 목록을 읽지 못했어요") from exc
+    if isinstance(document, list) and len(document) == 1 and isinstance(document[0], dict):
+        return document[0]
+    return None
+
+
+def find_entry(index: IO[bytes], chart: str, version: str) -> dict | None:
+    """버전이 정확히 같은 항목. 글자로 먼저 거르고, 맞는 것만 파싱한다."""
+    wanted = re.compile(rb"""^\s*(?:-\s+)?version:\s*["']?""" + re.escape(version.encode()) + rb"""["']?\s*$""", re.M)
+    parsed = 0
+    for item in chart_entries(index, chart):
+        if not wanted.search(item):
+            continue
+        parsed += 1
+        if parsed > MAX_PARSED_ENTRIES:
+            raise FetchFailed("index_unreadable", "차트 저장소 목록을 읽지 못했어요")
+        entry = parse_entry(item)
+        if entry is not None and str(entry.get("version")) == version:
+            return entry
+    return None
+
+
+def fetch_chart(repo_url: str, chart: str, version: str, *, opener: Opener = _open) -> bytes:
+    """저장소에서 그 차트 그 버전의 tgz 를 받아 돌려준다. 버전은 정확히 같은 것만 찾는다. 실패는 FetchFailed."""
+    if not CHART_NAME.match(chart) or not CHART_VERSION.match(version) or len(repo_url) > 2048:
+        raise FetchFailed("url_rejected", "차트 이름이나 버전 형식이 맞지 않아요")
+    deadline = time.monotonic() + TIMEOUT_SECONDS
+    base = checked_url(repo_url.rstrip("/") + "/")
+    with tempfile.TemporaryFile() as index:
+        download(urljoin(base, "index.yaml"), index, limit=MAX_INDEX_BYTES, deadline=deadline, opener=opener)
+        index.seek(0)
+        entry = find_entry(index, chart, version)
+    if entry is None:
+        raise FetchFailed("version_not_found", "저장소에서 그 차트 그 버전을 찾지 못했어요")
+    urls = entry.get("urls")
+    if not (isinstance(urls, list) and urls and isinstance(urls[0], str)):
+        raise FetchFailed("index_unreadable", "차트 저장소 목록에 내려받을 주소가 없어요")
+    with tempfile.SpooledTemporaryFile(max_size=MAX_CHART_BYTES) as sink:
+        download(urljoin(base, urls[0]), sink, limit=MAX_CHART_BYTES, deadline=deadline, opener=opener)
+        sink.seek(0)
+        data = sink.read()
+    digest = entry.get("digest")
+    # 숫자로만 된 값은 YAML 이 숫자로 읽는다 — 문자열로 견줘 검사를 비켜 가지 못하게 한다
+    if digest not in (None, "") and str(digest) != hashlib.sha256(data).hexdigest():
+        raise FetchFailed("digest_mismatch", "받은 차트의 digest 가 저장소 목록과 달라요")
+    return data
