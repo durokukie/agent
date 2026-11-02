@@ -119,6 +119,7 @@ kind 클러스터 E2E: `KUKIE_E2E_CONTEXT=kind-<name> python -m pytest -m e2e` �
 | 변수 | 뜻 |
 |---|---|
 | `KUKIE_SERVER_URL` | Kukie API 서버 주소 (예 `http://spring:8080`, 끝 `/` 는 뗀다). 토큰 검증(`/users/me`)과 내부 API 가 같은 주소를 쓴다 |
+| `KUKIE_HELM_RENDER_URL` | Helm 렌더링 전용 파드 주소 (예 `http://helm-render:8000`, `helm_render/README.md`). 없거나 닿지 않으면 Helm 렌더링은 "렌더링 실패"로 돌아오고 대화는 이어진다 |
 | `KUKIE_INTERNAL_TOKEN` | 내부 API 토큰 — kukie-server 의 `KUKIE_INTERNAL_TOKEN` 과 같은 값. 위 둘 중 하나라도 없으면 대화 경로는 503 |
 | `KUKIE_DEV_AUTH`, `KUKIE_DEV_USER` | server 없이 로컬 개발 — flat 엔드포인트(`/session` `/chat` `/approve` `/resume`)만 열린다. 계획은 `~/.kukie/plans` 의 `.md` 로만 남는다 |
 | `KUKIE_ACCESS_COOKIE` | 웹 access 쿠키 이름 (기본 `kukie_access`, kukie-server 와 같아야 한다) |
