@@ -1,0 +1,139 @@
+name: Helm render
+
+# 렌더링 서비스(helm_render/)만 본다. 에이전트 이미지와 따로 굽는다 — 에이전트 코드가 바뀔 때마다 이 파드가 다시 뜨지 않게.
+on:
+  pull_request:
+    branches: [develop]
+    paths: ["helm_render/**", ".github/workflows/helm-render.yml"]
+  push:
+    branches: [develop]
+    paths: ["helm_render/**", ".github/workflows/helm-render.yml"]
+
+permissions:
+  contents: read
+
+# uv 는 ci.yml · helm_render/Dockerfile 과 같은 버전이다
+env:
+  SETUP_UV_VERSION: "0.12.23"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          version: ${{ env.SETUP_UV_VERSION }}
+      # 버전과 sha256 은 helm_render/Dockerfile 과 같다 — 진짜 helm 으로 시험한다
+      - name: Install helm
+        env:
+          HELM_VERSION: v4.2.1
+          HELM_SHA256: 479dca836e5b45e8bd222400c5591b0e3a647378f03ff96597180db97c17fdae
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/helm.tgz" "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  $RUNNER_TEMP/helm.tgz" | sha256sum -c -
+          sudo tar -xzf "$RUNNER_TEMP/helm.tgz" -C /usr/local/bin --strip-components=1 linux-amd64/helm
+          helm version --short
+      - run: uv sync --locked
+        working-directory: helm_render
+      - run: uv run python -m pytest -q
+        working-directory: helm_render
+
+  # 출입증: kukie-infra 의 kukie-dev-github-helm-render 역할 — 이 레포 develop · main 에서만, kukie-helm-render 창고에만 쓸 수 있다.
+  # 창고가 IMMUTABLE 이라 태그는 dev-<커밋 SHA> 하나만 쓴다. ci.yml 의 image 잡과 같은 흐름이다.
+  image:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ap-northeast-2
+      REGISTRY: 320343233643.dkr.ecr.ap-northeast-2.amazonaws.com
+      REPOSITORY: kukie-helm-render
+      TAG: dev-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_HELM_RENDER_ROLE_ARN }}
+          aws-region: ap-northeast-2
+          allowed-account-ids: "320343233643"
+      - name: Log in to ECR
+        shell: bash
+        run: aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+      # 같은 커밋으로 다시 돌리면 이미 있는 태그라 push 가 거부된다(IMMUTABLE). 있으면 굽지 않고 그 digest 를 쓴다
+      - name: Build and push unless this commit is already in ECR
+        id: push
+        shell: bash
+        run: |
+          digest() {
+            aws ecr batch-get-image --repository-name "$REPOSITORY" --image-ids imageTag="$TAG" \
+              --accepted-media-types application/vnd.oci.image.index.v1+json application/vnd.oci.image.manifest.v1+json \
+                application/vnd.docker.distribution.manifest.list.v2+json application/vnd.docker.distribution.manifest.v2+json \
+              --query 'images[0].imageId.imageDigest' --output text
+          }
+          existing=$(digest)
+          if [ "$existing" = "None" ]; then
+            DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -t "$REGISTRY/$REPOSITORY:$TAG" helm_render
+            docker push "$REGISTRY/$REPOSITORY:$TAG"
+            for wait in 0 2 4 8 16; do
+              sleep "$wait"
+              existing=$(digest)
+              [ "$existing" != "None" ] && break
+            done
+          else
+            echo "이미 있는 태그 — 굽지 않는다"
+          fi
+          case "$existing" in
+            sha256:*) ;;
+            *) echo "digest 를 읽지 못했다: $existing" >&2; exit 1 ;;
+          esac
+          echo "### $REPOSITORY 이미지" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 태그: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: \`$existing\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=$existing" >> "$GITHUB_OUTPUT"
+      # 늦게 끝난 옛 실행이 새 digest 를 덮지 않게 한다. 이 워크플로는 경로로 걸러 도니, develop 끝과 같은지가 아니라
+      # 이 커밋 뒤에 helm_render 를 바꾼 커밋이 있는지를 본다 — 그런 커밋이 없으면 이 실행이 알린다
+      - name: Check newer render commits
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          newer=$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...develop" \
+            --jq '[.files[]? | select(.filename | startswith("helm_render/") or . == ".github/workflows/helm-render.yml")] | length')
+          if [ "$newer" = "0" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::이 커밋 뒤에 helm_render 를 바꾼 커밋이 있어 manifest 알림을 건너뛴다"
+          fi
+      - name: Get kukie-manifest bot token
+        if: steps.guard.outputs.latest == 'true'
+        id: bot
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.MANIFEST_APP_CLIENT_ID }}
+          private-key: ${{ secrets.MANIFEST_APP_PRIVATE_KEY }}
+          owner: durokukie
+          repositories: kukie-manifest
+          permission-contents: write
+      - name: Notify kukie-manifest
+        if: steps.guard.outputs.latest == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          APP: kukie-helm-render
+          DIGEST: ${{ steps.push.outputs.digest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api repos/durokukie/kukie-manifest/dispatches \
+            -f event_type=image-pushed \
+            -f "client_payload[app]=$APP" \
+            -f "client_payload[digest]=$DIGEST" \
+            -f "client_payload[source_repo]=$GITHUB_REPOSITORY" \
+            -f "client_payload[source_sha]=$GITHUB_SHA" \
+            -f "client_payload[run_url]=$RUN_URL"

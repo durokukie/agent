@@ -1,0 +1,26 @@
+[project]
+name = "kukie-helm-render"
+version = "0.1.0"
+description = "고객 Helm 차트를 렌더링만 하는 전용 서비스 (DURO-137)"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+    "pyyaml>=6.0",      # 차트 저장소 index.yaml 에서 고른 차트 한 덩어리를 읽는다 (fetch.py). helm 출력은 파싱하지 않는다
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[tool.uv]
+required-version = ">=0.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kukie_helm_render"]
