@@ -32,6 +32,7 @@ INSTRUCTIONS = """너는 아직 승인되지 않은 Kubernetes Action Plan의 �
 - 미리보기가 없는 작업(scale·restart·delete)은 Action Plan의 대상과 명령으로 판단한다.
 - tool 이 propose_git_change 면 GitOps PR 길이다. 승인 = Kukie 가 PR 을 머지하는 것이고, 클러스터는 ArgoCD 가 sync 한 뒤에
   바뀐다. gitops.render_diff(클러스터에서 실제로 바뀔 것)와 gitops.application(대상 앱·자동 sync·self-heal)을 근거로 판단한다.
+  gitops.risk_warnings 가 있으면 카드에 이미 보이는 경고다 — 되풀이하지 말고 이 변경의 맥락에서 무엇을 확인할지만 짚는다.
 - 현재 클러스터 상태는 주어지지 않았다 — 실행 시점 상태와 다를 수 있다는 점은 짚어도 된다.
 - 승인 또는 거절 결론을 대신 내리지 않는다.
 - 위험 등급을 다시 판정하거나 변경하지 않는다.

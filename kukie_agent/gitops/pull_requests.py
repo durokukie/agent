@@ -5,6 +5,7 @@ Plan 상태를 바꾸는 일은 guardrail/gitops_hook.py 가 한다. 여기는 G
 승인 전 (draft → open)
   1. targetRevision → 기본 브랜치(HEAD·빈 값) 또는 그 이름의 브랜치. 태그·커밋이면 PR 길이 없다
   2. 그 브랜치 끝 커밋의 레포를 받아 고칠 곳 찾기 + 렌더 비교 (kukie_agent/manifests)
+     새 리소스(DURO-154)는 고칠 곳 찾기 대신 manifests/new_resource.py 가 새 파일을 만든다 — 나머지 단계는 같다
   3. Secret 값이 든 diff 는 만들지 않는다 · 같은 파일을 고치는 Kukie PR 이 열려 있으면 기다린다 (Conflict Key)
   4. 새 브랜치 `kukie/<plan code>` 에 커밋 하나, 기본 브랜치로 PR
 
@@ -28,7 +29,7 @@ from kukie_agent.gitops import github
 from kukie_agent.gitops.github import GitHubError, PullRequest
 from kukie_agent.gitops.route import Route
 from kukie_agent.kubectl import thread_limiter
-from kukie_agent.manifests import Change, Refused, plan_change
+from kukie_agent.manifests import Change, NewResource, Refused, RiskWarning, plan_change, plan_new_resource
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +38,10 @@ RENDER_WORKERS = 4
 #: diff 에 이런 값이 더해지면 PR 을 만들지 않는다 — git 에 평문으로 영원히 남는다
 _SECRET_VALUE = re.compile(
     r"(?:\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\b(?:Basic|Bearer)\s+[A-Za-z0-9+/=._-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
-    r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b|^\s*kind:\s*Secret\s*$)",
+    r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b)",
     re.IGNORECASE,
 )
+_SECRET_KIND = re.compile(r"^\s*kind:\s*Secret\s*$", re.IGNORECASE)
 #: 승인 카드·PR 본문이 너무 길어지지 않게
 DIFF_LIMIT = 20_000
 
@@ -64,6 +66,8 @@ class Draft:
     render_diff: str
     warnings: list[str] = field(default_factory=list)
     merge_methods: tuple[str, ...] = ("squash",)
+    risk_warnings: list[dict[str, Any]] = field(default_factory=list)   # 새 리소스 요청에만 — manifests RiskWarning 모양
+    new_resources: list[dict[str, str]] = field(default_factory=list)   # 새 리소스 요청에만 (DURO-154)
 
     def file_entries(self) -> list[dict[str, str]]:
         return [{"path": path, "blob_sha": github.blob_sha(content)} for path, content in sorted(self.files.items())]
@@ -72,15 +76,26 @@ class Draft:
         """기획 07 Conflict Key 의 레포·파일 단위 키 — 같은 파일을 고치는 변경 둘이 겹치지 않게 (설계 4절)."""
         return [f"git:{self.repository}:{path}" for path in sorted(self.files)]
 
+    def add_risks(self, risks: list[RiskWarning]) -> None:
+        self.risk_warnings += [risk.model_dump() for risk in risks]
+        self.warnings += [risk.text for risk in risks]
+
 
 def _clip(text: str) -> str:
     return text if len(text) <= DIFF_LIMIT else text[:DIFF_LIMIT] + "\n… (너무 길어 잘랐어요)"
 
 
-def secret_in(file_diff: str) -> bool:
-    """diff 가 더하는 줄에 비밀 값처럼 보이는 것이 있나."""
+def secret_in(file_diff: str, *, kind_line: bool = True) -> bool:
+    """diff 가 더하는 줄에 비밀 값처럼 보이는 것이 있나.
+
+    kind_line=False 는 `kind: Secret` 줄을 보지 않는다 — 새 리소스(DURO-154)는 문서 구조로 Secret 을 이미 봤고,
+    `secretRef: {kind: Secret}` 처럼 가리키기만 하는 줄을 막지 않으려고.
+    """
+    def secret(line: str) -> bool:
+        return bool(_SECRET_VALUE.search(line) or (kind_line and _SECRET_KIND.search(line)))
+
     return any(
-        _SECRET_VALUE.search(line[1:])
+        secret(line[1:])
         for line in file_diff.splitlines()
         if line.startswith("+") and not line.startswith("+++")
     )
@@ -118,15 +133,17 @@ async def draft(route: Route, change: Change, token: server_api.RepoToken, *, hp
                          "반영되지 않아 PR 로 못 바꿔요.", kubectl=True)
         with tempfile.TemporaryDirectory(prefix="kukie-gitops-") as work:
             root = await gh.download(base_sha, Path(work) / "repo")
+            new = isinstance(change, NewResource)
             result = await to_thread.run_sync(
-                lambda: plan_change(root, route.source, route.target, change, hpa=hpa),
+                (lambda: plan_new_resource(root, route.source, route.target, change)) if new
+                else (lambda: plan_change(root, route.source, route.target, change, hpa=hpa)),
                 limiter=thread_limiter("gitops_render", RENDER_WORKERS),
             )
         if isinstance(result, Refused):
             if result.code == "busy":
                 raise Refuse(result.message)                # 툴 실패로 끝낸다 — 잠시 뒤 같은 요청이면 된다
             raise Refuse(result.message, kubectl=not result.retry, retry=result.retry)
-        if secret_in(result.file_diff):
+        if secret_in(result.file_diff, kind_line=not new):
             raise Refuse("바뀔 내용에 비밀 값(키·토큰·Secret)이 보여 PR 을 만들지 않았어요 — git 에 평문으로 남아요. "
                          "Sealed Secrets 나 External Secrets 를 쓰세요.")
         busy = await _busy_files(gh, set(result.files))
@@ -135,7 +152,9 @@ async def draft(route: Route, change: Change, token: server_api.RepoToken, *, hp
                          "(채팅에서 결정하거나 GitHub 에서 닫으면 돼요).")
     return Draft(repository=route.repository, base=base, base_sha=base_sha, files=result.files,
                  file_diff=_clip(result.file_diff), render_diff=_clip(result.render_diff),
-                 warnings=list(result.warnings), merge_methods=info.merge_methods)
+                 warnings=list(result.warnings), merge_methods=info.merge_methods,
+                 risk_warnings=[risk.model_dump() for risk in result.risk_warnings],
+                 new_resources=result.new_resources)
 
 
 #: PR 본문에 남기는 계획 표시 — 열린 Kukie PR 의 계획이 이미 닫혔는지(결정 없이 만료) 알아보려고
@@ -194,11 +213,13 @@ def pull_body(*, intent: str, expected_effects: list[str], side_effects: list[st
               application: dict[str, Any], plan_code: str, plan_id: str) -> str:
     effects = "\n".join(f"- {item}" for item in expected_effects)
     sides = "\n".join(f"- {item}" for item in side_effects)
+    risks = "".join(f"- {item['text']}\n" for item in draft.risk_warnings)
     return (
         f"Kukie 채팅에서 제안한 변경이에요 (Action Plan `{plan_code}`).\n\n"
         f"**왜**: {intent}\n\n**예상 영향**\n{effects}\n\n**부작용**\n{sides}\n\n"
         f"**대상 ArgoCD 앱**: `{application.get('namespace')}/{application.get('name')}` "
         f"({'self-heal 켜짐' if application.get('self_heal') else '자동 sync' if application.get('auto_sync') else '수동 sync'})\n\n"
+        + (f"**확인할 점**\n{risks}\n" if risks else "") +
         "**클러스터에서 바뀔 것 (렌더 비교)**\n\n```diff\n" + draft.render_diff + "\n```\n\n"
         "채팅에서 승인하면 Kukie 가 이 PR 을 머지하고 ArgoCD sync 를 지켜봐요. 거절하면 닫혀요.\n\n"
         f"<!-- kukie-plan: {plan_id} -->"

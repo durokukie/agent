@@ -1,4 +1,4 @@
-"""PR 길 변경 툴 — ArgoCD 가 관리하는 리소스를 매니페스트 레포 PR 로 바꾼다 (DURO-134).
+"""PR 길 변경 툴 — ArgoCD 가 관리하는 리소스를 매니페스트 레포 PR 로 바꾼다 (DURO-134). 새 리소스도 더한다 (DURO-154).
 
 기존 변경 4종(tools/mutate.py)처럼 Shared 대화에만 열린다. 승인 전 준비(고칠 곳 찾기·렌더 비교·브랜치·커밋·PR)와
 승인 뒤 실행(머지·sync 지켜보기)은 전부 guardrail/gitops_hook.py 가 한다 — 툴 본체는 훅 없이 불리면 거절한다(fail-closed).
@@ -37,6 +37,14 @@ def propose_git_change(ctx: RunContext[Deps], kind: str, name: str, change: Chan
       replicas(count) · image_tag(tag, container) · resources(container, requests, limits) · env(container, values, remove)
     그 밖의 변경, ArgoCD 가 관리하지 않는 리소스, 레포가 연결되지 않은 리소스는 kubectl 변경 툴로 한다 —
     잘못 부르면 시스템이 이유와 함께 다시 하라고 알려 준다.
+
+    새 리소스를 git 으로 남기며 만들 때는 what 을 new_resource 로 한다 — 이미 있는 ArgoCD 앱의 폴더에 새 파일을 더한다:
+      new_resource(application, manifest_yaml, file_name, application_namespace)
+    application 은 대상 ArgoCD 앱이다(모르면 앱 목록을 보고 사용자에게 고르게 하거나 제안한다). manifest_yaml 은 만들 리소스 전체로,
+    Deployment 와 Service 처럼 여러 문서(---)여도 된다. file_name 은 비워도 된다. kind·name 에는 그중 대표 리소스 하나를 적는다.
+    기존 파일·기존 리소스는 건드리지 않고, 값이 든 Secret 과 Kustomization 은 못 넣는다. 막히면 이유와 다음 방법을 알려 준다.
+    위험해 보이는 설정(클러스터 범위·privileged·latest 이미지 등)은 막지 않고 승인 카드에 경고로 올린다.
+
     시스템이 고칠 파일을 찾아 렌더링으로 확인하고 PR 을 연 뒤 승인 카드를 띄운다. 승인하면 PR 을 머지하고
     ArgoCD sync 가 끝날 때까지 지켜본 결과를 돌려준다 — 클러스터는 머지 뒤 ArgoCD 가 sync 해야 바뀐다.
     intent/expected_effects/side_effects 는 사용자가 이해할 수 있는 말로 채운다 — 승인 카드와 PR 본문에 실린다.

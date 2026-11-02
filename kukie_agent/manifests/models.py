@@ -17,6 +17,9 @@ _RESOURCE_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?(/[a-z0-9]([-a-z0-9
 _ENV_NAME = re.compile(r"^[-._a-zA-Z][-._a-zA-Z0-9]*$")
 # 컨테이너 이미지 태그 규칙 (OCI distribution spec)
 _TAG = r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+#: 리소스 kind·이름 모양 — kubectl 인자로도 쓰이므로(`-` 로 시작하면 옵션으로 읽힌다) 이 모양만 받는다
+KIND_SHAPE = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
+NAME_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:_-]*$")
 
 
 class Target(BaseModel):
@@ -40,6 +43,7 @@ class AppSource(BaseModel):
     source_type: str                     # status.sourceType: Directory · Kustomize · Helm · Plugin …
     path: str                            # spec.source.path — 레포 루트 기준
     directory_recurse: bool = False      # spec.source.directory.recurse (Directory 일 때만)
+    directory_filtered: bool = False     # spec.source.directory.include·exclude 가 있나 — 새 파일을 ArgoCD 가 안 읽을 수 있다
     ignore_differences: list[dict] = []  # spec.ignoreDifferences 그대로
     respect_ignore_differences: bool = False  # spec.syncPolicy.syncOptions 에 RespectIgnoreDifferences=true 가 있나
 
@@ -107,7 +111,16 @@ class Other(BaseModel):
     description: str
 
 
-Change = Annotated[Replicas | ImageTag | Resources | Env | Other, Field(discriminator="what")]
+class NewResource(BaseModel):
+    """이미 있는 ArgoCD 앱의 폴더에 새 매니페스트 파일을 더하는 요청 (DURO-154). 기존 리소스는 고치지 않는다."""
+    what: Literal["new_resource"] = "new_resource"
+    application: str = Field(min_length=1)      # 대상 ArgoCD Application 이름
+    application_namespace: str | None = None    # 같은 이름의 앱이 여러 네임스페이스에 있을 때만
+    manifest_yaml: str = Field(min_length=1)    # 더할 리소스 전체 (여러 문서 가능)
+    file_name: str | None = None                # 앱 폴더 기준 새 파일 이름. 비우면 첫 리소스 이름으로 짓는다
+
+
+Change = Annotated[Replicas | ImageTag | Resources | Env | Other | NewResource, Field(discriminator="what")]
 
 # 못 하는 이유. retry 가 True 면 고칠 곳을 다시 골라 볼 만하다(툴이 ModelRetry 로 이어 붙인다),
 # False 면 PR 로는 못 하는 일이라 kubectl + 경고 길로 간다 (설계 문서 3절).
@@ -125,6 +138,10 @@ RefuseCode = Literal[
     "render_failed",        # 렌더링이 안 된다
     "render_mismatch",      # 렌더 비교에서 요청 밖 변화가 보였다
     "busy",                 # 레포 검사 시간이 넘었다 — 잠시 뒤 다시 (kubectl 길·다시 고르기 둘 다 아니다)
+    "invalid_manifest",     # 새 리소스 YAML 을 리소스로 읽지 못했다
+    "overwrite",            # 새 파일 자리에 이미 파일이 있다
+    "resource_exists",      # 새로 만들려는 리소스가 이미 앱에 있다
+    "kustomize_config",     # 레포 밖을 끌어올 수 있는 Kustomize 설정을 새로 더하려 했다
 ]
 
 
@@ -135,12 +152,31 @@ class Refused(BaseModel):
     retry: bool = False
 
 
+class WarningLocation(BaseModel):
+    """경고가 가리키는 곳. value 에 비밀 값을 싣지 않는다."""
+    file: str               # 레포 루트 기준 파일
+    resource: str           # `Deployment shop/caddy`
+    field: str | None = None      # `spec.template.spec.containers[app].image`
+    value: str | None = None      # 그 칸의 값
+
+
+class RiskWarning(BaseModel):
+    """막지는 않지만 승인 전에 봐야 할 것 (DURO-154) — 어디가, 무슨 일이 날 수 있고, 어떻게 하면 되는지."""
+    code: str
+    location: WarningLocation
+    risk: str
+    suggestion: str
+    text: str               # 한 줄 문구 — 옛 앱이 gitops.warnings 로 같은 경고를 보여 준다
+
+
 class Ready(BaseModel):
     ok: Literal[True] = True
     files: dict[str, str]   # 레포 루트 기준 경로 → 고친 뒤 전체 내용 (새 파일 포함, 안 바뀐 파일은 없다)
     file_diff: str          # git diff 모양 — PR·승인 카드에 싣는다
     render_diff: str        # 클러스터에서 실제로 바뀔 것 — 요청한 리소스 하나의 렌더 결과 전·후
     warnings: list[str] = []
+    risk_warnings: list[RiskWarning] = []   # 새 리소스 요청에만 (DURO-154)
+    new_resources: list[dict[str, str]] = []  # 새 리소스 요청에만 — {api_version, kind, name, namespace, file}
 
 
 Result = Ready | Refused

@@ -5,6 +5,9 @@ GitHub 와 클러스터는 tests/fake_github.py. 레포 내용은 tests/fixtures
 """
 from __future__ import annotations
 
+import os
+import shutil
+
 import pytest
 from fastapi.testclient import TestClient
 from pydantic_ai import ModelResponse
@@ -17,6 +20,7 @@ from kukie_agent import server
 from kukie_agent.agent import agent
 from kukie_agent.gitops import github, route, watch
 from kukie_agent.guardrail import gitops_hook
+from kukie_agent.manifests.render import kustomize_bin
 
 CHANGE_ARGS = {
     "kind": "deployment",
@@ -464,3 +468,246 @@ def test_고아_PR을_닫지_못하면_막는다(client, fake_server, room, gh, 
     _chat(client, other, seen=seen)
 
     assert "같은 파일을 고치는 Kukie PR" in str(seen[0].content) and len(gh.pulls) == 1
+
+
+# ── 새 리소스 (DURO-154) ──────────────────────────────────
+
+CADDY_YAML = """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: caddy
+spec:
+  selector:
+    matchLabels: {app: caddy}
+  template:
+    metadata:
+      labels: {app: caddy}
+    spec:
+      containers:
+        - name: caddy
+          image: caddy:2.8.4
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: caddy
+spec:
+  selector: {app: caddy}
+  ports:
+    - port: 80
+"""
+NEW_ARGS = {
+    "kind": "Deployment",
+    "name": "caddy",
+    "change": {"what": "new_resource", "application": "shop-web", "manifest_yaml": CADDY_YAML},
+    "intent": "caddy 를 새로 띄운다.",
+    "expected_effects": ["caddy 파드와 Service 가 생긴다."],
+    "side_effects": ["노드 자원을 더 쓴다."],
+}
+
+
+def _new_args(**change):
+    return {**NEW_ARGS, "change": {**NEW_ARGS["change"], **change}}
+
+
+needs_kustomize = pytest.mark.skipif(
+    shutil.which(kustomize_bin()) is None and not os.environ.get("CI"),
+    reason="kustomize 가 없다 (CI 에서는 깔고 돈다)")
+
+
+def test_새_리소스는_클러스터에_없어도_고른_앱으로_PR을_열고_경고_없는_카드를_띄운다(client, fake_server, room, gh, cluster):
+    card = _card(client, room, NEW_ARGS)
+
+    pull = gh.pull_of(1)
+    assert pull["head_ref"].startswith("kukie/deployment-caddy-") and gh.branches["main"] == "c0"
+    assert gh.commits[pull["head_sha"]]["apps/plain/caddy.yaml"] == CADDY_YAML
+    assert gh.commits[pull["head_sha"]]["apps/plain/service.yaml"] == gh.commits["c0"]["apps/plain/service.yaml"]
+
+    assert card["tool"] == "propose_git_change"                 # 앱은 이 이름으로 PR 카드를 그린다
+    assert card["target"]["namespace"] == "shop" and card["target"]["kind"] == "Deployment"
+    view = card["gitops"]
+    assert view["files"] == ["apps/plain/caddy.yaml"]
+    assert view["file_diff"].startswith("--- /dev/null")
+    assert "Service caddy (머지 후)" in view["render_diff"]
+    assert view["risk_warnings"] == [] and view["warnings"] == []
+    assert view["new_resources"] == [
+        {"api_version": "apps/v1", "kind": "Deployment", "name": "caddy", "namespace": "shop", "file": "apps/plain/caddy.yaml"},
+        {"api_version": "v1", "kind": "Service", "name": "caddy", "namespace": "shop", "file": "apps/plain/caddy.yaml"},
+    ]
+    assert "확인할 점" not in pull["body"]
+
+    plan = _plan(fake_server, room)
+    change = plan["payload"]["args"]["change"]
+    assert "manifest_yaml" not in change and len(change["manifest_sha256"]) == 64     # Plan 의 args 에는 해시만
+    assert plan["payload"]["gitops"]["risk_warnings"] == []
+
+
+def test_경고가_있는_새_리소스는_카드와_Plan과_PR_본문에_같은_경고를_싣는다(client, fake_server, room, gh, cluster):
+    manifest = CADDY_YAML.replace("caddy:2.8.4", "caddy:latest")
+    card = _card(client, room, _new_args(manifest_yaml=manifest))
+
+    [risk] = card["gitops"]["risk_warnings"]
+    assert risk["code"] == "latest_image"
+    assert risk["location"] == {"file": "apps/plain/caddy.yaml", "resource": "Deployment shop/caddy",
+                                "field": "spec.template.spec.containers[caddy].image", "value": "caddy:latest"}
+    assert risk["risk"] and risk["suggestion"]
+    assert card["gitops"]["warnings"] == [risk["text"]]         # 옛 앱은 이 줄로 같은 경고를 본다
+    assert _plan(fake_server, room)["payload"]["gitops"]["risk_warnings"] == [risk]
+    assert risk["text"] in gh.pull_of(1)["body"]
+
+
+def test_클러스터에_이미_있는_이름이면_덮어쓴다고_경고한다(client, fake_server, room, gh, cluster):
+    cluster.live = {"caddy"}
+    card = _card(client, room, NEW_ARGS)
+
+    risks = card["gitops"]["risk_warnings"]
+    assert [risk["code"] for risk in risks] == ["already_in_cluster", "already_in_cluster"]
+    assert risks[0]["location"]["resource"] == "Deployment shop/caddy"
+    assert risks[0]["text"] in card["gitops"]["warnings"]
+
+
+def test_앱의_include_exclude는_판단에서_읽어_경고로_올린다(client, fake_server, room, gh, cluster):
+    cluster.directory = {"include": "*.yaml"}
+    card = _card(client, room, NEW_ARGS)
+    assert [risk["code"] for risk in card["gitops"]["risk_warnings"]] == ["directory_filter"]
+
+
+def test_새_리소스를_승인하면_머지하고_sync까지_지켜본다(client, fake_server, room, gh, cluster):
+    _card(client, room, NEW_ARGS)
+    head = gh.pull_of(1)["head_sha"]
+    _decide(client, room)
+
+    assert gh.merges[0]["head_sha"] == head
+    assert gh.commits[gh.merges[0]["sha"]]["apps/plain/caddy.yaml"] == CADDY_YAML
+    plan = _plan(fake_server, room)
+    assert plan["status"] == "APPLIED" and plan["executionResult"]["sync_result"]["status"] == "healthy"
+    assert [c["action"] for name, c in fake_server.calls if name == "plan_action"] == ["dry-run", "offer", "decision", "start", "result"]
+
+
+def test_새_리소스의_sync가_실패하면_없는_길을_제안하지_않는다(client, fake_server, room, gh, cluster):
+    _card(client, room, NEW_ARGS)
+    cluster.app_status = {"sync": {"status": "OutOfSync"},
+                          "operationState": {"phase": "Failed", "message": "not permitted in project",
+                                             "syncResult": {"revision": "merge1" + "0" * 34}}}
+    _decide(client, room)
+
+    assert _plan(fake_server, room)["executionResult"]["sync_result"]["status"] == "sync_failed"
+    content = str(_tool_result(fake_server, room)["content"])
+    assert "not permitted in project" in content                # ArgoCD 프로젝트가 막은 이유가 채팅까지 간다
+    assert "GitHub 에서 이 PR 을 revert" in content and "propose_git_change" not in content
+
+
+def test_새_리소스도_거절하면_PR을_닫는다(client, fake_server, room, gh, cluster):
+    _card(client, room, NEW_ARGS)
+    _decide(client, room, approved=False)
+
+    assert gh.pull_of(1)["state"] == "closed" and _plan(fake_server, room)["status"] == "REJECTED"
+
+
+def test_새_리소스도_승인하는_사이_레포_연결이_끊기면_STALE이다(client, fake_server, room, gh, cluster):
+    _card(client, room, NEW_ARGS)
+    fake_server.unlink_repo(fake_server.conversation(room)["clusterId"], REPO)
+    _decide(client, room)
+
+    assert _plan(fake_server, room)["status"] == "STALE" and gh.merges == []
+
+
+def test_새_리소스도_승인하는_사이_base가_앞서면_STALE이다(client, fake_server, room, gh, cluster):
+    _card(client, room, NEW_ARGS)
+    gh.push_to_base("apps/plain/caddy.yaml", "# 누가 먼저 넣었다\n")
+    _decide(client, room)
+
+    assert _plan(fake_server, room)["status"] == "STALE" and gh.merges == []
+
+
+@needs_kustomize
+def test_Kustomize_앱은_overlay에_새_파일과_resources_한_줄을_올린다(client, fake_server, room, gh, cluster):
+    cluster.source_type, cluster.path, cluster.destination = "Kustomize", "apps/kustomize/overlays/prod", "shop-prod"
+    card = _card(client, room, NEW_ARGS)
+
+    head = gh.commits[gh.pull_of(1)["head_sha"]]
+    assert head["apps/kustomize/overlays/prod/caddy.yaml"] == CADDY_YAML
+    assert "  - caddy.yaml\n" in head["apps/kustomize/overlays/prod/kustomization.yaml"]
+    assert head["apps/kustomize/base/kustomization.yaml"] == gh.commits["c0"]["apps/kustomize/base/kustomization.yaml"]
+    view = card["gitops"]
+    assert view["files"] == ["apps/kustomize/overlays/prod/caddy.yaml", "apps/kustomize/overlays/prod/kustomization.yaml"]
+    assert view["risk_warnings"] == [] and "Deployment shop-prod/caddy (머지 후)" in view["render_diff"]
+    assert card["target"]["namespace"] == "shop-prod"
+
+
+@pytest.mark.parametrize("setup, why", [
+    (lambda c: setattr(c, "source_type", "Helm"), "Helm 앱"),
+    (lambda c: setattr(c, "no_argocd", True), "ArgoCD 가 없어요"),
+    (lambda c: setattr(c, "same_name_in", "argocd-2"), "application_namespace"),
+    (lambda c: setattr(c, "repo_url", "https://gitlab.com/acme/manifests.git"), "GitHub 레포가 아니라"),
+])
+def test_PR로_못_더하는_앱이면_이유와_다른_길을_알려준다(client, fake_server, room, gh, cluster, setup, why):
+    setup(cluster)
+    seen: list = []
+    _chat(client, room, NEW_ARGS, seen=seen)
+
+    content = str(seen[0].content)
+    assert why in content and "apply_manifest" in content and "kubectl 길" not in content
+    assert fake_server.plans_of(room) == [] and gh.pulls == {}
+
+
+def test_레포가_연결되지_않은_앱이면_연결하라고_알려준다(client, fake_server, room, gh, cluster):
+    fake_server.unlink_repo(fake_server.conversation(room)["clusterId"], REPO)
+    seen: list = []
+    _chat(client, room, NEW_ARGS, seen=seen)
+
+    assert "연결돼 있지 않아요" in str(seen[0].content) and "레포를 연결" in str(seen[0].content)
+    assert gh.pulls == {}
+
+
+def test_앱을_못_찾으면_있는_앱을_알려준다(client, fake_server, room, gh, cluster):
+    seen: list = []
+    _chat(client, room, _new_args(application="nope"), seen=seen)
+
+    assert "'nope' 를 이 클러스터에서 찾지 못했어요" in str(seen[0].content) and "shop-web" in str(seen[0].content)
+
+
+def test_같은_이름의_앱이_여럿이어도_네임스페이스를_주면_고른다(client, fake_server, room, gh, cluster):
+    cluster.same_name_in = "argocd-2"
+    assert _card(client, room, _new_args(application_namespace="argocd"))["gitops"]["application"]["namespace"] == "argocd"
+
+
+def test_막히면_다음_방법을_담아_다시_하게_하고_PR을_만들지_않는다(client, fake_server, room, gh, cluster):
+    manifest = "apiVersion: v1\nkind: Secret\nmetadata: {name: caddy}\nstringData: {password: hunter2}\n"
+    seen: list = []
+    _chat(client, room, _new_args(manifest_yaml=manifest) | {"kind": "Secret"}, seen=seen)
+
+    assert isinstance(seen[0], RetryPromptPart) and "ExternalSecret" in str(seen[0].content)
+    assert fake_server.plans_of(room) == [] and gh.pulls == {}
+
+
+def test_매니페스트_값에_토큰이_보이면_PR을_만들지_않는다(client, fake_server, room, gh, cluster):
+    manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: caddy}\ndata: {auth: 'Bearer abcdefghijklmnop'}\n"
+    seen: list = []
+    _chat(client, room, _new_args(manifest_yaml=manifest) | {"kind": "ConfigMap"}, seen=seen)
+
+    assert "비밀 값" in str(seen[0].content) and gh.pulls == {}
+
+
+def test_Secret을_가리키기만_하는_줄은_막지_않는다(client, fake_server, room, gh, cluster):
+    manifest = ("apiVersion: acme.example/v1\nkind: Widget\nmetadata: {name: caddy}\nspec:\n  credentials:\n"
+                "    kind: Secret\n    name: db\n")
+    card = _card(client, room, _new_args(manifest_yaml=manifest) | {"kind": "Widget"})
+    assert card["gitops"]["files"] == ["apps/plain/caddy.yaml"]
+
+
+def test_기존_네_가지_변경의_카드에는_새_칸이_없다(client, fake_server, room, gh, cluster):
+    view = _card(client, room)["gitops"]
+    assert "risk_warnings" not in view and "new_resources" not in view
+
+
+def test_클러스터_조회에는_옵션처럼_보이는_이름을_넘기지_않는다(cluster):
+    """namePrefix·namespace 는 고객 레포의 값이다 — kubectl 인자로 그대로 넘기면 옵션으로 읽힐 수 있다."""
+    resources = [
+        {"kind": "Deployment", "name": "--kubeconfig=/x", "namespace": "shop"},
+        {"kind": "Deployment", "name": "ok", "namespace": "--context=x"},
+        {"kind": "--flag", "name": "ok", "namespace": "shop"},
+    ]
+    assert route.live_resources(resources, context="ctx", kubeconfig=None) == []
+    assert cluster.seen == []

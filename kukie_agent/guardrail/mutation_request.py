@@ -44,4 +44,9 @@ def canonicalize_mutation_args(
         values["manifest_sha256"] = hashlib.sha256(
             manifest.encode("utf-8")
         ).hexdigest()
+    if tool_name == "propose_git_change" and values["change"].get("what") == "new_resource":
+        # apply_manifest 와 같다 — Plan 의 args 에는 내용 대신 해시만. 내용은 PR(gitops.files 의 blob)에 있다 (DURO-154)
+        change = dict(values["change"])
+        change["manifest_sha256"] = hashlib.sha256(change.pop("manifest_yaml").encode("utf-8")).hexdigest()
+        values["change"] = change
     return CanonicalMutationArgs(normalized=normalized, plan=values)
