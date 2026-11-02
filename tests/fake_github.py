@@ -232,6 +232,7 @@ class FakeCluster:
     seen: list[list[str]] = field(default_factory=list)
     merged_revision: str = ""
     destination: str = "shop"
+    destination_server: str = "https://kubernetes.default.svc"
     #: spec.source.directory (recurse·include·exclude)
     directory: dict[str, Any] | None = None
     #: 클러스터에 이미 있는 다른 리소스 이름 (새 리소스 경고, DURO-154)
@@ -258,7 +259,8 @@ class FakeCluster:
         return {
             "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
             "metadata": {"name": "shop-web", "namespace": "argocd"},
-            "spec": {"project": "default", "destination": {"namespace": self.destination}, "syncPolicy": policy,
+            "spec": {"project": "default", "syncPolicy": policy,
+                     "destination": {"server": self.destination_server, "namespace": self.destination},
                      "source": {"repoURL": self.repo_url, "path": self.path, "targetRevision": self.revision,
                                 **({"directory": self.directory} if self.directory else {})}},
             "status": status,

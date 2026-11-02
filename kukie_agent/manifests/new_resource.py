@@ -35,6 +35,8 @@ from kukie_agent.manifests.render import (
 from kukie_agent.manifests.workload import split_image
 
 _FILE_SUFFIXES = (".yaml", ".yml")
+#: 파일 이름 길이 — 쿠버네티스 이름은 253자까지라 그대로 쓰면 파일 시스템 한도(255바이트)를 넘는다
+_FILE_NAME_LIMIT = 200
 #: 폴더에 있으면 ArgoCD 가 앱 형식을 다르게 읽는 파일 이름
 _RESERVED_FILES = (*KUSTOMIZATION_FILES, "Chart.yaml")
 #: 네임스페이스가 없는 대표 종류. `Cluster` 로 시작하는 종류(ClusterRole·ClusterIssuer …)는 따로 본다.
@@ -46,6 +48,13 @@ _CLUSTER_SCOPED = frozenset({
 })
 _CONTAINER_LISTS = ("containers", "initContainers", "ephemeralContainers")
 _VALUE_LIMIT = 200
+#: 쿠버네티스 이름 규칙. 렌더 비교는 YAML 만 읽어 못 거른다 — 그대로 올리면 머지한 뒤 sync 가 실패한다
+_DNS_SUBDOMAIN = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*")
+_DNS_LABEL = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
+_DNS_1035_LABEL = re.compile(r"[a-z]([-a-z0-9]*[a-z0-9])?")
+_SUBDOMAIN_LIMIT = 253
+_LABEL_LIMIT = 63
+_RBAC_GROUP = "rbac.authorization.k8s.io"
 #: 막을 때 공통으로 주는 다음 방법
 _OR_GITHUB = "이대로 올려야 한다면 GitHub 에서 직접 PR 을 올려 주세요."
 
@@ -181,12 +190,37 @@ def _parse(text: str, target: Target) -> list[dict] | Refused:
         if not (isinstance(doc, dict) and isinstance(doc.get("apiVersion"), str) and isinstance(doc.get("kind"), str)
                 and KIND_SHAPE.match(doc["kind"]) and isinstance(name, str) and NAME_SHAPE.match(name)):
             return _again("manifest_yaml 의 문서마다 apiVersion · kind · metadata.name 이 있어야 해요.")
+        if (problem := _bad_name(doc)) is not None:
+            return _again(problem)
         # List 안의 항목은 다른 검사(Secret 등)를 지나가므로 풀어서 받는다
         if doc["kind"].endswith("List") and isinstance(doc.get("items"), list):
             return _again(f"{doc['kind']} 는 항목을 문서(---)로 나눠 다시 주세요.")
     if not any(_same_kind(doc["kind"], target.kind) and doc["metadata"]["name"] == target.name for doc in loaded):
         return _again(f"kind·name({target.kind} {target.name})이 manifest_yaml 에 없어요 — 그 안의 리소스 하나로 적어 주세요.")
     return loaded
+
+
+def _bad_name(doc: dict) -> str | None:
+    """쿠버네티스가 받지 않을 이름·네임스페이스면 고칠 방법을 담은 문구."""
+    name = doc["metadata"]["name"]
+    namespace = doc["metadata"].get("namespace")
+    if namespace is not None and not (isinstance(namespace, str) and len(namespace) <= _LABEL_LIMIT
+                                      and _DNS_LABEL.fullmatch(namespace)):
+        return ("metadata.namespace 를 쿠버네티스 이름으로 못 써요. 소문자·숫자·'-' 로 63자 안에서 고치거나, "
+                "앱의 네임스페이스로 들어가게 지워 주세요.")
+    if doc["kind"] == "Service" and doc["apiVersion"] == "v1":
+        rule, limit, how = _DNS_1035_LABEL, _LABEL_LIMIT, "소문자로 시작하고 소문자·숫자·'-' 로"
+    elif doc["kind"] == "Namespace" and doc["apiVersion"] == "v1":
+        rule, limit, how = _DNS_LABEL, _LABEL_LIMIT, "소문자·숫자·'-' 로"
+    elif doc["apiVersion"].partition("/")[0] == _RBAC_GROUP:
+        rule, limit, how = None, _SUBDOMAIN_LIMIT, "RBAC 이름 규칙에 맞게"     # system:foo 처럼 콜론·대문자를 받는다
+    else:
+        rule, limit, how = _DNS_SUBDOMAIN, _SUBDOMAIN_LIMIT, "소문자·숫자·'-'·'.' 로"
+    if len(name) <= limit and (rule is None or rule.fullmatch(name)):
+        return None
+    shown = name if len(name) <= 60 else name[:60] + "…"
+    return (f"{doc['kind']} 의 이름 '{shown}' 은 쿠버네티스가 받지 않아요 — 머지해도 sync 가 실패해요. "
+            f"{how} {limit}자 안에서 고쳐 다시 제안해 주세요.")
 
 
 def _same_kind(a: str, b: str) -> bool:
@@ -209,7 +243,8 @@ def _blocked_kind(docs: list[dict]) -> Refused | None:
 
 
 def _default_name(doc: dict) -> str:
-    return (re.sub(r"[^A-Za-z0-9._-]+", "-", doc["metadata"]["name"]).strip(".-") or "resource") + ".yaml"
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", doc["metadata"]["name"])[:_FILE_NAME_LIMIT - len(".yaml")]
+    return (name.strip(".-") or "resource") + ".yaml"
 
 
 def _new_file(app: AppSource, app_dir: Path, name: str) -> Path | Refused:
@@ -222,6 +257,8 @@ def _new_file(app: AppSource, app_dir: Path, name: str) -> Path | Refused:
         return outside
     if path.suffix not in _FILE_SUFFIXES or any(part.startswith(".") for part in path.parts):
         return _again(f"'{name}' 는 새 파일 이름으로 못 써요 — 점으로 시작하지 않는 .yaml 이나 .yml 로 주세요.")
+    if any(len(part.encode("utf-8")) > _FILE_NAME_LIMIT for part in path.parts):
+        return _again(f"파일 이름이 너무 길어요 — {_FILE_NAME_LIMIT}바이트 안으로 줄여 다시 주세요.")
     if path.name in _RESERVED_FILES:
         return Refused(code="kustomize_config", retry=True,
                        message=f"'{path.name}' 는 ArgoCD 가 앱 형식을 다르게 읽는 이름이에요. 다른 파일 이름으로 다시 주세요.")

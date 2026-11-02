@@ -339,6 +339,48 @@ def test_리소스로_못_읽는_입력은_고쳐_달라고_한다(repo, manifes
     assert why in result.message and result.retry
 
 
+@pytest.mark.parametrize("api_version, kind, name", [
+    ("apps/v1", "Deployment", "CADDY"),
+    ("apps/v1", "Deployment", "bad_name"),
+    ("apps/v1", "Deployment", "bad:name"),
+    ("apps/v1", "Deployment", "bad-"),
+    ("apps/v1", "Deployment", "a" * 254),
+    ("v1", "Service", "1caddy"),
+    ("v1", "Service", "my.caddy"),
+    ("v1", "Service", "a" * 64),
+    ("v1", "Namespace", "my.caddy"),
+    ("rbac.authorization.k8s.io/v1", "ClusterRole", "a" * 254),
+])
+def test_쿠버네티스가_받지_않는_이름은_PR을_만들지_않고_고칠_방법을_알려준다(repo, api_version, kind, name):
+    manifest = f"apiVersion: {api_version}\nkind: {kind}\nmetadata: {{name: {name}}}\n"
+    result = refused(plan(repo, manifest, target=CADDY.model_copy(update={"kind": kind, "name": name})), "invalid_manifest")
+    assert result.retry and "고쳐 다시 제안해 주세요" in result.message and "자 안에서" in result.message
+    assert len(result.message) < 200                                    # 긴 이름을 그대로 싣지 않는다
+
+
+@pytest.mark.parametrize("api_version, kind, name", [
+    ("apps/v1", "Deployment", "my.caddy-1"),
+    ("apps/v1", "Deployment", "1caddy"),
+    ("apps/v1", "Deployment", "a" * 253),
+    ("v1", "Service", "a" * 63),
+    ("rbac.authorization.k8s.io/v1", "ClusterRole", "system:Caddy_view"),
+    ("rbac.authorization.k8s.io/v1", "RoleBinding", "system:caddy"),
+])
+def test_쿠버네티스가_받는_이름은_막지_않는다(repo, api_version, kind, name):
+    manifest = f"apiVersion: {api_version}\nkind: {kind}\nmetadata: {{name: '{name}'}}\n"
+    result = ready(plan(repo, manifest, target=CADDY.model_copy(update={"kind": kind, "name": name})))
+    assert result.new_resources[0]["name"] == name
+    assert all(len(path.rsplit("/", 1)[-1]) <= 200 for path in result.files)   # 긴 이름도 파일 시스템 한도 안으로
+
+
+@pytest.mark.parametrize("namespace", ["Shop", "my.shop", "a" * 64, "123"])
+def test_쿠버네티스가_받지_않는_네임스페이스도_고칠_방법을_알려준다(repo, namespace):
+    # 따옴표 없는 123 은 숫자로 읽힌다 — 글자가 아닌 네임스페이스도 거른다
+    manifest = SERVICE.replace("name: caddy\n", f"name: caddy\n  namespace: {namespace}\n")
+    result = refused(plan(repo, manifest, target=CADDY.model_copy(update={"kind": "Service"})), "invalid_manifest")
+    assert "metadata.namespace" in result.message and "지워" in result.message
+
+
 def test_YAML_오류_문구에_값을_싣지_않는다(repo):
     result = refused(plan(repo, 'password: "hunter2\n'), "invalid_manifest")
     assert "hunter2" not in result.message
@@ -347,6 +389,10 @@ def test_YAML_오류_문구에_값을_싣지_않는다(repo):
 @pytest.mark.parametrize("name", [".argocd-source.yaml", ".git/config.yaml", "caddy.txt", "caddy"])
 def test_파일_이름_모양이_틀리면_고쳐_달라고_한다(repo, name):
     refused(plan(repo, app=RECURSE, file_name=name), "invalid_manifest")
+
+
+def test_너무_긴_파일_이름은_고쳐_달라고_한다(repo):
+    assert "너무 길어요" in refused(plan(repo, file_name="a" * 300 + ".yaml"), "invalid_manifest").message
 
 
 def test_다른_파일_아래로는_못_쓴다(repo):

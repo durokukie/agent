@@ -621,6 +621,19 @@ def test_새_리소스도_승인하는_사이_base가_앞서면_STALE이다(clie
     assert _plan(fake_server, room)["status"] == "STALE" and gh.merges == []
 
 
+@pytest.mark.parametrize("field, value", [("destination", "other"), ("destination_server", "https://other.example")])
+@pytest.mark.parametrize("args", [NEW_ARGS, CHANGE_ARGS], ids=["새_리소스", "기존_변경"])
+def test_승인하는_사이_앱의_destination이_바뀌면_STALE이고_머지하지_않는다(client, fake_server, room, gh, cluster, args, field, value):
+    _card(client, room, args)
+    setattr(cluster, field, value)
+    _decide(client, room)
+
+    assert _plan(fake_server, room)["status"] == "STALE" and gh.merges == []
+    assert gh.pull_of(1)["state"] == "closed"
+    result = str(_tool_result(fake_server, room)["content"])
+    assert "실행하지 않았다" in result and "다시 제안" in result
+
+
 @needs_kustomize
 def test_Kustomize_앱은_overlay에_새_파일과_resources_한_줄을_올린다(client, fake_server, room, gh, cluster):
     cluster.source_type, cluster.path, cluster.destination = "Kustomize", "apps/kustomize/overlays/prod", "shop-prod"

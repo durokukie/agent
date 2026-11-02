@@ -69,6 +69,14 @@ class Route:
         meta = self.application.get("metadata") or {}
         return {"name": str(meta.get("name") or ""), "namespace": str(meta.get("namespace") or "")}
 
+    @property
+    def destination_key(self) -> dict[str, str] | None:
+        """spec.destination 전체 — 네임스페이스만 보면 다른 클러스터로 바뀐 것을 놓친다 (agent#132 리뷰)."""
+        if self.application is None:
+            return None
+        destination = (self.application.get("spec") or {}).get("destination") or {}
+        return {key: str(destination.get(key) or "") for key in ("server", "name", "namespace")}
+
     def fingerprint(self) -> dict[str, Any]:
         """승인 순간에 다시 판단한 것과 맞춰 볼 칸 — 하나라도 다르면 승인한 전제가 깨졌다 (STALE)."""
         return {
@@ -78,6 +86,7 @@ class Route:
             "source_path": self.source.path if self.source else None,
             "source_type": self.source.source_type if self.source else None,
             "revision": self.revision,
+            "destination": self.destination_key,
         }
 
 
