@@ -26,6 +26,7 @@ from kukie_agent.gitops.memo import is_memo
 from kukie_agent.glossary import explain_command
 from kukie_agent.kubectl import KubectlResult
 from kukie_agent.skills.base import KukieResponse, ToolStep
+from kukie_agent.tools.gitops import GitOpsResult
 from kukie_agent.tools.read import READ_TOOLS
 from kukie_agent.tools.repo import REPO_TOOLS
 from kukie_agent.validators import log_unregistered_flags
@@ -85,6 +86,29 @@ def collect_steps(ctx: RunContext[Deps]) -> list[ToolStep]:
     return steps
 
 
+def merged_reply(ctx: RunContext[Deps]) -> str | None:
+    """이번 턴의 변경이 'PR 을 머지했고 반영을 기다리는 중' 뿐이면 코드가 쓸 답. 아니면 None — 답은 LLM 몫이다.
+
+    답은 한 번 쓰면 그대로 남고 카드만 sync 결과로 바뀐다. 머지 직후의 "아직 4개예요" 는 2분 뒤에 틀린 말로 읽힌다.
+    머지 실패나 kubectl 변경이 같은 턴에 있으면 설명할 것이 있으므로 LLM 에게 맡긴다.
+    """
+    numbers: list[Any] = []
+    for msg in _current_turn(ctx.messages):
+        for part in getattr(msg, "parts", ()):
+            if (not isinstance(part, ToolReturnPart) or not isinstance(part.content, KubectlResult)
+                    or part.tool_name in READ_TOOL_NAMES):
+                continue
+            result = part.content
+            if not (isinstance(result, GitOpsResult) and result.success
+                    and (result.sync_result or {}).get("status") == "syncing"):
+                return None
+            numbers.append((result.pull_request or {}).get("number"))
+    if not numbers:
+        return None
+    pulls = ", ".join(f"PR #{number}" for number in numbers)
+    return f"{pulls} 을 머지했어요. 반영 결과는 위 카드에서 볼 수 있어요."
+
+
 _cache: dict[type[KukieResponse], Callable[..., KukieResponse]] = {}
 
 
@@ -100,6 +124,9 @@ def build_response_for(response_cls: type[KukieResponse]) -> Callable[..., Kukie
     llm_fields = {name: f for name, f in response_cls.model_fields.items() if name != "steps"}
 
     def build(ctx: RunContext[Deps], **llm_values: Any) -> KukieResponse:
+        reply = merged_reply(ctx)
+        if reply:
+            llm_values |= {"narration": reply, "suggested_next_action": None, "finding": None}
         return response_cls(steps=collect_steps(ctx), **llm_values)
 
     # pydantic-ai 는 함수 시그니처에서 LLM 스키마를 만든다 — 여기서 steps 가 빠진 시그니처를 박는다.

@@ -112,8 +112,9 @@ def _follow_up(sync: dict[str, Any] | None, plan: ActionPlan) -> str | None:
     """모델에게 다음 할 일. sync 는 뒤에서 지켜보므로 대개 아직 결과가 없고, 재시도가 끝난 결과를 받으면 실패 때 revert 를 제안한다.
     되돌리기도 새 PR·새 승인이다."""
     if sync and sync.get("status") == "syncing":
-        return ("머지는 끝났고 ArgoCD 반영은 뒤에서 지켜보는 중이다. 아직 반영됐다고 말하지 마라. 머지했다는 것과, 결과는 승인 카드와 "
-                "Action Plan 에 표시된다는 것을 알려라. 나중에 결과를 물으면 ArgoCD 앱 상태를 조회해 답하라.")
+        return ("머지는 끝났고 ArgoCD 반영은 뒤에서 지켜보는 중이다. 아직 반영됐다고 말하지 마라. 안 됐다고도 말하지 마라 — 지금 조회한 값은 "
+                "반영 전 값이므로 클러스터를 조회하지 마라. 머지했다는 것과, 결과는 승인 카드와 Action Plan 에 표시된다는 것을 알려라. "
+                "나중에 결과를 물으면 ArgoCD 앱 상태를 조회해 답하라.")
     if not sync or sync.get("status") not in ("sync_failed", "degraded"):
         return None
     if (plan.args.get("change") or {}).get("what") == "new_resource":
