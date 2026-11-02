@@ -567,6 +567,15 @@ def test_클러스터에_이미_있는_이름이면_덮어쓴다고_경고한다
     assert risks[0]["text"] in card["gitops"]["warnings"]
 
 
+def test_Cluster로_시작해도_네임스페이스가_있는_종류면_그_네임스페이스에서_이미_있는지_본다(client, fake_server, room, gh, cluster):
+    cluster.live = {"caddy"}
+    manifest = "apiVersion: operators.coreos.com/v1alpha1\nkind: ClusterServiceVersion\nmetadata: {name: caddy}\n"
+    card = _card(client, room, _new_args(manifest_yaml=manifest) | {"kind": "ClusterServiceVersion"})
+
+    assert [risk["code"] for risk in card["gitops"]["risk_warnings"]] == ["already_in_cluster"]
+    assert ["get", "ClusterServiceVersion", "caddy", "-o", "json", "-n", "shop"] in cluster.seen
+
+
 def test_앱의_include_exclude는_판단에서_읽어_경고로_올린다(client, fake_server, room, gh, cluster):
     cluster.directory = {"include": "*.yaml"}
     card = _card(client, room, NEW_ARGS)
@@ -632,6 +641,18 @@ def test_승인하는_사이_앱의_destination이_바뀌면_STALE이고_머지�
     assert gh.pull_of(1)["state"] == "closed"
     result = str(_tool_result(fake_server, room)["content"])
     assert "실행하지 않았다" in result and "다시 제안" in result
+
+
+def test_새_리소스도_승인_대조에서_context가_달라지면_멈춘다(client, fake_server, room, gh, cluster):
+    _card(client, room, NEW_ARGS)
+    fake_server.conversation(room)["context"] = "다른-클러스터"
+    from kukie_agent import conversations
+    conversations.registry.clear()                                 # 재시작 — 새 context 로 방을 다시 읽는다
+    _decide(client, room)
+
+    plan = _plan(fake_server, room)
+    assert gh.merges == [] and plan["decision"] is None and plan["payload"]["target"]["namespace"] == "shop"
+    assert "target" in str(_tool_result(fake_server, room)["content"])
 
 
 @needs_kustomize

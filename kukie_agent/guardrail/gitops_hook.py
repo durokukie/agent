@@ -179,7 +179,7 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
             logger.exception("새 리소스가 클러스터에 있는지 보지 못했다 — 그 경고만 빠진다")
             live = []
         draft.add_risks([already_in_cluster(resource) for resource in live])
-        # 카드의 대상은 요청한 네임스페이스가 아니라 실제로 만들어질 곳이다 — 승인 때는 Plan 의 것을 그대로 쓴다 (_execute)
+        # 카드의 대상은 요청한 네임스페이스가 아니라 실제로 만들어질 곳이다 — 승인 때는 이 칸만 Plan 의 것을 쓴다 (_execute)
         made = next((r for r in draft.new_resources if r["name"] == name), draft.new_resources[0])
         target = {**target, "namespace": made["namespace"] or namespace}
 
@@ -301,7 +301,8 @@ async def _execute(ctx, call, plan_args, target, risk, kind, name, namespace, ch
     try:
         await plan.approve_for_execution(
             tool=TOOL_NAME, args=plan_args, command=command_of(gitops["repository"]), risk=risk,
-            target=plan.target if isinstance(change, NewResource) else target,
+            # 새 리소스의 namespace 만 렌더 결과로 정해 Plan 에 있다 — context·kind·name 은 지금 값으로 대조한다 (agent#132 리뷰)
+            target={**target, "namespace": plan.target["namespace"]} if isinstance(change, NewResource) else target,
             user_id=ctx.deps.user_id,
         )
         await plan.mark_executing()

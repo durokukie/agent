@@ -177,6 +177,16 @@ def test_kustomize_namePrefix_가_붙어도_요청한_리소스로_본다(repo):
 
 
 @needs_kustomize
+def test_kustomize_namePrefix_와_이름이_겹치는_리소스를_같이_더해도_막지_않는다(repo):
+    file = repo / "apps/kustomize/overlays/prod/kustomization.yaml"
+    file.write_text(file.read_text(encoding="utf-8") + "namePrefix: x-\n", encoding="utf-8")
+    worker = pod().replace("name: caddy\nspec", "name: caddy-worker\nspec")
+    result = ready(plan(repo, f"{pod()}---\n{worker}", app=PROD))
+
+    assert {r["name"] for r in result.new_resources} == {"x-caddy", "x-caddy-worker"}
+
+
+@needs_kustomize
 def test_kustomize_images_가_태그를_정하면_렌더_결과로_보고_경고하지_않는다(repo):
     manifest = pod(image="public.ecr.aws/docker/library/nginx")          # overlay 의 images 가 태그를 붙인다
     result = ready(plan(repo, manifest, app=PROD, target=CADDY.model_copy(update={"namespace": "shop-prod"})))
@@ -319,6 +329,16 @@ def test_렌더_비교에서_요청하지_않은_리소스가_생기면_막는�
     assert "요청하지 않은 리소스도 생겨요: Service caddy" in result.message
 
 
+@pytest.mark.parametrize("names", [("api", "api-worker"), ("api-worker", "api")])
+@pytest.mark.parametrize("rendered", [("x-api", "x-api-worker"), ("x-api-worker", "x-api")])
+def test_렌더_이름이_서로를_품어도_짝을_맞게_찾는다(names, rendered):
+    def doc(name: str) -> str:
+        return f"apiVersion: apps/v1\nkind: Deployment\nmetadata: {{name: {name}}}\n"
+
+    created = _compare([yaml.safe_load(doc(name)) for name in names], {}, _objects(*map(doc, rendered)))
+    assert [key[3] for key, _ in created] == [f"x-{name}" for name in names]
+
+
 def test_렌더_결과에_요청한_리소스가_없으면_막는다():
     result = refused(_compare(list(yaml.safe_load_all(DEPLOYMENT)), {}, {}), "render_mismatch")
     assert "머지해도 클러스터에 안 생겨요" in result.message
@@ -455,6 +475,15 @@ def test_클러스터_범위_리소스는_경고한다(repo, manifest, kind):
     assert risk["location"]["field"] == "kind" and risk["location"]["value"] == kind
     assert risk["location"]["resource"] == f"{kind} caddy"
     assert ready(result).new_resources[0]["namespace"] == ""            # destination 이 있어도 네임스페이스가 없다
+
+
+def test_Cluster로_시작해도_네임스페이스가_있는_종류는_그_네임스페이스를_그대로_둔다(repo):
+    manifest = ("apiVersion: operators.coreos.com/v1alpha1\nkind: ClusterServiceVersion\n"
+                "metadata: {name: caddy, namespace: other}\n")
+    result = plan(repo, manifest, target=CADDY.model_copy(update={"kind": "ClusterServiceVersion"}))
+
+    assert ready(result).new_resources[0]["namespace"] == "other"
+    assert [risk.code for risk in ready(result).risk_warnings] == ["other_namespace"]
 
 
 def test_앱과_다른_네임스페이스는_경고한다(repo):

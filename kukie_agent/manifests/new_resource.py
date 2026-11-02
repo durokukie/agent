@@ -39,9 +39,10 @@ _FILE_SUFFIXES = (".yaml", ".yml")
 _FILE_NAME_LIMIT = 200
 #: 폴더에 있으면 ArgoCD 가 앱 형식을 다르게 읽는 파일 이름
 _RESERVED_FILES = (*KUSTOMIZATION_FILES, "Chart.yaml")
-#: 네임스페이스가 없는 대표 종류. `Cluster` 로 시작하는 종류(ClusterRole·ClusterIssuer …)는 따로 본다.
-#: 모르는 커스텀 리소스는 경고하지 않는다 — 이 목록은 경고용이라 막는 데 쓰지 않는다
+#: 네임스페이스가 없다고 아는 종류. 이름으로 짐작하지 않는다 — ClusterServiceVersion 처럼 네임스페이스가 있는 종류도 있고,
+#: 틀리면 namespace 칸이 비어 같은 이름을 못 찾는다(agent#132 리뷰). 모르는 커스텀 리소스는 경고하지 않고, 막는 데도 쓰지 않는다
 _CLUSTER_SCOPED = frozenset({
+    "ClusterRole", "ClusterRoleBinding", "ClusterIssuer", "ClusterSecretStore", "ClusterExternalSecret",
     "CustomResourceDefinition", "Namespace", "Node", "PersistentVolume", "StorageClass", "PriorityClass",
     "IngressClass", "RuntimeClass", "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration",
     "APIService", "CSIDriver", "VolumeSnapshotClass",
@@ -150,7 +151,7 @@ def plan_new_resource(repo: Path, app: AppSource, target: Target, request: NewRe
                            "앱의 include·exclude 설정이 이 파일 이름을 받는지 확인하세요."))
     for key, obj in created:
         # 네임스페이스를 안 적은 문서는 앱의 destination 으로 들어간다. 클러스터 범위 리소스는 네임스페이스가 없다
-        namespace = "" if _cluster_scoped(key[1]) else key[2] or target.namespace or ""
+        namespace = "" if key[1] in _CLUSTER_SCOPED else key[2] or target.namespace or ""
         resources.append({"api_version": key[0], "kind": key[1], "name": key[3], "namespace": namespace,
                           "file": relative})
         risks += _risks(obj, (key[0], key[1], namespace, key[3]), relative, target.namespace)
@@ -327,14 +328,12 @@ def _pick(doc: dict, new: dict[Key, dict]) -> Key | None:
     """그 문서가 렌더된 결과. Kustomize 의 namePrefix·nameSuffix 가 이름에 붙을 수 있어, 같은 이름이 없으면 그 이름을 품은 것을 본다."""
     name = doc["metadata"]["name"]
     same = [key for key in new if (key[0], key[1]) == (doc["apiVersion"], doc["kind"])]
-    return next((key for key in same if key[3] == name), None) or next((key for key in same if name in key[3]), None)
+    # 가장 짧은 것 — api·api-worker 를 같이 더하면 x-api-worker 도 api 를 품는다
+    return (next((key for key in same if key[3] == name), None)
+            or min((key for key in same if name in key[3]), key=lambda key: len(key[3]), default=None))
 
 
 # ── 경고 ──────────────────────────────────────────────────
-
-
-def _cluster_scoped(kind: str) -> bool:
-    return kind in _CLUSTER_SCOPED or kind.startswith("Cluster")
 
 
 def _risk(code: str, file: str, resource: str, field: str | None, value: str | None, risk: str,
@@ -370,7 +369,7 @@ def _risks(obj: dict, key: Key, file: str, destination: str | None) -> list[Risk
     resource = compare.label(key)
     kind, namespace = key[1], key[2]
     found: list[RiskWarning] = []
-    if _cluster_scoped(kind):
+    if kind in _CLUSTER_SCOPED:
         found.append(_risk("cluster_scoped", file, resource, "kind", kind,
                            "클러스터 전체에 영향을 줘요. 이 앱 밖의 리소스와 권한까지 바뀔 수 있어요.",
                            "꼭 클러스터 전체에 필요한지 확인하세요. 한 네임스페이스면 충분하면 Role·RoleBinding 같은 네임스페이스 범위로 바꾸세요."))
