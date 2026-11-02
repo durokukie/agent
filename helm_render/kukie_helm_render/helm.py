@@ -113,11 +113,10 @@ async def run_template(args: list[str], *, env: dict[str, str], settings: Settin
                 raise _OutputTooLarge
 
     async def read_errors() -> None:
-        # 다 읽기는 하되 앞부분만 둔다 — 읽지 않으면 helm 이 파이프에 막혀 시간 초과로 보인다
+        # 다 읽기는 하되 끝부분만 둔다 — 실제 Error 줄은 끝에 온다. 읽지 않으면 helm 이 파이프에 막혀 시간 초과로 보인다
         while chunk := await process.stderr.read(_READ_CHUNK):
-            room = settings.max_failure_text * 4 - len(errors)
-            if room > 0:
-                errors.extend(chunk[:room])
+            errors.extend(chunk)
+            del errors[:-settings.max_failure_text * 4]
 
     async def watch_memory() -> None:
         while _rss_bytes(process.pid) <= settings.max_rss_bytes:

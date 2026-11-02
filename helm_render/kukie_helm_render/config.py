@@ -21,11 +21,14 @@ class Settings:
     max_concurrent: int = 2
     timeout_seconds: float = 5.0
     max_output_bytes: int = 20 * MIB
-    #: helm 한 프로세스의 메모리. 넘으면 그 프로세스만 끝낸다. 실측 최대 137MB. 2개(400MiB) + 파이썬(측정 50~72MiB)이 파드 제한 512Mi 안에 든다
+    #: helm 한 프로세스의 메모리. 넘으면 그 프로세스만 끝낸다. 실측 최대 137MB. 2개(400MiB) + 파이썬(측정 50~72MiB)이 파드 제한 512Mi 안에 든다.
+    #: 큰 요청과 큰 출력의 버퍼까지 겹치면 넘을 수 있고, 그때는 이 파드만 재시작된다
     max_rss_bytes: int = 200 * MIB
     max_failure_text: int = 2000
 
     # 요청과 차트
+    #: 본문을 다 받기까지의 시간. 자리를 잡은 채 멈춘 연결이 렌더링을 계속 바쁘게 만들지 못하게 한다
+    body_timeout_seconds: float = 10.0
     max_body_bytes: int = 32 * MIB
     max_chart_bytes: int = 16 * MIB
     #: 압축을 푼 합계. 안쪽 charts/*.tgz 를 푼 크기까지 센다

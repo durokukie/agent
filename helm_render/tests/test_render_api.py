@@ -13,6 +13,7 @@ import pytest
 from conftest import chart_files, make_tgz, render_body
 from kukie_helm_render.app import create_app
 from kukie_helm_render.chart import unpack_chart
+from kukie_helm_render.helm import run_template
 
 SPIN = "{{ range until 100000 }}{{ range until 100000 }}{{ $x := 1 }}{{ end }}{{ end }}"
 
@@ -176,12 +177,43 @@ def test_missing_dependency_is_named(settings):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("api_versions", ["a"] * 10001),
+    ("api_versions", ["a"] * 5001),
+    ("api_versions", ["a" * 129]),
     ("value_files", [{"name": "", "content": ""}] * 257),
 ])
 def test_huge_lists_are_rejected_while_parsing(settings, field, value):
     response = post(settings, render_body(make_tgz(chart_files()), **{field: value}))
     assert response.status_code == 400 and response.json()["reason"] == "invalid_request"
+
+
+def test_largest_allowed_api_versions_reach_helm(settings):
+    """인자 한도를 넘어 내부 오류가 되지 않는다."""
+    response = post(settings, render_body(make_tgz(chart_files()), api_versions=["a" * 128] * 5000))
+    assert response.status_code == 200, response.text
+
+
+def test_stalled_body_gives_the_slot_back(settings):
+    fast = replace(settings, body_timeout_seconds=0.2, max_concurrent=1)
+
+    async def stalled():
+        yield b"{"
+        await asyncio.sleep(30)
+
+    async def scenario(client):
+        first = await client.post("/render", content=stalled())
+        after = await client.post("/render", json=render_body(make_tgz(chart_files())))
+        return first, after
+
+    first, after = run(fast, scenario)
+    assert first.status_code == 408 and first.json()["reason"] == "body_timeout"
+    assert after.status_code == 200                    # 자리가 돌아왔다
+
+
+def test_real_error_survives_long_stderr(settings):
+    """앞에 긴 경고가 있어도 끝의 진짜 오류를 돌려준다."""
+    script = 'head -c 100000 /dev/zero | tr "\\0" w >&2; echo "Error: the real reason" >&2; exit 1'
+    rendered = asyncio.run(run_template(["-c", script], env={"PATH": "/usr/bin:/bin"}, settings=replace(settings, helm_bin="/bin/sh")))
+    assert rendered.reason == "helm_failed" and "the real reason" in rendered.message
 
 
 def test_oversized_body_is_rejected(settings):

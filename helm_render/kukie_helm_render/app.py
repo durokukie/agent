@@ -36,14 +36,15 @@ logger = logging.getLogger("kukie_helm_render")
 _RELEASE = r"^[a-z0-9]([-a-z0-9.]{0,51}[a-z0-9])?$"
 _NAMESPACE = r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
 _KUBE_VERSION = r"^v?[0-9]+\.[0-9]+(\.[0-9]+)?([-+][0-9A-Za-z.+-]+)?$"
-_API_VERSION = r"^[A-Za-z0-9][A-Za-z0-9./-]{0,253}$"
+_API_VERSION = r"^[A-Za-z0-9][A-Za-z0-9./-]{0,127}$"
 _HELM_VERSION_HEADER = "X-Helm-Version"
 #: 작은 항목 수백만 개로 파싱 중에 메모리를 채우지 못하게 모델에서 먼저 막는다. value_files 의 실제 제한은 설정이 정한다
 _MAX_VALUE_FILE_ITEMS = 256
-_MAX_API_VERSIONS = 10000
+#: 값 길이와 함께 helm 실행 인자 한도(리눅스 기본 약 2MB) 안에 든다
+_MAX_API_VERSIONS = 5000
 _STATUS = {
     "busy": 429, "invalid_request": 400, "body_too_large": 413, "chart_too_large": 413, "schema_too_large": 413,
-    "output_too_large": 422, "timeout": 504, "internal": 500,
+    "output_too_large": 422, "timeout": 504, "body_timeout": 408, "internal": 500,
 }
 
 
@@ -173,9 +174,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def _render(request: Request) -> Response:
         started = time.monotonic()
         try:
-            body = await _read_body(request, settings.max_body_bytes)
+            async with asyncio.timeout(settings.body_timeout_seconds):
+                body = await _read_body(request, settings.max_body_bytes)
         except _BodyTooLarge:
             return _failure("body_too_large", "요청이 크기 제한을 넘어요")
+        except TimeoutError:
+            logger.info("render rejected reason=body_timeout")
+            return _failure("body_timeout", "요청 본문이 제한 시간 안에 오지 않았어요")
         workspace = Path(await asyncio.to_thread(tempfile.mkdtemp, dir=settings.work_dir))
         try:
             chart, values, conditions = await asyncio.to_thread(_prepare, body, settings, workspace)
