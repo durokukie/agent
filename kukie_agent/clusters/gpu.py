@@ -202,16 +202,14 @@ def pod_identity(item: dict[str, Any]) -> str:
     """파드의 정체 — uid(없으면 시작 시각)와 vLLM 컨테이너의 재시작 수. 최근 구간 p95 의 기억(LatencySample)을 같은 서빙
     프로세스에만 잇는다: 같은 이름으로 다시 뜬 파드(StatefulSet 의 qwen-0)는 uid 가, 컨테이너만 다시 뜬 파드는 재시작 수가
     다르다. 둘 다 히스토그램을 처음부터 다시 세는 프로세스라 옛 기억과 빼면 안 된다.
-    재시작 수는 vLLM 컨테이너(_vllm_container)의 것만 센다 — 사이드카(메시·로그)가 다시 떠도 vLLM 프로세스와 히스토그램은
-    그대로라 기억을 버릴 까닭이 없다 (agent#137 Codex 리뷰). 상태는 containerStatuses 와 initContainerStatuses(native
-    sidecar) 둘 다 본다."""
+    재시작 수는 vLLM 컨테이너(_vllm_container, spec.containers — vllm_targets 가 찾는 것과 같은 범위)의 것만 센다 —
+    사이드카(메시·로그)가 다시 떠도 vLLM 프로세스와 히스토그램은 그대로라 기억을 버릴 까닭이 없다 (agent#137 Codex 리뷰).
+    native sidecar(initContainers + restartPolicy Always)로 띄운 vLLM 은 애초에 대상이 아니다 (_containers)."""
     meta = item.get("metadata") or {}
-    spec = item.get("spec") or {}
     status = item.get("status") or {}
-    vllm_names = {c.get("name") for kind in ("containers", "initContainers")
-                  for c in spec.get(kind) or [] if isinstance(c, dict) and _vllm_container(c)}
-    restarts = sum(_positive_int(c.get("restartCount")) for kind in ("containerStatuses", "initContainerStatuses")
-                   for c in status.get(kind) or [] if isinstance(c, dict) and c.get("name") in vllm_names)
+    vllm_names = {c.get("name") for c in _containers(item) if _vllm_container(c)}
+    restarts = sum(_positive_int(c.get("restartCount")) for c in status.get("containerStatuses") or []
+                   if isinstance(c, dict) and c.get("name") in vllm_names)
     return f"{meta.get('uid') or status.get('startTime') or ''}:{restarts}"
 
 

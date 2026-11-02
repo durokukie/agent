@@ -298,15 +298,15 @@ def test_vLLM_지표가_없는_파드는_줄이_없다():
 
 
 def test_파드의_정체는_uid와_vLLM_컨테이너의_재시작_수다():
-    """사이드카(메시·로그)가 다시 떠도 vLLM 프로세스는 그대로라 세지 않는다 (agent#137 Codex 리뷰). native sidecar 로 띄운
-    vLLM(initContainers + restartPolicy Always)의 재시작은 initContainerStatuses 에 있다."""
+    """사이드카(메시·로그)가 다시 떠도 vLLM 프로세스는 그대로라 세지 않는다 (agent#137 Codex 리뷰). init 컨테이너는
+    vllm_targets 가 보지 않는 범위라 여기서도 세지 않는다."""
     item = {"metadata": {"name": "qwen-0", "uid": "u1"},
             "spec": {"containers": [{"name": "server", "command": ["vllm", "serve"]}, {"name": "istio-proxy", "image": "istio/proxyv2"}],
-                     "initContainers": [{"name": "warm", "image": "vllm/vllm-openai", "restartPolicy": "Always"}]},
+                     "initContainers": [{"name": "warm", "image": "vllm/vllm-openai"}]},
             "status": {"startTime": "2026-11-03T00:00:00Z",
                        "containerStatuses": [{"name": "server", "restartCount": 2}, {"name": "istio-proxy", "restartCount": 7}],
                        "initContainerStatuses": [{"name": "warm", "restartCount": 1}]}}
-    assert gpu.pod_identity(item) == "u1:3"
+    assert gpu.pod_identity(item) == "u1:2"
     assert gpu.pod_identity({"metadata": {"name": "p"}, "status": {"startTime": "2026-11-03T00:00:00Z"}}) == "2026-11-03T00:00:00Z:0"
     assert gpu.pod_identity({"metadata": {"name": "p"}}) == ":0"
 
