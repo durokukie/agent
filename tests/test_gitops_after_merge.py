@@ -378,6 +378,15 @@ def test_같이_보낸_변경이_실패하면_설명은_LLM이_쓴다():
     assert _reply_of([_merged_part()], [denied]) is None                # 머지 뒤
 
 
+def test_카드에_결과가_뜨지_않는_머지면_설명은_LLM이_쓴다():
+    unrecorded = _merged_part()
+    unrecorded.content = unrecorded.content.model_copy(update={"stderr": "[guardrail] 실행 결과를 Action Plan에 기록하지 못했습니다."})
+    no_number = _merged_part()
+    no_number.content = no_number.content.model_copy(update={"pull_request": None})
+    assert _reply_of([unrecorded]) is None
+    assert _reply_of([no_number]) is None
+
+
 def test_머지_앞의_재시도는_정상_흐름이라_코드가_쓴다():
     wrong_tool = RetryPromptPart(tool_name="scale_resource", content="PR 길이다", tool_call_id="s1")
     assert _reply_of([wrong_tool], [_merged_part()]) == MERGED_REPLY

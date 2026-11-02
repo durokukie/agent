@@ -87,10 +87,14 @@ def collect_steps(ctx: RunContext[Deps]) -> list[ToolStep]:
 
 
 def _is_waiting_merge(part: ToolReturnPart | RetryPromptPart) -> bool:
-    """머지까지 끝났고 sync 는 뒤에서 지켜보는 중인 PR 툴 결과인가."""
+    """머지까지 끝났고 sync 는 뒤에서 지켜보는 중인 PR 툴 결과인가.
+
+    stderr 가 있으면 기록을 못 한 머지다 — 지켜보기가 돌지 않아 카드에 결과가 뜨지 않으므로 "카드에서 보라" 고 하면 안 된다.
+    """
     result = part.content
-    return (isinstance(result, GitOpsResult) and result.success
-            and (result.sync_result or {}).get("status") == "syncing")
+    return (isinstance(result, GitOpsResult) and result.success and not result.stderr
+            and (result.sync_result or {}).get("status") == "syncing"
+            and bool((result.pull_request or {}).get("number")))
 
 
 def merged_reply(ctx: RunContext[Deps]) -> str | None:
@@ -108,7 +112,7 @@ def merged_reply(ctx: RunContext[Deps]) -> str | None:
         if numbers or merged:
             if len(merged) != len(parts):
                 return None
-            numbers += [(result.pull_request or {}).get("number") for result in merged]
+            numbers += [result.pull_request["number"] for result in merged]
     if not numbers:
         return None
     pulls = ", ".join(f"PR #{number}" for number in numbers)
