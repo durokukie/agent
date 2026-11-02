@@ -233,7 +233,7 @@ def test_직전_수집에_없던_모델은_다음_수집부터_구간이_있다(
     assert [(r["model"], r["latency_window_seconds"]) for r in rows] == [("a", 20.0), ("b", None)]
 
 
-def test_새_엔진의_버킷은_0부터_센다():
+def test_엔진이_늘어_같은_le의_합이_뛴_것은_요청으로_센다():
     """데이터 병렬 엔진이 늘면 같은 le 의 합이 뛴다 — 줄어든 것이 아니라 그만큼 요청이 있었던 것으로 본다."""
     line = 'vllm:time_to_first_token_seconds_bucket{engine="%s",le="%s",model_name="m"} %d\n'
     before_text = line % (0, "0.5", 10) + line % (0, "+Inf", 10)
@@ -241,6 +241,18 @@ def test_새_엔진의_버킷은_0부터_센다():
     _, before = gpu.serving_rows(before_text, pod="p", node="n", at=0.0)
     [row], _ = gpu.serving_rows(after_text, pod="p", node="n", previous=before, at=20.0)
     assert row["ttft_p95_ms"] == 500.0                                      # 구간 5개 중 4.75번째 → +Inf 버킷 → 0.5s
+
+
+def test_le_집합이_달라진_히스토그램은_잇지_않는다():
+    """직전에 없던 le 를 0 부터 빼면 차이 버킷이 위 le 보다 커져 p95 가 낮게 나온다 (agent#137 리뷰) — 그 키는 이번엔 구간 없음."""
+    line = 'vllm:time_to_first_token_seconds_bucket{le="%s",model_name="m"} %d\n'
+    before_text = line % ("0.5", 10) + line % ("+Inf", 10)
+    after_text = line % ("0.25", 8) + line % ("0.5", 12) + line % ("+Inf", 12)     # 버킷 설정이 다른 vLLM
+    _, before = gpu.serving_rows(before_text, pod="p", node="n", at=0.0)
+    [row], after = gpu.serving_rows(after_text, pod="p", node="n", previous=before, at=20.0)
+    assert (row["ttft_p95_ms"], row["latency_window_seconds"]) == (None, None)
+    [row], _ = gpu.serving_rows(after_text, pod="p", node="n", previous=after, at=40.0)
+    assert (row["ttft_p95_ms"], row["latency_window_seconds"]) == (None, 20.0)   # 다음 수집부터 잇는다
 
 
 def test_옛_vLLM_지표_이름도_읽고_엔진이_여럿이면_합친다():
@@ -285,9 +297,15 @@ def test_vLLM_지표가_없는_파드는_줄이_없다():
     assert gpu.serving_rows("http_requests_total 3\n", pod="router", node="n") == ([], gpu.LatencySample(0.0, {}))
 
 
-def test_파드의_정체는_uid와_재시작_수다():
+def test_파드의_정체는_uid와_vLLM_컨테이너의_재시작_수다():
+    """사이드카(메시·로그)가 다시 떠도 vLLM 프로세스는 그대로라 세지 않는다 (agent#137 Codex 리뷰). native sidecar 로 띄운
+    vLLM(initContainers + restartPolicy Always)의 재시작은 initContainerStatuses 에 있다."""
     item = {"metadata": {"name": "qwen-0", "uid": "u1"},
-            "status": {"startTime": "2026-11-03T00:00:00Z", "containerStatuses": [{"restartCount": 2}, {"restartCount": 1}]}}
+            "spec": {"containers": [{"name": "server", "command": ["vllm", "serve"]}, {"name": "istio-proxy", "image": "istio/proxyv2"}],
+                     "initContainers": [{"name": "warm", "image": "vllm/vllm-openai", "restartPolicy": "Always"}]},
+            "status": {"startTime": "2026-11-03T00:00:00Z",
+                       "containerStatuses": [{"name": "server", "restartCount": 2}, {"name": "istio-proxy", "restartCount": 7}],
+                       "initContainerStatuses": [{"name": "warm", "restartCount": 1}]}}
     assert gpu.pod_identity(item) == "u1:3"
     assert gpu.pod_identity({"metadata": {"name": "p"}, "status": {"startTime": "2026-11-03T00:00:00Z"}}) == "2026-11-03T00:00:00Z:0"
     assert gpu.pod_identity({"metadata": {"name": "p"}}) == ":0"
@@ -1074,6 +1092,7 @@ def _serving_memory(monkeypatch):
 
     def run(args, timeout):
         if args[1] == "--raw":
+            now[0] += state.get("slow", {}).get(args[2].split("/pods/")[1].split(":")[0], 0)   # 그 파드 읽기에 걸린 시간
             if "vllm-gpt-oss" not in args[2] or state["fail"]:
                 return _result(stderr="timed out", success=False)
             return _result(state["metrics"])
@@ -1105,6 +1124,20 @@ def test_개요는_파드마다_직전_수집을_기억해_최근_구간_p95를_
     assert set(clusters_api._latency_samples["c:fp:ns"]) == {"llm/vllm-gpt-oss-20b-7c9d5b8f6-q2k8m/:0"}
 
 
+def test_구간의_시각은_그_파드를_읽은_시각이다(monkeypatch):
+    """다른 파드의 읽기가 느려 라운드가 늦게 끝나도 이 파드의 구간은 안 늘어난다 (agent#137 리뷰). 대상은 이름순이라
+    zzz-vllm 이 vllm-gpt-oss 뒤에 읽힌다 — 두 번째 라운드에만 그 파드가 있고 읽기에 7초 걸린다."""
+    collect, now, state = _serving_memory(monkeypatch)
+    collect()
+    pods = json.loads(state["pods"])
+    pods["items"].append({"metadata": {"name": "zzz-vllm", "namespace": "llm"}, "status": {"phase": "Running"},
+                          "spec": {"nodeName": L40S_1, "containers": [{"name": "vllm", "image": "vllm/vllm-openai"}]}})
+    state["pods"], state["slow"] = json.dumps(pods), {"zzz-vllm": 7}
+    now[0] += 20
+    state["metrics"] = fixture("vllm_later.txt")
+    assert collect() == (975.0, 50.0, 20.0)                  # 라운드 끝으로 재면 27
+
+
 def test_지표를_한_번_못_읽어도_기억은_두고_다음_구간이_그만큼_길다(monkeypatch):
     collect, now, state = _serving_memory(monkeypatch)
     collect()
@@ -1125,7 +1158,7 @@ def test_파드가_다시_뜨면_기억을_잇지_않는다(monkeypatch):
     pods = json.loads(state["pods"])
     for item in pods["items"]:
         if item["metadata"]["name"].startswith("vllm-gpt-oss"):
-            item["status"]["containerStatuses"] = [{"restartCount": 1}]
+            item["status"]["containerStatuses"] = [{"name": "vllm", "restartCount": 1}]
     state["pods"] = json.dumps(pods)
     state["metrics"] = fixture("vllm_later.txt")             # 값은 늘었지만 다른 프로세스다
     assert collect() == (None, None, None)

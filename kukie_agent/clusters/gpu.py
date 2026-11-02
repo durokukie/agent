@@ -40,6 +40,7 @@ GPU 노드 — nodes
   한 번 읽은 값으로 내면 "뜬 뒤 전체" 의 p95 다 — 부하가 끝나도 안 내려가고 방금 느려진 것도 안 보인다 (DURO-124).
   그래서 파드마다 직전 수집의 누적 히스토그램(LatencySample — 버킷·count·sum)을 기억하고 두 수집의 차이로 p95 를 낸다
   (최근 구간 p95). 기억은 clusters_api 가 연결·파드마다 메모리에 둔다 (pod_identity 로 같은 프로세스인지 가린다).
+  구간의 시각은 그 파드의 /metrics 를 읽은 시각이다 — 라운드의 끝이 아니다 (다른 파드가 느려도 구간이 안 늘어난다).
     기억이 없다(첫 수집·파드가 바뀜·직전이 너무 오래됨)  p95 null, latency_window_seconds null
     값이 줄었다(프로세스가 다시 떠 처음부터 센다)         기억을 버리고 이번은 둘 다 null — 다음 수집부터 다시 잇는다
     구간에 요청이 없었다                                    p95 null, latency_window_seconds 는 있다 (앱은 "최근 요청 없음")
@@ -198,13 +199,19 @@ def vllm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> list[t
 
 
 def pod_identity(item: dict[str, Any]) -> str:
-    """파드의 정체 — uid(없으면 시작 시각)와 컨테이너 재시작 수. 최근 구간 p95 의 기억(LatencySample)을 같은 서빙
+    """파드의 정체 — uid(없으면 시작 시각)와 vLLM 컨테이너의 재시작 수. 최근 구간 p95 의 기억(LatencySample)을 같은 서빙
     프로세스에만 잇는다: 같은 이름으로 다시 뜬 파드(StatefulSet 의 qwen-0)는 uid 가, 컨테이너만 다시 뜬 파드는 재시작 수가
-    다르다. 둘 다 히스토그램을 처음부터 다시 세는 프로세스라 옛 기억과 빼면 안 된다."""
+    다르다. 둘 다 히스토그램을 처음부터 다시 세는 프로세스라 옛 기억과 빼면 안 된다.
+    재시작 수는 vLLM 컨테이너(_vllm_container)의 것만 센다 — 사이드카(메시·로그)가 다시 떠도 vLLM 프로세스와 히스토그램은
+    그대로라 기억을 버릴 까닭이 없다 (agent#137 Codex 리뷰). 상태는 containerStatuses 와 initContainerStatuses(native
+    sidecar) 둘 다 본다."""
     meta = item.get("metadata") or {}
+    spec = item.get("spec") or {}
     status = item.get("status") or {}
-    restarts = sum(_positive_int(c.get("restartCount")) for c in status.get("containerStatuses") or []
-                   if isinstance(c, dict))
+    vllm_names = {c.get("name") for kind in ("containers", "initContainers")
+                  for c in spec.get(kind) or [] if isinstance(c, dict) and _vllm_container(c)}
+    restarts = sum(_positive_int(c.get("restartCount")) for kind in ("containerStatuses", "initContainerStatuses")
+                   for c in status.get(kind) or [] if isinstance(c, dict) and c.get("name") in vllm_names)
     return f"{meta.get('uid') or status.get('startTime') or ''}:{restarts}"
 
 
@@ -461,20 +468,23 @@ def recent_histograms(current: LatencySample, previous: LatencySample | None) ->
     """두 수집 사이에 쌓인 히스토그램 — current 에 있고 previous 에도 있는 (모델, 종류)만. 기억이 없으면 None.
 
     어느 하나라도 줄었으면(버킷·count·sum — 서빙 프로세스가 다시 떠 처음부터 센다) 파드 전체가 None 이다: 히스토그램은
-    한 프로세스의 것이라 하나만 줄어도 나머지도 옛 기억과 이어지지 않는다. previous 에 없던 le(새 엔진·새 버킷)는 0 부터다.
+    한 프로세스의 것이라 하나만 줄어도 나머지도 옛 기억과 이어지지 않는다.
+    le 집합이 달라진 키(버킷 설정이 다른 vLLM 으로 바뀜)는 잇지 않고 건너뛴다 — 직전에 없던 le 를 0 부터 빼면 차이 버킷이
+    누적 순서를 어겨(위 le 보다 커져) p95 가 실제보다 낮게 나온다 (agent#137 리뷰). 엔진이 늘어 같은 le 의 합만 뛴 것은
+    그만큼 요청이 있었던 것으로 본다.
     """
     if previous is None:
         return None
     recent: dict[tuple[str, str], Histogram] = {}
     for key, now in current.histograms.items():
         before = previous.histograms.get(key)
-        if before is None:
+        if before is None or set(before.buckets) != set(now.buckets):
             continue
         if now.count < before.count or now.sum < before.sum:
             return None
         buckets = {}
         for le, value in now.buckets.items():
-            buckets[le] = value - before.buckets.get(le, 0.0)
+            buckets[le] = value - before.buckets[le]
             if buckets[le] < 0:
                 return None
         recent[key] = Histogram(buckets, now.count - before.count, now.sum - before.sum)

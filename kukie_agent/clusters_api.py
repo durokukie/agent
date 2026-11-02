@@ -700,33 +700,33 @@ def _collect_gpu(
             return gpu.build([], [], waiting), True
         return None, (False if waiting is not None and pods_complete else None)
 
-    def metrics(target: tuple[str, str, int]) -> str | None:
+    def metrics(target: tuple[str, str, int]) -> tuple[str | None, float]:
+        """(/metrics 본문, 읽은 시각) — 시각은 서빙 p95 구간의 끝이라 파드마다 따로 잰다 (agent#137 리뷰)."""
         namespace, pod, port = target
         timeout = budget(GPU_METRICS_TIMEOUT)
         if timeout < 1:
-            return None
+            return None, clock()
         result = run(gpu.proxy_command(namespace, pod, port), timeout)
         if not result.success:
             logger.debug("GPU 지표를 읽지 못했다 (%s/%s): %s", namespace, pod,
                          _failure_status(result.stderr or result.stdout))
-            return None
-        return result.stdout
+            return None, clock()
+        return result.stdout, clock()
 
     dcgm_rows = [row for row in nodes if row["node"] in dcgm]
     targets = [dcgm[row["node"]] for row in dcgm_rows] + [(ns, pod, port) for ns, pod, port, _, _ in vllm]
     with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
         texts = list(pool.map(metrics, targets))
-    for row, text in zip(dcgm_rows, texts):
+    for row, (text, _) in zip(dcgm_rows, texts):
         if text is not None:
             gpu.apply_dcgm(row, text)
     serving: list[dict[str, Any]] = []
-    now = clock()                                           # 지표를 다 읽은 시각 — 최근 구간의 끝
-    remembered = _latency_memory(cache_key, now)
-    for (namespace, pod, _, node, identity), text in zip(vllm, texts[len(dcgm_rows):]):
+    remembered = _latency_memory(cache_key, clock())
+    for (namespace, pod, _, node, identity), (text, at) in zip(vllm, texts[len(dcgm_rows):]):
         if text is None:
             continue                                        # 이번에 못 읽은 파드의 기억은 둔다 — 다음 구간이 그만큼 길어질 뿐
         pod_key = f"{namespace}/{pod}/{identity}"
-        rows, sample = gpu.serving_rows(text, pod=pod, node=node, previous=remembered.get(pod_key), at=now)
+        rows, sample = gpu.serving_rows(text, pod=pod, node=node, previous=remembered.get(pod_key), at=at)
         serving.extend(rows)
         remembered[pod_key] = sample
     if cache_key:
