@@ -229,6 +229,20 @@ def test_chart_url_in_index_goes_through_the_same_check(public_dns):
     assert caught.value.reason == "url_rejected"
 
 
+def test_broken_chart_url_in_index_is_a_failure(public_dns):
+    index = b"entries:\n  demo:\n  - version: 1.0.0\n    urls: [\"https://[::1/c.tgz\"]\n"
+    web = FakeWeb({"https://charts.example.com/index.yaml": (200, {}, index)})
+    with pytest.raises(FetchFailed) as caught:
+        fetch_chart("https://charts.example.com", "demo", "1.0.0", opener=web)
+    assert caught.value.reason == "url_rejected"
+
+
+def test_broken_redirect_is_a_failure(public_dns):
+    web = FakeWeb({"https://charts.example.com/index.yaml": (302, {"location": "https://[::1/x"}, b"")})
+    with pytest.raises(FetchFailed):
+        fetch_chart("https://charts.example.com", "demo", "1.0.0", opener=web)
+
+
 @pytest.mark.parametrize("chart,version", [("../x", "1.0.0"), ("x", "--flag"), ("x", "1.0.0/../y")])
 def test_chart_name_and_version_format(chart, version):
     with pytest.raises(FetchFailed):

@@ -38,6 +38,8 @@ _MAX_CHART_BYTES = 16 * 1024 * 1024
 _MAX_VALUES_BYTES = 4 * 1024 * 1024
 _MAX_ALIASES = 100
 _MAX_OBJECTS = 10000
+#: 앨리어스를 펼쳤을 때의 값 개수. 적은 앨리어스로도 겹겹이 가리키면 걷는 쪽에서 폭발한다
+_MAX_EXPANDED_NODES = 5_000_000
 _CHUNK = 64 * 1024
 _KUBE_VERSION = re.compile(r"^\s*v?([0-9]+(?:\.[0-9]+)*)")
 _GLOB = re.compile(r"[*?\[]")
@@ -192,6 +194,10 @@ def fetch_chart(repo_url: str, chart: str, version: str) -> FetchedChart:
         return FetchedChart(archive=chart_fetch.fetch_chart(repo_url, chart, version))
     except chart_fetch.FetchFailed as exc:
         return FetchedChart(reason=exc.reason, message=exc.message)
+    except (OSError, ValueError) as exc:
+        # 임시 파일을 못 만들거나 고객 값이 뜻밖의 모양일 때. 문구에 값이 섞일 수 있어 종류만 남긴다
+        logger.warning("차트 받기 실패: %s", type(exc).__name__)
+        return FetchedChart(reason="fetch_failed", message="차트를 받지 못했어요")
 
 
 def pack_chart(folder: Path) -> bytes:
@@ -244,7 +250,10 @@ def normalize_kube_version(version: str) -> str:
 
 def conditions_from_application(item: dict[str, Any], *, kube_version: str,
                                 api_versions: tuple[str, ...] = ()) -> RenderConditions:
-    """Application 의 렌더링 조건. kube_version · api_versions 는 대상 클러스터 값이고, helm 칸에 있으면 그것이 이긴다."""
+    """Application 의 렌더링 조건. kube_version · api_versions 는 대상 클러스터 값이고, helm 칸에 있으면 더하지 않고 대신한다.
+
+    Argo CD v3.5.3 의 GetKubeVersionOrDefault · GetAPIVersionsOrDefault 와 같다.
+    """
     spec = item.get("spec") or {}
     helm = helm_source(item).get("helm") or {}
     if helm.get("parameters") or helm.get("fileParameters"):
@@ -334,8 +343,30 @@ class _RenderedLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
 _RenderedLoader.add_constructor("tag:yaml.org,2002:value", lambda loader, node: node.value)
 
 
+def _check_expansion(root: Any) -> None:
+    """순환을 거절하고, 앨리어스를 펼친 크기를 센다. PyYAML 은 앨리어스를 같은 객체로 돌려주어 읽을 때는 작아도 걷는 쪽에서 터진다."""
+    on_path: set[int] = set()
+    stack: list[tuple[Any, bool]] = [(root, False)]
+    nodes = 0
+    while stack:
+        node, leaving = stack.pop()
+        if leaving:
+            on_path.discard(id(node))
+            continue
+        nodes += 1
+        if nodes > _MAX_EXPANDED_NODES:
+            raise ValueError("렌더링 결과가 앨리어스를 펼치면 너무 커요")
+        if not isinstance(node, (dict, list)):
+            continue
+        if id(node) in on_path:
+            raise ValueError("렌더링 결과에 자기 자신을 가리키는 앨리어스가 있어요")
+        on_path.add(id(node))
+        stack.append((node, True))
+        stack.extend((child, False) for child in (node.values() if isinstance(node, dict) else node))
+
+
 def parse_rendered(manifest: str) -> list[dict[str, Any]]:
-    """렌더링 결과를 객체 목록으로. 앨리어스를 먼저 세고 크기와 개수를 제한한다 — 이 파드에서 파싱하는 유일한 고객 출력이다.
+    """렌더링 결과를 객체 목록으로. 앨리어스 수, 펼친 크기, 객체 수를 제한한다 — 이 파드에서 파싱하는 유일한 고객 출력이다.
 
     제한을 넘거나 못 읽으면 ValueError. 메시지에 값 조각을 싣지 않는다.
     """
@@ -347,6 +378,7 @@ def parse_rendered(manifest: str) -> list[dict[str, Any]]:
             raise ValueError("렌더링 결과의 앨리어스가 너무 많아요")
         objects = []
         for document in yaml.load_all(manifest, Loader=_RenderedLoader):
+            _check_expansion(document)
             if isinstance(document, dict) and document.get("apiVersion") and document.get("kind"):
                 objects.append(document)
                 if len(objects) > _MAX_OBJECTS:

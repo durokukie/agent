@@ -83,6 +83,14 @@ def checked_url(url: str) -> str:
     return url
 
 
+def _joined(base: str, reference: str) -> str:
+    """index 나 리다이렉트가 준 주소를 합친다. 고객 값이라 깨진 주소일 수 있다."""
+    try:
+        return urljoin(base, reference)
+    except ValueError as exc:
+        raise FetchFailed("url_rejected", "차트 저장소 주소를 읽지 못했어요") from exc
+
+
 class _PinnedConnection(http.client.HTTPSConnection):
     """검사한 공인 주소로 연결한다. 인증서는 원래 이름으로 확인한다."""
 
@@ -124,7 +132,7 @@ def download(url: str, sink: IO[bytes], *, limit: int, deadline: float, opener: 
             status, headers, body = opener(url, address, min(left, _SOCKET_TIMEOUT_SECONDS))
             with body:
                 if status in _REDIRECTS and headers.get("location"):
-                    url = urljoin(url, headers["location"])
+                    url = _joined(url, headers["location"])
                     continue
                 if status != 200:
                     raise FetchFailed("fetch_failed", f"차트 저장소가 {status} 로 답했어요")
@@ -234,7 +242,7 @@ def fetch_chart(repo_url: str, chart: str, version: str, *, opener: Opener = _op
     if not (isinstance(urls, list) and urls and isinstance(urls[0], str)):
         raise FetchFailed("index_unreadable", "차트 저장소 목록에 내려받을 주소가 없어요")
     with tempfile.SpooledTemporaryFile(max_size=MAX_CHART_BYTES) as sink:
-        download(urljoin(base, urls[0]), sink, limit=MAX_CHART_BYTES, deadline=deadline, opener=opener)
+        download(_joined(base, urls[0]), sink, limit=MAX_CHART_BYTES, deadline=deadline, opener=opener)
         sink.seek(0)
         data = sink.read()
     digest = entry.get("digest")

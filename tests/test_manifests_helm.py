@@ -155,6 +155,14 @@ def test_real_pod_that_never_answers(monkeypatch):
         assert render(b"tgz", [], CONDITIONS).reason == "unavailable"
 
 
+@pytest.mark.parametrize("error", [OSError("no tmp"), ValueError("bad url")])
+def test_fetch_turns_unexpected_errors_into_a_result(monkeypatch, error):
+    def fails(*args):
+        raise error
+    monkeypatch.setattr(helm.chart_fetch, "fetch_chart", fails)
+    assert fetch_chart("https://charts.example.com", "demo", "1.0.0").reason == "fetch_failed"
+
+
 def test_fetch_never_raises(monkeypatch):
     monkeypatch.setattr(helm.chart_fetch, "fetch_chart", lambda *a: b"chart")
     assert fetch_chart("https://charts.example.com", "demo", "1.0.0").archive == b"chart"
@@ -295,6 +303,12 @@ def test_missing_value_file(repo):
     assert read_values(app(valueFiles=["nope.yaml"], ignoreMissingValueFiles=True), repo) == []
 
 
+def test_value_file_named_twice_keeps_first_place_like_argo(repo):
+    """Argo CD v3.5.3 getResolvedValueFiles 의 appendUnique: [a, b, a] 는 -f a -f b 다."""
+    got = read_values(app(valueFiles=["values-dev.yaml", "env/extra.yaml", "values-dev.yaml"]), repo)
+    assert [f.name for f in got] == ["values-dev.yaml", "env/extra.yaml"]
+
+
 def test_big_values_are_refused(repo, monkeypatch):
     monkeypatch.setattr(helm, "_MAX_VALUES_BYTES", 3)
     with pytest.raises(UnsupportedApplication):
@@ -330,6 +344,24 @@ def test_parse_rendered_limits_aliases():
     bomb = "apiVersion: v1\nkind: X\na: &a [1]\nb: [" + ", ".join(["*a"] * 200) + "]\n"
     with pytest.raises(ValueError, match="앨리어스"):
         parse_rendered(bomb)
+
+
+def test_parse_rendered_rejects_circular_alias():
+    with pytest.raises(ValueError, match="자기 자신"):
+        parse_rendered("apiVersion: v1\nkind: X\na: &x {b: *x}\n")
+
+
+def test_parse_rendered_limits_expanded_size(monkeypatch):
+    """앨리어스 스무 개로 2의 스무 제곱. 개수 제한은 통과한다."""
+    monkeypatch.setattr(helm, "_MAX_EXPANDED_NODES", 100000)
+    levels = ["a0: &a0 [1, 2]"] + [f"a{i}: &a{i} [*a{i - 1}, *a{i - 1}]" for i in range(1, 25)]
+    with pytest.raises(ValueError, match="펼치면"):
+        parse_rendered("apiVersion: v1\nkind: X\n" + "\n".join(levels) + "\n")
+
+
+def test_parse_rendered_allows_shared_values():
+    text = "apiVersion: v1\nkind: X\na: &x {b: 1}\nc: *x\nd: *x\n"
+    assert parse_rendered(text)[0]["d"] == {"b": 1}
 
 
 def test_parse_rendered_limits_size(monkeypatch):
