@@ -18,16 +18,18 @@ from types import SimpleNamespace
 import pytest
 import uvicorn
 from pydantic_ai import ModelResponse
-from pydantic_ai.messages import ToolCallPart
-from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.messages import ModelRequest, RetryPromptPart, ToolCallPart, ToolReturnPart, UserPromptPart
+from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 from pydantic_ai.tools import ToolApproved, ToolDenied
 
 from helpers import USER, answer_model, new_room, scale_call
-from kukie_agent import conversations_api, server, server_api
+from kukie_agent import conversations_api, progress, server, server_api
 from kukie_agent.agent import agent
 from kukie_agent.gitops import watch
 from kukie_agent.gitops.github import GitHubError
 from kukie_agent.guardrail import gitops_after_merge, gitops_hook
+from kukie_agent.kubectl import KubectlResult
+from kukie_agent.response import merged_reply
 from test_gitops_flow import _card, _decide, _plan, _settle, _tool_result
 from test_gitops_flow import client, cluster, gh, room  # noqa: F401 — 픽스처를 같이 쓴다
 
@@ -85,6 +87,7 @@ def test_sync_를_기다리지_않고_머지_뒤_바로_답한다(client, fake_s
     assert plan["executionResult"]["sync_result"]["status"] == "syncing"
     assert fake_server.runs_of(room)[-1]["status"] == "completed"
     assert "아직 반영됐다고 말하지 마라" in str(_tool_result(fake_server, room)["content"])
+    assert body["response"]["narration"] == "PR #1 머지가 끝났어요. 반영 결과는 위 카드에서 볼 수 있어요."
 
     gate.set()
     _settle(client)
@@ -290,6 +293,139 @@ def test_머지_뒤_모델이_실패해_다시_시도해도_머지와_지켜보�
 
 # ── 시간 안에 못 끝나면 먼저 답한다 ─────────────────────────
 
+# ── 머지 직후의 답은 코드가 쓴다 ──────────────────────────
+
+STALE_ANSWER = {
+    "narration": "ArgoCD 가 아직 동기화하지 않아 4개 상태입니다.",
+    "suggested_next_action": "잠시 뒤 다시 확인하세요.",
+    "finding": {"cause": "아직 sync 전", "evidence": "READY 4/4", "recommendation": "기다린다"},
+}
+MERGED_REPLY = "PR #1 머지가 끝났어요. 반영 결과는 위 카드에서 볼 수 있어요."
+
+
+def _stale_model():
+    """머지 직후 조회한 값으로 답을 쓰는 모델 — 답 양식은 한 번에, 미리보기는 나눠서 낸다."""
+    async def answer(messages, info):
+        return ModelResponse(parts=[ToolCallPart(tool_name=info.output_tools[0].name, args=STALE_ANSWER, tool_call_id="o")])
+
+    async def stream(messages, info):
+        yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args=json.dumps(STALE_ANSWER, ensure_ascii=False), tool_call_id="o")}
+
+    return FunctionModel(answer, stream_function=stream)
+
+
+def _approve_with(client, room, model):  # noqa: F811
+    with agent.override(model=model):
+        reply = client.post(f"/conversations/{room}/approve", json={"call_id": "call-1", "approved": True}, headers=USER)
+    assert reply.status_code == 200, reply.text
+    return reply.json()["response"]
+
+
+def test_머지_직후의_답은_LLM의_상태_판단_대신_코드가_쓴다(client, fake_server, room, gh, gate):  # noqa: F811
+    _card(client, room)
+    response = _approve_with(client, room, _stale_model())
+
+    assert response["narration"] == MERGED_REPLY
+    assert response["finding"] is None and response["suggested_next_action"] is None
+    assert response["steps"][0]["step_label"] == "PR 머지"       # 실행 기록은 그대로다
+    assert fake_server.runs_of(room)[-1]["responsePayload"]["response"]["narration"] == MERGED_REPLY   # 새로고침해도 같다
+
+
+def test_미리보기에도_LLM의_글이_보이지_않는다(client, fake_server, room, gh, gate, monkeypatch):  # noqa: F811
+    _card(client, room)
+    monkeypatch.setenv("KUKIE_STREAM_ANSWER", "1")
+    monkeypatch.setattr(progress, "ANSWER_INTERVAL_SECONDS", 0)
+    previews: list[str] = []
+    publish = progress.hub.publish
+
+    async def record(key, event):
+        if event["type"] == "answer":
+            previews.append(event["text"])
+        await publish(key, event)
+
+    monkeypatch.setattr(progress.hub, "publish", record)
+    response = _approve_with(client, room, _stale_model())
+
+    assert response["narration"] == MERGED_REPLY
+    assert previews and set(previews) == {MERGED_REPLY}
+
+
+def test_머지가_막히면_설명은_LLM이_쓴다(client, fake_server, room, gh, cluster):  # noqa: F811
+    _card(client, room)
+    gh.mergeable_state = "blocked"
+    response = _approve_with(client, room, _stale_model())
+
+    assert gh.merges == []
+    assert response["narration"] == STALE_ANSWER["narration"] and response["finding"] is not None
+
+
+def _merged_part(call_id="m1"):
+    result = gitops_hook.GitOpsResult(command="github pr merge o/r#1", stdout="머지", stderr="", success=True,
+                                      pull_request={"number": 1}, sync_result=watch.syncing())
+    return ToolReturnPart(tool_name=gitops_hook.TOOL_NAME, content=result, tool_call_id=call_id)
+
+
+def _reply_of(*requests):
+    messages = [ModelRequest(parts=[UserPromptPart(content="web 3개로")]), *(ModelRequest(parts=list(p)) for p in requests)]
+    return merged_reply(SimpleNamespace(messages=messages))
+
+
+def test_같이_보낸_변경이_실패하면_설명은_LLM이_쓴다():
+    failed = RetryPromptPart(tool_name=gitops_hook.TOOL_NAME, content="실행하지 않았다", tool_call_id="m2")
+    denied = ToolReturnPart(tool_name=gitops_hook.TOOL_NAME, content="거절됐다", tool_call_id="m2")
+    assert _reply_of([_merged_part()]) == MERGED_REPLY
+    assert _reply_of([_merged_part(), failed]) is None                  # 같은 묶음
+    assert _reply_of([failed, _merged_part()]) is None
+    assert _reply_of([_merged_part()], [denied]) is None                # 머지 뒤
+
+
+def test_카드에_결과가_뜨지_않는_머지면_설명은_LLM이_쓴다():
+    unrecorded = _merged_part()
+    unrecorded.content = unrecorded.content.model_copy(update={"stderr": "[guardrail] 실행 결과를 Action Plan에 기록하지 못했습니다."})
+    no_number = _merged_part()
+    no_number.content = no_number.content.model_copy(update={"pull_request": None})
+    assert _reply_of([unrecorded]) is None
+    assert _reply_of([no_number]) is None
+
+
+def test_머지_앞의_재시도는_정상_흐름이라_코드가_쓴다():
+    wrong_tool = RetryPromptPart(tool_name="scale_resource", content="PR 길이다", tool_call_id="s1")
+    assert _reply_of([wrong_tool], [_merged_part()]) == MERGED_REPLY
+
+
+def test_머지_앞에_돌아온_변경_결과가_있으면_설명은_LLM이_쓴다():
+    kubectl = KubectlResult(command="kubectl scale", stdout="scaled", stderr="", success=True)
+    done = ToolReturnPart(tool_name="scale_resource", content=kubectl, tool_call_id="s1")
+    denied = ToolReturnPart(tool_name=gitops_hook.TOOL_NAME, content="거절됐다", tool_call_id="m2")
+    assert _reply_of([done], [_merged_part()]) is None
+    assert _reply_of([denied], [_merged_part()]) is None
+
+
+def test_답_양식의_형식_재시도가_끼어도_코드가_쓴다(client, fake_server, room, gh, gate):  # noqa: F811
+    tries = []
+
+    async def answer(messages, info):
+        tries.append(1)
+        args = {"narration": 1} if len(tries) == 1 else STALE_ANSWER      # 첫 답은 형식이 틀렸다
+        return ModelResponse(parts=[ToolCallPart(tool_name=info.output_tools[0].name, args=args, tool_call_id=f"o{len(tries)}")])
+
+    _card(client, room)
+    response = _approve_with(client, room, FunctionModel(answer))
+
+    assert len(tries) == 2
+    assert response["narration"] == MERGED_REPLY and response["finding"] is None
+
+
+def test_다음_턴의_답은_LLM이_쓴다(client, fake_server, room, gh, cluster):  # noqa: F811
+    _card(client, room)
+    _decide(client, room)
+    _settle(client)
+    with agent.override(model=answer_model("지금 3개예요.")):
+        reply = client.post(f"/conversations/{room}/chat", json={"text": "지금 몇 개야?"}, headers=USER)
+
+    assert reply.json()["response"]["narration"] == "지금 3개예요."
+
+
 class _SlowModel:
     """승인 뒤 답을 늦게 내는 모델 — release 할 때까지 답하지 않는다."""
 
@@ -333,7 +469,7 @@ def test_시간_안에_못_끝나면_202로_먼저_답하고_일은_끝까지_�
     _settle(client)
     run = fake_server.runs_of(room)[-1]
     assert run["responsePayload"]["kind"] == "answer"        # 답은 기록으로 남아 앱이 다시 읽는다
-    assert "늦은 답" in json.dumps(run["responsePayload"], ensure_ascii=False)
+    assert "PR #1 머지가 끝났어요" in json.dumps(run["responsePayload"], ensure_ascii=False)
     assert len(gh.merges) == 1
     assert _plan(fake_server, room)["executionResult"]["sync_result"]["status"] == "healthy"
 

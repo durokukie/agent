@@ -33,6 +33,8 @@ from pydantic_ai.messages import AgentStreamEvent, PartDeltaEvent, PartStartEven
 from pydantic_ai.tools import ToolDefinition
 from pydantic_core import from_json
 
+from kukie_agent.response import merged_reply
+
 logger = logging.getLogger(__name__)
 
 #: 연결한 뒤 run 이 시작되기를 기다리는 시간. 화면은 POST 와 거의 동시에 연결하는데, 에이전트는 run 을 열기 전에
@@ -200,9 +202,10 @@ class ProgressHub:
         그리면 맞다. 미리보기일 뿐이고 진짜 답은 POST 응답이다.
         """
 
-        async def handle(_: RunContext[Any], events: AsyncIterable[AgentStreamEvent]) -> None:
+        async def handle(ctx: RunContext[Any], events: AsyncIterable[AgentStreamEvent]) -> None:
             args: dict[int, str | dict[str, Any]] = {}   # 응답 조각 번호 → 지금까지 모인 args (문자열 조각 또는 dict)
             latest = sent = ""
+            fixed = _merged_reply(ctx)
             last = 0.0
             async for event in events:
                 # 미리보기는 없어도 되는 덤이다 — 여기서 터져 진짜 답(run)이 죽으면 안 된다 (리뷰). 이벤트는 끝까지 소비한다
@@ -210,7 +213,7 @@ class ProgressHub:
                     text = _collect(args, event)
                     if text is None:
                         continue
-                    latest = text
+                    latest = fixed or text
                     now = time.monotonic()
                     if latest == sent or now - last < ANSWER_INTERVAL_SECONDS:
                         continue
@@ -280,6 +283,15 @@ _NOT_RUN = (ApprovalRequired, CallDeferred, ModelRetry)
 
 #: 답 미리보기를 이보다 자주 보내지 않는다 — 조각마다 미완성 JSON 을 다시 읽어 답이 길수록 일이 는다
 ANSWER_INTERVAL_SECONDS = 0.05
+
+
+def _merged_reply(ctx: RunContext[Any] | None) -> str | None:
+    """코드가 답을 쓸 턴이면 그 답 — 미리보기에 LLM 의 글이 잠깐 보였다 바뀌지 않게 한다. 미리보기가 run 을 죽이면 안 된다."""
+    try:
+        return merged_reply(ctx) if ctx is not None else None
+    except Exception:
+        logger.warning("머지 답을 만들지 못했다", exc_info=True)
+        return None
 
 
 def answer_streaming_enabled() -> bool:
