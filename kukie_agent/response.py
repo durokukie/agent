@@ -19,7 +19,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from pydantic_ai import RunContext
-from pydantic_ai.messages import ModelMessage, ModelRequest, ToolReturnPart, UserPromptPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, RetryPromptPart, ToolReturnPart, UserPromptPart
 
 from kukie_agent.deps import Deps
 from kukie_agent.gitops.memo import is_memo
@@ -86,23 +86,29 @@ def collect_steps(ctx: RunContext[Deps]) -> list[ToolStep]:
     return steps
 
 
+def _is_waiting_merge(part: ToolReturnPart | RetryPromptPart) -> bool:
+    """머지까지 끝났고 sync 는 뒤에서 지켜보는 중인 PR 툴 결과인가."""
+    result = part.content
+    return (isinstance(result, GitOpsResult) and result.success
+            and (result.sync_result or {}).get("status") == "syncing")
+
+
 def merged_reply(ctx: RunContext[Deps]) -> str | None:
     """이번 턴의 변경이 'PR 을 머지했고 반영을 기다리는 중' 뿐이면 코드가 쓸 답. 아니면 None — 답은 LLM 몫이다.
 
     답은 한 번 쓰면 그대로 남고 카드만 sync 결과로 바뀐다. 머지 직후의 "아직 4개예요" 는 2분 뒤에 틀린 말로 읽힌다.
-    머지 실패나 kubectl 변경이 같은 턴에 있으면 설명할 것이 있으므로 LLM 에게 맡긴다.
+    머지 실패, 거절, kubectl 변경이 머지와 같이 또는 뒤에 있으면 설명할 것이 있으므로 LLM 에게 맡긴다. 머지 앞의 실패는 보지 않는다 —
+    잘못 고른 툴을 ModelRetry 로 돌려보낸 뒤 PR 로 온 정상 흐름이다.
     """
     numbers: list[Any] = []
     for msg in _current_turn(ctx.messages):
-        for part in getattr(msg, "parts", ()):
-            if (not isinstance(part, ToolReturnPart) or not isinstance(part.content, KubectlResult)
-                    or part.tool_name in READ_TOOL_NAMES):
-                continue
-            result = part.content
-            if not (isinstance(result, GitOpsResult) and result.success
-                    and (result.sync_result or {}).get("status") == "syncing"):
+        parts = [part for part in getattr(msg, "parts", ())
+                 if isinstance(part, ToolReturnPart | RetryPromptPart) and part.tool_name not in READ_TOOL_NAMES]
+        merged = [part.content for part in parts if _is_waiting_merge(part)]
+        if numbers or merged:
+            if len(merged) != len(parts):
                 return None
-            numbers.append((result.pull_request or {}).get("number"))
+            numbers += [(result.pull_request or {}).get("number") for result in merged]
     if not numbers:
         return None
     pulls = ", ".join(f"PR #{number}" for number in numbers)

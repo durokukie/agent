@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import uvicorn
 from pydantic_ai import ModelResponse
-from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.messages import ModelRequest, RetryPromptPart, ToolCallPart, ToolReturnPart, UserPromptPart
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 from pydantic_ai.tools import ToolApproved, ToolDenied
 
@@ -28,6 +28,7 @@ from kukie_agent.agent import agent
 from kukie_agent.gitops import watch
 from kukie_agent.gitops.github import GitHubError
 from kukie_agent.guardrail import gitops_after_merge, gitops_hook
+from kukie_agent.response import merged_reply
 from test_gitops_flow import _card, _decide, _plan, _settle, _tool_result
 from test_gitops_flow import client, cluster, gh, room  # noqa: F401 — 픽스처를 같이 쓴다
 
@@ -355,6 +356,31 @@ def test_머지가_막히면_설명은_LLM이_쓴다(client, fake_server, room, 
 
     assert gh.merges == []
     assert response["narration"] == STALE_ANSWER["narration"] and response["finding"] is not None
+
+
+def _merged_part(call_id="m1"):
+    result = gitops_hook.GitOpsResult(command="github pr merge o/r#1", stdout="머지", stderr="", success=True,
+                                      pull_request={"number": 1}, sync_result=watch.syncing())
+    return ToolReturnPart(tool_name=gitops_hook.TOOL_NAME, content=result, tool_call_id=call_id)
+
+
+def _reply_of(*requests):
+    messages = [ModelRequest(parts=[UserPromptPart(content="web 3개로")]), *(ModelRequest(parts=list(p)) for p in requests)]
+    return merged_reply(SimpleNamespace(messages=messages))
+
+
+def test_같이_보낸_변경이_실패하면_설명은_LLM이_쓴다():
+    failed = RetryPromptPart(tool_name=gitops_hook.TOOL_NAME, content="실행하지 않았다", tool_call_id="m2")
+    denied = ToolReturnPart(tool_name=gitops_hook.TOOL_NAME, content="거절됐다", tool_call_id="m2")
+    assert _reply_of([_merged_part()]) == MERGED_REPLY
+    assert _reply_of([_merged_part(), failed]) is None                  # 같은 묶음
+    assert _reply_of([failed, _merged_part()]) is None
+    assert _reply_of([_merged_part()], [denied]) is None                # 머지 뒤
+
+
+def test_머지_앞의_재시도는_정상_흐름이라_코드가_쓴다():
+    wrong_tool = RetryPromptPart(tool_name="scale_resource", content="PR 길이다", tool_call_id="s1")
+    assert _reply_of([wrong_tool], [_merged_part()]) == MERGED_REPLY
 
 
 def test_다음_턴의_답은_LLM이_쓴다(client, fake_server, room, gh, cluster):  # noqa: F811
