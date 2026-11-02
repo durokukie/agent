@@ -28,6 +28,7 @@ from kukie_agent.agent import agent
 from kukie_agent.gitops import watch
 from kukie_agent.gitops.github import GitHubError
 from kukie_agent.guardrail import gitops_after_merge, gitops_hook
+from kukie_agent.kubectl import KubectlResult
 from kukie_agent.response import merged_reply
 from test_gitops_flow import _card, _decide, _plan, _settle, _tool_result
 from test_gitops_flow import client, cluster, gh, room  # noqa: F401 — 픽스처를 같이 쓴다
@@ -86,7 +87,7 @@ def test_sync_를_기다리지_않고_머지_뒤_바로_답한다(client, fake_s
     assert plan["executionResult"]["sync_result"]["status"] == "syncing"
     assert fake_server.runs_of(room)[-1]["status"] == "completed"
     assert "아직 반영됐다고 말하지 마라" in str(_tool_result(fake_server, room)["content"])
-    assert body["response"]["narration"] == "PR #1 을 머지했어요. 반영 결과는 위 카드에서 볼 수 있어요."
+    assert body["response"]["narration"] == "PR #1 머지가 끝났어요. 반영 결과는 위 카드에서 볼 수 있어요."
 
     gate.set()
     _settle(client)
@@ -299,7 +300,7 @@ STALE_ANSWER = {
     "suggested_next_action": "잠시 뒤 다시 확인하세요.",
     "finding": {"cause": "아직 sync 전", "evidence": "READY 4/4", "recommendation": "기다린다"},
 }
-MERGED_REPLY = "PR #1 을 머지했어요. 반영 결과는 위 카드에서 볼 수 있어요."
+MERGED_REPLY = "PR #1 머지가 끝났어요. 반영 결과는 위 카드에서 볼 수 있어요."
 
 
 def _stale_model():
@@ -392,6 +393,29 @@ def test_머지_앞의_재시도는_정상_흐름이라_코드가_쓴다():
     assert _reply_of([wrong_tool], [_merged_part()]) == MERGED_REPLY
 
 
+def test_머지_앞에_돌아온_변경_결과가_있으면_설명은_LLM이_쓴다():
+    kubectl = KubectlResult(command="kubectl scale", stdout="scaled", stderr="", success=True)
+    done = ToolReturnPart(tool_name="scale_resource", content=kubectl, tool_call_id="s1")
+    denied = ToolReturnPart(tool_name=gitops_hook.TOOL_NAME, content="거절됐다", tool_call_id="m2")
+    assert _reply_of([done], [_merged_part()]) is None
+    assert _reply_of([denied], [_merged_part()]) is None
+
+
+def test_답_양식의_형식_재시도가_끼어도_코드가_쓴다(client, fake_server, room, gh, gate):  # noqa: F811
+    tries = []
+
+    async def answer(messages, info):
+        tries.append(1)
+        args = {"narration": 1} if len(tries) == 1 else STALE_ANSWER      # 첫 답은 형식이 틀렸다
+        return ModelResponse(parts=[ToolCallPart(tool_name=info.output_tools[0].name, args=args, tool_call_id=f"o{len(tries)}")])
+
+    _card(client, room)
+    response = _approve_with(client, room, FunctionModel(answer))
+
+    assert len(tries) == 2
+    assert response["narration"] == MERGED_REPLY and response["finding"] is None
+
+
 def test_다음_턴의_답은_LLM이_쓴다(client, fake_server, room, gh, cluster):  # noqa: F811
     _card(client, room)
     _decide(client, room)
@@ -445,7 +469,7 @@ def test_시간_안에_못_끝나면_202로_먼저_답하고_일은_끝까지_�
     _settle(client)
     run = fake_server.runs_of(room)[-1]
     assert run["responsePayload"]["kind"] == "answer"        # 답은 기록으로 남아 앱이 다시 읽는다
-    assert "PR #1 을 머지했어요" in json.dumps(run["responsePayload"], ensure_ascii=False)
+    assert "PR #1 머지가 끝났어요" in json.dumps(run["responsePayload"], ensure_ascii=False)
     assert len(gh.merges) == 1
     assert _plan(fake_server, room)["executionResult"]["sync_result"]["status"] == "healthy"
 

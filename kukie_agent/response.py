@@ -26,7 +26,9 @@ from kukie_agent.gitops.memo import is_memo
 from kukie_agent.glossary import explain_command
 from kukie_agent.kubectl import KubectlResult
 from kukie_agent.skills.base import KukieResponse, ToolStep
+from kukie_agent.tools.gitops import TOOL_NAME as GITOPS_TOOL_NAME
 from kukie_agent.tools.gitops import GitOpsResult
+from kukie_agent.tools.mutate import MUTATING_TOOLS
 from kukie_agent.tools.read import READ_TOOLS
 from kukie_agent.tools.repo import REPO_TOOLS
 from kukie_agent.validators import log_unregistered_flags
@@ -35,6 +37,8 @@ from kukie_agent.validators import log_unregistered_flags
 # 안전 표시는 보수적으로 (DURO-44 결정 · fail-closed): 틀렸을 때 "읽기"로 잘못 표시하면
 # 사용자가 안심하고 넘기지만, "변경"으로 잘못 표시하면 한 번 더 확인할 뿐이다.
 READ_TOOL_NAMES: frozenset[str] = frozenset(tool.__name__ for tool in [*READ_TOOLS, *REPO_TOOLS])
+#: 클러스터나 레포를 바꾸는 툴. 답 양식(출력 툴)의 형식 재시도 같은 것은 "다른 변경의 실패" 가 아니다
+CHANGE_TOOL_NAMES: frozenset[str] = frozenset(MUTATING_TOOLS) | {GITOPS_TOOL_NAME}
 
 # 화면 블록 제목 — 툴 이름을 사람 말로. 미등록 툴은 이름 그대로.
 STEP_LABELS: dict[str, str] = {
@@ -101,22 +105,24 @@ def merged_reply(ctx: RunContext[Deps]) -> str | None:
     """이번 턴의 변경이 'PR 을 머지했고 반영을 기다리는 중' 뿐이면 코드가 쓸 답. 아니면 None — 답은 LLM 몫이다.
 
     답은 한 번 쓰면 그대로 남고 카드만 sync 결과로 바뀐다. 머지 직후의 "아직 4개예요" 는 2분 뒤에 틀린 말로 읽힌다.
-    머지 실패, 거절, kubectl 변경이 머지와 같이 또는 뒤에 있으면 설명할 것이 있으므로 LLM 에게 맡긴다. 머지 앞의 실패는 보지 않는다 —
-    잘못 고른 툴을 ModelRetry 로 돌려보낸 뒤 PR 로 온 정상 흐름이다.
+    머지 실패, 거절, kubectl 변경이 같은 턴에 있으면 설명할 것이 있으므로 LLM 에게 맡긴다. 머지 앞의 ModelRetry 만 보지 않는다 —
+    잘못 고른 툴을 돌려보낸 뒤 PR 로 온 정상 흐름이다.
     """
     numbers: list[Any] = []
     for msg in _current_turn(ctx.messages):
         parts = [part for part in getattr(msg, "parts", ())
-                 if isinstance(part, ToolReturnPart | RetryPromptPart) and part.tool_name not in READ_TOOL_NAMES]
+                 if isinstance(part, ToolReturnPart | RetryPromptPart) and part.tool_name in CHANGE_TOOL_NAMES]
         merged = [part.content for part in parts if _is_waiting_merge(part)]
         if numbers or merged:
             if len(merged) != len(parts):
                 return None
             numbers += [result.pull_request["number"] for result in merged]
+        elif any(isinstance(part, ToolReturnPart) for part in parts):
+            return None
     if not numbers:
         return None
     pulls = ", ".join(f"PR #{number}" for number in numbers)
-    return f"{pulls} 을 머지했어요. 반영 결과는 위 카드에서 볼 수 있어요."
+    return f"{pulls} 머지가 끝났어요. 반영 결과는 위 카드에서 볼 수 있어요."     # GitHub 에서 먼저 머지된 PR 도 맞는 말이어야 한다
 
 
 _cache: dict[type[KukieResponse], Callable[..., KukieResponse]] = {}
