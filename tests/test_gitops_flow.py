@@ -572,8 +572,17 @@ def test_Cluster로_시작해도_네임스페이스가_있는_종류면_그_네�
     manifest = "apiVersion: operators.coreos.com/v1alpha1\nkind: ClusterServiceVersion\nmetadata: {name: caddy}\n"
     card = _card(client, room, _new_args(manifest_yaml=manifest) | {"kind": "ClusterServiceVersion"})
 
-    assert [risk["code"] for risk in card["gitops"]["risk_warnings"]] == ["already_in_cluster"]
+    assert "already_in_cluster" in [risk["code"] for risk in card["gitops"]["risk_warnings"]]
     assert ["get", "ClusterServiceVersion", "caddy", "-o", "json", "-n", "shop"] in cluster.seen
+
+
+def test_이름이_같은_다른_종류의_네임스페이스를_카드_대상으로_쓰지_않는다(client, fake_server, room, gh, cluster):
+    service, deployment = CADDY_YAML.split("---\n")[1], CADDY_YAML.split("---\n")[0]
+    manifest = service.replace("name: caddy\n", "name: caddy\n  namespace: other\n") + "---\n" + deployment
+    card = _card(client, room, _new_args(manifest_yaml=manifest) | {"kind": "deployment"})
+
+    assert card["gitops"]["new_resources"][0]["namespace"] == "other"
+    assert card["target"]["namespace"] == "shop"                # 대표는 Deployment 다
 
 
 def test_앱의_include_exclude는_판단에서_읽어_경고로_올린다(client, fake_server, room, gh, cluster):

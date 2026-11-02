@@ -8,9 +8,10 @@ from kukie_agent.manifests.models import (
     AppSource, Change, Env, ImageTag, NewResource, Other, Ready, Refused, Replicas, Resources, Result, RiskWarning,
     Target,
 )
-from kukie_agent.manifests.new_resource import already_in_cluster, plan_new_resource
+from kukie_agent.manifests.new_resource import already_in_cluster, plan_new_resource, representative
 
 __all__ = [
     "AppSource", "Change", "Env", "ImageTag", "NewResource", "Other", "Ready", "Refused", "Replicas", "Resources",
-    "Result", "RiskWarning", "Target", "already_in_cluster", "plan_change", "plan_new_resource", "verify_change",
+    "Result", "RiskWarning", "Target", "already_in_cluster", "plan_change", "plan_new_resource", "representative",
+    "verify_change",
 ]

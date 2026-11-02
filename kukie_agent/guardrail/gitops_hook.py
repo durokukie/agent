@@ -38,7 +38,7 @@ from kukie_agent.guardrail.decision_guidance import generate_decision_guidance
 from kukie_agent.guardrail.hook import hooks
 from kukie_agent.guardrail.mutation_request import canonicalize_mutation_args
 from kukie_agent.kubectl import thread_limiter
-from kukie_agent.manifests import Change, NewResource, Replicas, already_in_cluster
+from kukie_agent.manifests import Change, NewResource, Replicas, already_in_cluster, representative
 from kukie_agent.tools.gitops import RISK, TOOL_NAME, GitOpsResult
 
 logger = logging.getLogger(__name__)
@@ -180,8 +180,8 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
             live = []
         draft.add_risks([already_in_cluster(resource) for resource in live])
         # 카드의 대상은 요청한 네임스페이스가 아니라 실제로 만들어질 곳이다 — 승인 때는 이 칸만 Plan 의 것을 쓴다 (_execute)
-        made = next((r for r in draft.new_resources if r["name"] == name), draft.new_resources[0])
-        target = {**target, "namespace": made["namespace"] or namespace}
+        made = representative(draft.new_resources, kind, name)
+        target = {**target, "namespace": (made or {}).get("namespace") or found.target.namespace or namespace}
 
     application = pull_requests.application_summary(found)
     command = command_of(found.repository)

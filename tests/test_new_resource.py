@@ -14,7 +14,7 @@ import pytest
 import yaml
 
 from kukie_agent.manifests import (
-    AppSource, NewResource, Ready, Refused, Target, plan_new_resource,
+    AppSource, NewResource, Ready, Refused, Target, plan_new_resource, representative,
 )
 from kukie_agent.manifests.compare import index
 from kukie_agent.manifests.new_resource import _compare
@@ -483,7 +483,26 @@ def test_Cluster로_시작해도_네임스페이스가_있는_종류는_그_네�
     result = plan(repo, manifest, target=CADDY.model_copy(update={"kind": "ClusterServiceVersion"}))
 
     assert ready(result).new_resources[0]["namespace"] == "other"
-    assert [risk.code for risk in ready(result).risk_warnings] == ["other_namespace"]
+    assert [risk.code for risk in ready(result).risk_warnings] == ["cluster_scoped", "other_namespace"]
+
+
+def test_목록에_없는_Cluster_종류도_경고하되_namespace_칸은_짐작으로_비우지_않는다(repo):
+    manifest = "apiVersion: kyverno.io/v1\nkind: ClusterPolicy\nmetadata: {name: caddy}\n"
+    result = plan(repo, manifest, target=CADDY.model_copy(update={"kind": "ClusterPolicy"}))
+
+    assert risk_of(result, "cluster_scoped")["location"]["value"] == "ClusterPolicy"
+    assert ready(result).new_resources[0]["namespace"] == "shop"
+
+
+def test_대표_리소스는_종류까지_맞춰_찾고_없으면_다른_리소스를_고르지_않는다():
+    service = {"kind": "Service", "name": "caddy", "namespace": "other"}
+    deployment = {"kind": "Deployment", "name": "caddy", "namespace": "shop"}
+    worker = {"kind": "Deployment", "name": "x-caddy-worker", "namespace": "other"}
+    short = {"kind": "Deployment", "name": "x-caddy", "namespace": "shop"}
+
+    assert representative([service, deployment], "deployment", "caddy") == deployment    # 모델이 쓴 소문자도 맞춘다
+    assert representative([service, worker, short], "Deployment", "caddy") == short      # namePrefix
+    assert representative([service, worker], "Deployment", "web") is None
 
 
 def test_앱과_다른_네임스페이스는_경고한다(repo):

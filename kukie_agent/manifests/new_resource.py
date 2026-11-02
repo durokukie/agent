@@ -345,6 +345,14 @@ def _risk(code: str, file: str, resource: str, field: str | None, value: str | N
                        risk=risk, suggestion=suggestion, text=f"{where}: {risk} {suggestion}")
 
 
+def representative(resources: list[dict[str, str]], kind: str, name: str) -> dict[str, str] | None:
+    """요청이 대표로 적은 리소스의 렌더 결과. 종류까지 맞춘다 — Deployment·Service 는 이름이 같은 경우가 흔하다.
+    이름은 _pick 처럼 본다 — namePrefix·nameSuffix 가 붙으면 그 이름을 품은 것 중 가장 짧은 것."""
+    same = [r for r in resources if _same_kind(r["kind"], kind)]
+    return (next((r for r in same if r["name"] == name), None)
+            or min((r for r in same if name in r["name"]), key=lambda r: len(r["name"]), default=None))
+
+
 def already_in_cluster(resource: dict[str, str]) -> RiskWarning:
     """git 에는 없지만 클러스터에 이미 있는 리소스 — 렌더 비교로는 안 보인다. 조회는 gitops/route.py 가 한다."""
     namespace = f"{resource['namespace']}/" if resource["namespace"] else ""
@@ -369,11 +377,12 @@ def _risks(obj: dict, key: Key, file: str, destination: str | None) -> list[Risk
     resource = compare.label(key)
     kind, namespace = key[1], key[2]
     found: list[RiskWarning] = []
-    if kind in _CLUSTER_SCOPED:
+    # 경고는 틀려도 막지 않으니 이름 짐작도 쓴다 (ClusterPolicy·ClusterTask …). namespace 칸은 아는 종류만 비운다 (plan_new_resource)
+    if kind in _CLUSTER_SCOPED or kind.startswith("Cluster"):
         found.append(_risk("cluster_scoped", file, resource, "kind", kind,
                            "클러스터 전체에 영향을 줘요. 이 앱 밖의 리소스와 권한까지 바뀔 수 있어요.",
                            "꼭 클러스터 전체에 필요한지 확인하세요. 한 네임스페이스면 충분하면 Role·RoleBinding 같은 네임스페이스 범위로 바꾸세요."))
-    elif namespace and destination and namespace != destination:
+    if namespace and destination and namespace != destination:
         found.append(_risk("other_namespace", file, resource, "metadata.namespace", namespace,
                            f"이 앱의 네임스페이스({destination})가 아닌 곳에 만들어져요. 다른 팀의 공간일 수 있고, ArgoCD 프로젝트가 막으면 sync 가 실패해요.",
                            f"metadata.namespace 를 지우거나 {destination} 로 바꾸세요. 그 네임스페이스가 맞다면 그곳을 보는 앱을 고르는 것도 방법이에요."))
