@@ -1,7 +1,7 @@
 """대화(채팅방) 단위 실행 엔드포인트 — kukie-electron docs/api-spec.md 1절.
 
   POST /conversations/{id}/chat          한 턴. request_id 로 멱등
-  POST /conversations/{id}/approve       승인 카드 결정. PR 머지 카드는 오래 걸리면 202 accepted 로 먼저 답한다 (_run_locked)
+  POST /conversations/{id}/approve       승인 카드 결정. PR 머지 카드는 오래 걸리면 202 accepted 로 먼저 답한다 (_finish_locked)
   POST /conversations/{id}/resume        재개 실패 뒤 다시 시도
 
 채팅방 만들기·목록·조회는 Kukie API 서버(kukie-server)의 공개 API 다 (DURO-113). agent 는 DB 를 갖지 않고,
@@ -46,6 +46,7 @@ from kukie_agent.auth import User, current_user
 from kukie_agent.clusters import access
 from kukie_agent.conversations import Conversation, registry
 from kukie_agent.gitops import memo as repo_link_memo
+from kukie_agent.guardrail import gitops_after_merge
 from kukie_agent.tools.gitops import TOOL_NAME as GITOPS_TOOL
 
 logger = logging.getLogger(__name__)
@@ -413,6 +414,8 @@ async def approve(
     run = _open_run(context)
     # 재개가 돌면 _to_payload 가 티켓을 지우므로, 저장 실패 안내에 실을 Plan id(승인한 카드만)는 여기서 미리 뽑는다
     plan_ids = _approved_plan_ids(session, body.call_id if body.approved else None)
+    # 지금 결정하는 카드로 본다 — 같은 턴의 다른 카드가 PR 이어도 kubectl 승인·PR 거절은 예전처럼 끝난 뒤 답한다
+    detach = body.approved and _only_merge_cards(session, {body.call_id})
     await conversation.lock.acquire()
 
     async def work() -> dict[str, Any]:
@@ -426,7 +429,7 @@ async def approve(
             raise await _record_failure(run, _wrap(exc))
         return await _continue_run(conversation, run, outcome, result, plan_ids)
 
-    return await _finish_locked(conversation, work, plan_ids)
+    return await _finish_locked(conversation, work, plan_ids, detach=detach)
 
 
 @router.post("/{conversation_id}/resume")
@@ -445,6 +448,9 @@ async def resume(
         raise _error(409, "PENDING_APPROVAL", f"아직 결정하지 않은 승인 건이 있다: {session.pending_ids}")
     run = _open_run(context)
     plan_ids = _approved_plan_ids(session)
+    # 새 결정이 없다 — 승인해 둔 카드로 본다. kubectl 카드까지 함께 돌면 그 동작을 바꾸지 않게 끝난 뒤 답한다
+    approved = {call_id for call_id, decision in session.decisions.items() if isinstance(decision, ToolApproved)}
+    detach = _only_merge_cards(session, approved)
     await conversation.lock.acquire()
 
     async def work() -> dict[str, Any]:
@@ -457,15 +463,18 @@ async def resume(
             raise await _record_failure(run, _wrap(exc))
         return await _continue_run(conversation, run, outcome, result, plan_ids)
 
-    return await _finish_locked(conversation, work, plan_ids)
+    return await _finish_locked(conversation, work, plan_ids, detach=detach)
 
 
-#: 응답이 먼저 나가고 뒤에서 마저 도는 승인들 — 참조를 쥐어 둔다 (asyncio 는 약한 참조만 든다)
-_detached: set[asyncio.Task[dict[str, Any]]] = set()
+def _only_merge_cards(session: Any, call_ids: set[str]) -> bool:
+    """이 카드들이 있고 전부 PR 머지 카드인가."""
+    if session.pending is None:
+        return False
+    calls = [call for call in session.pending.approvals if call.tool_call_id in call_ids]
+    return bool(calls) and all(call.tool_name == GITOPS_TOOL for call in calls)
 
 
-def _forget_detached(task: asyncio.Task[dict[str, Any]]) -> None:
-    _detached.discard(task)
+def _log_detached(task: asyncio.Task[dict[str, Any]]) -> None:
     if task.cancelled():
         return
     error = task.exception()
@@ -475,9 +484,9 @@ def _forget_detached(task: asyncio.Task[dict[str, Any]]) -> None:
 
 
 async def _finish_locked(
-    conversation: Conversation, work: Callable[[], Awaitable[dict[str, Any]]], plan_ids: list[str],
+    conversation: Conversation, work: Callable[[], Awaitable[dict[str, Any]]], plan_ids: list[str], *, detach: bool,
 ) -> dict[str, Any] | JSONResponse:
-    """이미 쥔 방 잠금 안에서 승인·재개를 돌리고 잠금을 푼다. PR 머지 카드면 요청과 떼어 돌려 APPROVE_WAIT 를 넘으면 먼저 답한다 (DURO-158).
+    """이미 쥔 방 잠금 안에서 승인·재개를 돌리고 잠금을 푼다. detach(PR 머지 승인)면 요청과 떼어 돌려 APPROVE_WAIT 를 넘으면 먼저 답한다 (DURO-158).
 
     머지 자체보다 그 앞뒤가 길 수 있다 — 길 다시 판단·GitHub 다시 보기·모델의 답(툴을 더 부르면 끝이 없다). 답을 앞단이 끊으면 앱은
     실패로 읽으므로 먼저 202 accepted 로 답한다. 일은 멈추지 않고 run·Plan 에 그대로 남고, 잠금도 끝날 때까지 쥔다(재클릭은 BUSY).
@@ -491,12 +500,11 @@ async def _finish_locked(
         finally:
             conversation.lock.release()
 
-    pending = session.pending
-    if pending is None or not any(call.tool_name == GITOPS_TOOL for call in pending.approvals):
+    if not detach:
         return await owned()
     task = asyncio.create_task(owned())
-    _detached.add(task)
-    task.add_done_callback(_forget_detached)
+    gitops_after_merge.keep_approval(task)      # 끌 때 server 연결을 닫기 전에 정리한다
+    task.add_done_callback(_log_detached)
     await asyncio.wait({task}, timeout=APPROVE_WAIT)
     if task.done():
         return task.result()

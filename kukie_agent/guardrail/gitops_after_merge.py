@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from contextlib import nullcontext
 from functools import partial
 from typing import Any
@@ -34,16 +35,20 @@ from kukie_agent.tools.gitops import TOOL_NAME
 
 logger = logging.getLogger(__name__)
 
-#: 지켜보기 동시 상한 — 대부분 잠들어 있지만 조회마다 kubectl 을 띄운다
-WATCH_WORKERS = 8
+#: 지켜보기 동시 상한 — 대부분 잠들어 있지만 조회마다 kubectl 을 띄운다. 하나가 SYNC_WAIT(10분)까지 자리를 쥘 수 있어 넉넉히 둔다
+WATCH_WORKERS = 32
 #: sync 결과를 남기는 재시도 사이 시간(초)
 SAVE_RETRY_SECONDS = (1, 5, 15, 30, 60)
 #: 재시작 복구의 재시도 사이 시간(초) — server 가 같이 재시작하는 중일 수 있다
 RECOVERY_RETRY_SECONDS = (5, 15, 30, 60, 120, 300)
-#: 끌 때 지켜보기가 끝나기를 기다리는 시간(초). 넘으면 놔둔다 — 다음 기동의 복구가 닫는다. 컨테이너 종료 유예(기본 10초)보다 짧아야 한다
-STOP_WAIT_SECONDS = 8.0
+#: 끌 때 떼어 돌던 승인·지켜보기가 끝나기를 기다리는 시간(초). 넘으면 취소한다 — 다음 기동의 복구가 닫는다.
+#: 취소를 기다리는 시간과 합쳐 컨테이너 종료 유예(기본 10초)보다 짧아야 한다
+STOP_WAIT_SECONDS = 7.0
+#: 취소한 작업이 내려가기를 기다리는 시간(초). 도는 kubectl 은 취소되지 않아 끝까지 기다리지 않는다
+CANCEL_WAIT_SECONDS = 1.0
 
 _tasks: set[asyncio.Task[None]] = set()
+_approvals: set[asyncio.Task[Any]] = set()
 _stopping = threading.Event()
 _recovering = False
 _claimed: set[str] = set()
@@ -62,6 +67,12 @@ def _sleep(seconds: float) -> None:
 def _keep(task: asyncio.Task[None]) -> None:
     _tasks.add(task)                    # asyncio 는 약한 참조만 든다
     task.add_done_callback(_tasks.discard)
+
+
+def keep_approval(task: asyncio.Task[Any]) -> None:
+    """응답이 먼저 나가고 뒤에서 마저 도는 승인을 맡아 둔다 — 끌 때 server 연결을 닫기 전에 정리한다 (stop)."""
+    _approvals.add(task)
+    task.add_done_callback(_approvals.discard)
 
 
 def claim(plan_id: str) -> None:
@@ -113,12 +124,25 @@ async def _save(plan: ActionPlan, sync: dict[str, Any]) -> None:
 
 
 async def stop() -> None:
-    """끌 때. 잠든 지켜보기를 깨워 interrupted 로 남긴다. 복구 재시도는 그냥 멈춘다 — 다음 기동이 다시 한다."""
+    """끌 때. 잠든 지켜보기를 깨워 interrupted 로 남긴다. 복구 재시도는 그냥 멈춘다 — 다음 기동이 다시 한다.
+
+    떼어 돌던 승인이 먼저다 — 머지 기록과 답을 남겨야 하고, 끝나면서 지켜보기를 새로 시작할 수 있다. 이 뒤에 server 연결이 닫힌다.
+    시간 안에 못 끝난 승인은 취소한다: run 은 기동 때 interrupt-orphaned 가, Plan 은 복구가 닫는다.
+    """
     _stopping.set()
-    if _tasks:
-        await asyncio.wait(set(_tasks), timeout=STOP_WAIT_SECONDS)
-    for task in set(_tasks):
+    deadline = time.monotonic() + STOP_WAIT_SECONDS
+    await _drain(_approvals, deadline)
+    await _drain(_tasks, deadline)
+
+
+async def _drain(tasks: set[Any], deadline: float) -> None:
+    if tasks:
+        await asyncio.wait(set(tasks), timeout=max(deadline - time.monotonic(), 0))
+    left = set(tasks)
+    for task in left:
         task.cancel()
+    if left:
+        await asyncio.wait(left, timeout=CANCEL_WAIT_SECONDS)
 
 
 def start() -> None:
@@ -135,10 +159,11 @@ def start_recovery() -> None:
 
 async def _recover_with_retries() -> None:
     global _recovering
+    runs: set[str] = set()      # 계획은 닫혔는데 run 을 못 닫은 것도 다음 차례에 이어 닫는다 — 닫힌 계획은 목록에 다시 나오지 않는다
     try:
         for delay in (*RECOVERY_RETRY_SECONDS, None):
             try:
-                await recover(final=delay is None)
+                await recover(final=delay is None, runs=runs)
                 return
             except Exception:
                 logger.exception("앞 프로세스의 PR 계획을 닫지 못했다 — %s초 뒤 다시", delay)
@@ -149,10 +174,12 @@ async def _recover_with_retries() -> None:
         _claimed.clear()
 
 
-async def recover(*, final: bool = True) -> None:
-    """앞 프로세스가 끝내지 못한 PR 길 계획을 닫는다. 하나라도 못 닫으면 나머지를 마친 뒤 던진다 — 닫힌 계획은 다음 번 목록에 없다."""
+async def recover(*, final: bool = True, runs: set[str] | None = None) -> None:
+    """앞 프로세스가 끝내지 못한 PR 길 계획을 닫는다. 하나라도 못 닫으면 나머지를 마친 뒤 던진다 — 닫힌 계획은 다음 번 목록에 없다.
+
+    runs 는 닫아야 할 run 을 담아 다시 시도에 넘기는 칸이다. 닫은 것은 빠지고 못 닫은 것은 남는다."""
     failed: Exception | None = None
-    runs: set[str] = set()
+    runs = set() if runs is None else runs
     for item in await server_api.unsettled_plans(TOOL_NAME):
         plan = ActionPlan.from_response(item.plan)
         if plan.id in _claimed:
@@ -169,13 +196,14 @@ async def recover(*, final: bool = True) -> None:
         logger.warning("앞 프로세스가 끝내지 못한 PR 계획을 닫았다: plan_id=%s status=%s", plan.id, plan.status)
         if item.run_active:
             runs.add(plan.run_id)
-    for run_id in runs:
+    for run_id in set(runs):
         try:
             await server_api.update_run(run_id, status="interrupted")
         except server_api.ServerError as exc:
-            if exc.status_code == 409:      # 방을 먼저 연 요청이 이미 닫았다
+            if exc.status_code != 409:      # 409: 방을 먼저 연 요청이 이미 닫았다
+                failed = exc
                 continue
-            failed = exc
+        runs.discard(run_id)
     if failed is not None:
         raise failed
 

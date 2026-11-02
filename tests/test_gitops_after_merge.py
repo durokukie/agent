@@ -13,13 +13,13 @@ import socket
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import uvicorn
 from pydantic_ai import ModelResponse
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models.function import FunctionModel
-from pydantic_ai.tools import DeferredToolRequests
 
 from helpers import USER, answer_model, new_room, scale_call
 from kukie_agent import conversations_api, server, server_api
@@ -116,7 +116,7 @@ def test_지켜보기는_요청과_따로_자기_임시_kubeconfig로_돈다(cli
 
     assert seen and all(existed for _, existed in seen)      # 요청의 파일은 이미 지워졌어도 지켜보기의 파일은 있다
     assert not seen[0][0].exists()                           # 끝나면 자기 파일도 지운다
-    assert client.portal.call(lambda: conversations_api._detached == set())
+    assert client.portal.call(lambda: gitops_after_merge._approvals == set())
 
 
 # ── 지켜보기의 끝: 실패·시간 초과 ───────────────────────────
@@ -337,22 +337,110 @@ def test_시간_안에_못_끝나면_202로_먼저_답하고_일은_끝까지_�
     assert _plan(fake_server, room)["executionResult"]["sync_result"]["status"] == "healthy"
 
 
-@pytest.mark.asyncio
-async def test_kubectl_카드는_시간이_넘어도_끝날_때까지_답을_기다린다(monkeypatch):
-    monkeypatch.setattr(conversations_api, "APPROVE_WAIT", 0)
+def _with_kubectl_card(client, room):  # noqa: F811
+    """PR 머지 카드(call-1) 옆에 kubectl 카드(call-2)가 같은 턴에 있는 방."""
+    _card(client, room)
+    conversation = conversations_api.registry.get(room)
+    conversation.session.pending.approvals.append(scale_call("call-2"))
+    return conversation
 
-    class Session:
-        pending = DeferredToolRequests(approvals=[scale_call("c")])
 
-    conversation = conversations_api.Conversation(id="r", session=Session())
+async def _finish(detach):
+    conversation = conversations_api.Conversation(id="r", session=SimpleNamespace(skill=SimpleNamespace(name="Shared")))
     await conversation.lock.acquire()
+    finished = asyncio.Event()
 
     async def work():
-        await asyncio.sleep(0.01)
+        await finished.wait()
         return {"kind": "answer"}
 
-    assert await conversations_api._finish_locked(conversation, work, []) == {"kind": "answer"}
-    assert not conversation.lock.locked()
+    asyncio.get_running_loop().call_later(0.02, finished.set)
+    return conversation, await conversations_api._finish_locked(conversation, work, [], detach=detach)
+
+
+@pytest.mark.asyncio
+async def test_떼어_돌리지_않는_결정은_시간이_넘어도_끝날_때까지_답을_기다린다(monkeypatch):
+    monkeypatch.setattr(conversations_api, "APPROVE_WAIT", 0)
+    conversation, reply = await _finish(detach=False)
+    assert reply == {"kind": "answer"} and not conversation.lock.locked()
+
+
+@pytest.mark.parametrize(("call_id", "approved", "status"), [
+    ("call-2", True, 200),      # kubectl 승인 — 옆에 PR 카드가 있어도 끝날 때까지 기다린다
+    ("call-1", False, 200),     # PR 거절
+    ("call-1", True, 202),      # PR 승인만 먼저 답한다
+])
+def test_섞인_턴은_지금_결정하는_카드로_떼어_돌릴지_정한다(client, fake_server, room, gh, cluster, monkeypatch, call_id, approved, status):  # noqa: F811
+    monkeypatch.setattr(conversations_api, "APPROVE_WAIT", 0)
+    _with_kubectl_card(client, room)
+
+    async def slow(session, call_id, approved):
+        await asyncio.sleep(0.05)
+        return {"kind": "approval", "skill": "Shared", "approvals": []}, None
+
+    monkeypatch.setattr(server, "_approve", slow)
+    r = client.post(f"/conversations/{room}/approve", json={"call_id": call_id, "approved": approved}, headers=USER)
+
+    assert r.status_code == status
+    client.portal.call(lambda: asyncio.wait(set(gitops_after_merge._approvals)) if gitops_after_merge._approvals else asyncio.sleep(0))
+    assert gh.merges == []
+
+
+def test_재개는_승인한_카드가_전부_PR일_때만_떼어_돌린다(client, fake_server, room, gh, cluster):  # noqa: F811
+    session = _with_kubectl_card(client, room).session
+    only = conversations_api._only_merge_cards
+    assert only(session, {"call-1"}) is True
+    assert only(session, {"call-1", "call-2"}) is False
+    assert only(session, {"call-2"}) is False
+    assert only(session, set()) is False                     # 전부 거절했으면 머지가 없다
+
+
+def test_PR_카드를_거절하면_시간이_넘어도_202로_답하지_않는다(client, fake_server, room, gh, cluster, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(conversations_api, "APPROVE_WAIT", 0)
+    _card(client, room)
+    with agent.override(model=answer_model()):
+        r = client.post(f"/conversations/{room}/approve", json={"call_id": "call-1", "approved": False}, headers=USER)
+    assert r.status_code == 200 and r.json()["kind"] == "answer"
+    assert gh.merges == []
+
+
+# ── 끌 때 ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_끌_때_떼어_돌던_승인을_마친_뒤에_server_연결을_닫는다(fake_server, monkeypatch):  # noqa: F811
+    order = []
+
+    async def approval():
+        await asyncio.sleep(0.05)
+        order.append("승인 기록")
+
+    async def close():
+        order.append("연결 닫기")
+
+    monkeypatch.setattr(server_api, "close", close)
+    async with server._lifespan(server.app):
+        gitops_after_merge.keep_approval(asyncio.create_task(approval()))
+
+    assert order == ["승인 기록", "연결 닫기"]
+
+
+@pytest.mark.asyncio
+async def test_끌_때_못_끝난_승인은_취소하고_방_잠금을_푼다(monkeypatch):
+    monkeypatch.setattr(gitops_after_merge, "STOP_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(conversations_api, "APPROVE_WAIT", 0)
+    conversation = conversations_api.Conversation(id="r", session=SimpleNamespace(skill=SimpleNamespace(name="Shared")))
+    await conversation.lock.acquire()
+
+    async def stuck():
+        await asyncio.Event().wait()
+
+    reply = await conversations_api._finish_locked(conversation, stuck, [], detach=True)
+    assert reply.status_code == 202 and conversation.lock.locked()
+
+    await gitops_after_merge.stop()
+    gitops_after_merge.start()
+
+    assert not conversation.lock.locked() and not gitops_after_merge._approvals
 
 
 # ── 끊긴 요청 ──────────────────────────────────────────────
@@ -521,6 +609,26 @@ def test_기동하면_뒤에서_복구하고_server가_아직_없으면_다시_�
 
     assert seen == ["propose_git_change"] * 2
     assert gitops_after_merge._recovering is False
+
+
+def test_계획은_닫았는데_run을_못_닫으면_다시_시도에서_이어_닫는다(client, fake_server, room, gh, cluster, monkeypatch):  # noqa: F811
+    _card(client, room)
+    plan = _die_while_executing(fake_server, room)
+    fake_server._result(plan, {"success": True, "stdout": "머지", "stderr": "", "exitCode": 0, "mergeCommit": "m" * 40,
+                               "syncResult": watch.syncing()})
+    real, failures = server_api.update_run, [1]
+
+    async def flaky(run_id, **fields):
+        if failures:
+            failures.pop()
+            raise server_api.ServerError(503, "SERVER_UNAVAILABLE", "잠깐 못 받는다")
+        return await real(run_id, **fields)
+
+    monkeypatch.setattr(server_api, "update_run", flaky)
+    asyncio.run(gitops_after_merge._recover_with_retries())
+
+    assert plan["executionResult"]["sync_result"]["status"] == "interrupted"
+    assert fake_server.runs_of(room)[-1]["status"] == "interrupted"
 
 
 def test_kubectl_계획은_복구가_건드리지_않는다(fake_server):
