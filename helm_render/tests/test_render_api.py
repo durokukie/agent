@@ -175,6 +175,15 @@ def test_missing_dependency_is_named(settings):
     assert post(settings, render_body(archive)).json()["reason"] == "missing_dependency"
 
 
+@pytest.mark.parametrize("field,value", [
+    ("api_versions", ["a"] * 10001),
+    ("value_files", [{"name": "", "content": ""}] * 257),
+])
+def test_huge_lists_are_rejected_while_parsing(settings, field, value):
+    response = post(settings, render_body(make_tgz(chart_files()), **{field: value}))
+    assert response.status_code == 400 and response.json()["reason"] == "invalid_request"
+
+
 def test_oversized_body_is_rejected(settings):
     small = replace(settings, max_body_bytes=1024)
     response = post(small, {"chart_tgz": "x" * 4096})

@@ -25,7 +25,7 @@ from typing import Annotated
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
 from kukie_helm_render.chart import ChartRejected, unpack_chart
 from kukie_helm_render.config import Settings
@@ -38,6 +38,9 @@ _NAMESPACE = r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
 _KUBE_VERSION = r"^v?[0-9]+\.[0-9]+(\.[0-9]+)?([-+][0-9A-Za-z.+-]+)?$"
 _API_VERSION = r"^[A-Za-z0-9][A-Za-z0-9./-]{0,253}$"
 _HELM_VERSION_HEADER = "X-Helm-Version"
+#: 작은 항목 수백만 개로 파싱 중에 메모리를 채우지 못하게 모델에서 먼저 막는다. value_files 의 실제 제한은 설정이 정한다
+_MAX_VALUE_FILE_ITEMS = 256
+_MAX_API_VERSIONS = 10000
 _STATUS = {
     "busy": 429, "invalid_request": 400, "body_too_large": 413, "chart_too_large": 413, "schema_too_large": 413,
     "output_too_large": 422, "timeout": 504, "internal": 500,
@@ -55,11 +58,12 @@ class ValueFile(BaseModel):
 class RenderRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     chart_tgz: str
-    value_files: list[ValueFile] = []
+    value_files: Annotated[list[ValueFile], Field(max_length=_MAX_VALUE_FILE_ITEMS)] = []
     release_name: Annotated[str, StringConstraints(pattern=_RELEASE)]
     namespace: Annotated[str, StringConstraints(pattern=_NAMESPACE)] | None = None
     kube_version: Annotated[str, StringConstraints(pattern=_KUBE_VERSION)]
-    api_versions: list[Annotated[str, StringConstraints(pattern=_API_VERSION)]] = []
+    api_versions: Annotated[list[Annotated[str, StringConstraints(pattern=_API_VERSION)]],
+                            Field(max_length=_MAX_API_VERSIONS)] = []
     skip_crds: bool = False
     skip_schema_validation: bool = False
     skip_tests: bool = False
