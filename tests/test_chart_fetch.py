@@ -110,11 +110,19 @@ def test_big_entry_is_rejected(monkeypatch):
     assert caught.value.reason == "index_too_large"
 
 
-def test_alias_bomb_is_rejected():
-    index = b"entries:\n  demo:\n  - version: 1.0.0\n    a: &a {x: 1}\n    b: [" + b", ".join([b"*a"] * 200) + b"]\n"
+def test_alias_in_entry_is_rejected():
+    """앨리어스 스무 개로 2의 스무 제곱. 값을 글자로 바꾸는 순간 펼쳐진다."""
+    levels = ["    a0: &a0 [1, 2]"] + [f"    a{i}: &a{i} [*a{i - 1}, *a{i - 1}]" for i in range(1, 30)]
+    index = "entries:\n  demo:\n  - version: 1.0.0\n    digest: *a29\n" + "\n".join(levels) + "\n"
     with pytest.raises(FetchFailed) as caught:
-        find_entry(io.BytesIO(index), "demo", "1.0.0")
+        find_entry(io.BytesIO(index.encode()), "demo", "1.0.0")
     assert caught.value.reason == "index_unreadable"
+
+
+def test_single_alias_is_rejected():
+    index = b"entries:\n  demo:\n  - version: 1.0.0\n    a: &a {x: 1}\n    digest: *a\n"
+    with pytest.raises(FetchFailed):
+        find_entry(io.BytesIO(index), "demo", "1.0.0")
 
 
 def test_repeated_decoys_stop_parsing(monkeypatch):

@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import yaml
 
 from kukie_agent.manifests import chart_fetch
 from kukie_agent.manifests.render import resolve_inside
@@ -36,10 +35,6 @@ _TIMEOUT = httpx.Timeout(20.0, connect=2.0)
 _MAX_RESPONSE_BYTES = 21 * 1024 * 1024
 _MAX_CHART_BYTES = 16 * 1024 * 1024
 _MAX_VALUES_BYTES = 4 * 1024 * 1024
-_MAX_ALIASES = 100
-_MAX_OBJECTS = 10000
-#: 앨리어스를 펼쳤을 때의 값 개수. 적은 앨리어스로도 겹겹이 가리키면 걷는 쪽에서 폭발한다
-_MAX_EXPANDED_NODES = 5_000_000
 _CHUNK = 64 * 1024
 _KUBE_VERSION = re.compile(r"^\s*v?([0-9]+(?:\.[0-9]+)*)")
 _GLOB = re.compile(r"[*?\[]")
@@ -336,60 +331,8 @@ def _value_file_root(raw: str, chart_dir: Path, repo_root: Path, refs: dict[str,
     return repo_root, (chart_dir.resolve() / raw).relative_to(repo_root.resolve(), walk_up=True).as_posix()
 
 
-class _RenderedLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
-    """렌더링 결과를 읽는 로더. `- =` 같은 값(kube-prometheus-stack)을 PyYAML 이 태그로 읽어 실패하므로 글자로 받는다."""
-
-
-_RenderedLoader.add_constructor("tag:yaml.org,2002:value", lambda loader, node: node.value)
-
-
-def _check_expansion(root: Any) -> None:
-    """순환을 거절하고, 앨리어스를 펼친 크기를 센다. PyYAML 은 앨리어스를 같은 객체로 돌려주어 읽을 때는 작아도 걷는 쪽에서 터진다."""
-    on_path: set[int] = set()
-    stack: list[tuple[Any, bool]] = [(root, False)]
-    nodes = 0
-    while stack:
-        node, leaving = stack.pop()
-        if leaving:
-            on_path.discard(id(node))
-            continue
-        nodes += 1
-        if nodes > _MAX_EXPANDED_NODES:
-            raise ValueError("렌더링 결과가 앨리어스를 펼치면 너무 커요")
-        if not isinstance(node, (dict, list)):
-            continue
-        if id(node) in on_path:
-            raise ValueError("렌더링 결과에 자기 자신을 가리키는 앨리어스가 있어요")
-        on_path.add(id(node))
-        stack.append((node, True))
-        stack.extend((child, False) for child in (node.values() if isinstance(node, dict) else node))
-
-
-def parse_rendered(manifest: str) -> list[dict[str, Any]]:
-    """렌더링 결과를 객체 목록으로. 앨리어스 수, 펼친 크기, 객체 수를 제한한다 — 이 파드에서 파싱하는 유일한 고객 출력이다.
-
-    제한을 넘거나 못 읽으면 ValueError. 메시지에 값 조각을 싣지 않는다.
-    """
-    if len(manifest) > _MAX_RESPONSE_BYTES:
-        raise ValueError("렌더링 결과가 너무 커요")
-    try:
-        aliases = sum(isinstance(event, yaml.AliasEvent) for event in yaml.parse(manifest, Loader=_RenderedLoader))
-        if aliases > _MAX_ALIASES:
-            raise ValueError("렌더링 결과의 앨리어스가 너무 많아요")
-        objects = []
-        for document in yaml.load_all(manifest, Loader=_RenderedLoader):
-            _check_expansion(document)
-            if isinstance(document, dict) and document.get("apiVersion") and document.get("kind"):
-                objects.append(document)
-                if len(objects) > _MAX_OBJECTS:
-                    raise ValueError("렌더링 결과의 객체가 너무 많아요")
-    except (yaml.YAMLError, RecursionError) as exc:
-        raise ValueError("렌더링 결과를 YAML 로 읽지 못했어요") from exc
-    return objects
-
-
 __all__ = [
     "FetchedChart", "HelmRendered", "RenderConditions", "UnsupportedApplication", "ValueFile",
-    "conditions_from_application", "fetch_chart", "helm_source", "pack_chart", "parse_rendered", "render",
+    "conditions_from_application", "fetch_chart", "helm_source", "pack_chart", "render",
     "value_files_from_application",
 ]

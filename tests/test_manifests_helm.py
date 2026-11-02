@@ -18,7 +18,7 @@ import pytest
 from kukie_agent.manifests import helm
 from kukie_agent.manifests.helm import (
     RenderConditions, UnsupportedApplication, ValueFile, conditions_from_application, fetch_chart, pack_chart,
-    parse_rendered, render, value_files_from_application,
+    render, value_files_from_application,
 )
 
 CONDITIONS = RenderConditions(release_name="rel", namespace="ns", kube_version="1.33.0")
@@ -327,50 +327,3 @@ def test_pack_keeps_links_as_links(tmp_path):
     assert "demo/Chart.yaml" in members
     assert members["demo/templates/x.yaml"].issym()    # 따라가서 내용을 담지 않는다
     assert not any(".git" in name for name in members)
-
-
-def test_parse_rendered_reads_objects():
-    text = "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a}\n---\n# comment only\n---\nnot: an object\n"
-    assert [o["metadata"]["name"] for o in parse_rendered(text)] == ["a"]
-
-
-def test_parse_rendered_handles_equals_scalar():
-    """kube-prometheus-stack 에 있는 값. 보통 PyYAML 은 여기서 실패한다."""
-    text = "apiVersion: v1\nkind: X\nmetadata: {name: a}\nargs:\n- =\n"
-    assert parse_rendered(text)[0]["args"] == ["="]
-
-
-def test_parse_rendered_limits_aliases():
-    bomb = "apiVersion: v1\nkind: X\na: &a [1]\nb: [" + ", ".join(["*a"] * 200) + "]\n"
-    with pytest.raises(ValueError, match="앨리어스"):
-        parse_rendered(bomb)
-
-
-def test_parse_rendered_rejects_circular_alias():
-    with pytest.raises(ValueError, match="자기 자신"):
-        parse_rendered("apiVersion: v1\nkind: X\na: &x {b: *x}\n")
-
-
-def test_parse_rendered_limits_expanded_size(monkeypatch):
-    """앨리어스 스무 개로 2의 스무 제곱. 개수 제한은 통과한다."""
-    monkeypatch.setattr(helm, "_MAX_EXPANDED_NODES", 100000)
-    levels = ["a0: &a0 [1, 2]"] + [f"a{i}: &a{i} [*a{i - 1}, *a{i - 1}]" for i in range(1, 25)]
-    with pytest.raises(ValueError, match="펼치면"):
-        parse_rendered("apiVersion: v1\nkind: X\n" + "\n".join(levels) + "\n")
-
-
-def test_parse_rendered_allows_shared_values():
-    text = "apiVersion: v1\nkind: X\na: &x {b: 1}\nc: *x\nd: *x\n"
-    assert parse_rendered(text)[0]["d"] == {"b": 1}
-
-
-def test_parse_rendered_limits_size(monkeypatch):
-    monkeypatch.setattr(helm, "_MAX_RESPONSE_BYTES", 5)
-    with pytest.raises(ValueError):
-        parse_rendered("apiVersion: v1\n")
-
-
-def test_parse_rendered_error_has_no_values():
-    with pytest.raises(ValueError) as caught:
-        parse_rendered("password: hunter2\n  bad: [")
-    assert "hunter2" not in str(caught.value)

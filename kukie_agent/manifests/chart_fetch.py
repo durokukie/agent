@@ -5,7 +5,7 @@
   - 이름을 풀어 나온 주소가 전부 공인 주소일 때만, 검사한 그 주소로 직접 연결한다 (검사 뒤 이름이 바뀌어도 소용없게)
   - 리다이렉트는 주소마다 같은 검사를 다시 하고 횟수를 제한한다
   - 크기와 전체 시간을 넘으면 읽는 도중 끊는다
-  - index.yaml 은 통째로 파싱하지 않는다. 원하는 버전의 한 항목만 꺼내 앨리어스 수를 세고 읽는다 (큰 저장소는 수 MB 이상이다)
+  - index.yaml 은 통째로 파싱하지 않는다. 원하는 버전의 한 항목만 꺼내 읽고 앨리어스는 거절한다 (큰 저장소는 수 MB 이상이다)
 인증이 필요한 저장소와 OCI 는 아직 지원하지 않는다. 블로킹이므로 스레드에서 부른다 (kubectl.thread_limiter).
 """
 from __future__ import annotations
@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 MAX_CHART_BYTES = 16 * 1024 * 1024
 MAX_INDEX_BYTES = 64 * 1024 * 1024
 MAX_ENTRY_BYTES = 1024 * 1024
-MAX_ALIASES = 100
 MAX_REDIRECTS = 3
 #: 버전 글자가 같은 항목을 몇 개까지 읽어 볼지. 나쁜 index 가 파싱을 반복하게 하지 못한다
 MAX_PARSED_ENTRIES = 20
@@ -196,11 +195,10 @@ def chart_entries(index: IO[bytes], chart: str) -> Iterator[bytes]:
 
 
 def parse_entry(item: bytes) -> dict | None:
-    """목록 항목 하나를 읽는다. 앨리어스를 먼저 세어 펼쳐서 메모리를 채우는 YAML 을 막는다."""
+    """목록 항목 하나를 읽는다. 앨리어스는 받지 않는다 — 차트 저장소 목록에는 쓰이지 않고, 값을 글자로 바꾸는 순간 겹겹이 펼쳐져 이 파드의 메모리를 채운다."""
     try:
-        aliases = sum(isinstance(event, yaml.AliasEvent) for event in yaml.parse(item, Loader=_LOADER))
-        if aliases > MAX_ALIASES:
-            raise FetchFailed("index_unreadable", "차트 저장소 목록의 앨리어스가 너무 많아요")
+        if any(isinstance(event, yaml.AliasEvent) for event in yaml.parse(item, Loader=_LOADER)):
+            raise FetchFailed("index_unreadable", "차트 저장소 목록에 앨리어스가 있어요")
         document = yaml.load(item, Loader=_LOADER)
     except (yaml.YAMLError, RecursionError) as exc:
         raise FetchFailed("index_unreadable", "차트 저장소 목록을 읽지 못했어요") from exc
