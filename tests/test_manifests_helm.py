@@ -111,6 +111,12 @@ def _closed_port() -> int:
         return sock.getsockname()[1]
 
 
+@pytest.mark.parametrize("url", ["http://helm-render:not-a-port", "http://[bad", "not a url"])
+def test_bad_service_url_is_a_failure_not_an_exception(monkeypatch, url):
+    monkeypatch.setenv(helm.RENDER_URL_ENV, url)
+    assert not render(b"tgz", [], CONDITIONS).ok
+
+
 def test_real_connection_refused(monkeypatch):
     monkeypatch.setenv(helm.RENDER_URL_ENV, f"http://127.0.0.1:{_closed_port()}")
     assert render(b"tgz", [], CONDITIONS).reason == "unavailable"
@@ -248,6 +254,11 @@ def test_value_files_keep_order_and_inline_goes_last(repo):
 def test_values_object_wins_over_values(repo):
     got = read_values(app(values="a: text\n", valuesObject={"a": "object"}), repo)
     assert json.loads(got[0].content) == {"a": "object"}
+
+
+def test_empty_values_object_still_wins_over_values(repo):
+    got = read_values(app(values="a: text\n", valuesObject={}), repo)
+    assert [f.content for f in got] == ["{}"]
 
 
 def test_ref_source_is_read_from_its_own_repo(repo, tmp_path):

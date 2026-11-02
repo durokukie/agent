@@ -128,8 +128,8 @@ def _post(path: str, payload: dict[str, Any], timeout: httpx.Timeout) -> tuple[i
                 if body is None:
                     return "bad_response"
                 return response.status_code, dict(response.headers), body
-    except httpx.HTTPError as exc:
-        # 파드가 죽는 중이면 연결 거부 · 끊김 · 시간 초과로 온다. 값이 섞이지 않게 종류만 남긴다
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
+        # 파드가 죽는 중이면 연결 거부 · 끊김 · 시간 초과로 온다. 주소 설정이 틀려도 대화를 끊지 않는다. 값이 섞이지 않게 종류만 남긴다
         logger.warning("helm-render 호출 실패: %s", type(exc).__name__)
         return "unavailable"
 
@@ -264,8 +264,8 @@ def conditions_from_application(item: dict[str, Any], *, kube_version: str,
 
 
 def _inline_values(helm: dict[str, Any]) -> str | None:
-    """Argo CD 는 valuesObject 가 있으면 그것을, 없으면 values 를 쓴다."""
-    if helm.get("valuesObject"):
+    """Argo CD 는 valuesObject 가 있으면 비어 있어도 그것을, 없으면 values 를 쓴다."""
+    if helm.get("valuesObject") is not None:
         return json.dumps(helm["valuesObject"])
     values = helm.get("values")
     return values if isinstance(values, str) and values.strip() else None

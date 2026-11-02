@@ -35,6 +35,8 @@ MAX_REDIRECTS = 3
 #: 버전 글자가 같은 항목을 몇 개까지 읽어 볼지. 나쁜 index 가 파싱을 반복하게 하지 못한다
 MAX_PARSED_ENTRIES = 20
 TIMEOUT_SECONDS = 30.0
+#: 응답 없이 기다리는 한 번의 시간. 전체 시간은 읽을 때마다 본다
+_SOCKET_TIMEOUT_SECONDS = 10.0
 
 _CHUNK = 64 * 1024
 _REDIRECTS = {301, 302, 303, 307, 308}
@@ -119,7 +121,7 @@ def download(url: str, sink: IO[bytes], *, limit: int, deadline: float, opener: 
             raise FetchFailed("fetch_timeout", "차트를 받는 시간이 제한을 넘었어요")
         address = public_address(urlsplit(url).hostname)
         try:
-            status, headers, body = opener(url, address, left)
+            status, headers, body = opener(url, address, min(left, _SOCKET_TIMEOUT_SECONDS))
             with body:
                 if status in _REDIRECTS and headers.get("location"):
                     url = urljoin(url, headers["location"])
@@ -127,7 +129,8 @@ def download(url: str, sink: IO[bytes], *, limit: int, deadline: float, opener: 
                 if status != 200:
                     raise FetchFailed("fetch_failed", f"차트 저장소가 {status} 로 답했어요")
                 received = 0
-                while chunk := body.read(_CHUNK):
+                # read1: 한 번 받은 만큼만 돌려준다. read 는 64KiB 가 찰 때까지 기다려, 조금씩 보내는 서버가 전체 시간 검사를 비켜 간다
+                while chunk := body.read1(_CHUNK):
                     received += len(chunk)
                     if received > limit:
                         raise FetchFailed("fetch_too_large", "받는 파일이 크기 제한을 넘었어요")
@@ -199,8 +202,9 @@ def parse_entry(item: bytes) -> dict | None:
 
 
 def find_entry(index: IO[bytes], chart: str, version: str) -> dict | None:
-    """버전이 정확히 같은 항목. 글자로 먼저 거르고, 맞는 것만 파싱한다."""
-    wanted = re.compile(rb"""^\s*(?:-\s+)?version:\s*["']?""" + re.escape(version.encode()) + rb"""["']?\s*$""", re.M)
+    """버전이 같은 항목. 앞의 v 는 helm 처럼 없는 셈 친다(`1.21.3` 은 `v1.21.3`). 글자로 먼저 거르고, 맞는 것만 파싱한다."""
+    bare = version.removeprefix("v")
+    wanted = re.compile(rb"""^\s*(?:-\s+)?version:\s*["']?v?""" + re.escape(bare.encode()) + rb"""["']?\s*$""", re.M)
     parsed = 0
     for item in chart_entries(index, chart):
         if not wanted.search(item):
@@ -209,13 +213,13 @@ def find_entry(index: IO[bytes], chart: str, version: str) -> dict | None:
         if parsed > MAX_PARSED_ENTRIES:
             raise FetchFailed("index_unreadable", "차트 저장소 목록을 읽지 못했어요")
         entry = parse_entry(item)
-        if entry is not None and str(entry.get("version")) == version:
+        if entry is not None and str(entry.get("version")).removeprefix("v") == bare:
             return entry
     return None
 
 
 def fetch_chart(repo_url: str, chart: str, version: str, *, opener: Opener = _open) -> bytes:
-    """저장소에서 그 차트 그 버전의 tgz 를 받아 돌려준다. 버전은 정확히 같은 것만 찾는다. 실패는 FetchFailed."""
+    """저장소에서 그 차트 그 버전의 tgz 를 받아 돌려준다. 범위(`1.x`)는 찾지 않는다. 실패는 FetchFailed."""
     if not CHART_NAME.match(chart) or not CHART_VERSION.match(version) or len(repo_url) > 2048:
         raise FetchFailed("url_rejected", "차트 이름이나 버전 형식이 맞지 않아요")
     deadline = time.monotonic() + TIMEOUT_SECONDS

@@ -93,6 +93,12 @@ def test_missing_chart_or_version():
     assert find_entry(io.BytesIO(INDEX), "demo", "9.9.9") is None
 
 
+def test_leading_v_is_ignored_like_helm():
+    index = b"entries:\n  demo:\n  - version: v1.2.3\n    urls: [a.tgz]\n  - version: 1.2.4\n    urls: [b.tgz]\n"
+    assert find_entry(io.BytesIO(index), "demo", "1.2.3")["urls"] == ["a.tgz"]
+    assert find_entry(io.BytesIO(index), "demo", "v1.2.4")["urls"] == ["b.tgz"]
+
+
 def test_version_is_matched_literally():
     assert find_entry(io.BytesIO(INDEX), "demo", "1.0.0".replace(".", "x")) is None
 
@@ -174,6 +180,20 @@ def test_oversized_download_stops_while_reading(public_dns, monkeypatch):
     with pytest.raises(FetchFailed) as caught:
         fetch_chart("https://charts.example.com/repo", "demo", "1.0.0", opener=web_with_chart(b"x" * 1000))
     assert caught.value.reason == "fetch_too_large"
+
+
+def test_trickling_server_hits_the_total_deadline(public_dns, monkeypatch):
+    """응답이 조금씩 계속 와도 전체 시간에서 끊는다."""
+    class Trickle(io.BytesIO):
+        def read1(self, size=-1):
+            clock["now"] += 11
+            return b"x"
+    clock = {"now": 0.0}
+    monkeypatch.setattr(chart_fetch.time, "monotonic", lambda: clock["now"])
+    web = lambda url, address, timeout: (200, {}, Trickle())
+    with pytest.raises(FetchFailed) as caught:
+        fetch_chart("https://charts.example.com", "demo", "1.0.0", opener=web)
+    assert caught.value.reason == "fetch_timeout"
 
 
 def test_redirect_to_internal_address_is_blocked(monkeypatch):
