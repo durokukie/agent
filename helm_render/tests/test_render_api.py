@@ -230,11 +230,11 @@ def test_logs_never_hold_values_or_output(settings, caplog):
     assert secret not in caplog.text                    # 로그에는 없다
 
 
-def test_fetch_rejects_internal_urls_at_the_api(settings):
+def test_there_is_no_way_to_fetch_a_chart(settings):
+    """이 파드는 나가는 길이 막혀 있다. 내려받기는 에이전트 일이다."""
     async def scenario(client):
-        return await client.post("/fetch", json={"repo_url": "http://169.254.169.254/", "chart": "x", "version": "1.0.0"})
-    response = run(settings, scenario)
-    assert response.status_code == 400 and response.json()["reason"] == "url_rejected"
+        return await client.post("/fetch", json={"repo_url": "https://example.com", "chart": "x", "version": "1.0.0"})
+    assert run(settings, scenario).status_code == 404
 
 
 def test_chart_with_vendored_subchart_renders(settings):

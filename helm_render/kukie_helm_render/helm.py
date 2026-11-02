@@ -15,7 +15,7 @@ from pathlib import Path
 
 from kukie_helm_render.config import Settings
 
-#: 아무도 듣지 않는 주소. Go 의 http 가 이쪽으로 가서 바깥에 닿지 못한다 — 스키마 검사(chart.py)의 다음 겹이다
+#: 아무도 듣지 않는 주소. Go 의 http 가 이쪽으로 간다 — 스키마 검사(chart.py)의 다음 겹이고, 그 뒤에 NetworkPolicy 가 있다
 OFFLINE_PROXY = "http://127.0.0.1:9"
 _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 _MEMORY_CHECK_SECONDS = 0.05

@@ -36,14 +36,6 @@ class Settings:
     max_value_files: int = 32
     max_values_bytes: int = 4 * MIB
 
-    # 차트 내려받기
-    max_concurrent_fetches: int = 2
-    fetch_timeout_seconds: float = 30.0
-    max_index_bytes: int = 64 * MIB
-    max_index_block_bytes: int = 8 * MIB
-    max_index_aliases: int = 100
-    max_redirects: int = 3
-
     @classmethod
     def from_env(cls) -> Settings:
         values = {}

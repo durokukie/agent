@@ -6,7 +6,6 @@ requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.30",
-    "pyyaml>=6.0",      # 차트 저장소 index.yaml 에서 고른 차트 한 덩어리를 읽는다 (fetch.py). helm 출력은 파싱하지 않는다
 ]
 
 [dependency-groups]

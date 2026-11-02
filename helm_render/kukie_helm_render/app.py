@@ -1,8 +1,9 @@
 """렌더링 API. 저장하는 것은 없다 — 요청마다 임시 폴더를 만들고 끝나면 지운다.
 
   POST /render  차트(tgz) + values + 렌더링 조건 → YAML (성공) 또는 {reason, message} (실패)
-  POST /fetch   저장소 주소 + 차트 + 버전 → tgz. 렌더링과 분리되어 있다
   GET  /health
+
+차트를 내려받지 않는다. 이 파드는 나가는 길이 전부 막혀 있고(NetworkPolicy), 차트는 에이전트가 받아 넘긴다.
 
 바쁘면 기다리지 않고 바로 429 로 답한다. 요청 본문을 읽기 전에 자리를 먼저 잡아, 넘치는 요청이 메모리를 쓰지 않게 한다.
 """
@@ -26,7 +27,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
 
-from kukie_helm_render import fetch as fetching
 from kukie_helm_render.chart import ChartRejected, unpack_chart
 from kukie_helm_render.config import Settings
 from kukie_helm_render.helm import Conditions, helm_env, helm_version, run_template, template_args
@@ -37,13 +37,10 @@ _RELEASE = r"^[a-z0-9]([-a-z0-9.]{0,51}[a-z0-9])?$"
 _NAMESPACE = r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
 _KUBE_VERSION = r"^v?[0-9]+\.[0-9]+(\.[0-9]+)?([-+][0-9A-Za-z.+-]+)?$"
 _API_VERSION = r"^[A-Za-z0-9][A-Za-z0-9./-]{0,253}$"
-_FETCH_BODY_LIMIT = 64 * 1024
 _HELM_VERSION_HEADER = "X-Helm-Version"
 _STATUS = {
     "busy": 429, "invalid_request": 400, "body_too_large": 413, "chart_too_large": 413, "schema_too_large": 413,
-    "output_too_large": 422, "timeout": 504, "fetch_timeout": 504, "address_blocked": 403, "url_rejected": 400,
-    "fetch_failed": 502, "fetch_too_large": 502, "index_too_large": 502, "index_unreadable": 502,
-    "digest_mismatch": 502, "internal": 500,
+    "output_too_large": 422, "timeout": 504, "internal": 500,
 }
 
 
@@ -66,13 +63,6 @@ class RenderRequest(BaseModel):
     skip_crds: bool = False
     skip_schema_validation: bool = False
     skip_tests: bool = False
-
-
-class FetchRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    repo_url: Annotated[str, StringConstraints(max_length=2048)]
-    chart: Annotated[str, StringConstraints(pattern=fetching.CHART_NAME.pattern)]
-    version: Annotated[str, StringConstraints(pattern=fetching.CHART_VERSION.pattern)]
 
 
 class _Slots:
@@ -159,7 +149,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # helm 에는 PATH 를 주지 않는다 (helm_env) — 여기서 절대 경로로 정해 둔다
     settings = replace(settings, helm_bin=shutil.which(settings.helm_bin) or settings.helm_bin)
     render_slots = _Slots(settings.max_concurrent)
-    fetch_slots = _Slots(settings.max_concurrent_fetches)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -219,35 +208,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return _failure("internal", "렌더링 서비스 내부 오류예요")
         finally:
             render_slots.give_back()
-
-    async def _fetch(request: Request) -> Response:
-        try:
-            body = await _read_body(request, _FETCH_BODY_LIMIT)
-            wanted = FetchRequest.model_validate_json(body)
-        except _BodyTooLarge:
-            return _failure("body_too_large", "요청이 크기 제한을 넘어요")
-        except ValidationError as exc:
-            return _invalid(exc)
-        try:
-            data = await asyncio.to_thread(fetching.fetch_chart, wanted.repo_url, wanted.chart, wanted.version, settings)
-        except fetching.FetchFailed as exc:
-            logger.info("fetch failed reason=%s", exc.reason)
-            return _failure(exc.reason, exc.message)
-        logger.info("fetch ok bytes=%d", len(data))
-        return Response(data, media_type="application/gzip")
-
-    @app.post("/fetch")
-    async def fetch(request: Request) -> Response:
-        if not fetch_slots.take():
-            return JSONResponse({"reason": "busy", "message": "차트 받기가 바빠요. 잠시 뒤 다시 시도해 주세요"},
-                                status_code=429, headers={"Retry-After": "1"})
-        try:
-            return await _fetch(request)
-        except Exception as exc:
-            logger.error("fetch error type=%s", type(exc).__name__)
-            return _failure("internal", "렌더링 서비스 내부 오류예요")
-        finally:
-            fetch_slots.give_back()
 
     return app
 
