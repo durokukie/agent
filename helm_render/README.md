@@ -29,7 +29,7 @@
 | 동시 렌더링 | 2개 | 기다리지 않고 429 `busy` |
 | 시간 | 5초 | 프로세스 종료, 504 `timeout` |
 | 출력 | 20MB | 읽는 도중 종료, 422 `output_too_large` |
-| helm 한 프로세스 메모리 | 220MiB | 종료, 422 `memory_exceeded` |
+| helm 한 프로세스 메모리 | 200MiB | 종료, 422 `memory_exceeded` |
 | 파드 메모리 | 512Mi (kukie-manifest) | 파드 재시작. 호출한 쪽에는 연결 실패로 보인다 |
 | 차트 압축 파일 / 푼 합계 / 파일 수 | 16MiB / 64MiB / 5000개 | 413 또는 422 |
 

@@ -21,8 +21,8 @@ class Settings:
     max_concurrent: int = 2
     timeout_seconds: float = 5.0
     max_output_bytes: int = 20 * MIB
-    #: helm 한 프로세스의 메모리. 넘으면 그 프로세스만 끝낸다. 파드 제한(512Mi)이 2개 + 파이썬을 담을 수 있게 잡았다
-    max_rss_bytes: int = 220 * MIB
+    #: helm 한 프로세스의 메모리. 넘으면 그 프로세스만 끝낸다. 실측 최대 137MB. 2개(400MiB) + 파이썬(측정 50~72MiB)이 파드 제한 512Mi 안에 든다
+    max_rss_bytes: int = 200 * MIB
     max_failure_text: int = 2000
 
     # 요청과 차트
