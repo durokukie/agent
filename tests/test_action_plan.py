@@ -838,3 +838,24 @@ def test_파일_계획도_PR을_싣고_STALE로_닫힌다(plan_dir):
             await loaded.mark_stale()
 
     sync(go())
+
+
+def test_머지를_먼저_남긴_계획에_sync_결과를_얹는다(monkeypatch, tmp_path):
+    plan = _create_plan(monkeypatch, tmp_path)
+    sync(plan.record_dry_run("succeeded", "", ""))
+    sync(plan.offer("가이드"))
+    sync(plan.approve_for_execution(tool=plan.tool, args=plan.args, command=plan.command, risk=plan.risk_level,
+                                    target=plan.target, user_id="u-1"))
+    sync(plan.mark_executing())
+    syncing, healthy = {"status": "syncing"}, {"status": "healthy", "message": "정상"}
+    sync(plan.record_execution(success=True, stdout="머지", stderr="", exit_code=0, merge_commit="m1", sync_result=syncing))
+
+    sync(plan.record_sync(healthy))
+    sync(plan.record_sync(healthy))                     # 같은 값은 그대로 성공한다
+
+    saved = ActionPlan.load(plan.path)
+    assert saved.status == "APPLIED"
+    assert saved.execution_result["merge_commit"] == "m1" and saved.execution_result["stdout"] == "머지"
+    assert saved.execution_result["sync_result"] == healthy
+    with pytest.raises(ValueError):
+        sync(plan.record_sync({"status": "interrupted"}))   # 끝난 결과는 덮지 않는다

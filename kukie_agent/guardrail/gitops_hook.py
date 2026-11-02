@@ -4,7 +4,7 @@ kubectl 변경 4종의 훅(guardrail/hook.py)과 같은 틀이다: Plan 은 serv
 기록된 뒤에야 다음으로 넘어간다. 다른 점은 셋이다.
 
   - **PR 은 승인 전에 연다** (결정 2026-10-30). dry-run 자리에 렌더 비교가, 승인 카드에 PR 링크·git diff·렌더 diff 가 온다
-  - **승인 = 머지** 다. 클러스터는 ArgoCD 가 sync 한 뒤에 바뀐다 — 승인 뒤 sync·health 를 지켜보고 결과를 Plan 에 싣는다
+  - **승인 = 머지** 다. 클러스터는 ArgoCD 가 sync 한 뒤에 바뀐다 — 머지를 먼저 Plan 에 남기고, sync·health 는 요청과 떼어 뒤에서 지켜본다
   - **승인 순간 길을 다시 판단한다.** 레포 연결이 끊겼거나 Application·PR 이 바뀌었으면 실행하지 않고 STALE 로 닫는다
 
 승인 전 흐름
@@ -13,7 +13,7 @@ kubectl 변경 4종의 훅(guardrail/hook.py)과 같은 틀이다: Plan 은 serv
 승인 뒤 흐름
     길 다시 판단 + PR 다시 보기(달라졌으면 STALE·PR 닫기) → decision·start → 머지
     → 브랜치 보호로 막히면 PR 을 남기고 FAILED("GitHub 에서 리뷰·머지가 필요해요")
-    → sync·health 지켜보기 → result(머지 커밋·sync 결과). 실패면 revert 제안을 툴 결과에 싣는다
+    → result(머지 커밋, sync 는 지켜보는 중) → 응답. 뒤에서 sync·health 를 지켜봐 Plan 에 얹는다 (gitops_after_merge.py, DURO-158)
 거절은 server.py 의 _approve 가 기록하고 close_rejected 로 PR 을 닫는다 (거절된 호출에는 훅이 돌지 않는다).
 
 새 리소스(change.what == new_resource, DURO-154)도 같은 흐름이다. 다른 곳은 셋이다: 길은 요청이 고른 앱으로 정하고,
@@ -21,6 +21,7 @@ kubectl 변경 4종의 훅(guardrail/hook.py)과 같은 틀이다: Plan 은 serv
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import uuid
@@ -33,6 +34,7 @@ from pydantic_ai import ApprovalRequired, ModelRetry, ToolFailed
 
 from kukie_agent.gitops import pull_requests, route as routing, watch
 from kukie_agent.gitops.github import GitHubError
+from kukie_agent.guardrail import gitops_after_merge
 from kukie_agent.guardrail.action_plan import ActionPlan, PlanTarget
 from kukie_agent.guardrail.decision_guidance import generate_decision_guidance
 from kukie_agent.guardrail.hook import hooks
@@ -44,8 +46,9 @@ from kukie_agent.tools.gitops import RISK, TOOL_NAME, GitOpsResult
 logger = logging.getLogger(__name__)
 
 _CHANGE = TypeAdapter(Change)
-#: 머지 뒤 지켜보기(watch, 최대 watch.SYNC_WAIT 초) 동시 상한
-WATCH_WORKERS = 8
+#: 머지를 Plan 에 남기는 시도 수·사이 시간(초) — 이걸 잃으면 머지됐는데 계획이 UNKNOWN 으로 닫힌다
+RECORD_ATTEMPTS = 3
+RECORD_RETRY_SECONDS = 1.0
 
 #: 승인 카드·Plan 에 싣는 "이 승인이 뜻하는 것" — kubectl 카드와 뜻이 다르다는 것을 분명히 (허브 문서 4절)
 NOTICE = "승인하면 Kukie 가 이 PR 을 머지해요. 클러스터는 ArgoCD 가 sync 한 뒤에 바뀌어요."
@@ -106,7 +109,11 @@ def _result(plan: ActionPlan) -> GitOpsResult:
 
 
 def _follow_up(sync: dict[str, Any] | None, plan: ActionPlan) -> str | None:
-    """sync 가 실패했으면 revert 제안 — 모델이 사용자에게 되돌릴지 묻게 한다. 되돌리기도 새 PR·새 승인이다."""
+    """모델에게 다음 할 일. sync 는 뒤에서 지켜보므로 대개 아직 결과가 없고, 재시도가 끝난 결과를 받으면 실패 때 revert 를 제안한다.
+    되돌리기도 새 PR·새 승인이다."""
+    if sync and sync.get("status") == "syncing":
+        return ("머지는 끝났고 ArgoCD 반영은 뒤에서 지켜보는 중이다. 아직 반영됐다고 말하지 마라. 머지했다는 것과, 결과는 승인 카드와 "
+                "Action Plan 에 표시된다는 것을 알려라. 나중에 결과를 물으면 ArgoCD 앱 상태를 조회해 답하라.")
     if not sync or sync.get("status") not in ("sync_failed", "degraded"):
         return None
     if (plan.args.get("change") or {}).get("what") == "new_resource":
@@ -126,7 +133,7 @@ async def _decide(ctx, kind: str, name: str, namespace: str, change: Change) -> 
 
 @hooks.on.tool_execute(tools=[TOOL_NAME])
 async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
-    """PR 을 승인 전에 열고, 승인되면 머지해 sync 까지 지켜본다. handler(툴 본체)는 부르지 않는다 — tools/gitops.py."""
+    """PR 을 승인 전에 열고, 승인되면 머지한다. sync 는 뒤에서 지켜본다. handler(툴 본체)는 부르지 않는다 — tools/gitops.py."""
     if not call.tool_call_id:
         raise ToolFailed(f"missing tool_call_id for mutation tool: {TOOL_NAME}")
     intent = args["intent"]
@@ -298,6 +305,7 @@ async def _execute(ctx, call, plan_args, target, risk, kind, name, namespace, ch
     assert token is not None and checked is not None
     pull = checked.pull
 
+    gitops_after_merge.claim(plan.id)
     try:
         await plan.approve_for_execution(
             tool=TOOL_NAME, args=plan_args, command=command_of(gitops["repository"]), risk=risk,
@@ -312,8 +320,8 @@ async def _execute(ctx, call, plan_args, target, risk, kind, name, namespace, ch
     display = _display(gitops["repository"], pull.number)
     if checked.merged:
         # 승인한 내용 그대로 GitHub 에서 이미 머지됐다 — 머지는 건너뛰고 sync 만 지켜본다 (agent#126 리뷰)
-        return await _watch_and_record(ctx, plan, gitops, pull, pull_request, token, pull.merge_commit,
-                                       f"PR #{pull.number} 은 GitHub 에서 이미 머지됐어요 ({pull.merge_commit[:12]}).")
+        return await _after_merge(ctx, plan, gitops, pull, pull_request, token, pull.merge_commit,
+                                  f"PR #{pull.number} 은 GitHub 에서 이미 머지됐어요 ({pull.merge_commit[:12]}).")
     if pull.mergeable_state == "blocked":
         return await _record(plan, GitOpsResult(
             command=display, stdout="", success=False, exit_code=1, pull_request=pull_request,
@@ -331,46 +339,61 @@ async def _execute(ctx, call, plan_args, target, risk, kind, name, namespace, ch
             ))
         # 머지 요청이 닿았는지 모른다 — 결과 없이 두면 재시도가 UNKNOWN 으로 남긴다
         raise
-    return await _watch_and_record(ctx, plan, gitops, pull, pull_request, token, merge_commit,
-                                   f"PR #{pull.number} 을 머지했어요 ({merge_commit[:12]}).")
+    return await _after_merge(ctx, plan, gitops, pull, pull_request, token, merge_commit,
+                              f"PR #{pull.number} 을 머지했어요 ({merge_commit[:12]}).")
 
 
-async def _watch_and_record(ctx, plan, gitops, pull, pull_request, token, merge_commit: str,
-                            merged_line: str) -> GitOpsResult:
-    await pull_requests.tidy_after_merge(gitops, token)
-    display = _display(gitops["repository"], pull.number)
+async def _after_merge(ctx, plan, gitops, pull, pull_request, token, merge_commit: str,
+                       merged_line: str) -> GitOpsResult:
+    """머지를 먼저 남기고 답한다. sync·health 는 요청과 떼어 뒤에서 지켜본다 (DURO-158).
+
+    ArgoCD 가 커밋을 가져가는 데만 3분이 걸려 요청에 묶으면 앞단(CloudFront 60초)이 끊는다. 기록은 응답·지켜보기보다 먼저다 —
+    프로세스가 어디서 죽든 머지한 사실이 남고, 재시도(_execute)는 이 기록을 보고 다시 머지하지 않는다.
+    """
     application = gitops.get("application") or {}
-    try:
-        sync = await to_thread.run_sync(partial(
-            watch.watch, application.get("name", ""), application.get("namespace", ""), merge_commit,
-            auto_sync=bool(application.get("auto_sync")), context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig,
-        ), limiter=thread_limiter("gitops_watch", WATCH_WORKERS))
-    except Exception:
-        logger.exception("sync 지켜보기 실패: plan_id=%s", plan.id)
-        sync = {"status": "unreadable", "message": "ArgoCD 앱 상태를 읽지 못했어요.", "sync_status": "Unknown",
-                "health_status": "Unknown", "revision": "", "waited_seconds": 0}
-    stdout = f"{merged_line} {sync['message']}"
-    return await _record(plan, GitOpsResult(
-        command=display, stdout=stdout, stderr="", success=True, exit_code=0, pull_request=pull_request,
+    auto_sync = bool(application.get("auto_sync"))
+    sync = watch.syncing() if auto_sync else watch.manual()
+    result = await _record(plan, GitOpsResult(
+        command=_display(gitops["repository"], pull.number),
+        stdout=merged_line if auto_sync else f"{merged_line} {sync['message']}",
+        stderr="", success=True, exit_code=0, pull_request=pull_request,
         merge_commit=merge_commit, sync_result=sync, note=_follow_up(sync, plan),
-    ))
-
-
-async def _record(plan: ActionPlan, result: GitOpsResult) -> GitOpsResult:
-    """결과를 Plan 에 남긴다. 못 남기면 kubectl 훅처럼 결과에 그 사실을 붙인다 — 같은 승인으로 다시 머지하지 않는다."""
-    try:
-        await plan.record_execution(
-            success=result.success, stdout=result.stdout, stderr=result.stderr, exit_code=result.exit_code,
-            merge_commit=result.merge_commit, sync_result=result.sync_result,
-        )
-    except Exception:
-        logger.exception("failed to record execution result: plan_id=%s", plan.id)
-        stderr = result.stderr.rstrip("\n")
-        stderr = (stderr + "\n\n" if stderr else "") + (
-            "[guardrail] 실행 결과를 Action Plan에 기록하지 못했습니다.\n동일 요청의 재실행은 차단되었습니다."
-        )
-        return result.model_copy(update={"stderr": stderr})
+    ), attempts=RECORD_ATTEMPTS)
+    # 기록을 못 했으면 sync 결과를 얹을 자리가 없다 — 재시도는 UNKNOWN 으로 닫히고 사용자는 PR 을 직접 본다 (_record 의 안내)
+    if auto_sync and plan.execution_result is not None:
+        gitops_after_merge.start_watch(plan, application, merge_commit, context=ctx.deps.context,
+                                       connection=ctx.deps.connection)
+    await pull_requests.tidy_after_merge(gitops, token)
     return result
+
+
+async def _record(plan: ActionPlan, result: GitOpsResult, *, attempts: int = 1) -> GitOpsResult:
+    """결과를 Plan 에 남긴다. 못 남기면 kubectl 훅처럼 결과에 그 사실을 붙인다 — 같은 승인으로 다시 머지하지 않는다."""
+    for left in range(attempts - 1, -1, -1):
+        try:
+            await plan.record_execution(
+                success=result.success, stdout=result.stdout, stderr=result.stderr, exit_code=result.exit_code,
+                merge_commit=result.merge_commit, sync_result=result.sync_result,
+            )
+            return result
+        except Exception as exc:
+            logger.exception("failed to record execution result: plan_id=%s", plan.id)
+            if attempts > 1 and isinstance(exc, ValueError):
+                # 상태 충돌 — 앞 시도가 닿았는데 응답만 잃었을 수 있다. 원본에 결과가 있으면 기록된 것이다
+                try:
+                    await plan.reload()
+                except Exception:
+                    logger.exception("plan 을 다시 읽지 못했다: plan_id=%s", plan.id)
+                if plan.execution_result is not None:
+                    return result
+                break
+            if left:
+                await asyncio.sleep(RECORD_RETRY_SECONDS)
+    stderr = result.stderr.rstrip("\n")
+    stderr = (stderr + "\n\n" if stderr else "") + (
+        "[guardrail] 실행 결과를 Action Plan에 기록하지 못했습니다.\n동일 요청의 재실행은 차단되었습니다."
+    )
+    return result.model_copy(update={"stderr": stderr})
 
 
 async def close_rejected(plan: ActionPlan, cluster_id: str | None) -> None:

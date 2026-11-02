@@ -2,9 +2,10 @@
 
 ArgoCD 는 기본 3분마다 git 을 읽는다(웹훅이 있으면 바로). 그래서 정해진 시간(SYNC_WAIT)만 기다리고, 그 안에 끝나지 않으면
 "아직" 으로 보고한다 — 머지는 이미 됐으니 실패가 아니다. Application 의 refresh 어노테이션은 붙이지 않는다(쓰기 권한·승인 밖의 변경).
+승인 요청과 떼어 뒤에서 돈다 (guardrail/gitops_after_merge.py, DURO-158) — 앱은 Plan 을 다시 읽어 결과를 본다.
 
-결과(sync_result) — Plan 의 executionResult.sync_result 와 승인 뒤 툴 결과에 그대로 싣는다
-    {"status": healthy | sync_failed | degraded | timeout | manual | unreadable,
+결과(sync_result) — Plan 의 executionResult.sync_result 에 싣는다. 머지와 함께 syncing 으로 남기고, 끝나면 나머지 값으로 바꾼다
+    {"status": syncing | healthy | sync_failed | degraded | timeout | manual | unreadable | interrupted,
      "sync_status": "Synced" …, "health_status": "Healthy" …, "revision": 마지막으로 본 sync 커밋,
      "message": 사람이 읽는 한 줄, "waited_seconds": 기다린 시간}
 """
@@ -18,8 +19,9 @@ from typing import Any
 
 from kukie_agent.kubectl import run_kubectl
 
-#: 기다리는 최대 시간(초). 승인 요청 하나가 이만큼 길어진다 — 앱의 요청 시간 제한보다 짧아야 한다
-SYNC_WAIT = float(os.environ.get("KUKIE_GITOPS_SYNC_WAIT") or 180)
+#: 기다리는 최대 시간(초). 요청과 떨어져 돌아 앞단의 시간 제한을 받지 않는다. git 읽기 주기(3분 + 흔들림)에 sync·롤아웃 시간을 더했다 —
+#: 실측에서 머지 뒤 반영까지 3분 37초가 걸렸다 (DURO-156). 앱이 결과를 기다리는 시간(READ_LIMIT)보다 짧아야 한다
+SYNC_WAIT = float(os.environ.get("KUKIE_GITOPS_SYNC_WAIT") or 600)
 POLL = 5.0
 ATTEMPT_TIMEOUT = 10
 
@@ -37,6 +39,26 @@ def _result(status: str, message: str, sync: str, health: str, revision: str, wa
             "message": message, "waited_seconds": round(waited)}
 
 
+def syncing() -> dict[str, Any]:
+    """머지를 기록할 때의 값 — 뒤에서 지켜보는 중이다. 끝나면 watch 의 결과로 바뀐다."""
+    return _result("syncing", "ArgoCD 가 머지한 커밋을 가져가 반영하는지 지켜보는 중이에요.", "Unknown", "Unknown", "", 0)
+
+
+def manual() -> dict[str, Any]:
+    return _result("manual", "자동 sync 가 꺼진 앱이에요. ArgoCD 에서 sync 해야 클러스터에 반영돼요.",
+                   "Unknown", "Unknown", "", 0)
+
+
+def unreadable() -> dict[str, Any]:
+    return _result("unreadable", "ArgoCD 앱 상태를 읽지 못했어요.", "Unknown", "Unknown", "", 0)
+
+
+def interrupted() -> dict[str, Any]:
+    """지켜보던 에이전트가 멈췄다. 다시 뜬 프로세스에는 사용자 토큰이 없어 클러스터를 다시 볼 수 없다 — 머지는 된 채로 닫는다."""
+    return _result("interrupted", "지켜보는 사이 에이전트가 다시 시작돼 결과를 확인하지 못했어요. 머지는 됐으니 ArgoCD 앱 상태를 확인해 주세요.",
+                   "Unknown", "Unknown", "", 0)
+
+
 def watch(
     name: str, namespace: str, revision: str, *, auto_sync: bool, context: str, kubeconfig: Path | None,
     wait: float | None = None, poll: float = POLL, clock=time.monotonic, sleep=time.sleep,
@@ -44,8 +66,7 @@ def watch(
     """머지 커밋 revision 으로 Synced + Healthy 가 될 때까지 (최대 wait 초). 블로킹 — 부르는 쪽이 스레드로 돌린다."""
     wait = SYNC_WAIT if wait is None else wait
     if not auto_sync:
-        return _result("manual", "자동 sync 가 꺼진 앱이에요. ArgoCD 에서 sync 해야 클러스터에 반영돼요.",
-                       "Unknown", "Unknown", "", 0)
+        return manual()
     started = clock()
     sync = health = "Unknown"
     seen = ""

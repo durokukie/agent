@@ -1,0 +1,540 @@
+"""승인 = 머지까지만 요청에 묶고, sync·health 는 뒤에서 — 끊긴 요청·재시작·재클릭·sync 실패·시간 초과 (DURO-158).
+
+test_gitops_flow.py 와 같은 틀이다: 가드레일 훅을 진짜로 돌리고 모델·server·GitHub·클러스터는 가짜다.
+끊긴 요청은 진짜 uvicorn 에 진짜 소켓을 열어 끊는다 — 취소되지 않는다는 것이 프레임워크의 동작이라 TestClient 로는 볼 수 없다.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import json
+import logging
+import socket
+import threading
+import time
+from pathlib import Path
+
+import pytest
+import uvicorn
+from pydantic_ai import ModelResponse
+from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.tools import DeferredToolRequests
+
+from helpers import USER, answer_model, new_room, scale_call
+from kukie_agent import conversations_api, server, server_api
+from kukie_agent.agent import agent
+from kukie_agent.gitops import watch
+from kukie_agent.gitops.github import GitHubError
+from kukie_agent.guardrail import gitops_after_merge, gitops_hook
+from test_gitops_flow import _card, _decide, _plan, _settle, _tool_result
+from test_gitops_flow import client, cluster, gh, room  # noqa: F401 — 픽스처를 같이 쓴다
+
+WAIT = 10   # 이 안에 끝나지 않으면 실패로 본다 (초)
+
+
+@pytest.fixture(autouse=True)
+def _fast_retries(monkeypatch):
+    monkeypatch.setattr(gitops_after_merge, "SAVE_RETRY_SECONDS", (0, 0))
+    monkeypatch.setattr(gitops_after_merge, "RECOVERY_RETRY_SECONDS", (0,))
+    monkeypatch.setattr(gitops_hook, "RECORD_RETRY_SECONDS", 0)
+
+
+@pytest.fixture
+def gate(monkeypatch, cluster):  # noqa: F811
+    """지켜보기의 kubectl 을 세운다 — set 하면 간다. 그동안 응답이 오는지 본다."""
+    event = threading.Event()
+    run = watch.run_kubectl
+
+    def held(args, **kwargs):
+        assert event.wait(WAIT)
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(watch, "run_kubectl", held)
+    yield event
+    event.set()
+
+
+def _actions(fake_server):
+    return [c["action"] for name, c in fake_server.calls if name == "plan_action"]
+
+
+def _sync(fake_server, room):  # noqa: F811
+    return _plan(fake_server, room)["executionResult"]["sync_result"]
+
+
+def _wait_for(check, what):
+    deadline = time.monotonic() + WAIT
+    while not check():
+        assert time.monotonic() < deadline, f"시간 안에 안 됐다: {what}"
+        time.sleep(0.01)
+
+
+# ── 머지까지 하고 바로 답한다 ──────────────────────────────
+
+def test_sync_를_기다리지_않고_머지_뒤_바로_답한다(client, fake_server, room, gh, gate):  # noqa: F811
+    _card(client, room)
+    body = _decide(client, room)                             # gate 가 닫혀 있어도 돌아온다
+
+    assert body["kind"] == "answer"
+    assert len(gh.merges) == 1
+    plan = _plan(fake_server, room)
+    assert plan["status"] == "APPLIED"
+    assert plan["executionResult"]["merge_commit"] == gh.merges[0]["sha"]
+    assert plan["executionResult"]["sync_result"]["status"] == "syncing"
+    assert fake_server.runs_of(room)[-1]["status"] == "completed"
+    assert "아직 반영됐다고 말하지 마라" in str(_tool_result(fake_server, room)["content"])
+
+    gate.set()
+    _settle(client)
+    assert _sync(fake_server, room)["status"] == "healthy"
+    assert _actions(fake_server)[-2:] == ["result", "sync-result"]
+
+
+def test_자동_sync가_꺼진_앱은_지켜보기를_시작하지_않는다(client, fake_server, room, gh, cluster):  # noqa: F811
+    cluster.auto_sync = False
+    _card(client, room)
+    _decide(client, room)
+
+    assert not gitops_after_merge._tasks
+    assert _sync(fake_server, room)["status"] == "manual"
+    assert "sync-result" not in _actions(fake_server)
+
+
+def test_지켜보기는_요청과_따로_자기_임시_kubeconfig로_돈다(client, fake_server, room, gh, cluster, monkeypatch):  # noqa: F811
+    seen: list[tuple[Path, bool]] = []
+    run = watch.run_kubectl
+
+    def spy(args, *, kubeconfig, **kwargs):
+        seen.append((kubeconfig, kubeconfig.exists()))
+        return run(args, kubeconfig=kubeconfig, **kwargs)
+
+    monkeypatch.setattr(watch, "run_kubectl", spy)
+    _card(client, room)
+    _decide(client, room)
+    _settle(client)
+
+    assert seen and all(existed for _, existed in seen)      # 요청의 파일은 이미 지워졌어도 지켜보기의 파일은 있다
+    assert not seen[0][0].exists()                           # 끝나면 자기 파일도 지운다
+    assert client.portal.call(lambda: conversations_api._detached == set())
+
+
+# ── 지켜보기의 끝: 실패·시간 초과 ───────────────────────────
+
+def test_sync가_실패하면_sync_failed를_남긴다(client, fake_server, room, gh, cluster):  # noqa: F811
+    _card(client, room)
+    cluster.app_status = {"sync": {"status": "OutOfSync"},
+                          "operationState": {"phase": "Failed", "message": "nope",
+                                             "syncResult": {"revision": "merge1" + "0" * 34}}}
+    _decide(client, room)
+    _settle(client)
+
+    plan = _plan(fake_server, room)
+    assert plan["status"] == "APPLIED" and plan["executionResult"]["sync_result"]["status"] == "sync_failed"
+
+
+def test_지켜보기가_시간을_넘기면_timeout으로_끝난다(client, fake_server, room, gh, cluster):  # noqa: F811
+    _card(client, room)
+    cluster.app_status = {"sync": {"status": "Synced", "revision": "old"}, "health": {"status": "Healthy"}}
+    _decide(client, room)
+    _settle(client)                                          # cluster 픽스처가 SYNC_WAIT 를 0 으로 둔다
+
+    plan = _plan(fake_server, room)
+    assert plan["status"] == "APPLIED" and plan["executionResult"]["sync_result"]["status"] == "timeout"
+
+
+def test_지켜보기_자체가_터져도_syncing에_멈추지_않는다(client, fake_server, room, gh, cluster, monkeypatch):  # noqa: F811
+    def boom(*a, **k):
+        raise RuntimeError("kubectl 없음")
+
+    monkeypatch.setattr(watch, "run_kubectl", boom)
+    _card(client, room)
+    _decide(client, room)
+    _settle(client)
+
+    assert _sync(fake_server, room)["status"] == "unreadable"
+    assert _plan(fake_server, room)["executionResult"]["merge_commit"] == gh.merges[0]["sha"]
+
+
+def test_sync_결과_기록이_잠깐_실패해도_다시_남긴다(client, fake_server, room, gh, cluster, monkeypatch):  # noqa: F811
+    real, failures = server_api.plan_action, [1]
+
+    async def flaky(plan_id, action, body=None):
+        if action == "sync-result" and failures:
+            failures.pop()
+            raise server_api.ServerError(503, "SERVER_UNAVAILABLE", "down")
+        return await real(plan_id, action, body)
+
+    monkeypatch.setattr(server_api, "plan_action", flaky)
+    _card(client, room)
+    _decide(client, room)
+    _settle(client)
+
+    assert _sync(fake_server, room)["status"] == "healthy"
+
+
+def test_끌_때_지켜보기를_멈추고_interrupted로_남긴다(fake_server, dev_auth, kubectl_ok, hook_passes, gh, cluster, room, monkeypatch):  # noqa: F811
+    from fastapi.testclient import TestClient
+
+    async def guidance(plan, manifest_preview=None):
+        return "확인한다."
+
+    monkeypatch.setattr(gitops_hook, "generate_decision_guidance", guidance)
+    monkeypatch.setattr(watch, "SYNC_WAIT", 3600)
+    cluster.app_status = {"sync": {"status": "Synced", "revision": "old"}, "health": {"status": "Healthy"}}
+    started = time.monotonic()
+    with TestClient(server.app) as test_client:
+        _card(test_client, room)
+        _decide(test_client, room)
+        assert _sync(fake_server, room)["status"] == "syncing"
+    assert time.monotonic() - started < WAIT                 # 한 시간을 기다리지 않는다
+
+    sync = _sync(fake_server, room)
+    assert sync["status"] == "interrupted" and "머지는 됐으니" in sync["message"]
+
+
+# ── 머지 기록 ──────────────────────────────────────────────
+
+def test_머지_기록이_잠깐_실패하면_다시_남긴다(client, fake_server, room, gh, cluster, monkeypatch):  # noqa: F811
+    real, failures = server_api.plan_action, [1]
+
+    async def flaky(plan_id, action, body=None):
+        if action == "result" and failures:
+            failures.pop()
+            raise server_api.ServerError(503, "SERVER_UNAVAILABLE", "down")
+        return await real(plan_id, action, body)
+
+    monkeypatch.setattr(server_api, "plan_action", flaky)
+    _card(client, room)
+    _decide(client, room)
+    _settle(client)
+
+    plan = _plan(fake_server, room)
+    assert plan["executionResult"]["merge_commit"] == gh.merges[0]["sha"]
+    assert plan["executionResult"]["sync_result"]["status"] == "healthy"
+
+
+def test_머지_기록의_응답만_잃으면_기록된_것으로_본다(client, fake_server, room, gh, cluster, monkeypatch):  # noqa: F811
+    real, lost = server_api.plan_action, [1]
+
+    async def lossy(plan_id, action, body=None):
+        updated = await real(plan_id, action, body)
+        if action == "result" and lost:
+            lost.pop()
+            raise server_api.ServerError(503, "SERVER_UNAVAILABLE", "응답을 잃었다")
+        return updated
+
+    monkeypatch.setattr(server_api, "plan_action", lossy)
+    _card(client, room)
+    _decide(client, room)
+    _settle(client)
+
+    assert "실행 결과를 Action Plan에 기록하지 못했습니다" not in str(_tool_result(fake_server, room)["content"])
+    assert _sync(fake_server, room)["status"] == "healthy"
+
+
+def test_머지_기록을_끝내_못_하면_지켜보지_않고_재실행도_막는다(client, fake_server, room, gh, cluster, monkeypatch):  # noqa: F811
+    real = server_api.plan_action
+
+    async def down(plan_id, action, body=None):
+        if action == "result":
+            raise server_api.ServerError(503, "SERVER_UNAVAILABLE", "down")
+        return await real(plan_id, action, body)
+
+    monkeypatch.setattr(server_api, "plan_action", down)
+    _card(client, room)
+    _decide(client, room)
+
+    assert not gitops_after_merge._tasks
+    assert "동일 요청의 재실행은 차단" in str(_tool_result(fake_server, room)["content"])
+    assert len(gh.merges) == 1
+
+
+# ── 재클릭·재시도 ───────────────────────────────────────────
+
+def test_같은_카드를_다시_눌러도_머지는_한_번이다(client, fake_server, room, gh, cluster):  # noqa: F811
+    _card(client, room)
+    _decide(client, room)
+    with agent.override(model=answer_model()):
+        again = client.post(f"/conversations/{room}/approve", json={"call_id": "call-1", "approved": True}, headers=USER)
+
+    assert again.status_code == 409 and again.json()["detail"]["code"] == "NOT_PENDING"
+    assert len(gh.merges) == 1
+    _settle(client)
+    assert _actions(fake_server).count("result") == 1 and _actions(fake_server).count("sync-result") == 1
+
+
+def test_머지_뒤_모델이_실패해_다시_시도해도_머지와_지켜보기는_한_번이다(client, fake_server, room, gh, cluster):  # noqa: F811
+    _card(client, room)
+    calls = []
+
+    def fails_once(messages, info):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("모델 장애")
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"narration": "머지했어요."}, tool_call_id="o")])
+
+    with agent.override(model=FunctionModel(fails_once)):
+        failed = client.post(f"/conversations/{room}/approve", json={"call_id": "call-1", "approved": True}, headers=USER)
+        assert failed.status_code == 503 and failed.json()["detail"]["code"] == "RESUME_RETRYABLE"
+        assert fake_server.runs_of(room)[-1]["status"] == "recovery_required"
+        retried = client.post(f"/conversations/{room}/resume", headers=USER)
+    assert retried.status_code == 200 and retried.json()["kind"] == "answer"
+
+    _settle(client)
+    assert len(gh.merges) == 1
+    assert _actions(fake_server).count("result") == 1 and _actions(fake_server).count("sync-result") == 1
+    assert _plan(fake_server, room)["executionResult"]["sync_result"]["status"] == "healthy"
+
+
+# ── 시간 안에 못 끝나면 먼저 답한다 ─────────────────────────
+
+class _SlowModel:
+    """승인 뒤 답을 늦게 내는 모델 — release 할 때까지 답하지 않는다."""
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.called = threading.Event()
+
+    def model(self):
+        async def answer(messages, info):
+            self.called.set()
+            while not self.release.is_set():
+                await asyncio.sleep(0.01)
+            return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"narration": "늦은 답"}, tool_call_id="o")])
+
+        async def stream(messages, info):       # 쓰이지 않는다 — 답 미리보기는 꺼져 있다
+            raise NotImplementedError
+            yield ""
+
+        return FunctionModel(answer, stream_function=stream)
+
+
+def test_시간_안에_못_끝나면_202로_먼저_답하고_일은_끝까지_간다(client, fake_server, room, gh, cluster, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(conversations_api, "APPROVE_WAIT", 0.2)
+    _card(client, room)
+    plan_id = _plan(fake_server, room)["id"]
+    slow = _SlowModel()
+    with agent.override(model=slow.model()):
+        first = client.post(f"/conversations/{room}/approve", json={"call_id": "call-1", "approved": True}, headers=USER)
+        assert first.status_code == 202
+        assert first.json()["kind"] == "accepted" and first.json()["plan_ids"] == [plan_id]
+        assert len(gh.merges) == 1                           # 머지는 이미 됐다
+
+        # 도는 동안 다시 눌러도, 재시도해도 잠금에 걸린다
+        again = client.post(f"/conversations/{room}/approve", json={"call_id": "call-1", "approved": True}, headers=USER)
+        assert again.status_code == 409 and again.json()["detail"]["code"] == "BUSY"
+        assert client.post(f"/conversations/{room}/resume", headers=USER).status_code == 409
+
+        slow.release.set()
+        _wait_for(lambda: fake_server.runs_of(room)[-1]["status"] == "completed", "run 이 끝난다")
+
+    _settle(client)
+    run = fake_server.runs_of(room)[-1]
+    assert run["responsePayload"]["kind"] == "answer"        # 답은 기록으로 남아 앱이 다시 읽는다
+    assert "늦은 답" in json.dumps(run["responsePayload"], ensure_ascii=False)
+    assert len(gh.merges) == 1
+    assert _plan(fake_server, room)["executionResult"]["sync_result"]["status"] == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_kubectl_카드는_시간이_넘어도_끝날_때까지_답을_기다린다(monkeypatch):
+    monkeypatch.setattr(conversations_api, "APPROVE_WAIT", 0)
+
+    class Session:
+        pending = DeferredToolRequests(approvals=[scale_call("c")])
+
+    conversation = conversations_api.Conversation(id="r", session=Session())
+    await conversation.lock.acquire()
+
+    async def work():
+        await asyncio.sleep(0.01)
+        return {"kind": "answer"}
+
+    assert await conversations_api._finish_locked(conversation, work, []) == {"kind": "answer"}
+    assert not conversation.lock.locked()
+
+
+# ── 끊긴 요청 ──────────────────────────────────────────────
+
+@pytest.fixture
+def real_server(client, monkeypatch):  # noqa: F811
+    """진짜 uvicorn. agent.override 가 ContextVar 라 테스트의 컨텍스트에서 띄운다."""
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    instance = uvicorn.Server(uvicorn.Config(server.app, host="127.0.0.1", port=port, lifespan="off", log_config=None))
+    started = threading.Event()
+    threads: list[threading.Thread] = []
+
+    def start():
+        # 스레드는 부른 쪽의 ContextVar 를 물려받지 않는다 — 모델 바꿔치기가 든 컨텍스트를 여기서 잡아 넘긴다
+        context = contextvars.copy_context()
+        threads.append(threading.Thread(target=context.run, args=(asyncio.run, _serve(instance, started)), daemon=True))
+        threads[0].start()
+        assert started.wait(WAIT)
+
+    yield port, start
+    instance.should_exit = True
+    for thread in threads:
+        thread.join(WAIT)
+
+
+async def _serve(instance, started):
+    task = asyncio.create_task(instance.serve())
+    while not instance.started:
+        await asyncio.sleep(0.01)
+    started.set()
+    await task
+    while gitops_after_merge._tasks:
+        await asyncio.wait(set(gitops_after_merge._tasks))
+
+
+def test_앞단이_요청을_끊어도_취소되지_않고_Plan에_끝까지_남는다(client, real_server, fake_server, room, gh, cluster, caplog, monkeypatch):  # noqa: F811
+    """실측의 그 상황 — web 이 499 로 끊었다. 머지·run·지켜보기가 끝까지 가고, uvicorn 은 끊긴 요청의 접근 로그를 남기지 않는다."""
+    _card(client, room)
+    port, start = real_server
+    slow = _SlowModel()
+    body = json.dumps({"call_id": "call-1", "approved": True}).encode()
+    with agent.override(model=slow.model()):
+        start()
+        with caplog.at_level(logging.INFO, logger="uvicorn.access"):
+            with socket.create_connection(("127.0.0.1", port)) as sock:
+                sock.sendall(
+                    f"POST /conversations/{room}/approve HTTP/1.1\r\nHost: x\r\nX-User: u-1\r\n"
+                    f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+                )
+                assert slow.called.wait(WAIT)                # 머지까지 끝나고 모델이 답을 쓰는 중이다
+            # 소켓을 닫았다 = 앞단이 끊었다. 그 뒤에 답을 내게 한다
+            time.sleep(0.1)
+            assert _plan(fake_server, room)["status"] == "APPLIED"
+            assert fake_server.runs_of(room)[-1]["status"] == "awaiting_approval"
+            slow.release.set()
+            _wait_for(lambda: fake_server.runs_of(room)[-1]["status"] == "completed", "끊겨도 run 이 끝난다")
+            _wait_for(lambda: _sync(fake_server, room)["status"] == "healthy", "끊겨도 sync 결과가 남는다")
+
+    assert len(gh.merges) == 1
+    assert not [r for r in caplog.records if "/approve" in r.getMessage()]
+
+
+# ── 재시작 ─────────────────────────────────────────────────
+
+def _die_while_executing(fake_server, room):  # noqa: F811
+    """앞 프로세스가 머지 전후로 죽은 자리를 만든다 — 승인·시작까지 남았고, 메모리의 지켜보기도 티켓도 없다."""
+    plan = _plan(fake_server, room)
+    fake_server._decision(plan, {"approved": True, "userId": "u-1", "call": {
+        "tool": plan["toolName"], "args": plan["payload"]["args"], "command": plan["payload"]["command"],
+        "risk": plan["risk"], "target": plan["payload"]["target"]}})
+    fake_server._start(plan, {})
+    return plan
+
+
+def test_재시작하면_지켜보던_계획은_interrupted로_닫히고_머지는_남는다(client, fake_server, room, gh, cluster):  # noqa: F811
+    _card(client, room)
+    plan = _die_while_executing(fake_server, room)
+    fake_server._result(plan, {"success": True, "stdout": "머지", "stderr": "", "exitCode": 0, "mergeCommit": "m" * 40,
+                               "syncResult": watch.syncing()})
+
+    asyncio.run(gitops_after_merge.recover())
+
+    assert plan["status"] == "APPLIED"
+    assert plan["executionResult"]["merge_commit"] == "m" * 40
+    assert plan["executionResult"]["sync_result"]["status"] == "interrupted"
+    run = fake_server.runs_of(room)[-1]
+    assert run["status"] == "interrupted"                    # 이어 갈 티켓이 없다
+    assert run["responsePayload"]["kind"] == "approval"      # 카드는 기록에 남아 Plan 으로 결과를 그린다
+
+
+def test_머지하고_기록_전에_죽었으면_GitHub을_보고_머지를_남긴다(client, fake_server, room, gh, cluster):  # noqa: F811
+    _card(client, room)
+    plan = _die_while_executing(fake_server, room)
+    sha = gh.merge_elsewhere(plan["payload"]["pull_request"]["number"])      # 머지 요청까지 닿고 기록 전에 죽었다
+
+    asyncio.run(gitops_after_merge.recover())
+
+    assert plan["status"] == "APPLIED"
+    assert plan["executionResult"]["merge_commit"] == sha
+    assert plan["executionResult"]["sync_result"]["status"] == "interrupted"
+    assert not gh.merges                                     # 복구는 머지하지 않는다
+
+
+def test_머지_전에_죽었으면_FAILED로_닫고_PR을_남긴다(client, fake_server, room, gh, cluster):  # noqa: F811
+    _card(client, room)
+    plan = _die_while_executing(fake_server, room)
+
+    asyncio.run(gitops_after_merge.recover())
+
+    assert plan["status"] == "FAILED" and plan["failureReason"] == "EXECUTION_FAILED"
+    assert "PR 은 남겨 뒀어요" in plan["executionResult"]["stderr"]
+    assert gh.pull_of(1)["state"] == "open" and not gh.merges
+
+
+def test_GitHub을_못_읽으면_다시_묻고_끝내_못_읽으면_UNKNOWN이다(client, fake_server, room, gh, cluster, monkeypatch):  # noqa: F811
+    _card(client, room)
+    plan = _die_while_executing(fake_server, room)
+
+    async def down(*a, **k):
+        raise GitHubError(502, "bad gateway")
+
+    monkeypatch.setattr(gitops_after_merge.pull_requests, "recheck", down)
+    with pytest.raises(GitHubError):
+        asyncio.run(gitops_after_merge.recover(final=False))
+    assert plan["status"] == "EXECUTING"                     # 아직 판단하지 않는다
+
+    asyncio.run(gitops_after_merge.recover(final=True))
+    assert plan["status"] == "UNKNOWN"
+
+
+def test_복구가_늦어도_이_프로세스가_실행_중인_계획은_건드리지_않는다(client, fake_server, room, gh, cluster, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(gitops_after_merge, "_recovering", True)
+    monkeypatch.setattr(gitops_after_merge, "_claimed", set())
+    _card(client, room)
+    plan = _die_while_executing(fake_server, room)
+    gitops_after_merge.claim(plan["id"])
+
+    asyncio.run(gitops_after_merge.recover())
+
+    assert plan["status"] == "EXECUTING"
+    assert fake_server.runs_of(room)[-1]["status"] == "awaiting_approval"
+
+
+def test_기동하면_뒤에서_복구하고_server가_아직_없으면_다시_시도한다(fake_server, gh, monkeypatch):  # noqa: F811
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("KUKIE_SERVER_URL", "http://server.test")
+    monkeypatch.setenv("KUKIE_INTERNAL_TOKEN", "internal")
+    real, failures = server_api.unsettled_plans, [1]
+    seen = []
+
+    async def flaky(tool_name):
+        seen.append(tool_name)
+        if failures:
+            failures.pop()
+            raise server_api.ServerError(503, "SERVER_UNAVAILABLE", "아직 안 떴다")
+        return await real(tool_name)
+
+    monkeypatch.setattr(server_api, "unsettled_plans", flaky)
+    with TestClient(server.app) as test_client:
+        assert test_client.get("/health").status_code == 200
+        _wait_for(lambda: len(seen) == 2, "다시 묻는다")
+        _settle(test_client)
+
+    assert seen == ["propose_git_change"] * 2
+    assert gitops_after_merge._recovering is False
+
+
+def test_kubectl_계획은_복구가_건드리지_않는다(fake_server):
+    room_id = new_room(fake_server, shared=True)
+    run = fake_server.put_run(room_id, request_id="r", status="awaiting_approval")
+    plan_id = fake_server.add_plan(run["id"], tool_call_id="c", tool_name="scale_resource", risk="caution", payload={},
+                                   status="EXECUTING", decision={"approved": True})
+
+    asyncio.run(gitops_after_merge.recover())
+
+    assert fake_server.plans[plan_id]["status"] == "EXECUTING" and run["status"] == "awaiting_approval"
+
+
+def test_sync_결과의_칸은_어느_값이든_같다():
+    # 앱이 읽는 칸이 그대로다 (api/gitops.ts readSyncResult)
+    for result in (watch.syncing(), watch.manual(), watch.unreadable(), watch.interrupted()):
+        assert set(result) == {"status", "sync_status", "health_status", "revision", "message", "waited_seconds"}
