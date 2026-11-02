@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import time
 
 import pytest
 
@@ -85,7 +86,7 @@ def test_exact_version_is_found_not_a_dependency_version():
 
 
 def test_last_chart_with_deeper_list_and_quoted_version():
-    assert find_entry(io.BytesIO(INDEX), "zeta", "3.0.0")["name"] == "zeta"
+    assert find_entry(io.BytesIO(INDEX), "zeta", "3.0.0")["urls"] == ["zeta.tgz"]
 
 
 def test_missing_chart_or_version():
@@ -110,31 +111,49 @@ def test_big_entry_is_rejected(monkeypatch):
     assert caught.value.reason == "index_too_large"
 
 
-def test_alias_in_entry_is_rejected():
-    """앨리어스 스무 개로 2의 스무 제곱. 값을 글자로 바꾸는 순간 펼쳐진다."""
-    levels = ["    a0: &a0 [1, 2]"] + [f"    a{i}: &a{i} [*a{i - 1}, *a{i - 1}]" for i in range(1, 30)]
-    index = "entries:\n  demo:\n  - version: 1.0.0\n    digest: *a29\n" + "\n".join(levels) + "\n"
+def test_deep_nesting_costs_nothing():
+    """libyaml 은 이 입력에 몇 분씩 걸린다(시간이 깊이의 제곱). 파서에 넣지 않으므로 바로 끝난다."""
+    index = b"entries:\n  demo:\n  - version: 1.0.0\n    a: " + b"[" * 400000 + b"]" * 400000 + b"\n    urls: [c.tgz]\n"
+    started = time.monotonic()
+    assert find_entry(io.BytesIO(index), "demo", "1.0.0")["urls"] == ["c.tgz"]
+    assert time.monotonic() - started < 1
+
+
+def test_aliases_are_plain_text():
+    """펼치지 않는다. 앵커 정의와 무관하게 글자일 뿐이고, digest 대조에서 걸린다."""
+    levels = "\n".join(f"    a{i}: &a{i} [*a{i - 1}, *a{i - 1}]" for i in range(1, 30))
+    index = f"entries:\n  demo:\n  - version: 1.0.0\n    a0: &a0 [1, 2]\n{levels}\n    digest: *a29\n".encode()
+    assert find_entry(io.BytesIO(index), "demo", "1.0.0")["digest"] == "*a29"
+
+
+def test_yaml_tags_are_plain_text():
+    index = b"entries:\n  demo:\n  - version: 1.0.0\n    a: !!python/object/apply:os.system [id]\n    urls: [c.tgz]\n"
+    assert find_entry(io.BytesIO(index), "demo", "1.0.0")["urls"] == ["c.tgz"]
+
+
+@pytest.mark.parametrize("urls", [
+    b"    urls:\n    - https://x/a.tgz\n    - https://y/a.tgz\n",
+    b"    urls:\n      - https://x/a.tgz\n      - https://y/a.tgz\n",
+    b"    urls: [https://x/a.tgz, https://y/a.tgz]\n",
+    b"    urls:\n    - \"https://x/a.tgz\"\n    - 'https://y/a.tgz'\n",
+])
+def test_url_styles(urls):
+    index = b"entries:\n  demo:\n  - version: 1.0.0\n" + urls + b"    digest: abc\n"
+    entry = find_entry(io.BytesIO(index), "demo", "1.0.0")
+    assert entry["urls"] == ["https://x/a.tgz", "https://y/a.tgz"] and entry["digest"] == "abc"
+
+
+def test_version_on_first_line_or_later_and_quoted():
+    index = b"entries:\n  demo:\n  - version: \"2.0.0\"\n    urls: [b.tgz]\n  - apiVersion: v2\n    version: '1.0.0'\n    urls: [a.tgz]\n"
+    assert find_entry(io.BytesIO(index), "demo", "2.0.0")["urls"] == ["b.tgz"]
+    assert find_entry(io.BytesIO(index), "demo", "1.0.0")["urls"] == ["a.tgz"]
+
+
+def test_entry_without_urls_is_a_failure(public_dns):
+    web = FakeWeb({"https://charts.example.com/index.yaml": (200, {}, b"entries:\n  demo:\n  - version: 1.0.0\n")})
     with pytest.raises(FetchFailed) as caught:
-        find_entry(io.BytesIO(index.encode()), "demo", "1.0.0")
+        fetch_chart("https://charts.example.com", "demo", "1.0.0", opener=web)
     assert caught.value.reason == "index_unreadable"
-
-
-def test_single_alias_is_rejected():
-    index = b"entries:\n  demo:\n  - version: 1.0.0\n    a: &a {x: 1}\n    digest: *a\n"
-    with pytest.raises(FetchFailed):
-        find_entry(io.BytesIO(index), "demo", "1.0.0")
-
-
-def test_repeated_decoys_stop_parsing(monkeypatch):
-    decoy = b"  - version: 2.0.0\n    dependencies:\n    - version: 1.0.0\n"
-    with pytest.raises(FetchFailed):
-        find_entry(io.BytesIO(b"entries:\n  demo:\n" + decoy * 50), "demo", "1.0.0")
-
-
-def test_unknown_yaml_tag_is_rejected_not_executed():
-    index = b"entries:\n  demo:\n  - version: 1.0.0\n    a: !!python/object/apply:os.system [id]\n"
-    with pytest.raises(FetchFailed):
-        find_entry(io.BytesIO(index), "demo", "1.0.0")
 
 
 class FakeWeb:
