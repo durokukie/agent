@@ -33,10 +33,17 @@ GPU 노드 — nodes
   아래 지표만 본다 — vllm:cache_config_info 처럼 model_name 이 없는 info 지표로 유령 줄이 생기지 않게.
     running·waiting   vllm:num_requests_running·waiting (엔진이 여럿이면 합)
     kv_cache_pct      vllm:kv_cache_usage_perc (옛 vLLM 은 gpu_cache_usage_perc) × 100, 엔진이 여럿이면 평균
-    ttft_p95_ms       vllm:time_to_first_token_seconds 히스토그램의 p95
-    itl_p95_ms        vllm:inter_token_latency_seconds (옛 vLLM 은 time_per_output_token_seconds) 히스토그램의 p95
+    ttft_p95_ms       vllm:time_to_first_token_seconds 히스토그램의 **최근 구간** p95
+    itl_p95_ms        vllm:inter_token_latency_seconds (옛 vLLM 은 time_per_output_token_seconds) 히스토그램의 최근 구간 p95
+    latency_window_seconds  그 구간의 길이(초) — 직전 수집부터 이번 수집까지
   p95 는 Prometheus histogram_quantile 처럼 버킷 안에서 선형으로 나눈 값이다. 히스토그램은 서빙 프로세스가 뜬 뒤 누적이라
-  "지금 5분" 이 아니라 "뜬 뒤 전체" 의 p95 다 — 한 번 읽기로는 구간을 자를 수 없다. 요청이 없었으면 null.
+  한 번 읽은 값으로 내면 "뜬 뒤 전체" 의 p95 다 — 부하가 끝나도 안 내려가고 방금 느려진 것도 안 보인다 (DURO-124).
+  그래서 파드마다 직전 수집의 누적 히스토그램(LatencySample — 버킷·count·sum)을 기억하고 두 수집의 차이로 p95 를 낸다
+  (최근 구간 p95). 기억은 clusters_api 가 연결·파드마다 메모리에 둔다 (pod_identity 로 같은 프로세스인지 가린다).
+  구간의 시각은 그 파드의 /metrics 를 읽은 시각이다 — 라운드의 끝이 아니다 (다른 파드가 느려도 구간이 안 늘어난다).
+    기억이 없다(첫 수집·파드가 바뀜·직전이 너무 오래됨)  p95 null, latency_window_seconds null
+    값이 줄었다(프로세스가 다시 떠 처음부터 센다)         기억을 버리고 이번은 둘 다 null — 다음 수집부터 다시 잇는다
+    구간에 요청이 없었다                                    p95 null, latency_window_seconds 는 있다 (앱은 "최근 요청 없음")
   vLLM 지표가 하나도 없는 파드(라우터 등)는 빠진다.
 
 꺼진 GPU 클러스터 — waiting
@@ -55,6 +62,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from dataclasses import dataclass
 from typing import Any
 
 #: 노드 목록 (클러스터 범위). 부르는 쪽이 `-n` 을 붙이지 않는다
@@ -175,9 +183,9 @@ def dcgm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> dict[s
     return targets
 
 
-def vllm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> list[tuple[str, str, int, str]]:
-    """GPU 노드 위의 vLLM 파드 — [(namespace, 파드, 포트, 노드)]. 이름순. pods 는 running_pods."""
-    targets: list[tuple[str, str, int, str]] = []
+def vllm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> list[tuple[str, str, int, str, str]]:
+    """GPU 노드 위의 vLLM 파드 — [(namespace, 파드, 포트, 노드, 정체)]. 이름순. pods 는 running_pods. 정체는 pod_identity."""
+    targets: list[tuple[str, str, int, str, str]] = []
     for item in pods:
         if (item.get("spec") or {}).get("nodeName") not in gpu_node_names:
             continue
@@ -185,9 +193,24 @@ def vllm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> list[t
             continue
         meta = item["metadata"]
         targets.append((meta.get("namespace") or "default", meta["name"], _vllm_port(item),
-                        (item.get("spec") or {}).get("nodeName") or ""))
+                        (item.get("spec") or {}).get("nodeName") or "", pod_identity(item)))
     targets.sort(key=lambda t: (t[0], t[1]))
     return targets[:MAX_METRIC_TARGETS]
+
+
+def pod_identity(item: dict[str, Any]) -> str:
+    """파드의 정체 — uid(없으면 시작 시각)와 vLLM 컨테이너의 재시작 수. 최근 구간 p95 의 기억(LatencySample)을 같은 서빙
+    프로세스에만 잇는다: 같은 이름으로 다시 뜬 파드(StatefulSet 의 qwen-0)는 uid 가, 컨테이너만 다시 뜬 파드는 재시작 수가
+    다르다. 둘 다 히스토그램을 처음부터 다시 세는 프로세스라 옛 기억과 빼면 안 된다.
+    재시작 수는 vLLM 컨테이너(_vllm_container, spec.containers — vllm_targets 가 찾는 것과 같은 범위)의 것만 센다 —
+    사이드카(메시·로그)가 다시 떠도 vLLM 프로세스와 히스토그램은 그대로라 기억을 버릴 까닭이 없다 (agent#137 Codex 리뷰).
+    native sidecar(initContainers + restartPolicy Always)로 띄운 vLLM 은 애초에 대상이 아니다 (_containers)."""
+    meta = item.get("metadata") or {}
+    status = item.get("status") or {}
+    vllm_names = {c.get("name") for c in _containers(item) if _vllm_container(c)}
+    restarts = sum(_positive_int(c.get("restartCount")) for c in status.get("containerStatuses") or []
+                   if isinstance(c, dict) and c.get("name") in vllm_names)
+    return f"{meta.get('uid') or status.get('startTime') or ''}:{restarts}"
 
 
 def namespace_names(stdout: str, *, skip: str | None = None,
@@ -353,15 +376,51 @@ def apply_dcgm(row: dict[str, Any], text: str) -> None:
 
 # ── vLLM ─────────────────────────────────────────────────
 
-def serving_rows(text: str, *, pod: str, node: str) -> list[dict[str, Any]]:
-    """vLLM /metrics 에서 모델마다 한 줄 (모듈 설명 "서빙"). vLLM 지표가 없으면 빈 목록."""
+@dataclass(frozen=True)
+class Histogram:
+    """Prometheus 히스토그램 하나 — 누적 버킷 {상한: 개수} 와 _count·_sum. 엔진이 여럿이면 같은 le 끼리 더한 값."""
+    buckets: dict[float, float]
+    count: float = 0.0
+    sum: float = 0.0
+
+
+@dataclass(frozen=True)
+class LatencySample:
+    """파드 하나의 /metrics 를 한 번 읽어 둔 누적 히스토그램 — (모델, 종류) 마다 하나. 종류는 _HISTOGRAM_KINDS 의 값.
+
+    at 은 읽은 시각(부르는 쪽의 시계 — clusters_api 는 time.monotonic). 다음 수집이 이것과의 차이로 최근 구간 p95 를 낸다.
+    """
+    at: float
+    histograms: dict[tuple[str, str], Histogram]
+
+
+#: 히스토그램 지표 이름(vllm: 과 _bucket·_count·_sum 을 뗀 것) → 종류
+_HISTOGRAM_KINDS = {
+    "time_to_first_token_seconds": "ttft",
+    "inter_token_latency_seconds": "itl",
+    "time_per_output_token_seconds": "itl_old",      # 옛 vLLM
+}
+_GAUGE_METRICS = frozenset({"num_requests_running", "num_requests_waiting", "kv_cache_usage_perc", "gpu_cache_usage_perc"})
+
+
+def serving_rows(text: str, *, pod: str, node: str, previous: LatencySample | None = None,
+                 at: float = 0.0) -> tuple[list[dict[str, Any]], LatencySample]:
+    """(vLLM /metrics 에서 모델마다 한 줄, 이번에 읽은 누적 히스토그램) — 모듈 설명 "서빙". vLLM 지표가 없으면 빈 목록.
+
+    p95 는 previous(같은 파드의 직전 수집)와의 차이로 낸다. previous 가 없으면 null 이고, 어느 히스토그램이든 값이 줄었으면
+    (서빙 프로세스가 다시 떴다) 그 파드의 모든 줄이 null 이다 — 부르는 쪽은 돌려준 LatencySample 을 다음 기억으로 두면 된다.
+    둘 다 latency_window_seconds 가 null 이다. 구간은 있는데 요청이 없었으면 p95 만 null 이다.
+    """
     models: dict[str, dict[str, Any]] = {}
+    histograms: dict[tuple[str, str], dict[str, Any]] = {}
     for name, labels, value in parse_metrics(text):
         metric = name[len("vllm:"):] if name.startswith("vllm:") else ""
-        if metric not in _VLLM_METRICS:
+        base, _, part = metric.rpartition("_")
+        kind = _HISTOGRAM_KINDS.get(base) if part in ("bucket", "count", "sum") else None
+        if metric not in _GAUGE_METRICS and kind is None:
             continue
-        model = models.setdefault(labels.get("model_name") or pod, {
-            "running": 0.0, "waiting": 0.0, "kv": [], "kv_old": [], "ttft": {}, "itl": {}, "itl_old": {}})
+        model_name = labels.get("model_name") or pod
+        model = models.setdefault(model_name, {"running": 0.0, "waiting": 0.0, "kv": [], "kv_old": []})
         if metric == "num_requests_running":
             model["running"] += value
         elif metric == "num_requests_waiting":
@@ -370,16 +429,25 @@ def serving_rows(text: str, *, pod: str, node: str) -> list[dict[str, Any]]:
             model["kv"].append(value)
         elif metric == "gpu_cache_usage_perc":
             model["kv_old"].append(value)
-        elif metric == "time_to_first_token_seconds_bucket":
-            _add_bucket(model["ttft"], labels, value)
-        elif metric == "inter_token_latency_seconds_bucket":
-            _add_bucket(model["itl"], labels, value)
-        elif metric == "time_per_output_token_seconds_bucket":
-            _add_bucket(model["itl_old"], labels, value)
+        else:
+            histogram = histograms.setdefault((model_name, kind), {"buckets": {}, "count": 0.0, "sum": 0.0})
+            if part == "bucket":
+                _add_bucket(histogram["buckets"], labels, value)
+            else:
+                histogram[part] += value
 
+    sample = LatencySample(at=at, histograms={key: Histogram(**h) for key, h in histograms.items()})
+    recent = recent_histograms(sample, previous) or {}
     rows = []
     for model_name, m in sorted(models.items()):
         kv = m["kv"] or m["kv_old"]
+        # 이 모델의 히스토그램이 직전 수집에도 있었을 때만 구간이 있다 — 새로 나타난 모델은 다음 수집부터
+        mine = {kind: histogram for (model, kind), histogram in recent.items() if model == model_name}
+
+        def p95(*kinds: str) -> float | None:
+            histogram = next((mine[kind] for kind in kinds if kind in mine), None)
+            return None if histogram is None else _ms(histogram_quantile(0.95, histogram.buckets))
+
         rows.append({
             "model": model_name,
             "pod": pod,
@@ -387,16 +455,38 @@ def serving_rows(text: str, *, pod: str, node: str) -> list[dict[str, Any]]:
             "running": round(m["running"]),
             "waiting": round(m["waiting"]),
             "kv_cache_pct": round(sum(kv) / len(kv) * 100, 1) if kv else 0,
-            "ttft_p95_ms": _ms(histogram_quantile(0.95, m["ttft"])),
-            "itl_p95_ms": _ms(histogram_quantile(0.95, m["itl"] or m["itl_old"])),
+            "ttft_p95_ms": p95("ttft"),
+            "itl_p95_ms": p95("itl", "itl_old"),
+            "latency_window_seconds": round(at - previous.at, 1) if mine and previous is not None else None,
         })
-    return rows
+    return rows, sample
 
 
-_VLLM_METRICS = frozenset({
-    "num_requests_running", "num_requests_waiting", "kv_cache_usage_perc", "gpu_cache_usage_perc",
-    "time_to_first_token_seconds_bucket", "inter_token_latency_seconds_bucket", "time_per_output_token_seconds_bucket",
-})
+def recent_histograms(current: LatencySample, previous: LatencySample | None) -> dict[tuple[str, str], Histogram] | None:
+    """두 수집 사이에 쌓인 히스토그램 — current 에 있고 previous 에도 있는 (모델, 종류)만. 기억이 없으면 None.
+
+    어느 하나라도 줄었으면(버킷·count·sum — 서빙 프로세스가 다시 떠 처음부터 센다) 파드 전체가 None 이다: 히스토그램은
+    한 프로세스의 것이라 하나만 줄어도 나머지도 옛 기억과 이어지지 않는다.
+    le 집합이 달라진 키(버킷 설정이 다른 vLLM 으로 바뀜)는 잇지 않고 건너뛴다 — 직전에 없던 le 를 0 부터 빼면 차이 버킷이
+    누적 순서를 어겨(위 le 보다 커져) p95 가 실제보다 낮게 나온다 (agent#137 리뷰). 엔진이 늘어 같은 le 의 합만 뛴 것은
+    그만큼 요청이 있었던 것으로 본다.
+    """
+    if previous is None:
+        return None
+    recent: dict[tuple[str, str], Histogram] = {}
+    for key, now in current.histograms.items():
+        before = previous.histograms.get(key)
+        if before is None or set(before.buckets) != set(now.buckets):
+            continue
+        if now.count < before.count or now.sum < before.sum:
+            return None
+        buckets = {}
+        for le, value in now.buckets.items():
+            buckets[le] = value - before.buckets[le]
+            if buckets[le] < 0:
+                return None
+        recent[key] = Histogram(buckets, now.count - before.count, now.sum - before.sum)
+    return recent
 
 
 def _add_bucket(buckets: dict[float, float], labels: dict[str, str], value: float) -> None:

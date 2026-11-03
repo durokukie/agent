@@ -84,6 +84,9 @@ GPU_METRICS_WORKERS = 4
 #: 프로세스 안 시각이라 복제본마다·재시작마다 따로 센다
 GPU_ABSENT_RECHECK = 600
 GPU_ABSENT_RECHECK_FORGET = 24 * 3600   # 이만큼 안 부른 연결의 시각은 지운다 — 메모리만 지키려는 것이라 간격보다 훨씬 길게
+#: 서빙 TTFT·ITL p95 의 최근 구간 상한(초). 직전 수집이 이보다 오래됐으면 기억을 버리고 이번 p95 는 null 이다 — 화면을
+#: 20초마다 읽는 동안은 구간이 20초(여럿이 보면 OVERVIEW_SHARE_TTL)이고, 닫았다 한참 뒤에 열면 옛 값과 빼지 않는다 (DURO-124)
+LATENCY_WINDOW_MAX = 600
 
 
 @router.post("/{cluster_id}/test")
@@ -697,30 +700,55 @@ def _collect_gpu(
             return gpu.build([], [], waiting), True
         return None, (False if waiting is not None and pods_complete else None)
 
-    def metrics(target: tuple[str, str, int]) -> str | None:
+    def metrics(target: tuple[str, str, int]) -> tuple[str | None, float]:
+        """(/metrics 본문, 읽은 시각) — 시각은 서빙 p95 구간의 끝이라 파드마다 따로 잰다 (agent#137 리뷰)."""
         namespace, pod, port = target
         timeout = budget(GPU_METRICS_TIMEOUT)
         if timeout < 1:
-            return None
+            return None, clock()
         result = run(gpu.proxy_command(namespace, pod, port), timeout)
         if not result.success:
             logger.debug("GPU 지표를 읽지 못했다 (%s/%s): %s", namespace, pod,
                          _failure_status(result.stderr or result.stdout))
-            return None
-        return result.stdout
+            return None, clock()
+        return result.stdout, clock()
 
     dcgm_rows = [row for row in nodes if row["node"] in dcgm]
-    targets = [dcgm[row["node"]] for row in dcgm_rows] + [(ns, pod, port) for ns, pod, port, _ in vllm]
+    targets = [dcgm[row["node"]] for row in dcgm_rows] + [(ns, pod, port) for ns, pod, port, _, _ in vllm]
     with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
         texts = list(pool.map(metrics, targets))
-    for row, text in zip(dcgm_rows, texts):
+    for row, (text, _) in zip(dcgm_rows, texts):
         if text is not None:
             gpu.apply_dcgm(row, text)
     serving: list[dict[str, Any]] = []
-    for (_, pod, _, node), text in zip(vllm, texts[len(dcgm_rows):]):
-        if text is not None:
-            serving.extend(gpu.serving_rows(text, pod=pod, node=node))
+    remembered = _latency_memory(cache_key, clock())
+    for (namespace, pod, _, node, identity), (text, at) in zip(vllm, texts[len(dcgm_rows):]):
+        if text is None:
+            continue                                        # 이번에 못 읽은 파드의 기억은 둔다 — 다음 구간이 그만큼 길어질 뿐
+        pod_key = f"{namespace}/{pod}/{identity}"
+        rows, sample = gpu.serving_rows(text, pod=pod, node=node, previous=remembered.get(pod_key), at=at)
+        serving.extend(rows)
+        remembered[pod_key] = sample
+    if cache_key:
+        with _latency_lock:
+            _latency_samples[cache_key] = remembered
     return gpu.build(nodes, serving, waiting or []), True
+
+
+def _latency_memory(cache_key: str | None, now: float) -> dict[str, gpu.LatencySample]:
+    """연결 하나의 vLLM 파드별 직전 누적 히스토그램 (복사본) — 최근 구간 p95 (DURO-124, clusters/gpu.py "서빙").
+
+    LATENCY_WINDOW_MAX 초보다 오래된 기억은 어느 연결의 것이든 지운다 — 대시보드를 닫았다 한참 뒤에 열면 "최근" 이 아니고,
+    사라진 파드·지운 클러스터의 기억이 쌓이지 않게. 연결 지문이 없으면(cache_key None) 기억하지 않아 p95 는 늘 null 이다.
+    """
+    with _latency_lock:
+        for key, samples in list(_latency_samples.items()):
+            live = {pod: sample for pod, sample in samples.items() if now - sample.at < LATENCY_WINDOW_MAX}
+            if live:
+                _latency_samples[key] = live
+            else:
+                del _latency_samples[key]
+        return dict(_latency_samples.get(cache_key, {})) if cache_key else {}
 
 
 @dataclass(frozen=True)
@@ -739,6 +767,10 @@ _readable_namespaces: dict[str, _NamespaceMemo] = {}
 _readable_lock = threading.Lock()
 #: 연결마다 GPU 노드 없는 곳에서 기다리는 파드를 마지막으로 찾은 시각 — _absent_search_due
 _gpu_absent_checked: dict[str, float] = {}
+#: 연결마다 vLLM 파드(namespace/파드/정체)별 직전 수집의 누적 히스토그램 — _latency_memory. 프로세스 안 기억이라
+#: 복제본마다 따로고, 재시작하면 첫 수집은 다시 null 이다
+_latency_samples: dict[str, dict[str, gpu.LatencySample]] = {}
+_latency_lock = threading.Lock()
 
 
 def _absent_search_due(cache_key: str | None, *, unknown: bool, clock=time.monotonic) -> bool:
