@@ -133,6 +133,9 @@ def test_ServedModel_숫자_칸은_정수만_싣는다(value, expected):
     ('error: the server doesn\'t have a resource type "servedmodels"', True),
     ('Error from server (Forbidden): servedmodels.serving.kukie.io is forbidden: cannot list resource', True),
     ("Unable to connect to the server: net/http: TLS handshake timeout", False),
+    ("error: unexpected response from gateway: 403 Forbidden", False),   # 사이 프록시의 문구로 hasGpu 를 덮지 않는다
+    ('Error from server (NotFound): Unable to list "serving.kukie.io/v1alpha1, Resource=servedmodels": '
+     "the server could not find the requested resource", False),
     ("", False),
 ])
 def test_ServedModel_조회_실패는_없다고_확인된_것과_모르는_것을_가른다(stderr, expected):
@@ -643,9 +646,9 @@ def test_ServedModel_조회는_남은_예산만큼만_기다리고_예산이_없
             now[0] = clusters_api.GPU_BUDGET - spare[0]
         return _gpu_cluster(args)
 
-    spare = [2]                                              # 파드를 읽고 나니 2초 남았다
+    spare = [6]                                              # 파드를 읽고 나니 6초 남았다 — 노드가 있으니 절반까지만
     body, _ = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
-    assert dict((tuple(args), t) for args, t in seen)[tuple(gpu.SERVED_MODELS_COMMAND)] == 2
+    assert dict((tuple(args), t) for args, t in seen)[tuple(gpu.SERVED_MODELS_COMMAND)] == 3
     assert len(body["nodes"]) == 2
 
     now[0], spare[0] = 0.0, 0                                # 하나도 안 남았다
@@ -653,6 +656,56 @@ def test_ServedModel_조회는_남은_예산만큼만_기다리고_예산이_없
     body, _ = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
     assert gpu.SERVED_MODELS_COMMAND not in [args for args, _ in seen]
     assert body["served_models"] is None and len(body["nodes"]) == 2
+
+
+def test_ServedModel이_매달려도_지표를_읽을_예산이_남는다(monkeypatch):
+    """파드 조회가 매달려 2초만 남은 라운드 — ServedModel 이 다 쓰면 지표가 전부 빈다 (agent#138 리뷰)."""
+    monkeypatch.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
+    now = [0.0]
+    raw: list[int] = []
+
+    def run(args, timeout):
+        if args == gpu.PODS_COMMAND:
+            now[0] = clusters_api.GPU_BUDGET - 2
+        if args == gpu.SERVED_MODELS_COMMAND:
+            now[0] += timeout
+            return _result(stderr="timed out", success=False)
+        if args[1] == "--raw":
+            raw.append(timeout)
+        return _gpu_cluster(args)
+
+    body, _ = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
+    assert body["served_models"] is None and raw
+
+
+def test_GPU로_알려진_꺼진_클러스터는_namespace_탐색이_ServedModel을_읽을_예산을_남긴다():
+    """노드가 없으면 탐색이 예산을 다 쓰는데, 그러면 꺼진 클러스터에서 ServedModel 을 못 읽는다 (agent#138 리뷰)."""
+    now = [0.0]
+    served: list[int] = []
+
+    def run(args, timeout):
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        if args == gpu.PODS_COMMAND:
+            return _result(stderr=FORBIDDEN, success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces(*(f"ns-{i}" for i in range(20))))
+        if args == gpu.SERVED_MODELS_COMMAND:
+            served.append(timeout)
+            return _result(fixture("served_models.json"))
+        now[0] += timeout
+        return _result(stderr="timed out", success=False)
+
+    body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", known=True, clock=lambda: now[0])
+    assert served == [clusters_api.GPU_SERVED_MODELS_TIMEOUT]
+    assert has_gpu is True and len(body["served_models"]) == 4
+
+
+def test_파드_목록이_깨진_꺼진_클러스터도_읽힌_ServedModel은_싣고_waiting은_빈_배열이다():
+    """waiting 은 늘 배열이다 — 노드가 있는 라운드와 같은 규칙 (agent#138 리뷰)."""
+    run, _ = _served_models_cluster(_result(fixture("served_models.json")), nodes="nodes.json", pods="not json")
+    body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", known=True, clock=lambda: 0.0)
+    assert has_gpu is True and body["waiting"] == [] and len(body["served_models"]) == 4
 
 
 def test_GPU로_알려진_꺼진_클러스터는_기다리는_파드가_없어도_ServedModel을_읽는다():

@@ -171,7 +171,8 @@ def _memory_label_mib(labels: dict[str, Any]) -> int:
 
 def served_models(stdout: str) -> list[dict[str, Any]]:
     """ServedModel 목록을 응답 줄로 (모듈 설명 "ServedModel"). 이름 없는 항목은 뺀다. 모양이 다르면 ValueError —
-    부르는 쪽이 served_models 를 null 로 둔다. 빈 목록은 "없다" 라는 뜻이라 gpu_nodes 처럼 엄격하게 읽는다."""
+    부르는 쪽이 served_models 를 null 로 둔다. 빈 목록은 "없다" 라는 뜻이라 gpu_nodes 처럼 엄격하게 읽는다.
+    download_percent·max_concurrency 는 CRD 스키마가 integer 라 오퍼레이터가 정수로만 쓴다 — 다른 값은 null 이다."""
     rows: list[dict[str, Any]] = []
     for item in _strict_items(stdout):
         meta = item.get("metadata")
@@ -194,9 +195,11 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
 
 def served_models_absent(stderr: str) -> bool:
     """ServedModel 조회 실패가 "CRD 가 없다" 나 "볼 수 없다" 라고 확인된 것인가 — 시간 초과처럼 모르는 실패와 가른다.
-    거부(Forbidden)는 _pods_by_namespace 와 같이 Kukie 가 볼 수 없는 곳이라 못 본 곳으로 치지 않는다."""
+    거부(Forbidden)는 _pods_by_namespace 와 같이 Kukie 가 볼 수 없는 곳이라 못 본 곳으로 치지 않는다.
+    server 의 hasGpu 를 false 로 덮는 근거라 kubectl 문구로 좁힌다 — 사이 프록시의 `403 Forbidden` 본문은 모르는 실패다.
+    그 밖의 문구(NotFound 등)도 모르는 실패다: hasGpu 를 덮지 않는 안전한 쪽이다."""
     lowered = stderr.lower()
-    return "doesn't have a resource type" in lowered or "forbidden" in lowered
+    return "doesn't have a resource type" in lowered or "(forbidden)" in lowered or " is forbidden" in lowered
 
 
 # ── 지표를 읽을 파드 ───────────────────────────────────────

@@ -55,7 +55,7 @@ OVERVIEW_TIMEOUT = 15
 GPU_METRICS_TIMEOUT = 5
 #: 모든 namespace 파드를 못 읽을 때 namespace 하나의 파드 목록 시간 제한(초). namespace 마다 한 번이라 지표처럼 짧게 끊는다
 GPU_PODS_TIMEOUT = 5
-#: ServedModel 목록 시간 제한(초). 지표보다 먼저 읽으므로 매달려도 지표를 읽을 예산이 남게 짧게 끊는다
+#: ServedModel 목록 시간 제한(초). 지표보다 먼저 읽으므로 짧게 끊는다. GPU 노드가 있으면 남은 예산의 절반까지만 쓴다(_collect_gpu)
 GPU_SERVED_MODELS_TIMEOUT = 5
 #: 파드를 읽을 수 있었던 namespace 를 연결마다 기억하는 시간(초). 그동안은 그 namespace 만 읽는다.
 #: 고객이 새 namespace 나 RoleBinding 을 더하면 이만큼 늦게 보인다 — 짧게 둔다
@@ -644,6 +644,8 @@ def _collect_gpu(
     때만이다 — 모든 namespace 파드를 읽었거나, namespace 마다 읽은 것이 전부 성공·거부로 끝났을 때. 시간 초과·예산 부족·
     파드 목록 파싱 실패로 못 본 곳이 있으면 None 이다(꺼진 GPU 클러스터를 한 번의 실패로 "GPU 없음" 으로 덮지 않게).
     known 이 True 인 곳은 ServedModel 조회도 CRD 없음·거부로 끝나야 False 다 — 시간 초과·예산 부족이면 None 이다.
+    gpu 칸의 waiting 은 늘 배열이다 — 파드 목록이 깨져 못 읽은 라운드도 빈 배열로 나간다(노드가 있을 때도, ServedModel 만 읽힌 꺼진
+    클러스터도). ServedModel 만 읽혔다고 그 라운드의 served_models 까지 버리지 않는다.
     known 은 server 에 남은 값이다. True(GPU 클러스터)가 아니면 노드가 없을 때 파드를 GPU_ABSENT_RECHECK 초에 한 번만
     찾는다(_absent_search_due) — 이 프로세스에서 기록이 없으면 바로 한 번. 그 사이에는 (None, 지금 값) 이다.
 
@@ -677,8 +679,10 @@ def _collect_gpu(
     else:
         logger.debug("GPU 지표 파드를 namespace 마다 찾는다: %s", _failure_status(pods_result.stderr or pods_result.stdout))
         # 탐색은 남은 예산의 절반까지만 — 지표를 읽을 시간을 남긴다 (agent#120 리뷰). GPU 노드가 없으면 지표를 읽지 않으니
-        # 다 쓴다 — 기다리는 파드를 찾는 길이 이것뿐이다 (agent#121 리뷰)
-        search_deadline = clock() + max(0.0, deadline - clock()) / 2 if nodes else deadline
+        # 다 쓴다 — 기다리는 파드를 찾는 길이 이것뿐이다 (agent#121 리뷰). 다만 GPU 로 알려진 꺼진 클러스터는 ServedModel 을
+        # 읽을 시간은 남긴다 (agent#138 리뷰)
+        search_deadline = (clock() + max(0.0, deadline - clock()) / 2 if nodes
+                           else deadline - (GPU_SERVED_MODELS_TIMEOUT if known is True else 0))
 
         def search_budget(limit: int) -> int:
             return min(limit, int(search_deadline - clock()))
@@ -699,10 +703,15 @@ def _collect_gpu(
     except (ValueError, AttributeError, TypeError):
         logger.debug("GPU 를 기다리는 파드를 찾지 못했다 (파드 목록을 읽지 못했다)")
         waiting = None                                      # 못 읽은 것과 "없다" 는 다르다 — 아래에서 None(모른다)
+    def served_budget(limit: int) -> int:
+        """GPU 노드가 있으면 남은 예산의 절반까지만 — namespace 탐색처럼 지표를 읽을 시간을 남긴다 (agent#138 리뷰)."""
+        remaining = deadline - clock()
+        return min(limit, int(remaining / 2 if nodes else remaining))
+
     # GPU 노드가 없으면 기다리는 파드가 있거나 GPU 클러스터로 알려진 곳만 읽는다 — GPU 없는 일반 클러스터에 조회를 늘리지 않는다
     served_models, served_absent = None, True
     if nodes or waiting or known is True:
-        served_models, served_absent = _read_served_models(run, budget)
+        served_models, served_absent = _read_served_models(run, served_budget)
     if not nodes:
         if waiting or served_models is not None:
             return gpu.build([], [], waiting or [], served_models), True
