@@ -1,4 +1,4 @@
-"""클러스터 개요의 gpu 칸 — GPU 노드, 그 위의 DCGM 지표, 서빙 중인 vLLM 모델 (DURO-118).
+"""클러스터 개요의 gpu 칸 — GPU 노드, 그 위의 DCGM 지표, 서빙 중인 vLLM 모델 (DURO-118), ServedModel 상태 (DURO-182).
 
 overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순수 함수만 둔다. kubectl 은 clusters_api.py 가 돌린다.
 
@@ -10,7 +10,9 @@ overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순�
                      (kukie-infra customer-templates/gpu-read-rbac-v1.yaml)는 namespace 목록은 클러스터 전체에, 파드 목록은 고객이
                      고른 namespace 에만 준다. namespace 목록도 못 읽으면 개요가 이미 읽은 클러스터 namespace 의 파드에서만 찾는다
                      (running_pods 로 한 번만 파싱한다)
-  3. proxy_command   찾은 파드의 /metrics 를 API 서버 **파드 프록시**로 읽는다 (Prometheus 없이 kubectl 권한만으로).
+  3. SERVED_MODELS_COMMAND  모든 namespace 의 ServedModel. 지표보다 먼저 읽는다 — 지표 파드가 매달려도 예산이 남게.
+                     GPU 노드가 없으면 기다리는 파드가 있거나 server 값이 GPU 클러스터(true)일 때만 읽는다 — 아래 "ServedModel"
+  4. proxy_command   찾은 파드의 /metrics 를 API 서버 **파드 프록시**로 읽는다 (Prometheus 없이 kubectl 권한만으로).
                      서비스 프록시가 아니라 파드 프록시인 이유: DCGM exporter 는 노드마다 하나인 DaemonSet 이라 서비스로
                      부르면 아무 파드 하나에 붙어 다른 노드의 값을 받는다. vLLM 도 레플리카마다 값이 다르다
   지표를 못 읽으면 그 노드의 실시간 값만 null, 그 파드만 serving 에서 빠진다 — 개요는 그대로 200.
@@ -54,6 +56,16 @@ GPU 노드 — nodes
   다시 찾는다(clusters_api.GPU_ABSENT_RECHECK — 0대인 채 GPU 워크로드를 새로 올린 경우). GPU 노드가 있을 때도
   같은 파드 목록에서 GPU 를 기다리는 파드를 waiting 에 싣는다(늘어나는 중인 레플리카 등).
 
+ServedModel — served_models
+  kukie-gpu-operator 의 CRD. 한 줄이 ServedModel 하나다: namespace·name(metadata), model(spec.source.huggingface),
+  phase·reason·message(status), download_percent(status.download.percent), max_concurrency(status.baseline.maxConcurrency).
+  namespace·이름순. 오퍼레이터가 아직 status 를 쓰지 않았으면 문자열 칸은 "", 숫자 칸은 null 이다.
+    null  CRD 가 없거나(애드온을 안 깐 곳) 거부·시간 초과·예산 부족·모양이 다른 출력으로 못 읽었다. 개요는 그대로 200
+    []    읽었는데 하나도 없다
+  GPU 노드가 없어도 읽는 곳: 기다리는 파드가 있거나 server 값이 true 인 곳(꺼진 GPU 클러스터). 그 밖의 GPU 노드 없는 곳은
+  읽지 않는다 — GPU 없는 일반 클러스터마다 개요 때 kubectl 이 늘지 않게. 꺼진 GPU 클러스터에서 읽혔으면 하나도 없어도(애드온이
+  깔린 곳이다) 빈 gpu 칸(nodes 빈 배열)을 주고 GPU 클러스터로 둔다 — 모델을 지우고 노드를 끈 뒤에도 GPU 화면이 이어지게.
+
 측정 기록 — benchmarks
   측정 Job 도구가 아직 없어 늘 빈 배열이다. 계약(api-spec §3)대로 채울 때는 에이전트가 거른다 — 우리 GPU 클러스터의 팀 Admin 만.
 """
@@ -69,6 +81,9 @@ from typing import Any
 NODES_COMMAND: list[str] = ["get", "nodes", "-o", "json"]
 #: DCGM exporter·vLLM 파드를 찾는 파드 목록 (모든 namespace). 부르는 쪽이 `-n` 을 붙이지 않는다
 PODS_COMMAND: list[str] = ["get", "pods", "-A", "-o", "json"]
+
+#: 모든 namespace 의 ServedModel (모듈 설명 "ServedModel"). 부르는 쪽이 `-n` 을 붙이지 않는다
+SERVED_MODELS_COMMAND: list[str] = ["get", "servedmodels.serving.kukie.io", "-A", "-o", "json"]
 
 #: 모든 namespace 파드를 못 읽을 때 namespace 마다 파드를 읽으려고 보는 namespace 목록 (클러스터 범위)
 NAMESPACES_COMMAND: list[str] = ["get", "namespaces", "-o", "json"]
@@ -96,12 +111,8 @@ def gpu_nodes(stdout: str) -> list[dict[str, Any]]:
     모양이 다르면 ValueError — 부르는 쪽이 gpu 를 null 로 둔다. 다른 목록(_items)과 달리 items 칸이 없거나 객체가 아닌
     항목이 섞여도 ValueError 다: 빈 목록은 "GPU 노드 없음" 으로 server 의 hasGpu 를 false 로 덮기 때문이다 (PR #119 리뷰).
     """
-    data = json.loads(stdout or "")
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
-        raise ValueError("노드 목록 모양이 아니다")
     rows: list[dict[str, Any]] = []
-    for item in items:
+    for item in _strict_items(stdout):
         meta = item.get("metadata") or {}
         status = item.get("status") or {}
         labels = meta.get("labels") or {}
@@ -154,6 +165,38 @@ def _memory_label_mib(labels: dict[str, Any]) -> int:
     if match:
         return int(match[1]) * (1024 if match[2].upper() == "G" else 1)
     return 0
+
+
+# ── ServedModel ──────────────────────────────────────────
+
+def served_models(stdout: str) -> list[dict[str, Any]]:
+    """ServedModel 목록을 응답 줄로 (모듈 설명 "ServedModel"). 이름 없는 항목은 뺀다. 모양이 다르면 ValueError —
+    부르는 쪽이 served_models 를 null 로 둔다. 빈 목록은 "없다" 라는 뜻이라 gpu_nodes 처럼 엄격하게 읽는다."""
+    rows: list[dict[str, Any]] = []
+    for item in _strict_items(stdout):
+        meta = item.get("metadata")
+        if not isinstance(meta, dict) or not meta.get("name"):
+            continue
+        status = item.get("status") or {}
+        rows.append({
+            "namespace": meta.get("namespace") or "default",
+            "name": meta["name"],
+            "model": ((item.get("spec") or {}).get("source") or {}).get("huggingface") or "",
+            "phase": status.get("phase") or "",
+            "reason": status.get("reason") or "",
+            "message": status.get("message") or "",
+            "download_percent": _int_or_none((status.get("download") or {}).get("percent")),
+            "max_concurrency": _int_or_none((status.get("baseline") or {}).get("maxConcurrency")),
+        })
+    rows.sort(key=lambda r: (r["namespace"], r["name"]))
+    return rows
+
+
+def served_models_absent(stderr: str) -> bool:
+    """ServedModel 조회 실패가 "CRD 가 없다" 나 "볼 수 없다" 라고 확인된 것인가 — 시간 초과처럼 모르는 실패와 가른다.
+    거부(Forbidden)는 _pods_by_namespace 와 같이 Kukie 가 볼 수 없는 곳이라 못 본 곳으로 치지 않는다."""
+    lowered = stderr.lower()
+    return "doesn't have a resource type" in lowered or "forbidden" in lowered
 
 
 # ── 지표를 읽을 파드 ───────────────────────────────────────
@@ -297,7 +340,7 @@ def merge_pod_lists(outputs: list[str]) -> str:
 
 
 def proxy_command(namespace: str, pod: str, port: int) -> list[str]:
-    """API 서버 파드 프록시로 /metrics 를 읽는 kubectl 인자 (모듈 설명 "읽는 순서" 3)."""
+    """API 서버 파드 프록시로 /metrics 를 읽는 kubectl 인자 (모듈 설명 "읽는 순서" 4)."""
     return ["get", "--raw", f"/api/v1/namespaces/{namespace}/pods/{pod}:{port}/proxy/metrics"]
 
 
@@ -525,12 +568,15 @@ def _ms(seconds: float | None) -> float | None:
 # ── 합치기 ───────────────────────────────────────────────
 
 def build(nodes: list[dict[str, Any]], serving: list[dict[str, Any]],
-          waiting: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
-    """ClusterGpu. GPU 노드도 GPU 를 기다리는 파드도 없으면 None — 앱은 "GPU 노드가 없어요" 를 띄운다.
-    노드는 없고 기다리는 파드만 있으면 꺼진 GPU 클러스터다(nodes 빈 배열)."""
-    if not nodes and not waiting:
+          waiting: list[dict[str, Any]] | None = None,
+          served_models: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    """ClusterGpu. GPU 노드도 GPU 를 기다리는 파드도 없고 ServedModel 도 못 읽었으면 None — 앱은 "GPU 노드가 없어요" 를 띄운다.
+    노드는 없고 기다리는 파드나 읽어 낸 ServedModel(빈 배열 포함)이 있으면 꺼진 GPU 클러스터다(nodes 빈 배열).
+    served_models 의 null 은 "못 읽었다", 빈 배열은 "없다" 다 — 모듈 설명 "ServedModel"."""
+    if not nodes and not waiting and served_models is None:
         return None
-    return {"nodes": nodes, "serving": serving, "benchmarks": [], "waiting": waiting or []}
+    return {"nodes": nodes, "serving": serving, "benchmarks": [], "waiting": waiting or [],
+            "served_models": served_models}
 
 
 # ── Prometheus 글 형식 ────────────────────────────────────
@@ -580,6 +626,19 @@ def _items(stdout: str) -> list[dict[str, Any]]:
     if not isinstance(items, list):
         raise ValueError("kubectl 출력의 items 가 목록이 아니다")
     return [item for item in items if isinstance(item, dict)]
+
+
+def _strict_items(stdout: str) -> list[dict[str, Any]]:
+    """_items 와 달리 items 칸이 없거나 객체가 아닌 항목이 섞여도 ValueError 다 — 빈 목록이 "없다" 로 읽히는 목록에 쓴다."""
+    data = json.loads(stdout or "")
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        raise ValueError("kubectl 목록 모양이 아니다")
+    return items
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _positive_int(value: Any) -> int:
