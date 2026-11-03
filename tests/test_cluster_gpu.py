@@ -678,8 +678,11 @@ def test_ServedModel이_매달려도_지표를_읽을_예산이_남는다(monkey
     assert body["served_models"] is None and raw
 
 
-def test_GPU로_알려진_꺼진_클러스터는_namespace_탐색이_ServedModel을_읽을_예산을_남긴다():
-    """노드가 없으면 탐색이 예산을 다 쓰는데, 그러면 꺼진 클러스터에서 ServedModel 을 못 읽는다 (agent#138 리뷰)."""
+def test_GPU로_알려진_꺼진_클러스터는_namespace_탐색이_ServedModel을_읽을_예산을_남긴다(monkeypatch):
+    """노드가 없으면 탐색이 예산을 다 쓰는데, 그러면 꺼진 클러스터에서 ServedModel 을 못 읽는다 (agent#138 리뷰).
+
+    가짜 시계는 호출마다 시간이 쌓인다고 보므로 탐색을 차례로 돌린다."""
+    monkeypatch.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
     now = [0.0]
     served: list[int] = []
 
