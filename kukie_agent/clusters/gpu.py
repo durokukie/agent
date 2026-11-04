@@ -65,6 +65,8 @@ Karpenter GPU 풀 — node_pools
     []    GPU 풀이 없다 — CRD 가 없거나(Karpenter 를 안 깐 곳, 앱이 설치를 안내한다) 읽었는데 GPU 풀이 없다
           (CPU 풀만 있는 Karpenter 클러스터는 GPU 클러스터가 아니다). 빈 배열만으로는 gpu 칸을 만들지 않는다
   거부는 응답에서는 null 이지만 hasGpu 판단에서는 CRD 없음과 같다 — 볼 수 없는 곳은 못 본 곳으로 치지 않는다(node_pools_absent).
+  [] 는 "노드를 띄울 수 있는 GPU 풀이 없다" 만 말한다. CRD 없음·CPU 풀만 있음·GPU 풀을 다 꺼 둠(아래)이 같은 값이라, Karpenter 가
+  깔렸는지까지 가려 주지는 않는다 (agent#139 리뷰). 가르려면 칸을 더해야 하고 그것은 약속을 고치는 일이다.
   GPU 풀 판별 — 넷 중 하나면 된다. 빈 목록은 hasGpu 를 false 로 덮는 근거라 GPU 풀을 고르는 흔한 설정을 빠뜨리지 않는다
     spec.template.spec.taints 의 key 가 GPU_RESOURCES
     spec.limits 에 GPU_RESOURCES 칸이 있다
