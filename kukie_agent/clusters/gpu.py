@@ -70,8 +70,8 @@ Karpenter GPU 풀 — node_pools
       NotIn 은 "GPU 는 빼라" 라는 일반 풀의 흔한 설정이라 보지 않는다. m7g(Graviton)처럼 g 로 끝나는 계열은 GPU 가 아니다
     requirements 가 karpenter.k8s.aws/instance-gpu-* (count·manufacturer·name 등) 를 NotIn·DoesNotExist 밖의 연산자로 요구한다 —
       이 라벨은 GPU 인스턴스에만 붙으므로 요구하는 것만으로 GPU 인스턴스로 좁혀진다
-  다만 limits 의 GPU 수가 0 인 풀은 응답에서 뺀다(usable_pools) — 노드를 띄우지 못하게 꺼 둔 풀이다. 앱이 "모델을 시작하면 노드가 켜진다"
-  고 안내하면 안 된다. 그래도 "GPU 풀 없음" 과 다르다: 꺼 둔 풀만 있으면 node_pools 는 [] 이지만 hasGpu 를 false 로 덮지 않는다
+  다만 limits 의 어느 자원이든(cpu·memory·GPU) 0 인 풀은 응답에서 뺀다 — 노드를 띄우지 못하게 꺼 둔 풀이다. 앱이 "모델을 시작하면 노드가
+  켜진다" 고 안내하면 안 된다. 그래도 "GPU 풀 없음" 과 다르다: 꺼 둔 풀만 있으면 node_pools 는 [] 이지만 hasGpu 를 false 로 덮지 않는다
   (상한을 잠깐 0 으로 내린 GPU 클러스터가 목록에서 빠지지 않게).
   이 칸은 "GPU 풀이 있다" 는 사실만 말한다. 그 풀이 지금 있는 GPU 노드를 관리하는지는 가리지 않는다 — 노드 그룹과 GPU 풀을 같이 쓰는
   클러스터도 채워진다 (agent#139 리뷰). 약속(DURO-184)은 고객 전제 조건을 Karpenter 로 두고 앱이 이 칸으로 방식을 고른다.
@@ -132,6 +132,9 @@ _GPU_INSTANCE = re.compile(r"(?:gr?|p)(?:\d|$)")
 #: GPU 인스턴스에만 붙는 라벨의 앞부분과, 그 라벨을 요구하지 않는 연산자 (모듈 설명 "Karpenter GPU 풀")
 _GPU_LABEL_PREFIX = "karpenter.k8s.aws/instance-gpu-"
 _GPU_LABEL_EXCLUDING: tuple[str, ...] = ("NotIn", "DoesNotExist")
+
+#: NodePool limits 의 0 — 0·"0"·"0Gi"·"0.0"
+_ZERO_QUANTITY = re.compile(r"0+(?:\.0+)?[A-Za-z]*")
 
 #: 지표를 읽는 파드 수 상한 (DCGM·vLLM 따로). 한 번 읽기가 시간 제한까지 걸려도 개요가 끝없이 늘지 않게
 MAX_METRIC_TARGETS = 8
@@ -243,11 +246,12 @@ def served_models_absent(stderr: str) -> bool:
 
 # ── Karpenter GPU 풀 ─────────────────────────────────────
 
-def node_pools(stdout: str) -> list[dict[str, Any]]:
-    """NodePool 목록에서 GPU 풀만 줄로 (모듈 설명 "Karpenter GPU 풀"). 꺼 둔 풀(gpu_limit 0)도 싣는다 — 응답에 실을 것은 usable_pools 다.
-    이름 없는 항목은 뺀다. 모양이 다르면 ValueError — 부르는 쪽이 node_pools 를 null 로 둔다.
+def node_pools(stdout: str) -> tuple[list[dict[str, Any]], bool]:
+    """(노드를 띄울 수 있는 GPU 풀 줄, 꺼 둔 GPU 풀이 있나) — 모듈 설명 "Karpenter GPU 풀". 이름 없는 항목은 뺀다.
+    모양이 다르면 ValueError — 부르는 쪽이 node_pools 를 null 로 둔다.
     빈 목록은 "GPU 풀 없음" 으로 hasGpu 를 false 로 덮는 근거라 엄격하게 읽는다."""
     rows: list[dict[str, Any]] = []
+    disabled = False
     for item in _strict_items(stdout):
         meta = item.get("metadata")
         if not isinstance(meta, dict) or not meta.get("name"):
@@ -257,14 +261,12 @@ def node_pools(stdout: str) -> list[dict[str, Any]]:
         limited = next((name for name in GPU_RESOURCES if name in limits), None)
         if limited is None and not _gpu_template((spec.get("template") or {}).get("spec") or {}):
             continue
+        if any(_ZERO_QUANTITY.fullmatch(str(value)) for value in limits.values()):
+            disabled = True
+            continue
         rows.append({"name": meta["name"], "gpu_limit": _quantity_or_none(limits[limited]) if limited else None})
     rows.sort(key=lambda r: r["name"])
-    return rows
-
-
-def usable_pools(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """node_pools 줄에서 꺼 둔 풀(gpu_limit 0)을 뺀 것 — 노드를 띄울 수 있는 GPU 풀, 응답의 node_pools 다."""
-    return [row for row in rows if row["gpu_limit"] != 0]
+    return rows, disabled
 
 
 def _gpu_template(template: dict[str, Any]) -> bool:
@@ -736,7 +738,7 @@ def _text_or_none(value: Any) -> str | None:
 
 
 def _quantity_or_none(value: Any) -> int | None:
-    """NodePool limits 의 수량 — 2 나 "2". 0 은 값이다(꺼 둔 풀 — usable_pools). `1k` 같은 단위는 GPU 수에 쓰지 않아 null 이다."""
+    """NodePool limits 의 GPU 수 — 2 나 "2". `1k` 같은 단위는 GPU 수에 쓰지 않아 null 이다."""
     if isinstance(value, str) and value.isdecimal():
         return int(value)
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
