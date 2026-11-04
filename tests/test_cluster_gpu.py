@@ -41,7 +41,22 @@ def test_GPU_자원이_있는_노드만_싣고_실시간_값은_아직_null이�
     rows = gpu.gpu_nodes(fixture("gpu_nodes.json"))
     assert [r["node"] for r in rows] == [L40S_1, L40S_4]                      # CPU 노드는 빠진다, 이름순
     assert rows[0] == {"node": L40S_1, "product": "NVIDIA-L40S", "count": 1, "memory_mib": 46068,
+                       "instance_type": "g6e.xlarge", "zone": "ap-northeast-2b", "capacity_type": "on-demand",
                        "utilization_pct": None, "memory_used_mib": None, "temperature_c": None, "power_w": None}
+
+
+@pytest.mark.parametrize(("labels", "expected"), [
+    ({"karpenter.sh/capacity-type": "spot"}, "spot"),
+    ({"karpenter.sh/capacity-type": "on-demand"}, "on-demand"),
+    ({"eks.amazonaws.com/capacityType": "ON_DEMAND"}, "on-demand"),
+    ({"eks.amazonaws.com/capacityType": "SPOT"}, "spot"),
+    ({}, None),
+    ({"karpenter.sh/capacity-type": ""}, None),
+])
+def test_요금_종류를_한_가지_말로_맞춘다(labels, expected):
+    """온디맨드 단가를 스팟 노드에 말하지 않게 앱이 보는 값이다."""
+    stdout = _list(_node("n1", labels=labels, allocatable={"nvidia.com/gpu": "1"}))
+    assert gpu.gpu_nodes(stdout)[0]["capacity_type"] == expected
 
 
 def test_time_slicing으로_불어난_자원_수보다_물리_GPU_수_라벨을_믿는다():
@@ -55,6 +70,7 @@ def test_라벨이_없으면_자원_수와_인스턴스_종류로_메모리는_0
                          allocatable={"nvidia.com/gpu": "2"}))
     assert gpu.gpu_nodes(stdout)[0] == {
         "node": "n1", "product": "g6e.xlarge", "count": 2, "memory_mib": 0,
+        "instance_type": "g6e.xlarge", "zone": None, "capacity_type": None,
         "utilization_pct": None, "memory_used_mib": None, "temperature_c": None, "power_w": None}
 
 

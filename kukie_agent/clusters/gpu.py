@@ -27,6 +27,10 @@ GPU 노드 — nodes
   product  라벨 nvidia.com/gpu.product (AMD 는 amd.com/gpu.product-name), 없으면 인스턴스 종류 라벨, 그것도 없으면 ""
   memory_mib  노드 전체 GPU 메모리 = GPU 하나 메모리(라벨 nvidia.com/gpu.memory, MiB) × count.
               라벨이 없으면 DCGM 의 FB_USED + FB_FREE + FB_RESERVED 합, 그것도 없으면 0
+  instance_type  라벨 node.kubernetes.io/instance-type, 없으면 null
+  zone           라벨 topology.kubernetes.io/zone, 없으면 null
+  capacity_type  on-demand·spot 처럼 소문자와 - 로. 라벨 karpenter.sh/capacity-type, 없으면 eks.amazonaws.com/capacityType(ON_DEMAND·SPOT),
+                 둘 다 없으면 null. 앱이 온디맨드 단가를 스팟 노드에 말하지 않게 하는 값이다
   실시간 값(DCGM) — GPU 마다 나오는 줄을 노드 하나로 모은다: 사용률은 평균, 메모리 사용·전력은 합, 온도는 가장 높은 것.
   MIG 인스턴스는 부모 GPU 의 UUID 를 같이 쓰고 GPU_I_ID 로만 갈리므로 (UUID, GPU_I_ID) 로 묶는다.
   AMD 는 DCGM 이 없어 실시간 값이 늘 null 이다.
@@ -171,6 +175,9 @@ def gpu_nodes(stdout: str) -> list[dict[str, Any]]:
             "product": _product(labels, resource),
             "count": count,
             "memory_mib": per_gpu * count if per_gpu else 0,
+            "instance_type": _text_or_none(labels.get("node.kubernetes.io/instance-type")),
+            "zone": _text_or_none(labels.get("topology.kubernetes.io/zone")),
+            "capacity_type": _capacity_type(labels),
             "utilization_pct": None,
             "memory_used_mib": None,
             "temperature_c": None,
@@ -178,6 +185,12 @@ def gpu_nodes(stdout: str) -> list[dict[str, Any]]:
         })
     rows.sort(key=lambda r: r["node"])
     return rows
+
+
+def _capacity_type(labels: dict[str, Any]) -> str | None:
+    """Karpenter 는 on-demand, 관리형 노드 그룹은 ON_DEMAND 로 적는다 — 한 가지 말로 맞춘다."""
+    value = _text_or_none(labels.get("karpenter.sh/capacity-type")) or _text_or_none(labels.get("eks.amazonaws.com/capacityType"))
+    return value.lower().replace("_", "-") if value else None
 
 
 def _gpu_resource(status: dict[str, Any]) -> tuple[str | None, int]:
