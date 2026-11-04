@@ -85,7 +85,8 @@ Karpenter GPU 풀 — node_pools
 
 ServedModel — served_models
   kukie-gpu-operator 의 CRD. 한 줄이 ServedModel 하나다: namespace·name(metadata), model(spec.source.huggingface),
-  phase·reason·message(status), download_percent(status.download.percent), max_concurrency(status.baseline.maxConcurrency),
+  phase·reason·message(status), download_percent(status.download.percent), download_bytes(status.download.downloadedBytes),
+  download_total_bytes(status.download.totalBytes), max_concurrency(status.baseline.maxConcurrency),
   started_at(status.startedAt), stops_at(status.stopsAt). 두 시각은 오퍼레이터가 쓴 RFC3339 문자열 그대로이고, 없으면 null 이다.
   여기서 계산하지 않는다 — 언제 멈추는지는 spec.maxRuntime·차트 기본값·연장 annotation 을 모두 아는 오퍼레이터가 정한다.
   namespace·이름순. 오퍼레이터가 아직 status 를 쓰지 않았으면 문자열 칸은 "", 숫자·시각 칸은 null 이다.
@@ -216,13 +217,15 @@ def _memory_label_mib(labels: dict[str, Any]) -> int:
 def served_models(stdout: str) -> list[dict[str, Any]]:
     """ServedModel 목록을 응답 줄로 (모듈 설명 "ServedModel"). 이름 없는 항목은 뺀다. 모양이 다르면 ValueError —
     부르는 쪽이 served_models 를 null 로 둔다. 빈 목록은 "없다" 라는 뜻이라 gpu_nodes 처럼 엄격하게 읽는다.
-    download_percent·max_concurrency 는 CRD 스키마가 integer 라 오퍼레이터가 정수로만 쓴다 — 다른 값은 null 이다."""
+    download_percent·download_bytes·download_total_bytes·max_concurrency 는 CRD 스키마가 integer 라 오퍼레이터가 정수로만 쓴다 —
+    다른 값은 null 이다. 오븐이 전체 크기를 모르면 totalBytes 가 없어 download_total_bytes 가 null 이고, 옛 오븐은 둘 다 null 이다."""
     rows: list[dict[str, Any]] = []
     for item in _strict_items(stdout):
         meta = item.get("metadata")
         if not isinstance(meta, dict) or not meta.get("name"):
             continue
         status = item.get("status") or {}
+        download = status.get("download") or {}
         rows.append({
             "namespace": meta.get("namespace") or "default",
             "name": meta["name"],
@@ -230,7 +233,9 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
             "phase": status.get("phase") or "",
             "reason": status.get("reason") or "",
             "message": status.get("message") or "",
-            "download_percent": _int_or_none((status.get("download") or {}).get("percent")),
+            "download_percent": _int_or_none(download.get("percent")),
+            "download_bytes": _int_or_none(download.get("downloadedBytes")),
+            "download_total_bytes": _int_or_none(download.get("totalBytes")),
             "max_concurrency": _int_or_none((status.get("baseline") or {}).get("maxConcurrency")),
             "started_at": _text_or_none(status.get("startedAt")),
             "stops_at": _text_or_none(status.get("stopsAt")),

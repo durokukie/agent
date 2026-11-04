@@ -104,17 +104,21 @@ def test_ServedModel을_namespace_이름순으로_응답_줄로_바꾼다():
     assert gpu.served_models(fixture("served_models.json")) == [
         {"namespace": "a-team", "name": "gpt-oss-20b", "model": "openai/gpt-oss-20b", "phase": "Failed",
          "reason": "Unschedulable", "message": "0/2 nodes are available: 2 Insufficient nvidia.com/gpu.",
-         "download_percent": 100, "max_concurrency": None, "started_at": None, "stops_at": None},
+         "download_percent": 100, "download_bytes": None, "download_total_bytes": None,
+         "max_concurrency": None, "started_at": None, "stops_at": None},
         {"namespace": "llm", "name": "gpt-oss-20b", "model": "openai/gpt-oss-20b", "phase": "Ready",
-         "reason": "", "message": "", "download_percent": 100, "max_concurrency": 12,
+         "reason": "", "message": "", "download_percent": 100, "download_bytes": 44452911104,
+         "download_total_bytes": 44452911104, "max_concurrency": 12,
          "started_at": "2026-11-04T01:00:00Z", "stops_at": "2026-11-04T03:00:00Z"},
         # 오퍼레이터가 아직 status 를 쓰지 않았다 — 문자열은 "", 숫자는 null
         {"namespace": "llm", "name": "just-created", "model": "org/just-created", "phase": "",
-         "reason": "", "message": "", "download_percent": None, "max_concurrency": None,
+         "reason": "", "message": "", "download_percent": None, "download_bytes": None, "download_total_bytes": None,
+         "max_concurrency": None,
          "started_at": None, "stops_at": None},
-        # 내려받기 0% 는 값이다 — null 이 아니다
+        # 내려받기 0% 는 값이다 — null 이 아니다. 전체 크기를 모르면 받은 용량만 있다 (약속: percent 0, totalBytes 없음)
         {"namespace": "llm", "name": "qwen3", "model": "Qwen/Qwen3.6-35B-A3B", "phase": "Downloading",
-         "reason": "Downloading", "message": "download Job is running", "download_percent": 0, "max_concurrency": None,
+         "reason": "Downloading", "message": "download Job is running", "download_percent": 0,
+         "download_bytes": 1073741824, "download_total_bytes": None, "max_concurrency": None,
          "started_at": None, "stops_at": None},
     ]
 
@@ -136,6 +140,25 @@ def test_ServedModel_숫자_칸은_정수만_싣는다(value, expected):
     item = {"metadata": {"name": "m"}, "status": {"download": {"percent": value}, "baseline": {"maxConcurrency": value}}}
     [row] = gpu.served_models(_list(item))
     assert (row["download_percent"], row["max_concurrency"]) == (expected, expected)
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (13314398618, 13314398618), (0, 0), (None, None), ("13314398618", None), (True, None), (1.5, None),
+])
+def test_내려받은_용량과_전체_용량은_정수만_싣는다(value, expected):
+    """int64 라 32비트를 넘는 값(모델은 수십 GB 다)도 그대로 싣는다."""
+    item = {"metadata": {"name": "m"}, "status": {"download": {"downloadedBytes": value, "totalBytes": value}}}
+    [row] = gpu.served_models(_list(item))
+    assert (row["download_bytes"], row["download_total_bytes"]) == (expected, expected)
+
+
+def test_옛_오븐은_용량_칸이_null이고_퍼센트와_이유는_그대로다():
+    """오븐 0.5.1 전에는 percent 만 쓴다. 그래도 기존 download_percent·reason 은 바뀌지 않는다."""
+    item = {"metadata": {"name": "m"},
+            "status": {"phase": "Downloading", "reason": "JobRunning", "download": {"percent": 40}}}
+    [row] = gpu.served_models(_list(item))
+    assert (row["download_percent"], row["reason"]) == (40, "JobRunning")
+    assert (row["download_bytes"], row["download_total_bytes"]) == (None, None)
 
 
 def test_시간이_지나_멈춘_ServedModel은_상태와_시각을_그대로_싣는다():
