@@ -1,9 +1,8 @@
 """Private 스킬 — 혼자 보는 대화. 읽기 툴(kubectl 5종 + 레포 3종)만, 변경 툴은 아예 노출하지 않는다 (DURO-100)."""
+from kukie_agent import prompts
 from kukie_agent.skills.base import Skill
 
-PROMPT = """이 대화는 Private 대화다. 클러스터를 읽을 수만 있고 바꿀 수는 없다.
-변경을 요청받으면 시도하지 말고, 변경은 Shared 대화에서만 할 수 있다고 알려라.
-대신 사용자가 직접 터미널에서 실행할 kubectl 명령과 각 플래그의 의미를 안내해라."""
+PROMPT = prompts.load("private")
 
 SKILL = Skill(
     name="Private",
