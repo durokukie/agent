@@ -126,20 +126,20 @@ def test_ServedModel을_namespace_이름순으로_응답_줄로_바꾼다():
         {"namespace": "a-team", "name": "gpt-oss-20b", "model": "openai/gpt-oss-20b", "phase": "Failed",
          "reason": "Unschedulable", "message": "0/2 nodes are available: 2 Insufficient nvidia.com/gpu.",
          "download_percent": 100, "download_bytes": None, "download_total_bytes": None,
-         "max_concurrency": None, "engine_image": A_TEAM_IMAGE, "started_at": None, "stops_at": None},
+         "max_concurrency": None, "engine_image": A_TEAM_IMAGE, "gpus": 1, "started_at": None, "stops_at": None},
         {"namespace": "llm", "name": "gpt-oss-20b", "model": "openai/gpt-oss-20b", "phase": "Ready",
          "reason": "", "message": "", "download_percent": 100, "download_bytes": 44452911104,
-         "download_total_bytes": 44452911104, "max_concurrency": 12, "engine_image": VLLM_IMAGE,
+         "download_total_bytes": 44452911104, "max_concurrency": 12, "engine_image": VLLM_IMAGE, "gpus": 1,
          "started_at": "2026-11-04T01:00:00Z", "stops_at": "2026-11-04T03:00:00Z"},
         # 오퍼레이터가 아직 status 를 쓰지 않았다 — 문자열은 "", 숫자는 null
         {"namespace": "llm", "name": "just-created", "model": "org/just-created", "phase": "",
          "reason": "", "message": "", "download_percent": None, "download_bytes": None, "download_total_bytes": None,
-         "max_concurrency": None, "engine_image": JUST_CREATED_IMAGE,
+         "max_concurrency": None, "engine_image": JUST_CREATED_IMAGE, "gpus": None,
          "started_at": None, "stops_at": None},
         # 내려받기 0% 는 값이다 — null 이 아니다. 전체 크기를 모르면 받은 용량만 있다 (약속: percent 0, totalBytes 없음)
         {"namespace": "llm", "name": "qwen3", "model": "Qwen/Qwen3.6-35B-A3B", "phase": "Downloading",
          "reason": "Downloading", "message": "download Job is running", "download_percent": 0,
-         "download_bytes": 1073741824, "download_total_bytes": None, "max_concurrency": None, "engine_image": VLLM_IMAGE,
+         "download_bytes": 1073741824, "download_total_bytes": None, "max_concurrency": None, "engine_image": VLLM_IMAGE, "gpus": 1,
          "started_at": None, "stops_at": None},
     ]
 
@@ -177,6 +177,20 @@ def test_내려받은_용량과_전체_용량은_정수만_싣는다(value, expe
 def test_엔진_이미지가_없으면_null이다(spec):
     [row] = gpu.served_models(_list({"metadata": {"name": "m"}, "spec": spec}))
     assert row["engine_image"] is None
+
+
+@pytest.mark.parametrize(("spec", "expected"), [
+    ({"engine": {"gpus": 4}}, 4), ({"engine": {"gpus": 1}}, 1),
+    ({"engine": {"gpus": 3}}, 3),                                            # CRD 는 받지만 서버 시작 요청은 안 받는 값 — 여기서는 거르지 않는다
+    ({}, None), ({"engine": None}, None), ({"engine": {}}, None),
+    ({"engine": {"gpus": None}}, None), ({"engine": {"gpus": "4"}}, None),
+    ({"engine": {"gpus": True}}, None), ({"engine": {"gpus": 1.5}}, None),
+    ({"engine": {"gpus": 0}}, None), ({"engine": {"gpus": -1}}, None),       # 앱은 null 만 1장으로 본다 — 0장으로 다시 시작하지 않게
+])
+def test_ServedModel의_GPU_수는_spec_engine_gpus의_1_이상_정수만_싣고_나머지는_null이다(spec, expected):
+    """[다시 시작] 이 같은 GPU 수로 시작하는 값이다. null 이면 앱이 1장으로 본다 (DURO-186)."""
+    [row] = gpu.served_models(_list({"metadata": {"name": "m"}, "spec": spec}))
+    assert row["gpus"] == expected
 
 
 def test_옛_오븐은_용량_칸이_null이고_퍼센트와_이유는_그대로다():
@@ -233,8 +247,8 @@ def _picks(key: str, *values: str, operator: str = "In") -> list[dict]:
 
 def test_NodePool_목록에서_GPU_풀만_이름순으로_싣는다():
     assert gpu.node_pools(fixture("node_pools.json")) == ([
-        {"name": "batch-gpu", "gpu_limit": None},      # 계열로만 알아본 풀 — limits 가 없다
-        {"name": "gpu", "gpu_limit": 2},
+        {"name": "batch-gpu", "gpu_limit": None, "instance_types": None},      # 계열로만 알아본 풀 — limits 가 없고 인스턴스 제한도 모른다
+        {"name": "gpu", "gpu_limit": 2, "instance_types": ["g6e.xlarge"]},
     ], False)                                          # default 는 CPU 풀이다. NotIn 으로 GPU 계열을 뺀 것이 GPU 풀이 되면 안 된다
     assert gpu.NODE_POOLS_COMMAND == ["get", "nodepools.karpenter.sh", "-o", "json"]
 
@@ -278,7 +292,7 @@ def test_GPU_풀로_보지_않는다(pool):
 @pytest.mark.parametrize(("limit", "expected"), [(2, 2), ("2", 2), ("1k", None), (1.5, None), (True, None),
                                                  (-1, None), (None, None), ("", None)])
 def test_GPU_상한은_정수로_읽히는_것만_싣는다(limit, expected):
-    assert gpu.node_pools(_list(_pool(limits={"nvidia.com/gpu": limit}))) == ([{"name": "p", "gpu_limit": expected}], False)
+    assert gpu.node_pools(_list(_pool(limits={"nvidia.com/gpu": limit}))) == ([{"name": "p", "gpu_limit": expected, "instance_types": None}], False)
 
 
 @pytest.mark.parametrize("limits", [{"nvidia.com/gpu": 0}, {"nvidia.com/gpu": "0"}, {"cpu": 0}, {"cpu": "0"},
@@ -287,13 +301,129 @@ def test_limits의_어느_자원이든_0이면_꺼_둔_풀이라_응답에서_�
     """Karpenter 는 limits 를 넘는 노드를 띄우지 않는다 — 풀을 멈춰 두는 흔한 방법이다 (agent#139 리뷰)."""
     off = _pool("off", limits=limits, requirements=_picks(FAMILY, "g6e"))
     assert gpu.node_pools(_list(off)) == ([], True)
-    assert gpu.node_pools(_list(off, _pool("on", limits={"nvidia.com/gpu": 2}))) == ([{"name": "on", "gpu_limit": 2}], True)
+    assert gpu.node_pools(_list(off, _pool("on", limits={"nvidia.com/gpu": 2}))) == ([{"name": "on", "gpu_limit": 2, "instance_types": None}], True)
 
 
 def test_CPU_풀을_꺼_둔_것은_GPU_풀과_상관없다():
     assert gpu.node_pools(_list(_pool("cpu", limits={"cpu": 0}))) == ([], False)
     assert gpu.node_pools(_list(_pool("p", limits={"cpu": "10", "memory": "100Gi", "nvidia.com/gpu": 1}))) == (
-        [{"name": "p", "gpu_limit": 1}], False)
+        [{"name": "p", "gpu_limit": 1, "instance_types": None}], False)
+
+
+def test_instance_type_In_값을_적힌_순서대로_싣는다():
+    """kukie-gpu 의 NodePool gpu 와 같은 모양이다 — 다른 키의 조건이 같이 있어도 된다."""
+    requirements = [*_picks("karpenter.sh/capacity-type", "on-demand"), *_picks(INSTANCE_TYPE, "g6e.xlarge", "g6e.12xlarge")]
+    pool = _pool(limits={"nvidia.com/gpu": "5"}, taints=[{"key": "nvidia.com/gpu"}], requirements=requirements)
+    assert gpu.node_pools(_list(pool)) == (
+        [{"name": "p", "gpu_limit": 5, "instance_types": ["g6e.xlarge", "g6e.12xlarge"]}], False)
+
+
+def test_instance_types는_적힌_순서를_지키며_중복을_뺀다():
+    requirements = _picks(INSTANCE_TYPE, "g6e.12xlarge", "g6e.xlarge", "g6e.12xlarge", "g6e.xlarge")
+    [row], _ = gpu.node_pools(_list(_pool(limits={"nvidia.com/gpu": 2}, requirements=requirements)))
+    assert row["instance_types"] == ["g6e.12xlarge", "g6e.xlarge"]
+
+
+TWO_TYPES = _picks(INSTANCE_TYPE, "g6e.xlarge", "g6e.12xlarge")
+
+
+@pytest.mark.parametrize("other", [
+    _picks("karpenter.sh/capacity-type", "on-demand"),
+    _picks("karpenter.sh/capacity-type", "spot", operator="NotIn"),
+    _picks("topology.kubernetes.io/zone", "ap-northeast-2a", "ap-northeast-2c"),
+    _picks("topology.k8s.aws/zone-id", "apne2-az1"),
+    _picks("kubernetes.io/arch", "amd64"),
+    _picks("kubernetes.io/os", "linux"),
+    [{"key": "topology.kubernetes.io/zone", "operator": "Exists"}],
+])
+def test_GPU_장수를_안_바꾸는_조건은_같이_있어도_instance_types를_싣는다(other):
+    [row], _ = gpu.node_pools(_list(_pool(limits={"nvidia.com/gpu": 2}, requirements=[*other, *TWO_TYPES])))
+    assert row["instance_types"] == ["g6e.xlarge", "g6e.12xlarge"]
+
+
+@pytest.mark.parametrize("other", [
+    _picks("karpenter.k8s.aws/instance-gpu-count", "1"),                     # 12xlarge(4장)를 뺀다 — 앱이 4장 칸을 보여 주면 Unschedulable 에 머문다
+    _picks("karpenter.k8s.aws/instance-gpu-count", "2", operator="Lt"),
+    _picks("karpenter.k8s.aws/instance-size", "12xlarge", operator="NotIn"),
+    _picks(FAMILY, "g6"),
+    _picks(FAMILY, "g6", operator="NotIn"),
+    _picks("karpenter.k8s.aws/instance-category", "g"),
+    _picks("karpenter.k8s.aws/instance-memory", "100000", operator="Lt"),
+    _picks(INSTANCE_TYPE, "g6e.12xlarge", operator="NotIn"),
+    _picks("karpenter.k8s.aws/capacity-reservation-id", "cr-1"),             # instance- 로 시작하지 않아도 좁힌다
+    _picks("example.com/team", "ml"),                                        # 좁히는지 모르는 키는 제한을 모르는 것이다
+    [{"operator": "In", "values": ["x"]}],                                   # 키가 없거나 문자열이 아니다
+    [{"key": None, "operator": "In", "values": ["x"]}],
+    [{"key": ["x"], "operator": "In", "values": ["x"]}],
+    [{"key": {"x": 1}, "operator": "In", "values": ["x"]}],
+])
+def test_고를_범위를_좁힐_수_있는_조건이_같이_있으면_instance_types는_null이고_풀은_그대로다(other):
+    """Karpenter 는 모든 조건의 교집합만 띄운다. 키가 앞에 있어도 뒤에 있어도 같다."""
+    for requirements in ([*TWO_TYPES, *other], [*other, *TWO_TYPES]):
+        pool = _pool(limits={"nvidia.com/gpu": 2}, taints=[{"key": "nvidia.com/gpu"}], requirements=requirements)
+        assert gpu.node_pools(_list(pool)) == ([{"name": "p", "gpu_limit": 2, "instance_types": None}], False)
+
+
+TEMPLATE_TAINT = [{"key": "nvidia.com/gpu", "effect": "NoSchedule"}]
+
+
+@pytest.mark.parametrize("requirements", [
+    [],
+    _picks(FAMILY, "g6e"),                                                   # 다른 조건만 있다
+    _picks("karpenter.k8s.aws/instance-gpu-count", "0", operator="Gt"),
+    _picks(INSTANCE_TYPE, "m5.large", operator="NotIn"),
+    [{"key": INSTANCE_TYPE, "operator": "Exists"}],
+    _picks(INSTANCE_TYPE, "g6e.xlarge") + _picks(INSTANCE_TYPE, "g6e.xlarge", "g6e.12xlarge"),    # 키가 여러 번
+    _picks(INSTANCE_TYPE, "g6e.xlarge") + _picks(INSTANCE_TYPE, "m5.large", operator="NotIn"),
+    _picks(INSTANCE_TYPE),                                                   # 값이 비었다
+    [{"key": INSTANCE_TYPE, "operator": "In"}],
+    [{"key": INSTANCE_TYPE, "operator": "In", "values": "g6e.xlarge"}],
+    [{"key": INSTANCE_TYPE, "operator": "In", "values": ["g6e.xlarge", 3]}],
+    [{"key": INSTANCE_TYPE, "operator": "In", "values": ["g6e.xlarge", ""]}],
+    [{"key": INSTANCE_TYPE, "operator": "In", "values": ["g6e.xlarge", None]}],
+])
+def test_instance_types는_In_하나로_고른_것이_아니면_null이고_풀은_그대로_있다(requirements):
+    pool = _pool(limits={"nvidia.com/gpu": 2}, taints=TEMPLATE_TAINT, requirements=requirements)
+    assert gpu.node_pools(_list(pool)) == ([{"name": "p", "gpu_limit": 2, "instance_types": None}], False)
+
+
+@pytest.mark.parametrize("template", [
+    None, "x", 3, [], {}, {"spec": None}, {"spec": "x"}, {"spec": []}, {"spec": {"requirements": None}},
+    {"spec": {"requirements": "x"}}, {"spec": {"requirements": 3}}, {"spec": {"requirements": {}}},
+    {"spec": {"requirements": ["x"]}}, {"spec": {"requirements": [None, *_picks(INSTANCE_TYPE, "g6e.xlarge")]}},
+])
+def test_GPU_상한이_있는_풀은_템플릿_모양이_이상해도_ValueError_없이_instance_types만_null이다(template):
+    """이 풀은 GPU 풀 판별이 템플릿을 읽지 않아 지금까지 읽혔다. 새 칸 때문에 node_pools 째 null 이 되면 hasGpu 판단이 바뀐다."""
+    pool = {"metadata": {"name": "p"}, "spec": {"limits": {"nvidia.com/gpu": 2}, "template": template}}
+    assert gpu.node_pools(_list(pool)) == ([{"name": "p", "gpu_limit": 2, "instance_types": None}], False)
+
+
+@pytest.mark.parametrize("template", [
+    {"taints": TEMPLATE_TAINT, "requirements": "x"},                         # taint 로 판별이 끝나 requirements 를 읽지 않는다
+    {"taints": TEMPLATE_TAINT, "requirements": [None]},
+    {"requirements": [*_picks(FAMILY, "g6e"), None]},                        # 앞쪽 조건으로 판별이 끝나 뒤를 읽지 않는다
+])
+def test_GPU_판별이_읽지_않은_requirements_모양이_이상해도_instance_types만_null이다(template):
+    pool = {"metadata": {"name": "p"}, "spec": {"template": {"spec": template}}}
+    assert gpu.node_pools(_list(pool)) == ([{"name": "p", "gpu_limit": None, "instance_types": None}], False)
+
+
+@pytest.mark.parametrize("requirements", [
+    [{"key": INSTANCE_TYPE, "operator": "In", "values": ["g6e.xlarge", 3]}],    # 값이 이상해도 GPU 계열을 고른 풀이다
+    _picks(INSTANCE_TYPE, "g6e.xlarge") + _picks(INSTANCE_TYPE, "g6e.12xlarge"),
+    _picks(FAMILY, "g6e"),
+])
+def test_instance_types가_null이어도_GPU_풀_판별은_그대로다(requirements):
+    assert gpu.node_pools(_list(_pool(requirements=requirements))) == (
+        [{"name": "p", "gpu_limit": None, "instance_types": None}], False)
+
+
+@pytest.mark.parametrize("pool", [
+    _pool(requirements=_picks(INSTANCE_TYPE, "m5.large", "c7i.xlarge")),     # GPU 풀이 아니면 instance-type 이 있어도 안 싣는다
+    _pool(requirements=_picks(INSTANCE_TYPE, "g6e.xlarge", operator="NotIn")),
+])
+def test_instance_type을_읽어도_GPU_풀이_아닌_것은_빈_목록_그대로다(pool):
+    assert gpu.node_pools(_list(pool)) == ([], False)
 
 
 @pytest.mark.parametrize("broken", ["", "not json", "{}", '{"items": {}}', '{"items": ["x"]}', "[]"])
@@ -965,6 +1095,7 @@ def test_GPU_없는_일반_클러스터에는_ServedModel_조회가_늘지_않�
 # ── Karpenter GPU 풀만 있는 클러스터 (DURO-184) ─────────────
 
 GPU_POOLS = _result(_list(_pool("gpu", limits={"nvidia.com/gpu": 2})))
+GPU_POOL_ROW = {"name": "gpu", "gpu_limit": 2, "instance_types": None}
 
 
 @pytest.mark.parametrize("known", [None, False, True])
@@ -975,7 +1106,7 @@ def test_노드도_대기_파드도_모델도_없어도_GPU_풀이_있으면_GPU
                                               clock=lambda: 0.0)
     assert has_gpu is True
     assert body == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [], "served_models": None,
-                    "node_pools": [{"name": "gpu", "gpu_limit": 2}]}
+                    "node_pools": [GPU_POOL_ROW]}
     assert [args for args, _ in seen] == [gpu.NODES_COMMAND, gpu.PODS_COMMAND, gpu.NODE_POOLS_COMMAND,
                                           gpu.SERVED_MODELS_COMMAND]   # GPU 풀을 찾은 라운드에 ServedModel 도 읽는다
 
@@ -996,7 +1127,9 @@ def test_GPU_없음으로_남은_클러스터도_재확인_주기에_GPU_풀을_
     r = client.get(f"/clusters/{cluster}/overview", headers=USER)
     assert r.status_code == 200
     assert r.json()["gpu"]["nodes"] == []
-    assert r.json()["gpu"]["node_pools"] == [{"name": "batch-gpu", "gpu_limit": None}, {"name": "gpu", "gpu_limit": 2}]
+    assert r.json()["gpu"]["node_pools"] == [
+        {"name": "batch-gpu", "gpu_limit": None, "instance_types": None},
+        {"name": "gpu", "gpu_limit": 2, "instance_types": ["g6e.xlarge"]}]
     assert [body["hasGpu"] for body in _gpu_calls(fake_server)] == [True]
     assert fake_server.clusters[cluster]["hasGpu"] is True
 
@@ -1026,7 +1159,7 @@ def test_GPU_풀을_나중에_만들면_재확인_주기가_지나야_보이고_
     assert call() == (None, False) and seen == [gpu.NODES_COMMAND]   # 간격 안 — 노드만 본다
     now[0] += 1
     body, has_gpu = call()
-    assert has_gpu is True and body["node_pools"] == [{"name": "gpu", "gpu_limit": 2}]
+    assert has_gpu is True and body["node_pools"] == [GPU_POOL_ROW]
 
 
 @pytest.mark.parametrize("known", [None, False])
@@ -1096,10 +1229,25 @@ def test_CRD가_없어도_GPU_클러스터의_hasGpu는_다른_근거가_있으�
     assert has_gpu is True and body["node_pools"] == [] and len(body["waiting"]) == 1
 
 
+@pytest.mark.parametrize("requirements", [
+    _picks(FAMILY, "g6e"),
+    [{"key": INSTANCE_TYPE, "operator": "In", "values": ["g6e.xlarge", 3]}],
+    _picks(INSTANCE_TYPE, "g6e.xlarge") + _picks(INSTANCE_TYPE, "g6e.12xlarge"),
+    "x",
+])
+def test_instance_types가_null이어도_꺼진_클러스터의_hasGpu는_true다(requirements):
+    """빈 node_pools 는 hasGpu 를 false 로 덮는 근거다 — 새 칸이 풀을 빈 목록이나 null 로 만들면 안 된다 (DURO-186)."""
+    pools = _result(_list(_pool("gpu", limits={"nvidia.com/gpu": 2}, requirements=requirements)))
+    run, _ = _served_models_cluster(_result(stderr=NO_CRD, success=False), nodes="nodes.json", pools=pools)
+    body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", cache_key=f"odd-pool:{requirements}", known=None,
+                                              clock=lambda: 0.0)
+    assert has_gpu is True and body["node_pools"] == [GPU_POOL_ROW]
+
+
 def test_GPU_노드가_있는_클러스터도_node_pools를_싣고_못_읽으면_그_칸만_null이다():
     run, _ = _served_models_cluster(_result('{"items": []}'), pods=fixture("gpu_pods.json"), pools=GPU_POOLS)
     body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: 0.0)
-    assert has_gpu is True and body["node_pools"] == [{"name": "gpu", "gpu_limit": 2}] and len(body["nodes"]) == 2
+    assert has_gpu is True and body["node_pools"] == [GPU_POOL_ROW] and len(body["nodes"]) == 2
 
     run, _ = _served_models_cluster(_result('{"items": []}'), pods=fixture("gpu_pods.json"),
                                     pools=_result(stderr="timed out", success=False))
@@ -1198,7 +1346,7 @@ def test_파드_조회가_매달려_모자란_라운드도_NodePool은_읽는다
 
     body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", cache_key="slow-pods:fp:ns", known=False, clock=lambda: now[0])
     assert timeouts == {"nodepools.karpenter.sh": 2, "servedmodels.serving.kukie.io": 3}
-    assert has_gpu is True and body["node_pools"] == [{"name": "gpu", "gpu_limit": 2}]
+    assert has_gpu is True and body["node_pools"] == [GPU_POOL_ROW]
 
 
 def test_NodePool과_ServedModel이_함께_매달려도_지표_몫은_남은_예산의_절반이다(monkeypatch):
@@ -1291,7 +1439,7 @@ def test_namespace_탐색이_매달려도_NodePool을_읽을_예산이_남는다
 
     body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", known=known, clock=lambda: now[0])
     assert pool_timeouts == [expected]                       # known 이 true 가 아니면 남은 5초를 ServedModel 과 나눈다
-    assert has_gpu is True and body["node_pools"] == [{"name": "gpu", "gpu_limit": 2}]
+    assert has_gpu is True and body["node_pools"] == [GPU_POOL_ROW]
 
 
 def test_GPU_노드가_없고_namespace마다_찾아도_없으면_모른다(client, fake_server, monkeypatch):
