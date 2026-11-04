@@ -61,6 +61,8 @@ GPU_SERVED_MODELS_TIMEOUT = 5
 GPU_NODE_POOLS_TIMEOUT = 5
 #: 측정 기록 ConfigMap 목록 시간 제한(초). 없어도 되는 칸이라 더 짧게 끊는다. GPU 노드가 있으면 NodePool·ServedModel 이 쓰고 남은 절반 몫 안에서만 쓴다(_collect_gpu)
 GPU_BENCHMARKS_TIMEOUT = 3
+#: 마지막으로 성공한 측정 기록을 연결마다 기억하는 시간(초). 넘으면 어느 연결의 것이든 지운다 — 메모리를 지키고, 하루 넘게 못 읽은 표를 계속 보이지 않게
+GPU_BENCHMARKS_FORGET = 24 * 3600
 #: 파드를 읽을 수 있었던 namespace 를 연결마다 기억하는 시간(초). 그동안은 그 namespace 만 읽는다.
 #: 고객이 새 namespace 나 RoleBinding 을 더하면 이만큼 늦게 보인다 — 짧게 둔다
 READABLE_NAMESPACES_TTL = 120
@@ -157,7 +159,7 @@ async def cluster_overview(
     server 값이 GPU 클러스터(true)가 아닌 곳은 이 파드를 GPU_ABSENT_RECHECK 초에 한 번만 찾는다. 알아낸 GPU 클러스터 여부를
     server 에 남긴다(_record_gpu). Karpenter GPU 풀(gpu.node_pools)과 ServedModel(gpu.served_models)은 지표 전에 읽고, CRD 가 없거나
     못 읽으면 그 칸만 null 이다. GPU 풀이 있으면 노드가 0대여도 gpu 칸을 주고 GPU 클러스터로 둔다. ServedModel 이 읽히면 측정 기록(gpu.benchmarks)도
-    읽고, 못 읽으면 그 칸만 빈 배열이다.
+    읽는다. 잠깐 못 읽으면 마지막으로 성공한 값을, 그것도 없으면 빈 배열을 싣는다.
 
     kubectl 이 실패하면 연결 확인과 같은 기준(_failure_status)으로 갈라 502 로 답한다.
       CLUSTER_AUTH_EXPIRED  인증 실패·권한 없음 (연결 확인의 auth_expired)
@@ -677,7 +679,7 @@ def _collect_gpu(
         logger.debug("개요의 GPU 조회를 건너뛴다 (노드 목록을 읽지 못했다)")
         return None, None
     if budget(OVERVIEW_TIMEOUT) < 1:
-        return gpu.build(nodes, []), (True if nodes else None)
+        return gpu.build(nodes, [], benchmarks=_remembered_benchmarks(cache_key, clock)), (True if nodes else None)
     # 예산을 본 뒤에 창을 잡는다 — 바로 아래에서 파드 조회를 늘 보내므로, 잡은 창은 조회를 보낸 라운드다
     if not nodes and known is not True and not _absent_search_due(cache_key, unknown=known is None, clock=clock):
         return None, (False if known is False else None)
@@ -690,9 +692,10 @@ def _collect_gpu(
         # 탐색은 남은 예산의 절반까지만 — 지표를 읽을 시간을 남긴다 (agent#120 리뷰). GPU 노드가 없으면 지표를 읽지 않으니
         # 쓴다 — 기다리는 파드를 찾는 길이 이것뿐이다 (agent#121 리뷰). 다만 NodePool 을 읽을 시간은 남긴다 — pools_budget 이 그
         # 몫을 ServedModel 과 나눠, 이 라운드에 GPU 클러스터를 처음 찾아도 ServedModel 까지 답한다. GPU 로 알려진 꺼진 클러스터는
-        # ServedModel 몫을 따로 남긴다 (agent#138·#139 리뷰). 일반 클러스터는 ServedModel 을 읽지 않으니 그 몫을 떼지 않는다
+        # ServedModel·측정 기록 몫을 따로 남긴다 (agent#138·#139·#144 리뷰). 일반 클러스터는 둘 다 읽지 않으니 그 몫을 떼지 않는다
         search_deadline = (clock() + max(0.0, deadline - clock()) / 2 if nodes
-                           else deadline - GPU_NODE_POOLS_TIMEOUT - (GPU_SERVED_MODELS_TIMEOUT if known is True else 0))
+                           else deadline - GPU_NODE_POOLS_TIMEOUT
+                           - (GPU_SERVED_MODELS_TIMEOUT + GPU_BENCHMARKS_TIMEOUT if known is True else 0))
 
         def search_budget(limit: int) -> int:
             return min(limit, int(search_deadline - clock()))
@@ -731,10 +734,16 @@ def _collect_gpu(
 
     # GPU 노드가 없으면 기다리는 파드나 GPU 풀이 있거나 GPU 클러스터로 알려진 곳만 읽는다 — GPU 없는 일반 클러스터에 조회를 늘리지 않는다
     served_models, served_absent = None, True
-    if nodes or waiting or node_pools or known is True:
+    read_served = nodes or waiting or node_pools or known is True
+    if read_served:
         served_models, served_absent = _read_served_models(run, served_budget)
-    # 같은 몫 안에서 ServedModel 뒤에 읽는다 — 매달려도 지표 몫은 그대로다. 몫이 안 남으면 조회 없이 빈 배열이다
-    benchmarks = _read_benchmarks(run, served_budget) if served_models is not None else []
+    # 같은 몫 안에서 ServedModel 뒤에 읽는다 — 매달려도 지표 몫은 그대로다. 못 읽은 라운드는 기억해 둔 값을 쓴다
+    if served_models is not None:
+        benchmarks = _read_benchmarks(run, served_budget, cache_key=cache_key, clock=clock)
+    else:
+        if read_served and served_absent:                   # CRD 없음·거부 — 잠깐의 실패가 아니다
+            _forget_benchmarks(cache_key)
+        benchmarks = _remembered_benchmarks(cache_key, clock)
     if not nodes:
         if waiting or node_pools or served_models is not None:
             return gpu.build([], [], waiting or [], served_models, node_pools, benchmarks), True
@@ -793,20 +802,66 @@ def _read_served_models(run, budget) -> tuple[list[dict[str, Any]] | None, bool]
         return None, False
 
 
-def _read_benchmarks(run, budget) -> list[dict[str, Any]]:
-    """측정 기록 줄 — clusters/gpu.py "측정 기록". 거부·시간 초과·예산 부족·깨진 출력은 모두 [] 이고 개요를 실패시키지 않는다."""
+def _read_benchmarks(run, budget, *, cache_key: str | None = None, clock=time.monotonic) -> list[dict[str, Any]]:
+    """측정 기록 줄 — clusters/gpu.py "측정 기록". 어떤 실패도 개요를 실패시키지 않는다. 시간 초과·예산 부족·깨진 출력은
+    마지막으로 성공한 값을 준다 — 한 번 실패로 표가 깜빡이지 않게 (agent#144 리뷰). 처음부터 실패면 [] 다.
+    거부는 잠깐의 실패가 아니라 "볼 수 없다" 는 답이라 기억을 지운다 — 권한을 거둔 고객의 값을 계속 보이지 않게."""
     timeout = budget(GPU_BENCHMARKS_TIMEOUT)
     if timeout < 1:
-        return []
+        return _remembered_benchmarks(cache_key, clock)
     result = run(gpu.BENCHMARKS_COMMAND, timeout)
     if not result.success:
-        logger.debug("측정 기록을 읽지 못했다: %s", _failure_status(result.stderr or result.stdout or ""))
-        return []
+        text = result.stderr or result.stdout or ""
+        logger.debug("측정 기록을 읽지 못했다: %s", _failure_status(text))
+        if gpu.served_models_absent(text):
+            _forget_benchmarks(cache_key)
+        return _remembered_benchmarks(cache_key, clock, timed_out=_timed_out(text))
     try:
-        return gpu.benchmarks(result.stdout)
+        rows = gpu.benchmarks(result.stdout)
     except (ValueError, AttributeError, TypeError, RecursionError):
         logger.debug("측정 기록을 읽지 못했다 (목록 모양이 아니다)")
-        return []
+        return _remembered_benchmarks(cache_key, clock)
+    if cache_key:
+        now = clock()
+        with _benchmarks_lock:
+            _forget_old_benchmarks(now)
+            _benchmarks_memory[cache_key] = _BenchmarksMemo(rows, now)
+    return rows
+
+
+def _timed_out(stderr: str) -> bool:
+    """kubectl 을 시간 제한으로 끊었거나(subprocess) kubectl 이 시간 초과로 끝났나 — 측정 기록 목록이 너무 커졌다는 신호일 수 있다."""
+    lowered = stderr.lower()
+    return "timed out" in lowered or "deadline exceeded" in lowered
+
+
+def _remembered_benchmarks(cache_key: str | None, clock=time.monotonic, *, timed_out: bool = False) -> list[dict[str, Any]]:
+    """연결의 마지막 성공 측정 기록, 없으면 []. 시간 초과면 다음 성공까지 경고를 한 번만 남긴다 — 표는 그대로라 로그 말고는
+    알아챌 길이 없고, 20초 주기마다 남기면 로그만 쌓인다. 연결 지문이 없으면(cache_key None) 기억이 없어 늘 [] 이고 경고도 매번이다."""
+    now = clock()
+    with _benchmarks_lock:
+        _forget_old_benchmarks(now)
+        memo = _benchmarks_memory.get(cache_key) if cache_key else None
+        warn = timed_out and not (memo and memo.warned)
+        if warn and cache_key:
+            memo = memo or _benchmarks_memory.setdefault(cache_key, _BenchmarksMemo([], now))
+            memo.warned = True
+        rows = memo.rows if memo else []
+    if warn:
+        logger.warning("측정 기록 조회가 시간 초과로 끝났다 — 기억해 둔 %d줄을 쓴다. ConfigMap 이 너무 많은지 본다", len(rows))
+    return rows
+
+
+def _forget_benchmarks(cache_key: str | None) -> None:
+    if cache_key:
+        with _benchmarks_lock:
+            _benchmarks_memory.pop(cache_key, None)
+
+
+def _forget_old_benchmarks(now: float) -> None:
+    """GPU_BENCHMARKS_FORGET 초보다 오래된 기억을 어느 연결의 것이든 지운다. _benchmarks_lock 안에서 부른다."""
+    for key in [key for key, memo in _benchmarks_memory.items() if now - memo.at >= GPU_BENCHMARKS_FORGET]:
+        del _benchmarks_memory[key]
 
 
 def _read_node_pools(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:
@@ -858,6 +913,13 @@ class _NamespaceMemo:
     whole: bool = True                 # names 가 목록 전부다 — MAX_POD_NAMESPACES 로 자르지 않았다
 
 
+@dataclass
+class _BenchmarksMemo:
+    rows: list[dict[str, Any]]
+    at: float                          # 마지막으로 읽은 시각. 처음부터 시간 초과면 그 시각이고 rows 는 비어 있다
+    warned: bool = False               # 이 실패가 이어지는 동안 시간 초과 경고를 남겼다
+
+
 #: 연결(클러스터 id·연결 지문·클러스터 namespace)마다의 기억. 프로세스 안 기억이라 복제본마다 따로 채운다.
 #: 연결을 바꾸면 키가 달라져 옛 기억을 쓰지 않는다
 _readable_namespaces: dict[str, _NamespaceMemo] = {}
@@ -868,6 +930,9 @@ _gpu_absent_checked: dict[str, float] = {}
 #: 복제본마다 따로고, 재시작하면 첫 수집은 다시 null 이다
 _latency_samples: dict[str, dict[str, gpu.LatencySample]] = {}
 _latency_lock = threading.Lock()
+#: 연결마다 마지막으로 성공한 측정 기록 — _read_benchmarks. 한 연결에 많아야 MAX_BENCHMARKS 줄이고 GPU_BENCHMARKS_FORGET 뒤에 지운다
+_benchmarks_memory: dict[str, _BenchmarksMemo] = {}
+_benchmarks_lock = threading.Lock()
 
 
 def _absent_search_due(cache_key: str | None, *, unknown: bool, clock=time.monotonic) -> bool:

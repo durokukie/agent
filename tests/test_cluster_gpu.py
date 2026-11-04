@@ -218,10 +218,19 @@ def test_ServedModel_시각_칸은_문자열만_싣는다(value):
     assert (row["started_at"], row["stops_at"]) == (None, None)
 
 
-@pytest.mark.parametrize("baseline", [None, {}, {"maxConcurrency": 4}, {"measuredAt": ""}, {"measuredAt": 1730682000}])
-def test_측정한_적_없는_ServedModel의_measured_at은_null이다(baseline):
+@pytest.mark.parametrize("baseline", [
+    None, {}, {"maxConcurrency": 4}, {"measuredAt": ""}, {"measuredAt": 1730682000},
+    {"measuredAt": "어제"}, {"measuredAt": "2026-11-05T01:00:00"}, {"measuredAt": "2026-13-05T01:00:00Z"},
+])
+def test_측정한_적_없거나_형식이_다른_measured_at은_null이다(baseline):
     [row] = gpu.served_models(_list({"metadata": {"name": "m"}, "status": {"baseline": baseline}}))
     assert row["measured_at"] is None
+
+
+def test_RFC3339인_measured_at은_적힌_그대로_싣는다():
+    baseline = {"measuredAt": "2026-11-05T10:00:00.5+09:00"}
+    [row] = gpu.served_models(_list({"metadata": {"name": "m"}, "status": {"baseline": baseline}}))
+    assert row["measured_at"] == "2026-11-05T10:00:00.5+09:00"
 
 
 @pytest.mark.parametrize(("stderr", "expected"), [
@@ -275,6 +284,16 @@ def test_측정_기록은_최근_순이고_시간대가_달라도_시각으로_�
                                 _measure_cm("fraction", measuredAt="2026-11-05T00:30:00.5Z")))
     assert [row["id"] for row in rows] == ["new", "offset", "fraction", "old"]
     assert rows[1]["at"] == "2026-11-05T10:00:00+09:00"                                            # 적힌 그대로 싣는다
+
+
+def test_측정_기록은_나노초_차이도_순서를_지키고_같은_시각은_id로_놓는다():
+    """datetime 은 마이크로초 아래를 버린다 — 그 아래 자리만 다른 기록이 id 순으로 놓이면 50개 상한에서 새 기록이 잘린다 (agent#144 리뷰)."""
+    rows = gpu.benchmarks(_list(_measure_cm("z-older", measuredAt="2026-11-05T01:00:00.000000001Z"),
+                                _measure_cm("a-newer", measuredAt="2026-11-05T01:00:00.000000009Z"),
+                                _measure_cm("b-same", measuredAt="2026-11-05T01:00:00.000000005Z"),
+                                _measure_cm("c-same", measuredAt="2026-11-05T01:00:00.000000005Z"),
+                                _measure_cm("no-fraction", measuredAt="2026-11-05T01:00:00Z")))
+    assert [row["id"] for row in rows] == ["a-newer", "c-same", "b-same", "z-older", "no-fraction"]
 
 
 def test_측정_기록은_최근_50개까지만_싣는다():
@@ -346,6 +365,9 @@ def test_모양이_다른_측정_기록은_그_줄만_건너뛴다(broken):
     {**MEASURED, "steps": "x"},
     {**MEASURED, "steps": ["x"]},
     {**MEASURED, "steps": [{"c": 32, "ttft95": None, "itl95": None}]},  # 남는 단계가 없다
+    {**MEASURED, "steps": [_step(), {"c": 16, "tps": 787}]},            # 키가 없는 단계는 null 과 다르다 — 잘린 단계를 조용히 빼지 않는다
+    {**MEASURED, "steps": [_step(), {"c": 16, "ttft95": 402, "tps": 787}]},
+    {**MEASURED, "steps": [_step(), {"c": 16, "itl95": 18.3, "tps": 787}]},
     {**MEASURED, "steps": [_step(c=None)]},
     {**MEASURED, "steps": [_step(c=0)]},
     {**MEASURED, "steps": [_step(c=True)]},
@@ -1167,6 +1189,176 @@ def test_GPU_없는_일반_클러스터는_측정_기록을_조회하지_않는�
     assert body is None
     commands = [args for args, _ in seen]
     assert gpu.SERVED_MODELS_COMMAND not in commands and gpu.BENCHMARKS_COMMAND not in commands
+
+
+def test_GPU로_알려진_꺼진_클러스터는_namespace_탐색이_측정_기록_몫도_남긴다(monkeypatch):
+    """모델을 지운 꺼진 클러스터에서 탐색·NodePool·ServedModel 이 저마다 몫을 다 써도 측정 기록을 읽는다 (agent#144 리뷰).
+
+    가짜 시계는 호출마다 시간이 쌓인다고 보므로 탐색을 차례로 돌린다."""
+    monkeypatch.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
+    now = [0.0]
+    timeouts: list[int] = []
+
+    def run(args, timeout):
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        if args == gpu.PODS_COMMAND:
+            return _result(stderr=FORBIDDEN, success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces(*(f"ns-{i}" for i in range(20))))
+        if args == gpu.SERVED_MODELS_COMMAND:
+            now[0] += timeout
+            return _result('{"items": []}')
+        if args == gpu.BENCHMARKS_COMMAND:
+            timeouts.append(timeout)
+            return _result(_list(_measure_cm()))
+        now[0] += timeout                                               # namespace 파드·NodePool 은 몫을 다 쓰고 실패한다
+        return _result(stderr="timed out", success=False)
+
+    body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", known=True, clock=lambda: now[0])
+    assert timeouts == [clusters_api.GPU_BENCHMARKS_TIMEOUT]
+    assert has_gpu is True and len(body["benchmarks"]) == 1
+
+
+KEY = "cluster:fingerprint:shop"
+
+
+def _remembering_cluster(*, benchmarks: list, served: list | None = None):
+    """(run, 시계, 부른 명령) — 조회마다 정해 둔 결과를 차례로 돌려주는 가짜 클러스터."""
+    now = [0.0]
+    seen: list[list[str]] = []
+
+    def run(args, timeout):
+        seen.append(args)
+        if args == gpu.SERVED_MODELS_COMMAND and served:
+            return served.pop(0)
+        if args == gpu.SERVED_MODELS_COMMAND:
+            return _result('{"items": []}')
+        if args == gpu.BENCHMARKS_COMMAND:
+            return benchmarks.pop(0)
+        return _gpu_cluster(args)
+
+    return run, now, seen
+
+
+def _round(run, now, key=KEY):
+    return clusters_api._collect_gpu(run, namespace_pods="{}", cache_key=key, clock=lambda: now[0])[0]["benchmarks"]
+
+
+GOOD = _result(_list(_measure_cm()))
+TIMED_OUT = _result(stderr="Command 'kubectl' timed out after 3 seconds", success=False)
+
+
+@pytest.mark.parametrize("failure", [
+    TIMED_OUT,
+    _result(stderr="context deadline exceeded", success=False),
+    _result(stderr="Unable to connect to the server: EOF", success=False),
+    _result("not json"),
+    _result('{"items": {}}'),
+])
+def test_측정_기록_조회가_실패하면_마지막으로_성공한_값을_쓴다(failure):
+    """한 번 실패로 표가 비었다가 다시 차서 깜빡이지 않게 (agent#144 리뷰)."""
+    run, now, _ = _remembering_cluster(benchmarks=[failure, GOOD, failure, _result('{"items": []}'), failure])
+    assert _round(run, now) == []                                       # 처음부터 실패면 빈 배열이다 (null 이 아니다)
+    first = _round(run, now)
+    assert len(first) == 1
+    assert _round(run, now) == first
+    assert _round(run, now) == []                                       # 읽었는데 없으면 없는 것이다 — 다 지운 기록을 되살리지 않는다
+    assert _round(run, now) == []
+
+
+def test_ServedModel을_시간_초과로_못_읽은_라운드도_기억한_측정_기록을_쓴다():
+    run, now, seen = _remembering_cluster(benchmarks=[GOOD],
+                                          served=[_result('{"items": []}'), _result(stderr="timed out", success=False)])
+    first = _round(run, now)
+    assert len(first) == 1
+    seen.clear()
+    assert _round(run, now) == first and gpu.BENCHMARKS_COMMAND not in seen
+
+
+def test_측정_기록을_읽을_몫이_없는_라운드도_기억한_값을_쓴다():
+    now = [0.0]
+    served_hangs = [False]
+    seen: list[list[str]] = []
+
+    def run(args, timeout):
+        seen.append(args)
+        if args == gpu.PODS_COMMAND:
+            now[0] += clusters_api.GPU_BUDGET - 8
+        if args == gpu.SERVED_MODELS_COMMAND:
+            if served_hangs[0]:
+                now[0] += timeout
+            return _result('{"items": []}')
+        if args == gpu.BENCHMARKS_COMMAND:
+            return GOOD
+        return _gpu_cluster(args)
+
+    first = _round(run, now)
+    assert len(first) == 1
+    served_hangs[0] = True
+    seen.clear()
+    assert _round(run, now) == first and gpu.BENCHMARKS_COMMAND not in seen
+
+
+@pytest.mark.parametrize(("benchmarks", "served"), [
+    ([GOOD, _result(stderr=FORBIDDEN, success=False)], None),           # 측정 기록 조회가 거부됐다
+    ([GOOD], [_result('{"items": []}'), _result(stderr=FORBIDDEN, success=False)]),   # ServedModel 조회가 거부됐다
+    ([GOOD], [_result('{"items": []}'), _result(stderr=NO_CRD, success=False)]),      # 애드온을 지웠다
+])
+def test_거부와_CRD_없음은_잠깐의_실패가_아니라_기억을_지운다(benchmarks, served):
+    """권한을 거둔 고객의 값을 하루 동안 계속 보이지 않게. 다시 시간 초과가 나도 되살아나지 않는다."""
+    run, now, _ = _remembering_cluster(benchmarks=benchmarks, served=served)
+    assert len(_round(run, now)) == 1
+    assert _round(run, now) == []
+    assert clusters_api._benchmarks_memory == {}
+
+
+def test_측정_기록_기억은_연결마다_따로다():
+    run, now, _ = _remembering_cluster(benchmarks=[GOOD, TIMED_OUT, TIMED_OUT])
+    assert len(_round(run, now, "a")) == 1
+    assert _round(run, now, "b") == []                                  # 다른 연결의 값을 쓰지 않는다
+    assert len(_round(run, now, "a")) == 1
+
+
+def test_연결_지문이_없으면_측정_기록을_기억하지_않는다():
+    run, now, _ = _remembering_cluster(benchmarks=[GOOD, TIMED_OUT])
+    assert len(_round(run, now, None)) == 1
+    assert _round(run, now, None) == [] and clusters_api._benchmarks_memory == {}
+
+
+def test_오래된_측정_기록_기억은_어느_연결의_것이든_지운다():
+    """부르지 않는 연결의 기억이 쌓이지 않게. 하루 넘게 못 읽은 표도 계속 보이지 않게."""
+    run, now, _ = _remembering_cluster(benchmarks=[GOOD, GOOD, TIMED_OUT])
+    assert len(_round(run, now, "old")) == 1
+    now[0] = clusters_api.GPU_BENCHMARKS_FORGET - 1
+    assert len(_round(run, now, "fresh")) == 1
+    assert set(clusters_api._benchmarks_memory) == {"old", "fresh"}
+    now[0] = clusters_api.GPU_BENCHMARKS_FORGET
+    assert _round(run, now, "old") == []                                # 기억이 지워져 시간 초과 라운드가 빈 배열이다
+    assert "fresh" in clusters_api._benchmarks_memory
+
+
+def test_측정_기록_시간_초과는_다음_성공까지_경고를_한_번만_남긴다(caplog):
+    """표는 기억으로 유지되어 로그 말고는 알아챌 길이 없다. 20초 주기마다 남기면 로그만 쌓인다."""
+    run, now, _ = _remembering_cluster(benchmarks=[GOOD, TIMED_OUT, TIMED_OUT, GOOD, TIMED_OUT, _result("not json")])
+    with caplog.at_level("WARNING", logger="kukie_agent.clusters_api"):
+        for _ in range(3):
+            _round(run, now)
+        assert caplog.text.count("시간 초과") == 1
+        caplog.clear()
+        _round(run, now)                                                # 성공하면 다시 경고할 수 있다
+        _round(run, now)
+        assert caplog.text.count("시간 초과") == 1 and "kubectl" not in caplog.text    # 원문은 남기지 않는다
+        caplog.clear()
+        _round(run, now)                                                # 깨진 출력은 시간 초과가 아니다
+        assert caplog.text == ""
+
+
+def test_처음부터_시간_초과여도_경고는_한_번이고_값은_빈_배열이다(caplog):
+    run, now, _ = _remembering_cluster(benchmarks=[TIMED_OUT, TIMED_OUT])
+    with caplog.at_level("WARNING", logger="kukie_agent.clusters_api"):
+        assert _round(run, now) == [] and _round(run, now) == []
+    assert caplog.text.count("시간 초과") == 1
 
 
 def test_측정_기록이_매달려도_지표_몫을_쓰지_않는다(monkeypatch):

@@ -102,7 +102,7 @@ ServedModel — served_models
   download_total_bytes(status.download.totalBytes), max_concurrency(status.baseline.maxConcurrency),
   engine_image(spec.engine.image), gpus(spec.engine.gpus — 파드 하나의 GPU 수, 1 이상 정수가 아니면 null. DURO-186),
   started_at(status.startedAt), stops_at(status.stopsAt), measured_at(status.baseline.measuredAt).
-  세 시각은 오퍼레이터가 쓴 RFC3339 문자열 그대로이고, 없으면 null 이다.
+  세 시각은 오퍼레이터가 쓴 RFC3339 문자열 그대로이고, 없으면 null 이다. measured_at 은 측정 기록의 at 과 견주는 값이라 형식이 다르면 null 이다.
   여기서 계산하지 않는다 — 언제 멈추는지는 spec.maxRuntime·차트 기본값·연장 annotation 을 모두 아는 오퍼레이터가 정한다.
   namespace·이름순. 오퍼레이터가 아직 status 를 쓰지 않았으면 문자열 칸은 "", 숫자·시각 칸은 null 이다.
     null  CRD 가 없거나(애드온을 안 깐 곳) 거부·시간 초과·예산 부족·모양이 다른 출력으로 못 읽었다. 개요는 그대로 200
@@ -117,12 +117,15 @@ ServedModel — served_models
   한 줄: id(metadata.name), model, at(measuredAt), input_tokens·output_tokens·sla(baseline.json 의 sla), steps, gpus, partial, max_concurrency.
   ConfigMap 의 다른 칸(engineImage·engineArgs 등)과 baseline.json 의 다른 칸은 싣지 않는다.
   steps 한 칸: concurrency(c), ttft_p95_ms(ttft95), itl_p95_ms(itl95), output_tokens_per_s(tps). 적힌 순서 그대로다.
-    ttft95·itl95 가 null 인 단계는 그 단계만 뺀다 — 오븐이 그 단계의 p95 를 얻지 못하면 쓰는 값이고, 앱은 숫자만 그린다.
+    ttft95·itl95 가 명시적 null 인 단계는 그 단계만 뺀다 — 오븐이 그 단계의 p95 를 얻지 못하면 쓰는 값이고, 앱은 숫자만 그린다.
+    키가 아예 없는 단계는 오븐이 쓴 모양이 아니라 아래 "모양이 다른 항목" 이다.
   모양이 다른 항목은 그 줄만 건너뛴다: 이름·model 이 없다, measuredAt 이 RFC3339 가 아니다, baseline.json 이 JSON 이 아니다,
-  sla 칸이 빠졌다, 숫자가 아니거나 음수·NaN·무한대다(NaN·무한대는 JSON 응답을 만들 때 예외가 나 개요를 깬다), 남는 단계가 없다,
+  sla 칸이 빠졌다, 단계에 칸이 빠졌다, 숫자가 아니거나 음수·NaN·무한대다(NaN·무한대는 JSON 응답을 만들 때 예외가 나 개요를 깬다), 남는 단계가 없다,
   단계·model 이 상한보다 길다. gpus·max_concurrency 는 문자열로 적힌 1 이상 정수만 싣고 나머지는 null, partial 은 "true" 만 true 다.
   읽는 조건은 ServedModel 과 같다 — served_models 가 null 이면(애드온이 없거나 못 읽었다) 조회하지 않고 [] 다. GPU 없는 일반 클러스터에 kubectl 이 늘지 않는다.
-  거부·시간 초과·예산 부족·깨진 출력도 [] 다. "못 읽음" 을 따로 말하지 않는다. 이 칸은 GPU 클러스터 판단(hasGpu)에 쓰지 않는다.
+  시간 초과·예산 부족·깨진 출력이면 연결마다 기억해 둔 마지막 성공 값을 싣고(clusters_api._read_benchmarks — 한 번 실패로 표가 깜빡이지 않게),
+  그것도 없으면 [] 다. 거부와 CRD 없음은 잠깐의 실패가 아니라 "볼 수 없다" 는 답이라 기억을 지우고 [] 다. 웹이 배열로 읽으므로 null 은 쓰지 않는다.
+  이 칸은 GPU 클러스터 판단(hasGpu)에 쓰지 않는다.
 """
 from __future__ import annotations
 
@@ -148,8 +151,9 @@ MAX_BENCHMARKS = 50
 #: 측정 기록 한 줄의 단계 수·model 길이 상한. 오븐은 단계가 7개이고 결과를 4096바이트에 담는다 — 넘으면 오븐이 쓴 값이 아니다
 MAX_BENCHMARK_STEPS = 64
 MAX_BENCHMARK_MODEL = 256
-#: 측정 시각. 대문자 T·Z 와 오프셋까지 있어야 한다 — 시각끼리 견주어 최근 순으로 놓으려면 시간대가 있어야 한다
-_RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})")
+#: 측정 시각. 대문자 T·Z 와 오프셋까지 있어야 한다 — 시각끼리 견주어 최근 순으로 놓으려면 시간대가 있어야 한다.
+#: 소수 초는 정렬 때 따로 읽는다 — datetime 은 마이크로초까지만 담는다 (_measured_time)
+_RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.([0-9]{1,9}))?(?:Z|[+-][0-9]{2}:[0-9]{2})")
 
 #: Karpenter NodePool (모듈 설명 "Karpenter GPU 풀"). 클러스터 범위 자원이라 `-A`·`-n` 이 없다
 NODE_POOLS_COMMAND: list[str] = ["get", "nodepools.karpenter.sh", "-o", "json"]
@@ -278,6 +282,7 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
         download = status.get("download") or {}
         spec = item.get("spec") or {}
         engine = spec.get("engine") or {}
+        baseline = status.get("baseline") or {}
         rows.append({
             "namespace": meta.get("namespace") or "default",
             "name": meta["name"],
@@ -288,12 +293,12 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
             "download_percent": _int_or_none(download.get("percent")),
             "download_bytes": _int_or_none(download.get("downloadedBytes")),
             "download_total_bytes": _int_or_none(download.get("totalBytes")),
-            "max_concurrency": _int_or_none((status.get("baseline") or {}).get("maxConcurrency")),
+            "max_concurrency": _int_or_none(baseline.get("maxConcurrency")),
             "engine_image": _text_or_none(engine.get("image")),
             "gpus": _count_or_none(engine.get("gpus")),
             "started_at": _text_or_none(status.get("startedAt")),
             "stops_at": _text_or_none(status.get("stopsAt")),
-            "measured_at": _text_or_none((status.get("baseline") or {}).get("measuredAt")),
+            "measured_at": baseline.get("measuredAt") if _measured_time(baseline.get("measuredAt")) else None,
         })
     rows.sort(key=lambda r: (r["namespace"], r["name"]))
     return rows
@@ -318,8 +323,8 @@ def benchmarks(stdout: str) -> list[dict[str, Any]]:
     return [row for _, row in runs[:MAX_BENCHMARKS]]
 
 
-def _benchmark_run(item: dict[str, Any]) -> tuple[datetime, dict[str, Any]] | None:
-    """ConfigMap 하나를 (측정 시각, 응답 줄)로. 모양이 다르면 None — 어떤 모양에도 예외를 내지 않는다."""
+def _benchmark_run(item: dict[str, Any]) -> tuple[tuple[datetime, int], dict[str, Any]] | None:
+    """ConfigMap 하나를 (측정 시각의 정렬 키, 응답 줄)로. 모양이 다르면 None — 어떤 모양에도 예외를 내지 않는다."""
     meta, data = item.get("metadata"), item.get("data")
     if not isinstance(meta, dict) or not isinstance(data, dict):
         return None
@@ -352,15 +357,15 @@ def _benchmark_run(item: dict[str, Any]) -> tuple[datetime, dict[str, Any]] | No
 
 
 def _benchmark_steps(raw: Any) -> list[dict[str, Any]] | None:
-    """baseline.json 의 steps 를 응답 칸으로. p95 가 null 인 단계만 빼고, 그 밖에 모양이 다른 단계가 있으면 None 이다 —
-    가운데 단계가 빠진 표를 온전한 측정처럼 보이지 않게."""
+    """baseline.json 의 steps 를 응답 칸으로. p95 가 명시적 null 인 단계만 빼고, 그 밖에 모양이 다른 단계(키가 없는 것 포함)가
+    있으면 None 이다 — 가운데 단계가 빠진 표를 온전한 측정처럼 보이지 않게 (agent#144 리뷰)."""
     if not isinstance(raw, list) or len(raw) > MAX_BENCHMARK_STEPS:
         return None
     rows: list[dict[str, Any]] = []
     for step in raw:
-        if not isinstance(step, dict):
+        if not isinstance(step, dict) or "ttft95" not in step or "itl95" not in step:
             return None
-        if step.get("ttft95") is None or step.get("itl95") is None:
+        if step["ttft95"] is None or step["itl95"] is None:
             continue
         row = {"concurrency": _count_or_none(step.get("c")), "ttft_p95_ms": _measure_number(step["ttft95"]),
                "itl_p95_ms": _measure_number(step["itl95"]), "output_tokens_per_s": _measure_number(step.get("tps"))}
@@ -380,11 +385,14 @@ def _baseline_json(value: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _measured_time(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not _RFC3339.fullmatch(value):
+def _measured_time(value: Any) -> tuple[datetime, int] | None:
+    """RFC3339 측정 시각의 정렬 키 — (시각, 나노초). 형식이 다르면 None. datetime 은 마이크로초 아래를 버리므로 소수 초를
+    따로 견주어 그 아래 자리까지 순서를 지킨다 (agent#144 리뷰)."""
+    match = _RFC3339.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
         return None
     try:
-        return datetime.fromisoformat(value)
+        return datetime.fromisoformat(value), int((match[1] or "").ljust(9, "0"))
     except ValueError:      # 13월처럼 모양만 맞는 값
         return None
 
