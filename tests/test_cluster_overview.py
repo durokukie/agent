@@ -241,6 +241,8 @@ def _result(stdout: str = "", *, stderr: str = "", success: bool = True) -> Kube
 
 
 def _by_resource(args: list[str]) -> KubectlResult:
+    if args[1] == "nodepools.karpenter.sh":             # 이 가짜 클러스터에는 Karpenter 가 없다
+        return _result(stderr='error: the server doesn\'t have a resource type "nodepools"', success=False)
     return _result(fixture({"deployments,statefulsets,daemonsets": "workloads", "pods": "pods",
                             "events": "events", "daemonsets": "daemonsets", "nodes": "nodes"}[args[1]]))
 

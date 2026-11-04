@@ -55,8 +55,10 @@ OVERVIEW_TIMEOUT = 15
 GPU_METRICS_TIMEOUT = 5
 #: 모든 namespace 파드를 못 읽을 때 namespace 하나의 파드 목록 시간 제한(초). namespace 마다 한 번이라 지표처럼 짧게 끊는다
 GPU_PODS_TIMEOUT = 5
-#: ServedModel 목록 시간 제한(초). 지표보다 먼저 읽으므로 짧게 끊는다. GPU 노드가 있으면 남은 예산의 절반까지만 쓴다(_collect_gpu)
+#: ServedModel 목록 시간 제한(초). 지표보다 먼저 읽으므로 짧게 끊는다. GPU 노드가 있으면 NodePool 과 합쳐 남은 예산의 절반까지만 쓴다(_collect_gpu)
 GPU_SERVED_MODELS_TIMEOUT = 5
+#: Karpenter NodePool 목록 시간 제한(초). ServedModel 처럼 짧게 끊는다. GPU 노드가 있으면 ServedModel 과 합쳐 남은 예산의 절반까지만 쓴다(_collect_gpu)
+GPU_NODE_POOLS_TIMEOUT = 5
 #: 파드를 읽을 수 있었던 namespace 를 연결마다 기억하는 시간(초). 그동안은 그 namespace 만 읽는다.
 #: 고객이 새 namespace 나 RoleBinding 을 더하면 이만큼 늦게 보인다 — 짧게 둔다
 READABLE_NAMESPACES_TTL = 120
@@ -151,7 +153,8 @@ async def cluster_overview(
     GPU(gpu)는 그 뒤에 노드 → 모든 파드 → 지표 순으로 읽는다 (clusters/gpu.py). 노드를 못 읽으면 gpu 만 null 이고 그 뒤는
     읽지 않는다. GPU 노드가 없으면 GPU 를 기다리는 파드를 찾는다 — 있으면 nodes 가 빈 gpu 칸(꺼진 GPU 클러스터), 없으면 null.
     server 값이 GPU 클러스터(true)가 아닌 곳은 이 파드를 GPU_ABSENT_RECHECK 초에 한 번만 찾는다. 알아낸 GPU 클러스터 여부를
-    server 에 남긴다(_record_gpu). ServedModel(gpu.served_models)은 지표 전에 읽고, CRD 가 없거나 못 읽으면 그 칸만 null 이다.
+    server 에 남긴다(_record_gpu). Karpenter GPU 풀(gpu.node_pools)과 ServedModel(gpu.served_models)은 지표 전에 읽고, CRD 가 없거나
+    못 읽으면 그 칸만 null 이다. GPU 풀이 있으면 노드가 0대여도 gpu 칸을 주고 GPU 클러스터로 둔다.
 
     kubectl 이 실패하면 연결 확인과 같은 기준(_failure_status)으로 갈라 502 로 답한다.
       CLUSTER_AUTH_EXPIRED  인증 실패·권한 없음 (연결 확인의 auth_expired)
@@ -639,11 +642,14 @@ def _collect_gpu(
     """(개요의 gpu 칸, GPU 클러스터인가) — clusters/gpu.py 의 "읽는 순서". 어느 단계가 실패해도 오류로 올리지 않는다.
 
     GPU 노드가 있거나, 노드는 없어도 GPU 를 기다리는 파드가 있으면(0대로 내려 둔 GPU 클러스터) True 다. known 이 True 인 곳에서
-    ServedModel 이 읽혔을 때도(하나도 없어도 — 애드온이 깔린 꺼진 GPU 클러스터다) True 다.
+    ServedModel 이 읽혔을 때도(하나도 없어도 — 애드온이 깔린 꺼진 GPU 클러스터다) True 다. Karpenter GPU 풀이 있어도 True 다 —
+    노드 0대에 기다리는 파드도 모델도 없는 곳을 찾아내는 길은 이것뿐이다. 풀은 파드를 읽은 라운드마다 읽으므로, known 이 True 가
+    아닌 곳은 GPU_ABSENT_RECHECK 초에 한 번만 읽는다.
     노드 목록을 못 읽었으면 None(모른다)이다. 노드가 없을 때 False 는 파드를 끝까지 읽어 기다리는 파드가 없다고 확인했을
     때만이다 — 모든 namespace 파드를 읽었거나, namespace 마다 읽은 것이 전부 성공·거부로 끝났을 때. 시간 초과·예산 부족·
     파드 목록 파싱 실패로 못 본 곳이 있으면 None 이다(꺼진 GPU 클러스터를 한 번의 실패로 "GPU 없음" 으로 덮지 않게).
     known 이 True 인 곳은 ServedModel 조회도 CRD 없음·거부로 끝나야 False 다 — 시간 초과·예산 부족이면 None 이다.
+    NodePool 조회도 CRD 없음·거부·GPU 풀 없음으로 끝나야 False 다 — 못 읽은 풀이 GPU 풀일 수 있다.
     gpu 칸의 waiting 은 늘 배열이다 — 파드 목록이 깨져 못 읽은 라운드도 빈 배열로 나간다(노드가 있을 때도, ServedModel 만 읽힌 꺼진
     클러스터도). ServedModel 만 읽혔다고 그 라운드의 served_models 까지 버리지 않는다.
     known 은 server 에 남은 값이다. True(GPU 클러스터)가 아니면 노드가 없을 때 파드를 GPU_ABSENT_RECHECK 초에 한 번만
@@ -679,10 +685,11 @@ def _collect_gpu(
     else:
         logger.debug("GPU 지표 파드를 namespace 마다 찾는다: %s", _failure_status(pods_result.stderr or pods_result.stdout))
         # 탐색은 남은 예산의 절반까지만 — 지표를 읽을 시간을 남긴다 (agent#120 리뷰). GPU 노드가 없으면 지표를 읽지 않으니
-        # 다 쓴다 — 기다리는 파드를 찾는 길이 이것뿐이다 (agent#121 리뷰). 다만 GPU 로 알려진 꺼진 클러스터는 ServedModel 을
-        # 읽을 시간은 남긴다 (agent#138 리뷰)
+        # 쓴다 — 기다리는 파드를 찾는 길이 이것뿐이다 (agent#121 리뷰). 다만 NodePool 을 읽을 시간은 남긴다 — pools_budget 이 그
+        # 몫을 ServedModel 과 나눠, 이 라운드에 GPU 클러스터를 처음 찾아도 ServedModel 까지 답한다. GPU 로 알려진 꺼진 클러스터는
+        # ServedModel 몫을 따로 남긴다 (agent#138·#139 리뷰). 일반 클러스터는 ServedModel 을 읽지 않으니 그 몫을 떼지 않는다
         search_deadline = (clock() + max(0.0, deadline - clock()) / 2 if nodes
-                           else deadline - (GPU_SERVED_MODELS_TIMEOUT if known is True else 0))
+                           else deadline - GPU_NODE_POOLS_TIMEOUT - (GPU_SERVED_MODELS_TIMEOUT if known is True else 0))
 
         def search_budget(limit: int) -> int:
             return min(limit, int(search_deadline - clock()))
@@ -703,19 +710,30 @@ def _collect_gpu(
     except (ValueError, AttributeError, TypeError):
         logger.debug("GPU 를 기다리는 파드를 찾지 못했다 (파드 목록을 읽지 못했다)")
         waiting = None                                      # 못 읽은 것과 "없다" 는 다르다 — 아래에서 None(모른다)
-    def served_budget(limit: int) -> int:
-        """GPU 노드가 있으면 남은 예산의 절반까지만 — namespace 탐색처럼 지표를 읽을 시간을 남긴다 (agent#138 리뷰)."""
-        remaining = deadline - clock()
-        return min(limit, int(remaining / 2 if nodes else remaining))
 
-    # GPU 노드가 없으면 기다리는 파드가 있거나 GPU 클러스터로 알려진 곳만 읽는다 — GPU 없는 일반 클러스터에 조회를 늘리지 않는다
+    # GPU 노드가 있으면 NodePool·ServedModel 을 합쳐 남은 예산의 절반까지만 — namespace 탐색처럼 지표를 읽을 시간을 남긴다.
+    # 따로 절반씩 깎으면 지표 몫이 네 번째로 줄어 서빙 중인 모델이 화면에서 빠진다 (agent#138·#139 리뷰)
+    reads_deadline = clock() + max(0.0, deadline - clock()) / 2 if nodes else deadline
+
+    def pools_budget(limit: int) -> int:
+        """GPU 노드가 있으면 합친 몫의 절반. 없으면 ServedModel 몫을 남기되, 파드 조회가 매달려 모자란 라운드도 절반은 쓴다 —
+        GPU 풀만 있는 클러스터를 찾는 길이 이것뿐이다."""
+        remaining = reads_deadline - clock()
+        return min(limit, int(remaining / 2 if nodes else max(remaining - GPU_SERVED_MODELS_TIMEOUT, remaining / 2)))
+
+    node_pools, pools_absent = _read_node_pools(run, pools_budget)
+
+    def served_budget(limit: int) -> int:
+        return min(limit, int(reads_deadline - clock()))
+
+    # GPU 노드가 없으면 기다리는 파드나 GPU 풀이 있거나 GPU 클러스터로 알려진 곳만 읽는다 — GPU 없는 일반 클러스터에 조회를 늘리지 않는다
     served_models, served_absent = None, True
-    if nodes or waiting or known is True:
+    if nodes or waiting or node_pools or known is True:
         served_models, served_absent = _read_served_models(run, served_budget)
     if not nodes:
-        if waiting or served_models is not None:
-            return gpu.build([], [], waiting or [], served_models), True
-        return None, (False if waiting is not None and pods_complete and served_absent else None)
+        if waiting or node_pools or served_models is not None:
+            return gpu.build([], [], waiting or [], served_models, node_pools), True
+        return None, (False if waiting is not None and pods_complete and served_absent and pools_absent else None)
 
     def metrics(target: tuple[str, str, int]) -> tuple[str | None, float]:
         """(/metrics 본문, 읽은 시각) — 시각은 서빙 p95 구간의 끝이라 파드마다 따로 잰다 (agent#137 리뷰)."""
@@ -749,7 +767,7 @@ def _collect_gpu(
     if cache_key:
         with _latency_lock:
             _latency_samples[cache_key] = remembered
-    return gpu.build(nodes, serving, waiting or [], served_models), True
+    return gpu.build(nodes, serving, waiting or [], served_models, node_pools), True
 
 
 def _read_served_models(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:
@@ -768,6 +786,29 @@ def _read_served_models(run, budget) -> tuple[list[dict[str, Any]] | None, bool]
     except (ValueError, AttributeError, TypeError):
         logger.debug("ServedModel 을 읽지 못했다 (목록 모양이 아니다)")
         return None, False
+
+
+def _read_node_pools(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:
+    """(GPU 풀 줄, GPU 풀이 없다고 확인했나) — clusters/gpu.py "Karpenter GPU 풀". 못 읽으면 줄은 None 이고 개요를 실패시키지 않는다.
+    CRD 없음은 못 읽은 것이 아니라 줄이 [] 다 — 앱이 Karpenter 설치를 안내한다. 거부는 줄이 None 이다.
+    둘째 값은 CRD 없음·거부이거나 읽었는데 GPU 풀이 없을 때만 True 다 — 시간 초과·예산 부족·깨진 출력은 있는지 모른다.
+    꺼 둔 풀은 줄에 싣지 않지만 "없다" 도 아니다 — 상한을 잠깐 0 으로 내린 클러스터의 hasGpu 를 덮지 않는다."""
+    timeout = budget(GPU_NODE_POOLS_TIMEOUT)
+    if timeout < 1:
+        return None, False
+    result = run(gpu.NODE_POOLS_COMMAND, timeout)
+    if not result.success:
+        text = result.stderr or result.stdout or ""
+        if gpu.node_pools_crd_missing(text):
+            return [], True
+        logger.debug("NodePool 을 읽지 못했다: %s", _failure_status(text))
+        return None, gpu.node_pools_absent(text)
+    try:
+        rows, disabled = gpu.node_pools(result.stdout)
+    except (ValueError, AttributeError, TypeError):
+        logger.debug("NodePool 을 읽지 못했다 (목록 모양이 아니다)")
+        return None, False
+    return rows, not rows and not disabled
 
 
 def _latency_memory(cache_key: str | None, now: float) -> dict[str, gpu.LatencySample]:

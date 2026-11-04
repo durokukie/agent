@@ -1,4 +1,5 @@
-"""클러스터 개요의 gpu 칸 — GPU 노드, 그 위의 DCGM 지표, 서빙 중인 vLLM 모델 (DURO-118), ServedModel 상태 (DURO-182).
+"""클러스터 개요의 gpu 칸 — GPU 노드, 그 위의 DCGM 지표, 서빙 중인 vLLM 모델 (DURO-118), ServedModel 상태 (DURO-182),
+Karpenter GPU NodePool (DURO-184).
 
 overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순수 함수만 둔다. kubectl 은 clusters_api.py 가 돌린다.
 
@@ -10,9 +11,10 @@ overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순�
                      (kukie-infra customer-templates/gpu-read-rbac-v1.yaml)는 namespace 목록은 클러스터 전체에, 파드 목록은 고객이
                      고른 namespace 에만 준다. namespace 목록도 못 읽으면 개요가 이미 읽은 클러스터 namespace 의 파드에서만 찾는다
                      (running_pods 로 한 번만 파싱한다)
-  3. SERVED_MODELS_COMMAND  모든 namespace 의 ServedModel. 지표보다 먼저 읽는다 — 지표 파드가 매달려도 예산이 남게.
-                     GPU 노드가 없으면 기다리는 파드가 있거나 server 값이 GPU 클러스터(true)일 때만 읽는다 — 아래 "ServedModel"
-  4. proxy_command   찾은 파드의 /metrics 를 API 서버 **파드 프록시**로 읽는다 (Prometheus 없이 kubectl 권한만으로).
+  3. NODE_POOLS_COMMAND  Karpenter NodePool (클러스터 범위). 파드를 읽은 라운드마다 한 번 — 아래 "Karpenter GPU 풀"
+  4. SERVED_MODELS_COMMAND  모든 namespace 의 ServedModel. 지표보다 먼저 읽는다 — 지표 파드가 매달려도 예산이 남게.
+                     GPU 노드가 없으면 기다리는 파드나 GPU 풀이 있거나 server 값이 GPU 클러스터(true)일 때만 읽는다 — 아래 "ServedModel"
+  5. proxy_command   찾은 파드의 /metrics 를 API 서버 **파드 프록시**로 읽는다 (Prometheus 없이 kubectl 권한만으로).
                      서비스 프록시가 아니라 파드 프록시인 이유: DCGM exporter 는 노드마다 하나인 DaemonSet 이라 서비스로
                      부르면 아무 파드 하나에 붙어 다른 노드의 값을 받는다. vLLM 도 레플리카마다 값이 다르다
   지표를 못 읽으면 그 노드의 실시간 값만 null, 그 파드만 serving 에서 빠진다 — 개요는 그대로 200.
@@ -56,13 +58,40 @@ GPU 노드 — nodes
   다시 찾는다(clusters_api.GPU_ABSENT_RECHECK — 0대인 채 GPU 워크로드를 새로 올린 경우). GPU 노드가 있을 때도
   같은 파드 목록에서 GPU 를 기다리는 파드를 waiting 에 싣는다(늘어나는 중인 레플리카 등).
 
+Karpenter GPU 풀 — node_pools
+  Karpenter 가 노드를 띄우는 클러스터는 노드가 0대여도 GPU 클러스터다. 앱은 이 칸이 비어 있지 않으면 노드 켜기·끄기 버튼을
+  숨기고 "모델을 시작하면 노드가 자동으로 켜진다" 고 안내한다. 한 줄이 GPU 풀 하나다: name, gpu_limit(spec.limits 의 GPU 수, 이름순).
+    null  거부·시간 초과·예산 부족·모양이 다른 출력으로 못 읽었다. 앱은 "확인하지 못했어요" 로 그린다. 개요는 그대로 200
+    []    GPU 풀이 없다 — CRD 가 없거나(Karpenter 를 안 깐 곳, 앱이 설치를 안내한다) 읽었는데 GPU 풀이 없다
+          (CPU 풀만 있는 Karpenter 클러스터는 GPU 클러스터가 아니다). 빈 배열만으로는 gpu 칸을 만들지 않는다
+  거부는 응답에서는 null 이지만 hasGpu 판단에서는 CRD 없음과 같다 — 볼 수 없는 곳은 못 본 곳으로 치지 않는다(node_pools_absent).
+  [] 는 "노드를 띄울 수 있는 GPU 풀이 없다" 만 말한다. CRD 없음·CPU 풀만 있음·GPU 풀을 다 꺼 둠(아래)이 같은 값이라, Karpenter 가
+  깔렸는지까지 가려 주지는 않는다 (agent#139 리뷰). 가르려면 칸을 더해야 하고 그것은 약속을 고치는 일이다.
+  GPU 풀 판별 — 넷 중 하나면 된다. 빈 목록은 hasGpu 를 false 로 덮는 근거라 GPU 풀을 고르는 흔한 설정을 빠뜨리지 않는다
+    spec.template.spec.taints 의 key 가 GPU_RESOURCES
+    spec.limits 에 GPU_RESOURCES 칸이 있다
+    spec.template.spec.requirements 의 instance-family·instance-type·instance-category 가 operator In 으로 g·gr·p 계열을 고른다.
+      NotIn 은 "GPU 는 빼라" 라는 일반 풀의 흔한 설정이라 보지 않는다. m7g(Graviton)처럼 g 로 끝나는 계열은 GPU 가 아니다
+    requirements 가 karpenter.k8s.aws/instance-gpu-* (count·manufacturer·name 등) 를 NotIn·DoesNotExist 밖의 연산자로 요구한다 —
+      이 라벨은 GPU 인스턴스에만 붙으므로 요구하는 것만으로 GPU 인스턴스로 좁혀진다
+  다만 limits 의 어느 자원이든(cpu·memory·GPU) 0 인 풀은 응답에서 뺀다 — 노드를 띄우지 못하게 꺼 둔 풀이다. 앱이 "모델을 시작하면 노드가
+  켜진다" 고 안내하면 안 된다. 그래도 "GPU 풀 없음" 과 다르다: 꺼 둔 풀만 있으면 node_pools 는 [] 이지만 hasGpu 를 false 로 덮지 않는다
+  (상한을 잠깐 0 으로 내린 GPU 클러스터가 목록에서 빠지지 않게).
+  이 칸은 "GPU 풀이 있다" 는 사실만 말한다. 그 풀이 지금 있는 GPU 노드를 관리하는지는 가리지 않는다 — 노드 그룹과 GPU 풀을 같이 쓰는
+  클러스터도 채워진다 (agent#139 리뷰). 약속(DURO-184)은 고객 전제 조건을 Karpenter 로 두고 앱이 이 칸으로 방식을 고른다.
+  GPU 풀이 있으면 노드가 0대이고 기다리는 파드도 모델도 없어도 빈 gpu 칸(nodes 빈 배열)을 주고 GPU 클러스터로 둔다.
+  GPU 노드가 없고 server 값이 true 가 아닌 곳은 기다리는 파드를 찾는 라운드(clusters_api.GPU_ABSENT_RECHECK)에만 읽는다 —
+  일반 클러스터의 다른 라운드에는 kubectl 이 늘지 않는다.
+
 ServedModel — served_models
   kukie-gpu-operator 의 CRD. 한 줄이 ServedModel 하나다: namespace·name(metadata), model(spec.source.huggingface),
-  phase·reason·message(status), download_percent(status.download.percent), max_concurrency(status.baseline.maxConcurrency).
-  namespace·이름순. 오퍼레이터가 아직 status 를 쓰지 않았으면 문자열 칸은 "", 숫자 칸은 null 이다.
+  phase·reason·message(status), download_percent(status.download.percent), max_concurrency(status.baseline.maxConcurrency),
+  started_at(status.startedAt), stops_at(status.stopsAt). 두 시각은 오퍼레이터가 쓴 RFC3339 문자열 그대로이고, 없으면 null 이다.
+  여기서 계산하지 않는다 — 언제 멈추는지는 spec.maxRuntime·차트 기본값·연장 annotation 을 모두 아는 오퍼레이터가 정한다.
+  namespace·이름순. 오퍼레이터가 아직 status 를 쓰지 않았으면 문자열 칸은 "", 숫자·시각 칸은 null 이다.
     null  CRD 가 없거나(애드온을 안 깐 곳) 거부·시간 초과·예산 부족·모양이 다른 출력으로 못 읽었다. 개요는 그대로 200
     []    읽었는데 하나도 없다
-  GPU 노드가 없어도 읽는 곳: 기다리는 파드가 있거나 server 값이 true 인 곳(꺼진 GPU 클러스터). 그 밖의 GPU 노드 없는 곳은
+  GPU 노드가 없어도 읽는 곳: 기다리는 파드나 GPU 풀이 있거나 server 값이 true 인 곳(꺼진 GPU 클러스터). 그 밖의 GPU 노드 없는 곳은
   읽지 않는다 — GPU 없는 일반 클러스터마다 개요 때 kubectl 이 늘지 않게. 꺼진 GPU 클러스터에서 읽혔으면 하나도 없어도(애드온이
   깔린 곳이다) 빈 gpu 칸(nodes 빈 배열)을 주고 GPU 클러스터로 둔다 — 모델을 지우고 노드를 끈 뒤에도 GPU 화면이 이어지게.
 
@@ -85,6 +114,9 @@ PODS_COMMAND: list[str] = ["get", "pods", "-A", "-o", "json"]
 #: 모든 namespace 의 ServedModel (모듈 설명 "ServedModel"). 부르는 쪽이 `-n` 을 붙이지 않는다
 SERVED_MODELS_COMMAND: list[str] = ["get", "servedmodels.serving.kukie.io", "-A", "-o", "json"]
 
+#: Karpenter NodePool (모듈 설명 "Karpenter GPU 풀"). 클러스터 범위 자원이라 `-A`·`-n` 이 없다
+NODE_POOLS_COMMAND: list[str] = ["get", "nodepools.karpenter.sh", "-o", "json"]
+
 #: 모든 namespace 파드를 못 읽을 때 namespace 마다 파드를 읽으려고 보는 namespace 목록 (클러스터 범위)
 NAMESPACES_COMMAND: list[str] = ["get", "namespaces", "-o", "json"]
 #: namespace 마다 파드를 읽는 수 상한. 넘으면 GPU 쪽 이름(NAMESPACE_HINTS)이 들어간 것부터 고른다
@@ -95,6 +127,18 @@ NAMESPACE_HINTS: tuple[str, ...] = ("gpu", "nvidia", "dcgm", "vllm", "llm", "ser
 
 #: GPU 로 보는 확장 자원 (위에 있는 것이 먼저)
 GPU_RESOURCES: tuple[str, ...] = ("nvidia.com/gpu", "amd.com/gpu")
+
+#: NodePool requirements 에서 인스턴스 종류를 고르는 키
+_INSTANCE_KEYS: tuple[str, ...] = ("karpenter.k8s.aws/instance-family", "node.kubernetes.io/instance-type",
+                                   "karpenter.k8s.aws/instance-category")
+#: GPU 인스턴스 계열 — g·p(category), g6e·g6e.xlarge·gr6·p4d. 앞에서부터 맞춘다 (m7g·c7gn 은 GPU 가 아니다)
+_GPU_INSTANCE = re.compile(r"(?:gr?|p)(?:\d|$)")
+#: GPU 인스턴스에만 붙는 라벨의 앞부분과, 그 라벨을 요구하지 않는 연산자 (모듈 설명 "Karpenter GPU 풀")
+_GPU_LABEL_PREFIX = "karpenter.k8s.aws/instance-gpu-"
+_GPU_LABEL_EXCLUDING: tuple[str, ...] = ("NotIn", "DoesNotExist")
+
+#: NodePool limits 의 0 — 0·"0"·"0Gi"·"0.0"
+_ZERO_QUANTITY = re.compile(r"0+(?:\.0+)?[A-Za-z]*")
 
 #: 지표를 읽는 파드 수 상한 (DCGM·vLLM 따로). 한 번 읽기가 시간 제한까지 걸려도 개요가 끝없이 늘지 않게
 MAX_METRIC_TARGETS = 8
@@ -188,6 +232,8 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
             "message": status.get("message") or "",
             "download_percent": _int_or_none((status.get("download") or {}).get("percent")),
             "max_concurrency": _int_or_none((status.get("baseline") or {}).get("maxConcurrency")),
+            "started_at": _text_or_none(status.get("startedAt")),
+            "stops_at": _text_or_none(status.get("stopsAt")),
         })
     rows.sort(key=lambda r: (r["namespace"], r["name"]))
     return rows
@@ -200,6 +246,57 @@ def served_models_absent(stderr: str) -> bool:
     그 밖의 문구(NotFound 등)도 모르는 실패다: hasGpu 를 덮지 않는 안전한 쪽이다."""
     lowered = stderr.lower()
     return "doesn't have a resource type" in lowered or "(forbidden)" in lowered or " is forbidden" in lowered
+
+
+# ── Karpenter GPU 풀 ─────────────────────────────────────
+
+def node_pools(stdout: str) -> tuple[list[dict[str, Any]], bool]:
+    """(노드를 띄울 수 있는 GPU 풀 줄, 꺼 둔 GPU 풀이 있나) — 모듈 설명 "Karpenter GPU 풀". 이름 없는 항목은 뺀다.
+    모양이 다르면 ValueError — 부르는 쪽이 node_pools 를 null 로 둔다.
+    빈 목록은 "GPU 풀 없음" 으로 hasGpu 를 false 로 덮는 근거라 엄격하게 읽는다."""
+    rows: list[dict[str, Any]] = []
+    disabled = False
+    for item in _strict_items(stdout):
+        meta = item.get("metadata")
+        if not isinstance(meta, dict) or not meta.get("name"):
+            continue
+        spec = item.get("spec") or {}
+        limits = spec.get("limits") or {}
+        limited = next((name for name in GPU_RESOURCES if name in limits), None)
+        if limited is None and not _gpu_template((spec.get("template") or {}).get("spec") or {}):
+            continue
+        if any(_ZERO_QUANTITY.fullmatch(str(value)) for value in limits.values()):
+            disabled = True
+            continue
+        rows.append({"name": meta["name"], "gpu_limit": _quantity_or_none(limits[limited]) if limited else None})
+    rows.sort(key=lambda r: r["name"])
+    return rows, disabled
+
+
+def _gpu_template(template: dict[str, Any]) -> bool:
+    """NodePool 템플릿이 GPU 노드를 띄우는가 — GPU taint, g·p 계열을 고르거나 GPU 라벨을 요구하는 requirements."""
+    if any(taint.get("key") in GPU_RESOURCES for taint in template.get("taints") or []):
+        return True
+    return any(_gpu_requirement(req) for req in template.get("requirements") or [])
+
+
+def _gpu_requirement(req: dict[str, Any]) -> bool:
+    key, operator = str(req.get("key") or ""), req.get("operator")
+    if key.startswith(_GPU_LABEL_PREFIX):
+        return bool(operator) and operator not in _GPU_LABEL_EXCLUDING
+    return key in _INSTANCE_KEYS and operator == "In" and any(
+        isinstance(value, str) and _GPU_INSTANCE.match(value) for value in req.get("values") or [])
+
+
+def node_pools_absent(stderr: str) -> bool:
+    """NodePool 조회 실패가 "CRD 가 없다" 나 "볼 수 없다" 라고 확인된 것인가 — served_models_absent 와 같은 기준이다.
+    hasGpu 를 false 로 덮어도 되는지를 가른다. 응답 칸의 값은 node_pools_crd_missing 이 가른다."""
+    return served_models_absent(stderr)
+
+
+def node_pools_crd_missing(stderr: str) -> bool:
+    """NodePool 조회 실패가 "CRD 가 없다" 인가 — Karpenter 를 안 깐 곳이라 응답은 []("GPU 풀 없음") 이다. 거부는 모르는 것이라 null 이다."""
+    return "doesn't have a resource type" in stderr.lower()
 
 
 # ── 지표를 읽을 파드 ───────────────────────────────────────
@@ -343,7 +440,7 @@ def merge_pod_lists(outputs: list[str]) -> str:
 
 
 def proxy_command(namespace: str, pod: str, port: int) -> list[str]:
-    """API 서버 파드 프록시로 /metrics 를 읽는 kubectl 인자 (모듈 설명 "읽는 순서" 4)."""
+    """API 서버 파드 프록시로 /metrics 를 읽는 kubectl 인자 (모듈 설명 "읽는 순서" 5)."""
     return ["get", "--raw", f"/api/v1/namespaces/{namespace}/pods/{pod}:{port}/proxy/metrics"]
 
 
@@ -572,14 +669,16 @@ def _ms(seconds: float | None) -> float | None:
 
 def build(nodes: list[dict[str, Any]], serving: list[dict[str, Any]],
           waiting: list[dict[str, Any]] | None = None,
-          served_models: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
-    """ClusterGpu. GPU 노드도 GPU 를 기다리는 파드도 없고 ServedModel 도 못 읽었으면 None — 앱은 "GPU 노드가 없어요" 를 띄운다.
-    노드는 없고 기다리는 파드나 읽어 낸 ServedModel(빈 배열 포함)이 있으면 꺼진 GPU 클러스터다(nodes 빈 배열).
-    served_models 의 null 은 "못 읽었다", 빈 배열은 "없다" 다 — 모듈 설명 "ServedModel"."""
-    if not nodes and not waiting and served_models is None:
+          served_models: list[dict[str, Any]] | None = None,
+          node_pools: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    """ClusterGpu. GPU 노드도 GPU 를 기다리는 파드도 GPU 풀도 없고 ServedModel 도 못 읽었으면 None — 앱은 "GPU 노드가 없어요" 를 띄운다.
+    노드는 없고 기다리는 파드나 GPU 풀, 읽어 낸 ServedModel(빈 배열 포함)이 있으면 꺼진 GPU 클러스터다(nodes 빈 배열).
+    served_models·node_pools 의 null 은 "못 읽었다", 빈 배열은 "없다" 다. 빈 node_pools 는 served_models 와 달리 gpu 칸을 만들지
+    않는다 — CPU 풀만 있는 Karpenter 클러스터는 GPU 클러스터가 아니다."""
+    if not nodes and not waiting and served_models is None and not node_pools:
         return None
     return {"nodes": nodes, "serving": serving, "benchmarks": [], "waiting": waiting or [],
-            "served_models": served_models}
+            "served_models": served_models, "node_pools": node_pools}
 
 
 # ── Prometheus 글 형식 ────────────────────────────────────
@@ -642,6 +741,17 @@ def _strict_items(stdout: str) -> list[dict[str, Any]]:
 
 def _int_or_none(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _text_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _quantity_or_none(value: Any) -> int | None:
+    """NodePool limits 의 GPU 수 — 2 나 "2". `1k` 같은 단위는 GPU 수에 쓰지 않아 null 이다."""
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
 def _positive_int(value: Any) -> int:
