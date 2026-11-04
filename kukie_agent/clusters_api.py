@@ -59,6 +59,8 @@ GPU_PODS_TIMEOUT = 5
 GPU_SERVED_MODELS_TIMEOUT = 5
 #: Karpenter NodePool 목록 시간 제한(초). ServedModel 처럼 짧게 끊는다. GPU 노드가 있으면 ServedModel 과 합쳐 남은 예산의 절반까지만 쓴다(_collect_gpu)
 GPU_NODE_POOLS_TIMEOUT = 5
+#: 측정 기록 ConfigMap 목록 시간 제한(초). 없어도 되는 칸이라 더 짧게 끊는다. GPU 노드가 있으면 NodePool·ServedModel 이 쓰고 남은 절반 몫 안에서만 쓴다(_collect_gpu)
+GPU_BENCHMARKS_TIMEOUT = 3
 #: 파드를 읽을 수 있었던 namespace 를 연결마다 기억하는 시간(초). 그동안은 그 namespace 만 읽는다.
 #: 고객이 새 namespace 나 RoleBinding 을 더하면 이만큼 늦게 보인다 — 짧게 둔다
 READABLE_NAMESPACES_TTL = 120
@@ -68,7 +70,7 @@ GPU_BUDGET = 20
 #: 같은 연결의 개요를 여러 요청이 나눠 쓰는 시간(초). GPU 화면은 20초마다(앱 OVERVIEW_LIVE_MS) 개요를 다시 읽는데, 여러
 #: 사람·탭이 같은 클러스터를 보면 그 수만큼 kubectl 이 돌고 고객 API 서버 감사 로그에도 그만큼 쌓인다. 이 시간 안의 요청은
 #: 진행 중이거나 막 끝난 한 번의 결과를 같이 쓴다. 한 사람의 20초 주기보다 짧게 둬서 혼자 볼 때는 늘 새로 읽는다.
-#: 나눠 쓰려면 응답에 사람마다 다른 값이 없어야 한다 — 지금은 없다. benchmarks 를 Admin 에게만 채우게 되면 나눠 쓴 뒤에 거른다.
+#: 나눠 쓰려면 응답에 사람마다 다른 값이 없어야 한다 — 지금은 없다. 측정 기록(benchmarks)도 팀 누구나 같은 값이다.
 #: ArgoCD 앱 목록·상세(DURO-145)도 같은 시간·같은 헬퍼로 나눠 쓴다 — 화면을 켜 두고 여러 사람이 볼 때 같다
 OVERVIEW_SHARE_TTL = 10
 #: `?fresh=true`(화면의 "다시 읽기")여도 이보다 덜 된 결과(초)는 나눠 쓴다. 사람이 누른 다시 읽기는 늘 새로 읽은 것처럼 보이고,
@@ -154,7 +156,8 @@ async def cluster_overview(
     읽지 않는다. GPU 노드가 없으면 GPU 를 기다리는 파드를 찾는다 — 있으면 nodes 가 빈 gpu 칸(꺼진 GPU 클러스터), 없으면 null.
     server 값이 GPU 클러스터(true)가 아닌 곳은 이 파드를 GPU_ABSENT_RECHECK 초에 한 번만 찾는다. 알아낸 GPU 클러스터 여부를
     server 에 남긴다(_record_gpu). Karpenter GPU 풀(gpu.node_pools)과 ServedModel(gpu.served_models)은 지표 전에 읽고, CRD 가 없거나
-    못 읽으면 그 칸만 null 이다. GPU 풀이 있으면 노드가 0대여도 gpu 칸을 주고 GPU 클러스터로 둔다.
+    못 읽으면 그 칸만 null 이다. GPU 풀이 있으면 노드가 0대여도 gpu 칸을 주고 GPU 클러스터로 둔다. ServedModel 이 읽히면 측정 기록(gpu.benchmarks)도
+    읽고, 못 읽으면 그 칸만 빈 배열이다.
 
     kubectl 이 실패하면 연결 확인과 같은 기준(_failure_status)으로 갈라 502 로 답한다.
       CLUSTER_AUTH_EXPIRED  인증 실패·권한 없음 (연결 확인의 auth_expired)
@@ -730,9 +733,11 @@ def _collect_gpu(
     served_models, served_absent = None, True
     if nodes or waiting or node_pools or known is True:
         served_models, served_absent = _read_served_models(run, served_budget)
+    # 같은 몫 안에서 ServedModel 뒤에 읽는다 — 매달려도 지표 몫은 그대로다. 몫이 안 남으면 조회 없이 빈 배열이다
+    benchmarks = _read_benchmarks(run, served_budget) if served_models is not None else []
     if not nodes:
         if waiting or node_pools or served_models is not None:
-            return gpu.build([], [], waiting or [], served_models, node_pools), True
+            return gpu.build([], [], waiting or [], served_models, node_pools, benchmarks), True
         return None, (False if waiting is not None and pods_complete and served_absent and pools_absent else None)
 
     def metrics(target: tuple[str, str, int]) -> tuple[str | None, float]:
@@ -767,7 +772,7 @@ def _collect_gpu(
     if cache_key:
         with _latency_lock:
             _latency_samples[cache_key] = remembered
-    return gpu.build(nodes, serving, waiting or [], served_models, node_pools), True
+    return gpu.build(nodes, serving, waiting or [], served_models, node_pools, benchmarks), True
 
 
 def _read_served_models(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:
@@ -786,6 +791,22 @@ def _read_served_models(run, budget) -> tuple[list[dict[str, Any]] | None, bool]
     except (ValueError, AttributeError, TypeError):
         logger.debug("ServedModel 을 읽지 못했다 (목록 모양이 아니다)")
         return None, False
+
+
+def _read_benchmarks(run, budget) -> list[dict[str, Any]]:
+    """측정 기록 줄 — clusters/gpu.py "측정 기록". 거부·시간 초과·예산 부족·깨진 출력은 모두 [] 이고 개요를 실패시키지 않는다."""
+    timeout = budget(GPU_BENCHMARKS_TIMEOUT)
+    if timeout < 1:
+        return []
+    result = run(gpu.BENCHMARKS_COMMAND, timeout)
+    if not result.success:
+        logger.debug("측정 기록을 읽지 못했다: %s", _failure_status(result.stderr or result.stdout or ""))
+        return []
+    try:
+        return gpu.benchmarks(result.stdout)
+    except (ValueError, AttributeError, TypeError, RecursionError):
+        logger.debug("측정 기록을 읽지 못했다 (목록 모양이 아니다)")
+        return []
 
 
 def _read_node_pools(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:

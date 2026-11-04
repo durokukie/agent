@@ -34,7 +34,7 @@
         "startedAt": "2026-11-04T01:00:00Z",
         "stopsAt": "2026-11-04T03:00:00Z",
         "download": {"percent": 100, "downloadedBytes": 44452911104, "totalBytes": 44452911104},
-        "baseline": {"maxConcurrency": 12, "maxWaiting": 4, "maxKvPercent": 80, "generation": 1}
+        "baseline": {"maxConcurrency": 12, "maxWaiting": 4, "maxKvPercent": 80, "generation": 1, "measuredAt": "2026-11-04T01:30:00Z"}
       }
     },
     {
