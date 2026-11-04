@@ -61,8 +61,10 @@ GPU 노드 — nodes
 Karpenter GPU 풀 — node_pools
   Karpenter 가 노드를 띄우는 클러스터는 노드가 0대여도 GPU 클러스터다. 앱은 이 칸이 비어 있지 않으면 노드 켜기·끄기 버튼을
   숨기고 "모델을 시작하면 노드가 자동으로 켜진다" 고 안내한다. 한 줄이 GPU 풀 하나다: name, gpu_limit(spec.limits 의 GPU 수, 이름순).
-    null  CRD 가 없거나(Karpenter 를 안 깐 곳) 거부·시간 초과·예산 부족·모양이 다른 출력으로 못 읽었다. 개요는 그대로 200
-    []    읽었는데 GPU 풀이 없다 (CPU 풀만 있는 Karpenter 클러스터는 GPU 클러스터가 아니다)
+    null  거부·시간 초과·예산 부족·모양이 다른 출력으로 못 읽었다. 앱은 "확인하지 못했어요" 로 그린다. 개요는 그대로 200
+    []    GPU 풀이 없다 — CRD 가 없거나(Karpenter 를 안 깐 곳, 앱이 설치를 안내한다) 읽었는데 GPU 풀이 없다
+          (CPU 풀만 있는 Karpenter 클러스터는 GPU 클러스터가 아니다). 빈 배열만으로는 gpu 칸을 만들지 않는다
+  거부는 응답에서는 null 이지만 hasGpu 판단에서는 CRD 없음과 같다 — 볼 수 없는 곳은 못 본 곳으로 치지 않는다(node_pools_absent).
   GPU 풀 판별 — 넷 중 하나면 된다. 빈 목록은 hasGpu 를 false 로 덮는 근거라 GPU 풀을 고르는 흔한 설정을 빠뜨리지 않는다
     spec.template.spec.taints 의 key 가 GPU_RESOURCES
     spec.limits 에 GPU_RESOURCES 칸이 있다
@@ -285,8 +287,14 @@ def _gpu_requirement(req: dict[str, Any]) -> bool:
 
 
 def node_pools_absent(stderr: str) -> bool:
-    """NodePool 조회 실패가 "CRD 가 없다" 나 "볼 수 없다" 라고 확인된 것인가 — served_models_absent 와 같은 기준이다."""
+    """NodePool 조회 실패가 "CRD 가 없다" 나 "볼 수 없다" 라고 확인된 것인가 — served_models_absent 와 같은 기준이다.
+    hasGpu 를 false 로 덮어도 되는지를 가른다. 응답 칸의 값은 node_pools_crd_missing 이 가른다."""
     return served_models_absent(stderr)
+
+
+def node_pools_crd_missing(stderr: str) -> bool:
+    """NodePool 조회 실패가 "CRD 가 없다" 인가 — Karpenter 를 안 깐 곳이라 응답은 []("GPU 풀 없음") 이다. 거부는 모르는 것이라 null 이다."""
+    return "doesn't have a resource type" in stderr.lower()
 
 
 # ── 지표를 읽을 파드 ───────────────────────────────────────

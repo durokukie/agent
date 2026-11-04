@@ -790,6 +790,7 @@ def _read_served_models(run, budget) -> tuple[list[dict[str, Any]] | None, bool]
 
 def _read_node_pools(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:
     """(GPU 풀 줄, GPU 풀이 없다고 확인했나) — clusters/gpu.py "Karpenter GPU 풀". 못 읽으면 줄은 None 이고 개요를 실패시키지 않는다.
+    CRD 없음은 못 읽은 것이 아니라 줄이 [] 다 — 앱이 Karpenter 설치를 안내한다. 거부는 줄이 None 이다.
     둘째 값은 CRD 없음·거부이거나 읽었는데 GPU 풀이 없을 때만 True 다 — 시간 초과·예산 부족·깨진 출력은 있는지 모른다.
     꺼 둔 풀은 줄에 싣지 않지만 "없다" 도 아니다 — 상한을 잠깐 0 으로 내린 클러스터의 hasGpu 를 덮지 않는다."""
     timeout = budget(GPU_NODE_POOLS_TIMEOUT)
@@ -798,6 +799,8 @@ def _read_node_pools(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:
     result = run(gpu.NODE_POOLS_COMMAND, timeout)
     if not result.success:
         text = result.stderr or result.stdout or ""
+        if gpu.node_pools_crd_missing(text):
+            return [], True
         logger.debug("NodePool 을 읽지 못했다: %s", _failure_status(text))
         return None, gpu.node_pools_absent(text)
     try:

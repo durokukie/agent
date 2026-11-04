@@ -263,6 +263,16 @@ def test_NodePool_조회_실패는_없다고_확인된_것과_모르는_것을_�
     assert gpu.node_pools_absent(stderr) is expected
 
 
+@pytest.mark.parametrize(("stderr", "expected"), [
+    ('error: the server doesn\'t have a resource type "nodepools"', True),
+    ('Error from server (Forbidden): nodepools.karpenter.sh is forbidden: cannot list resource', False),   # 거부는 모른다 — null
+    ("Unable to connect to the server: net/http: TLS handshake timeout", False),
+    ("", False),
+])
+def test_응답의_빈_배열은_CRD가_없을_때뿐이다(stderr, expected):
+    assert gpu.node_pools_crd_missing(stderr) is expected
+
+
 # ── 지표 파드 찾기 ──────────────────────────────────────────
 
 def pods(name: str = "gpu_pods.json") -> list[dict]:
@@ -568,7 +578,8 @@ def test_GPU_클러스터는_노드_파드_지표_순으로_읽어_gpu_칸을_�
     assert body["benchmarks"] == []
     assert [args for args, _ in seen[4:8]] == [gpu.NODES_COMMAND, gpu.PODS_COMMAND, gpu.NODE_POOLS_COMMAND,
                                                gpu.SERVED_MODELS_COMMAND]
-    assert body["served_models"] is None and body["node_pools"] is None   # 이 가짜 클러스터에는 CRD 가 없다
+    assert body["served_models"] is None                              # 이 가짜 클러스터에는 CRD 가 없다
+    assert body["node_pools"] == []                                   # NodePool CRD 가 없으면 "GPU 풀 없음" — 앱이 설치를 안내한다
     assert sorted(args for args, _ in seen[8:]) == sorted([           # 지표는 동시에 읽는다
         gpu.proxy_command("gpu-operator", "nvidia-dcgm-exporter-abcde", 9400),
         gpu.proxy_command("gpu-operator", "nvidia-dcgm-exporter-fghij", 9400),
@@ -687,7 +698,7 @@ def test_GPU_노드가_0대여도_GPU를_기다리는_파드가_있으면_꺼진
     monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
     r = client.get(f"/clusters/{cluster}/overview", headers=USER)
     assert r.status_code == 200
-    assert r.json()["gpu"] == {"nodes": [], "serving": [], "benchmarks": [], "served_models": None, "node_pools": None, "waiting": [
+    assert r.json()["gpu"] == {"nodes": [], "serving": [], "benchmarks": [], "served_models": None, "node_pools": [], "waiting": [
         {"namespace": "llm", "pod": "vllm-gpt-oss-20b-b897b5d97-kkjsq", "gpus": 1, "phase": "Pending"}]}
     assert not any(args[1] == "--raw" for args in seen)
     assert [body["hasGpu"] for body in _gpu_calls(fake_server)] == ([True] if stored is None else [])
@@ -854,7 +865,7 @@ def test_GPU로_알려진_꺼진_클러스터에_ServedModel이_하나도_없어
     run, _ = _served_models_cluster(_result('{"items": []}'), nodes="nodes.json")
     body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", known=True, clock=lambda: 0.0)
     assert has_gpu is True
-    assert body == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [], "served_models": [], "node_pools": None}
+    assert body == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [], "served_models": [], "node_pools": []}
 
 
 @pytest.mark.parametrize(("served", "expected"), [
@@ -1008,6 +1019,31 @@ def test_NodePool을_못_읽으면_까닭에_따라_GPU_여부가_갈린다(pool
     run, _ = _served_models_cluster(_result(stderr=NO_CRD, success=False), nodes="nodes.json", pools=pools)
     assert clusters_api._collect_gpu(run, namespace_pods="{}", cache_key=f"pool-fail:{expected}:{pools.stdout}{pools.stderr}",
                                      known=None, clock=lambda: 0.0) == (None, expected)
+
+
+@pytest.mark.parametrize(("pools", "expected"), [
+    (_result(stderr=NO_POOL_CRD, success=False), []),      # Karpenter 를 안 깐 곳 — 앱이 설치를 안내한다
+    (_result('{"items": []}'), []),
+    (_result(stderr=FORBIDDEN, success=False), None),      # 아래는 못 읽음 — 앱이 "확인하지 못했어요" 를 띄운다
+    (_result(stderr="context deadline exceeded", success=False), None),
+    (_result("not json"), None),
+])
+def test_CRD_없음과_GPU_풀_없음은_빈_배열이고_못_읽음만_null이다(pools, expected):
+    run, _ = _served_models_cluster(_result('{"items": []}'), pods=fixture("gpu_pods.json"), pools=pools)
+    body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: 0.0)
+    assert has_gpu is True and body["node_pools"] == expected and len(body["nodes"]) == 2
+
+
+def test_CRD가_없어도_GPU_클러스터의_hasGpu는_다른_근거가_있으면_true로_남고_빈_배열이_칸을_만들지_않는다():
+    """응답이 [] 로 바뀌어도 hasGpu 판단과 gpu 칸 유무는 그대로다 — 칸은 다른 근거가 있을 때만 생긴다."""
+    missing = _result(stderr=NO_POOL_CRD, success=False)
+    run, _ = _served_models_cluster(_result(fixture("served_models.json")), nodes="nodes.json", pools=missing)
+    body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", known=True, clock=lambda: 0.0)
+    assert has_gpu is True and body["node_pools"] == [] and len(body["served_models"]) == 4
+
+    run, _ = _served_models_cluster(_result(fixture("served_models.json")), nodes="nodes.json", pods=_list(_vllm_pending()), pools=missing)
+    body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", known=None, clock=lambda: 0.0)
+    assert has_gpu is True and body["node_pools"] == [] and len(body["waiting"]) == 1
 
 
 def test_GPU_노드가_있는_클러스터도_node_pools를_싣고_못_읽으면_그_칸만_null이다():
