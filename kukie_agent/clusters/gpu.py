@@ -64,13 +64,19 @@ GPU 노드 — nodes
 
 Karpenter GPU 풀 — node_pools
   Karpenter 가 노드를 띄우는 클러스터는 노드가 0대여도 GPU 클러스터다. 앱은 이 칸이 비어 있지 않으면 노드 켜기·끄기 버튼을
-  숨기고 "모델을 시작하면 노드가 자동으로 켜진다" 고 안내한다. 한 줄이 GPU 풀 하나다: name, gpu_limit(spec.limits 의 GPU 수, 이름순).
+  숨기고 "모델을 시작하면 노드가 자동으로 켜진다" 고 안내한다. 한 줄이 GPU 풀 하나다: name, gpu_limit(spec.limits 의 GPU 수), instance_types. 이름순.
     null  거부·시간 초과·예산 부족·모양이 다른 출력으로 못 읽었다. 앱은 "확인하지 못했어요" 로 그린다. 개요는 그대로 200
     []    GPU 풀이 없다 — CRD 가 없거나(Karpenter 를 안 깐 곳, 앱이 설치를 안내한다) 읽었는데 GPU 풀이 없다
           (CPU 풀만 있는 Karpenter 클러스터는 GPU 클러스터가 아니다). 빈 배열만으로는 gpu 칸을 만들지 않는다
   거부는 응답에서는 null 이지만 hasGpu 판단에서는 CRD 없음과 같다 — 볼 수 없는 곳은 못 본 곳으로 치지 않는다(node_pools_absent).
   [] 는 "노드를 띄울 수 있는 GPU 풀이 없다" 만 말한다. CRD 없음·CPU 풀만 있음·GPU 풀을 다 꺼 둠(아래)이 같은 값이라, Karpenter 가
   깔렸는지까지 가려 주지는 않는다 (agent#139 리뷰). 가르려면 칸을 더해야 하고 그것은 약속을 고치는 일이다.
+  instance_types  spec.template.spec.requirements 의 node.kubernetes.io/instance-type 이 In 으로 고른 값, 적힌 순서 그대로 (DURO-186).
+    앱이 시작 창에서 고를 수 있는 GPU 수를 이 목록으로 정한다. null 은 "제한을 모른다" 다 — 앱은 1장만 보낸다
+      키가 없다(instance-family 같은 다른 조건만 있어도 그렇다), In 이 아니다, 키가 여러 번 나온다(Karpenter 가 합친 결과를 여기서 계산하지 않는다),
+      requirements·values 모양이 이상하다(문자열이 아닌 값, 빈 문자열, 빈 목록)
+    GPU 풀 판별과 hasGpu 판단에는 쓰지 않는다. 그래서 모양이 이상해도 ValueError 를 내지 않고 이 칸만 null 이다 — 예외를 내면
+    node_pools 전체가 null 이 되어 hasGpu 판단이 바뀐다.
   GPU 풀 판별 — 넷 중 하나면 된다. 빈 목록은 hasGpu 를 false 로 덮는 근거라 GPU 풀을 고르는 흔한 설정을 빠뜨리지 않는다
     spec.template.spec.taints 의 key 가 GPU_RESOURCES
     spec.limits 에 GPU_RESOURCES 칸이 있다
@@ -91,7 +97,7 @@ ServedModel — served_models
   kukie-gpu-operator 의 CRD. 한 줄이 ServedModel 하나다: namespace·name(metadata), model(spec.source.huggingface),
   phase·reason·message(status), download_percent(status.download.percent), download_bytes(status.download.downloadedBytes),
   download_total_bytes(status.download.totalBytes), max_concurrency(status.baseline.maxConcurrency),
-  engine_image(spec.engine.image),
+  engine_image(spec.engine.image), gpus(spec.engine.gpus — 파드 하나의 GPU 수, 없으면 null. DURO-186),
   started_at(status.startedAt), stops_at(status.stopsAt). 두 시각은 오퍼레이터가 쓴 RFC3339 문자열 그대로이고, 없으면 null 이다.
   여기서 계산하지 않는다 — 언제 멈추는지는 spec.maxRuntime·차트 기본값·연장 annotation 을 모두 아는 오퍼레이터가 정한다.
   namespace·이름순. 오퍼레이터가 아직 status 를 쓰지 않았으면 문자열 칸은 "", 숫자·시각 칸은 null 이다.
@@ -135,7 +141,8 @@ NAMESPACE_HINTS: tuple[str, ...] = ("gpu", "nvidia", "dcgm", "vllm", "llm", "ser
 GPU_RESOURCES: tuple[str, ...] = ("nvidia.com/gpu", "amd.com/gpu")
 
 #: NodePool requirements 에서 인스턴스 종류를 고르는 키
-_INSTANCE_KEYS: tuple[str, ...] = ("karpenter.k8s.aws/instance-family", "node.kubernetes.io/instance-type",
+_INSTANCE_TYPE_KEY = "node.kubernetes.io/instance-type"
+_INSTANCE_KEYS: tuple[str, ...] = ("karpenter.k8s.aws/instance-family", _INSTANCE_TYPE_KEY,
                                    "karpenter.k8s.aws/instance-category")
 #: GPU 인스턴스 계열 — g·p(category), g6e·g6e.xlarge·gr6·p4d. 앞에서부터 맞춘다 (m7g·c7gn 은 GPU 가 아니다)
 _GPU_INSTANCE = re.compile(r"(?:gr?|p)(?:\d|$)")
@@ -231,7 +238,7 @@ def _memory_label_mib(labels: dict[str, Any]) -> int:
 def served_models(stdout: str) -> list[dict[str, Any]]:
     """ServedModel 목록을 응답 줄로 (모듈 설명 "ServedModel"). 이름 없는 항목은 뺀다. 모양이 다르면 ValueError —
     부르는 쪽이 served_models 를 null 로 둔다. 빈 목록은 "없다" 라는 뜻이라 gpu_nodes 처럼 엄격하게 읽는다.
-    download_percent·download_bytes·download_total_bytes·max_concurrency 는 CRD 스키마가 integer 라 오퍼레이터가 정수로만 쓴다 —
+    download_percent·download_bytes·download_total_bytes·max_concurrency·gpus 는 CRD 스키마가 integer 라 오퍼레이터가 정수로만 쓴다 —
     다른 값은 null 이다. 오븐이 전체 크기를 모르면 totalBytes 가 없어 download_total_bytes 가 null 이고, 옛 오븐은 둘 다 null 이다."""
     rows: list[dict[str, Any]] = []
     for item in _strict_items(stdout):
@@ -241,6 +248,7 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
         status = item.get("status") or {}
         download = status.get("download") or {}
         spec = item.get("spec") or {}
+        engine = spec.get("engine") or {}
         rows.append({
             "namespace": meta.get("namespace") or "default",
             "name": meta["name"],
@@ -252,7 +260,8 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
             "download_bytes": _int_or_none(download.get("downloadedBytes")),
             "download_total_bytes": _int_or_none(download.get("totalBytes")),
             "max_concurrency": _int_or_none((status.get("baseline") or {}).get("maxConcurrency")),
-            "engine_image": _text_or_none((spec.get("engine") or {}).get("image")),
+            "engine_image": _text_or_none(engine.get("image")),
+            "gpus": _int_or_none(engine.get("gpus")),
             "started_at": _text_or_none(status.get("startedAt")),
             "stops_at": _text_or_none(status.get("stopsAt")),
         })
@@ -274,7 +283,8 @@ def served_models_absent(stderr: str) -> bool:
 def node_pools(stdout: str) -> tuple[list[dict[str, Any]], bool]:
     """(노드를 띄울 수 있는 GPU 풀 줄, 꺼 둔 GPU 풀이 있나) — 모듈 설명 "Karpenter GPU 풀". 이름 없는 항목은 뺀다.
     모양이 다르면 ValueError — 부르는 쪽이 node_pools 를 null 로 둔다.
-    빈 목록은 "GPU 풀 없음" 으로 hasGpu 를 false 로 덮는 근거라 엄격하게 읽는다."""
+    빈 목록은 "GPU 풀 없음" 으로 hasGpu 를 false 로 덮는 근거라 엄격하게 읽는다. instance_types 는 그 판단에 쓰지 않아
+    모양이 이상하면 그 칸만 null 이다 (_instance_types)."""
     rows: list[dict[str, Any]] = []
     disabled = False
     for item in _strict_items(stdout):
@@ -289,9 +299,27 @@ def node_pools(stdout: str) -> tuple[list[dict[str, Any]], bool]:
         if any(_ZERO_QUANTITY.fullmatch(str(value)) for value in limits.values()):
             disabled = True
             continue
-        rows.append({"name": meta["name"], "gpu_limit": _quantity_or_none(limits[limited]) if limited else None})
+        rows.append({"name": meta["name"], "gpu_limit": _quantity_or_none(limits[limited]) if limited else None,
+                     "instance_types": _instance_types(spec)})
     rows.sort(key=lambda r: r["name"])
     return rows, disabled
+
+
+def _instance_types(spec: dict[str, Any]) -> list[str] | None:
+    """NodePool 이 instance-type 을 In 으로 고른 값 (모듈 설명 "Karpenter GPU 풀"). 어떤 모양에도 예외를 내지 않는다 —
+    GPU 상한이 있는 풀은 GPU 풀 판별이 템플릿을 읽지 않아, 여기서 예외가 나면 지금까지 읽히던 풀이 node_pools 째 null 이 된다."""
+    template = spec.get("template")
+    template_spec = template.get("spec") if isinstance(template, dict) else None
+    requirements = template_spec.get("requirements") if isinstance(template_spec, dict) else None
+    if not isinstance(requirements, list) or not all(isinstance(req, dict) for req in requirements):
+        return None
+    picks = [req for req in requirements if req.get("key") == _INSTANCE_TYPE_KEY]
+    if len(picks) != 1 or picks[0].get("operator") != "In":
+        return None
+    values = picks[0].get("values")
+    if not isinstance(values, list) or not values or not all(isinstance(value, str) and value for value in values):
+        return None
+    return values
 
 
 def _gpu_template(template: dict[str, Any]) -> bool:
