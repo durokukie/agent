@@ -55,9 +55,9 @@ OVERVIEW_TIMEOUT = 15
 GPU_METRICS_TIMEOUT = 5
 #: 모든 namespace 파드를 못 읽을 때 namespace 하나의 파드 목록 시간 제한(초). namespace 마다 한 번이라 지표처럼 짧게 끊는다
 GPU_PODS_TIMEOUT = 5
-#: ServedModel 목록 시간 제한(초). 지표보다 먼저 읽으므로 짧게 끊는다. GPU 노드가 있으면 남은 예산의 절반까지만 쓴다(_collect_gpu)
+#: ServedModel 목록 시간 제한(초). 지표보다 먼저 읽으므로 짧게 끊는다. GPU 노드가 있으면 NodePool 과 합쳐 남은 예산의 절반까지만 쓴다(_collect_gpu)
 GPU_SERVED_MODELS_TIMEOUT = 5
-#: Karpenter NodePool 목록 시간 제한(초). ServedModel 처럼 짧게 끊는다. GPU 노드가 있으면 남은 예산의 절반까지만 쓴다(_collect_gpu)
+#: Karpenter NodePool 목록 시간 제한(초). ServedModel 처럼 짧게 끊는다. GPU 노드가 있으면 ServedModel 과 합쳐 남은 예산의 절반까지만 쓴다(_collect_gpu)
 GPU_NODE_POOLS_TIMEOUT = 5
 #: 파드를 읽을 수 있었던 namespace 를 연결마다 기억하는 시간(초). 그동안은 그 namespace 만 읽는다.
 #: 고객이 새 namespace 나 RoleBinding 을 더하면 이만큼 늦게 보인다 — 짧게 둔다
@@ -710,17 +710,19 @@ def _collect_gpu(
         logger.debug("GPU 를 기다리는 파드를 찾지 못했다 (파드 목록을 읽지 못했다)")
         waiting = None                                      # 못 읽은 것과 "없다" 는 다르다 — 아래에서 None(모른다)
 
+    # GPU 노드가 있으면 NodePool·ServedModel 을 합쳐 남은 예산의 절반까지만 — namespace 탐색처럼 지표를 읽을 시간을 남긴다.
+    # 따로 절반씩 깎으면 지표 몫이 네 번째로 줄어 서빙 중인 모델이 화면에서 빠진다 (agent#138·#139 리뷰)
+    reads_deadline = clock() + max(0.0, deadline - clock()) / 2 if nodes else deadline
+
     def pools_budget(limit: int) -> int:
-        """GPU 노드가 있으면 남은 예산의 절반까지만, GPU 로 알려진 꺼진 클러스터는 ServedModel 을 읽을 시간을 남기고."""
-        remaining = deadline - clock()
+        """GPU 노드가 있으면 합친 몫의 절반, GPU 로 알려진 꺼진 클러스터는 ServedModel 을 읽을 시간을 남기고."""
+        remaining = reads_deadline - clock()
         return min(limit, int(remaining / 2 if nodes else remaining - (GPU_SERVED_MODELS_TIMEOUT if known is True else 0)))
 
     node_pools, pools_absent = _read_node_pools(run, pools_budget)
 
     def served_budget(limit: int) -> int:
-        """GPU 노드가 있으면 남은 예산의 절반까지만 — namespace 탐색처럼 지표를 읽을 시간을 남긴다 (agent#138 리뷰)."""
-        remaining = deadline - clock()
-        return min(limit, int(remaining / 2 if nodes else remaining))
+        return min(limit, int(reads_deadline - clock()))
 
     # GPU 노드가 없으면 기다리는 파드나 GPU 풀이 있거나 GPU 클러스터로 알려진 곳만 읽는다 — GPU 없는 일반 클러스터에 조회를 늘리지 않는다
     served_models, served_absent = None, True

@@ -198,6 +198,11 @@ def test_NodePool_목록에서_GPU_풀만_이름순으로_싣는다():
     _pool(requirements=_picks(INSTANCE_TYPE, "g6e.xlarge")),
     _pool(requirements=_picks(INSTANCE_TYPE, "m5.large", "p5.48xlarge")),    # 섞여 있어도 GPU 노드를 띄울 수 있다
     _pool(taints=[{"key": "amd.com/gpu", "effect": "NoSchedule"}]),
+    _pool(requirements=_picks("karpenter.k8s.aws/instance-category", "g", "p")),
+    _pool(requirements=_picks("karpenter.k8s.aws/instance-gpu-count", "0", operator="Gt")),
+    _pool(requirements=_picks("karpenter.k8s.aws/instance-gpu-count", "1", operator="Gte")),
+    _pool(requirements=_picks("karpenter.k8s.aws/instance-gpu-manufacturer", "nvidia")),
+    _pool(requirements=[{"key": "karpenter.k8s.aws/instance-gpu-name", "operator": "Exists"}]),
 ])
 def test_GPU_풀로_본다(pool):
     assert [row["name"] for row in gpu.node_pools(_list(pool))] == ["p"]
@@ -210,13 +215,19 @@ def test_GPU_풀로_본다(pool):
     _pool(requirements=[{"key": FAMILY, "operator": "Exists"}]),
     _pool(requirements=_picks(FAMILY, "m7g", "c7gn", "hpc7g", "inf2")),      # Graviton 은 g 로 끝나지 시작하지 않는다
     _pool(requirements=_picks("kubernetes.io/arch", "g6e")),                 # 인스턴스 종류를 고르는 키가 아니다
+    _pool(requirements=_picks("karpenter.k8s.aws/instance-category", "c", "m", "r")),
+    _pool(requirements=_picks("karpenter.k8s.aws/instance-category", "g", "p", operator="NotIn")),
+    _pool(requirements=[{"key": "karpenter.k8s.aws/instance-gpu-count", "operator": "DoesNotExist"}]),   # GPU 를 뺀다
+    _pool(requirements=_picks("karpenter.k8s.aws/instance-gpu-manufacturer", "nvidia", operator="NotIn")),
+    _pool(limits={"nvidia.com/gpu": 0}, taints=[{"key": "nvidia.com/gpu", "effect": "NoSchedule"}]),     # 꺼 둔 풀
+    _pool(limits={"nvidia.com/gpu": "0"}, requirements=_picks(FAMILY, "g6e")),
     {"spec": {"limits": {"nvidia.com/gpu": 1}}},                             # 이름이 없다
 ])
 def test_GPU_풀로_보지_않는다(pool):
     assert gpu.node_pools(_list(pool)) == []
 
 
-@pytest.mark.parametrize(("limit", "expected"), [(2, 2), ("2", 2), (0, 0), ("0", 0), ("1k", None), (1.5, None), (True, None),
+@pytest.mark.parametrize(("limit", "expected"), [(2, 2), ("2", 2), ("1k", None), (1.5, None), (True, None),
                                                  (-1, None), (None, None), ("", None)])
 def test_GPU_상한은_정수로_읽히는_것만_싣는다(limit, expected):
     assert gpu.node_pools(_list(_pool(limits={"nvidia.com/gpu": limit}))) == [{"name": "p", "gpu_limit": expected}]
@@ -997,8 +1008,39 @@ def test_GPU_노드가_있는_클러스터도_node_pools를_싣고_못_읽으면
     assert has_gpu is True and body["node_pools"] is None and len(body["nodes"]) == 2
 
 
+def test_GPU_풀을_꺼_두면_GPU_클러스터로_올리지_않는다():
+    """limits 0 인 풀만 남은 곳 — 앱이 "모델을 시작하면 노드가 켜진다" 고 안내하면 모델이 영구 Pending 이다 (agent#139 리뷰)."""
+    pools = _result(_list(_pool("gpu", limits={"nvidia.com/gpu": 0}, taints=[{"key": "nvidia.com/gpu"}])))
+    run, _ = _served_models_cluster(_result(stderr=NO_CRD, success=False), nodes="nodes.json", pools=pools)
+    assert clusters_api._collect_gpu(run, namespace_pods="{}", cache_key="pool-off:fp:ns", known=None,
+                                     clock=lambda: 0.0) == (None, False)
+
+
+def test_NodePool과_ServedModel이_함께_매달려도_지표_몫은_남은_예산의_절반이다(monkeypatch):
+    """둘이 따로 절반씩 깎으면 지표 몫이 네 번째로 줄어 서빙 중인 모델이 빠진다 (agent#139 리뷰)."""
+    monkeypatch.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
+    now = [0.0]
+    timeouts: dict[str, int] = {}
+    left_for_metrics: list[float] = []
+
+    def run(args, timeout):
+        if args == gpu.PODS_COMMAND:
+            now[0] = clusters_api.GPU_BUDGET - 16
+        if args in (gpu.NODE_POOLS_COMMAND, gpu.SERVED_MODELS_COMMAND):
+            timeouts[args[1]] = timeout
+            now[0] += timeout
+            return _result(stderr="timed out", success=False)
+        if args[1] == "--raw":
+            left_for_metrics.append(clusters_api.GPU_BUDGET - now[0])
+        return _gpu_cluster(args)
+
+    clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
+    assert timeouts == {"nodepools.karpenter.sh": 4, "servedmodels.serving.kukie.io": 4}
+    assert left_for_metrics[0] == 8
+
+
 def test_NodePool이_매달려도_ServedModel과_지표를_읽을_예산이_남는다(monkeypatch):
-    """파드 조회가 매달려 4초만 남은 라운드 — NodePool 은 절반까지만 쓴다."""
+    """파드 조회가 매달려 4초만 남은 라운드 — 둘이 합쳐 절반, NodePool 은 그 절반까지만 쓴다."""
     monkeypatch.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
     now = [0.0]
     pool_timeouts: list[int] = []
@@ -1018,7 +1060,7 @@ def test_NodePool이_매달려도_ServedModel과_지표를_읽을_예산이_남�
         return _gpu_cluster(args)
 
     body, _ = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: now[0])
-    assert pool_timeouts == [2] and raw
+    assert pool_timeouts == [1] and raw
     assert body["node_pools"] is None and len(body["served_models"]) == 4
 
 

@@ -63,11 +63,16 @@ Karpenter GPU 풀 — node_pools
   숨기고 "모델을 시작하면 노드가 자동으로 켜진다" 고 안내한다. 한 줄이 GPU 풀 하나다: name, gpu_limit(spec.limits 의 GPU 수, 이름순).
     null  CRD 가 없거나(Karpenter 를 안 깐 곳) 거부·시간 초과·예산 부족·모양이 다른 출력으로 못 읽었다. 개요는 그대로 200
     []    읽었는데 GPU 풀이 없다 (CPU 풀만 있는 Karpenter 클러스터는 GPU 클러스터가 아니다)
-  GPU 풀 판별 — 셋 중 하나면 된다
+  GPU 풀 판별 — 넷 중 하나면 된다. 빈 목록은 hasGpu 를 false 로 덮는 근거라 GPU 풀을 고르는 흔한 설정을 빠뜨리지 않는다
     spec.template.spec.taints 의 key 가 GPU_RESOURCES
     spec.limits 에 GPU_RESOURCES 칸이 있다
-    spec.template.spec.requirements 의 instance-family·instance-type 이 operator In 으로 g·gr·p 계열을 고른다.
+    spec.template.spec.requirements 의 instance-family·instance-type·instance-category 가 operator In 으로 g·gr·p 계열을 고른다.
       NotIn 은 "GPU 는 빼라" 라는 일반 풀의 흔한 설정이라 보지 않는다. m7g(Graviton)처럼 g 로 끝나는 계열은 GPU 가 아니다
+    requirements 가 karpenter.k8s.aws/instance-gpu-* (count·manufacturer·name 등) 를 In·Exists·Gt·Gte 로 요구한다 —
+      이 라벨은 GPU 인스턴스에만 붙으므로 요구하는 것만으로 GPU 인스턴스로 좁혀진다
+  다만 limits 의 GPU 수가 0 인 풀은 뺀다 — 노드를 띄우지 못하게 꺼 둔 풀이다. 앱이 "모델을 시작하면 노드가 켜진다" 고 안내하면 안 된다.
+  이 칸은 "GPU 풀이 있다" 는 사실만 말한다. 그 풀이 지금 있는 GPU 노드를 관리하는지는 가리지 않는다 — 노드 그룹과 GPU 풀을 같이 쓰는
+  클러스터도 채워진다 (agent#139 리뷰). 약속(DURO-184)은 고객 전제 조건을 Karpenter 로 두고 앱이 이 칸으로 방식을 고른다.
   GPU 풀이 있으면 노드가 0대이고 기다리는 파드도 모델도 없어도 빈 gpu 칸(nodes 빈 배열)을 주고 GPU 클러스터로 둔다.
   GPU 노드가 없고 server 값이 true 가 아닌 곳은 기다리는 파드를 찾는 라운드(clusters_api.GPU_ABSENT_RECHECK)에만 읽는다 —
   일반 클러스터의 다른 라운드에는 kubectl 이 늘지 않는다.
@@ -118,9 +123,13 @@ NAMESPACE_HINTS: tuple[str, ...] = ("gpu", "nvidia", "dcgm", "vllm", "llm", "ser
 GPU_RESOURCES: tuple[str, ...] = ("nvidia.com/gpu", "amd.com/gpu")
 
 #: NodePool requirements 에서 인스턴스 종류를 고르는 키
-_INSTANCE_KEYS: tuple[str, ...] = ("karpenter.k8s.aws/instance-family", "node.kubernetes.io/instance-type")
-#: GPU 인스턴스 계열 — g6e·g6e.xlarge·gr6·p4d. 앞에서부터 맞춘다 (m7g·c7gn 은 GPU 가 아니다)
-_GPU_INSTANCE = re.compile(r"(?:gr?|p)\d")
+_INSTANCE_KEYS: tuple[str, ...] = ("karpenter.k8s.aws/instance-family", "node.kubernetes.io/instance-type",
+                                   "karpenter.k8s.aws/instance-category")
+#: GPU 인스턴스 계열 — g·p(category), g6e·g6e.xlarge·gr6·p4d. 앞에서부터 맞춘다 (m7g·c7gn 은 GPU 가 아니다)
+_GPU_INSTANCE = re.compile(r"(?:gr?|p)(?:\d|$)")
+#: GPU 인스턴스에만 붙는 라벨의 앞부분과, 그 라벨을 요구하는 연산자 (모듈 설명 "Karpenter GPU 풀")
+_GPU_LABEL_PREFIX = "karpenter.k8s.aws/instance-gpu-"
+_GPU_LABEL_OPERATORS: tuple[str, ...] = ("In", "Exists", "Gt", "Gte")
 
 #: 지표를 읽는 파드 수 상한 (DCGM·vLLM 따로). 한 번 읽기가 시간 제한까지 걸려도 개요가 끝없이 늘지 않게
 MAX_METRIC_TARGETS = 8
@@ -245,18 +254,27 @@ def node_pools(stdout: str) -> list[dict[str, Any]]:
         limited = next((name for name in GPU_RESOURCES if name in limits), None)
         if limited is None and not _gpu_template((spec.get("template") or {}).get("spec") or {}):
             continue
-        rows.append({"name": meta["name"], "gpu_limit": _quantity_or_none(limits[limited]) if limited else None})
+        gpu_limit = _quantity_or_none(limits[limited]) if limited else None
+        if gpu_limit == 0:
+            continue                                        # 꺼 둔 풀이다 — 노드를 띄우지 못한다
+        rows.append({"name": meta["name"], "gpu_limit": gpu_limit})
     rows.sort(key=lambda r: r["name"])
     return rows
 
 
 def _gpu_template(template: dict[str, Any]) -> bool:
-    """NodePool 템플릿이 GPU 노드를 띄우는가 — GPU taint 또는 g·p 계열을 고른 requirements."""
+    """NodePool 템플릿이 GPU 노드를 띄우는가 — GPU taint, g·p 계열을 고르거나 GPU 라벨을 요구하는 requirements."""
     if any(taint.get("key") in GPU_RESOURCES for taint in template.get("taints") or []):
         return True
-    return any(req.get("key") in _INSTANCE_KEYS and req.get("operator") == "In"
-               and any(isinstance(value, str) and _GPU_INSTANCE.match(value) for value in req.get("values") or [])
-               for req in template.get("requirements") or [])
+    return any(_gpu_requirement(req) for req in template.get("requirements") or [])
+
+
+def _gpu_requirement(req: dict[str, Any]) -> bool:
+    key, operator = str(req.get("key") or ""), req.get("operator")
+    if key.startswith(_GPU_LABEL_PREFIX):
+        return operator in _GPU_LABEL_OPERATORS
+    return key in _INSTANCE_KEYS and operator == "In" and any(
+        isinstance(value, str) and _GPU_INSTANCE.match(value) for value in req.get("values") or [])
 
 
 def node_pools_absent(stderr: str) -> bool:
@@ -713,7 +731,7 @@ def _text_or_none(value: Any) -> str | None:
 
 
 def _quantity_or_none(value: Any) -> int | None:
-    """NodePool limits 의 수량 — 2 나 "2". 0 은 값이다("이 풀은 GPU 를 안 띄운다"). `1k` 같은 단위는 GPU 수에 쓰지 않아 null 이다."""
+    """NodePool limits 의 수량 — 2 나 "2". 0 은 값이다(꺼 둔 풀 — node_pools 가 뺀다). `1k` 같은 단위는 GPU 수에 쓰지 않아 null 이다."""
     if isinstance(value, str) and value.isdecimal():
         return int(value)
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
