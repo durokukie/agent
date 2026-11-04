@@ -122,7 +122,7 @@ ServedModel — served_models
   모양이 다른 항목은 그 줄만 건너뛴다: 이름·model 이 없다, measuredAt 이 RFC3339 가 아니다, baseline.json 이 JSON 이 아니다,
   sla 칸이 빠졌다, 단계에 칸이 빠졌다, 숫자가 아니거나 음수·NaN·무한대다(NaN·무한대는 JSON 응답을 만들 때 예외가 나 개요를 깬다), 남는 단계가 없다,
   단계·model 이 상한보다 길다. gpus·max_concurrency 는 문자열로 적힌 1 이상 정수만 싣고 나머지는 null, partial 은 "true" 만 true 다.
-  읽는 조건은 ServedModel 과 같다 — served_models 가 null 이면(애드온이 없거나 못 읽었다) 조회하지 않고 [] 다. GPU 없는 일반 클러스터에 kubectl 이 늘지 않는다.
+  읽는 조건은 ServedModel 과 같다 — served_models 가 null 이면(애드온이 없거나 못 읽었다) 조회하지 않는다. 그 라운드의 값은 아래 기억 규칙을 따른다. GPU 없는 일반 클러스터에 kubectl 이 늘지 않는다.
   시간 초과·예산 부족·깨진 출력이면 연결마다 기억해 둔 마지막 성공 값을 싣고(clusters_api._read_benchmarks — 한 번 실패로 표가 깜빡이지 않게),
   그것도 없으면 [] 다. 거부와 CRD 없음은 잠깐의 실패가 아니라 "볼 수 없다" 는 답이라 기억을 지우고 [] 다. 웹이 배열로 읽으므로 null 은 쓰지 않는다.
   이 칸은 GPU 클러스터 판단(hasGpu)에 쓰지 않는다.
