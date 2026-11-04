@@ -1,5 +1,5 @@
 """클러스터 개요의 gpu 칸 — GPU 노드, 그 위의 DCGM 지표, 서빙 중인 vLLM 모델 (DURO-118), ServedModel 상태 (DURO-182),
-Karpenter GPU NodePool (DURO-184).
+Karpenter GPU NodePool (DURO-184), 측정 기록 (DURO-188).
 
 overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순수 함수만 둔다. kubectl 은 clusters_api.py 가 돌린다.
 
@@ -14,7 +14,8 @@ overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순�
   3. NODE_POOLS_COMMAND  Karpenter NodePool (클러스터 범위). 파드를 읽은 라운드마다 한 번 — 아래 "Karpenter GPU 풀"
   4. SERVED_MODELS_COMMAND  모든 namespace 의 ServedModel. 지표보다 먼저 읽는다 — 지표 파드가 매달려도 예산이 남게.
                      GPU 노드가 없으면 기다리는 파드나 GPU 풀이 있거나 server 값이 GPU 클러스터(true)일 때만 읽는다 — 아래 "ServedModel"
-  5. proxy_command   찾은 파드의 /metrics 를 API 서버 **파드 프록시**로 읽는다 (Prometheus 없이 kubectl 권한만으로).
+  5. BENCHMARKS_COMMAND  측정 기록 ConfigMap. ServedModel 이 읽힌 라운드에만 읽는다 — 아래 "측정 기록"
+  6. proxy_command   찾은 파드의 /metrics 를 API 서버 **파드 프록시**로 읽는다 (Prometheus 없이 kubectl 권한만으로).
                      서비스 프록시가 아니라 파드 프록시인 이유: DCGM exporter 는 노드마다 하나인 DaemonSet 이라 서비스로
                      부르면 아무 파드 하나에 붙어 다른 노드의 값을 받는다. vLLM 도 레플리카마다 값이 다르다
   지표를 못 읽으면 그 노드의 실시간 값만 null, 그 파드만 serving 에서 빠진다 — 개요는 그대로 200.
@@ -100,7 +101,8 @@ ServedModel — served_models
   phase·reason·message(status), download_percent(status.download.percent), download_bytes(status.download.downloadedBytes),
   download_total_bytes(status.download.totalBytes), max_concurrency(status.baseline.maxConcurrency),
   engine_image(spec.engine.image), gpus(spec.engine.gpus — 파드 하나의 GPU 수, 1 이상 정수가 아니면 null. DURO-186),
-  started_at(status.startedAt), stops_at(status.stopsAt). 두 시각은 오퍼레이터가 쓴 RFC3339 문자열 그대로이고, 없으면 null 이다.
+  started_at(status.startedAt), stops_at(status.stopsAt), measured_at(status.baseline.measuredAt).
+  세 시각은 오퍼레이터가 쓴 RFC3339 문자열 그대로이고, 없으면 null 이다. measured_at 은 측정 기록의 at 과 견주는 값이라 형식이 다르면 null 이다.
   여기서 계산하지 않는다 — 언제 멈추는지는 spec.maxRuntime·차트 기본값·연장 annotation 을 모두 아는 오퍼레이터가 정한다.
   namespace·이름순. 오퍼레이터가 아직 status 를 쓰지 않았으면 문자열 칸은 "", 숫자·시각 칸은 null 이다.
     null  CRD 가 없거나(애드온을 안 깐 곳) 거부·시간 초과·예산 부족·모양이 다른 출력으로 못 읽었다. 개요는 그대로 200
@@ -110,7 +112,20 @@ ServedModel — served_models
   깔린 곳이다) 빈 gpu 칸(nodes 빈 배열)을 주고 GPU 클러스터로 둔다 — 모델을 지우고 노드를 끈 뒤에도 GPU 화면이 이어지게.
 
 측정 기록 — benchmarks
-  측정 Job 도구가 아직 없어 늘 빈 배열이다. 계약(api-spec §3)대로 채울 때는 에이전트가 거른다 — 우리 GPU 클러스터의 팀 Admin 만.
+  오븐이 측정을 정상으로 마칠 때마다 namespace llm 에 남기는 ConfigMap(라벨 serving.kukie.io/measure-result=true, 주인 없음)이 한 줄이다.
+  모델을 지워도 남아서, 모델이 돌지 않는 클러스터에도 줄이 있다. 팀 누구나 같은 값을 받는다. 최근 순으로 MAX_BENCHMARKS 개까지.
+  한 줄: id(metadata.name), model, at(measuredAt), input_tokens·output_tokens·sla(baseline.json 의 sla), steps, gpus, partial, max_concurrency.
+  ConfigMap 의 다른 칸(engineImage·engineArgs 등)과 baseline.json 의 다른 칸은 싣지 않는다.
+  steps 한 칸: concurrency(c), ttft_p95_ms(ttft95), itl_p95_ms(itl95), output_tokens_per_s(tps). 적힌 순서 그대로다.
+    ttft95·itl95 가 명시적 null 인 단계는 그 단계만 뺀다 — 오븐이 그 단계의 p95 를 얻지 못하면 쓰는 값이고, 앱은 숫자만 그린다.
+    키가 아예 없는 단계는 오븐이 쓴 모양이 아니라 아래 "모양이 다른 항목" 이다.
+  모양이 다른 항목은 그 줄만 건너뛴다: 이름·model 이 없다, measuredAt 이 RFC3339 가 아니다, baseline.json 이 JSON 이 아니다,
+  sla 칸이 빠졌다, 단계에 칸이 빠졌다, 숫자가 아니거나 음수·NaN·무한대다(NaN·무한대는 JSON 응답을 만들 때 예외가 나 개요를 깬다), 남는 단계가 없다,
+  단계·model 이 상한보다 길다. gpus·max_concurrency 는 문자열로 적힌 1 이상 정수만 싣고 나머지는 null, partial 은 "true" 만 true 다.
+  읽는 조건은 ServedModel 과 같다 — served_models 가 null 이면(애드온이 없거나 못 읽었다) 조회하지 않는다. 그 라운드의 값은 아래 기억 규칙을 따른다. GPU 없는 일반 클러스터에 kubectl 이 늘지 않는다.
+  시간 초과·예산 부족·깨진 출력이면 연결마다 기억해 둔 마지막 성공 값을 싣고(clusters_api._read_benchmarks — 한 번 실패로 표가 깜빡이지 않게),
+  그것도 없으면 [] 다. 거부와 CRD 없음은 잠깐의 실패가 아니라 "볼 수 없다" 는 답이라 기억을 지우고 [] 다. 웹이 배열로 읽으므로 null 은 쓰지 않는다.
+  이 칸은 GPU 클러스터 판단(hasGpu)에 쓰지 않는다.
 """
 from __future__ import annotations
 
@@ -118,6 +133,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 #: 노드 목록 (클러스터 범위). 부르는 쪽이 `-n` 을 붙이지 않는다
@@ -127,6 +143,17 @@ PODS_COMMAND: list[str] = ["get", "pods", "-A", "-o", "json"]
 
 #: 모든 namespace 의 ServedModel (모듈 설명 "ServedModel"). 부르는 쪽이 `-n` 을 붙이지 않는다
 SERVED_MODELS_COMMAND: list[str] = ["get", "servedmodels.serving.kukie.io", "-A", "-o", "json"]
+
+#: 측정 기록 ConfigMap (모듈 설명 "측정 기록"). 오븐이 llm 에만 남긴다. 부르는 쪽이 `-n` 을 붙이지 않는다
+BENCHMARKS_COMMAND: list[str] = ["get", "configmaps", "-n", "llm", "-l", "serving.kukie.io/measure-result=true", "-o", "json"]
+#: 응답에 싣는 측정 기록 수 상한. 개요는 20초마다 다시 읽으므로 응답이 커지지 않게 한다
+MAX_BENCHMARKS = 50
+#: 측정 기록 한 줄의 단계 수·model 길이 상한. 오븐은 단계가 7개이고 결과를 4096바이트에 담는다 — 넘으면 오븐이 쓴 값이 아니다
+MAX_BENCHMARK_STEPS = 64
+MAX_BENCHMARK_MODEL = 256
+#: 측정 시각. 대문자 T·Z 와 오프셋까지 있어야 한다 — 시각끼리 견주어 최근 순으로 놓으려면 시간대가 있어야 한다.
+#: 소수 초는 정렬 때 따로 읽는다 — datetime 은 마이크로초까지만 담는다 (_measured_time)
+_RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.([0-9]{1,9}))?(?:Z|[+-][0-9]{2}:[0-9]{2})")
 
 #: Karpenter NodePool (모듈 설명 "Karpenter GPU 풀"). 클러스터 범위 자원이라 `-A`·`-n` 이 없다
 NODE_POOLS_COMMAND: list[str] = ["get", "nodepools.karpenter.sh", "-o", "json"]
@@ -255,6 +282,7 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
         download = status.get("download") or {}
         spec = item.get("spec") or {}
         engine = spec.get("engine") or {}
+        baseline = status.get("baseline") or {}
         rows.append({
             "namespace": meta.get("namespace") or "default",
             "name": meta["name"],
@@ -265,11 +293,12 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
             "download_percent": _int_or_none(download.get("percent")),
             "download_bytes": _int_or_none(download.get("downloadedBytes")),
             "download_total_bytes": _int_or_none(download.get("totalBytes")),
-            "max_concurrency": _int_or_none((status.get("baseline") or {}).get("maxConcurrency")),
+            "max_concurrency": _int_or_none(baseline.get("maxConcurrency")),
             "engine_image": _text_or_none(engine.get("image")),
             "gpus": _count_or_none(engine.get("gpus")),
             "started_at": _text_or_none(status.get("startedAt")),
             "stops_at": _text_or_none(status.get("stopsAt")),
+            "measured_at": baseline.get("measuredAt") if _measured_time(baseline.get("measuredAt")) else None,
         })
     rows.sort(key=lambda r: (r["namespace"], r["name"]))
     return rows
@@ -282,6 +311,108 @@ def served_models_absent(stderr: str) -> bool:
     그 밖의 문구(NotFound 등)도 모르는 실패다: hasGpu 를 덮지 않는 안전한 쪽이다."""
     lowered = stderr.lower()
     return "doesn't have a resource type" in lowered or "(forbidden)" in lowered or " is forbidden" in lowered
+
+
+# ── 측정 기록 ─────────────────────────────────────────────
+
+def benchmarks(stdout: str) -> list[dict[str, Any]]:
+    """측정 기록 ConfigMap 목록을 응답 줄로 (모듈 설명 "측정 기록"). 모양이 다른 항목은 그 줄만 건너뛰어 나머지를 살린다.
+    그래서 _strict_items 가 아니라 _items 다. 목록 자체가 깨졌으면 ValueError — 부르는 쪽이 [] 로 둔다."""
+    runs = [run for item in _items(stdout) if (run := _benchmark_run(item)) is not None]
+    runs.sort(key=lambda run: (run[0], run[1]["id"]), reverse=True)
+    return [row for _, row in runs[:MAX_BENCHMARKS]]
+
+
+def _benchmark_run(item: dict[str, Any]) -> tuple[tuple[datetime, int], dict[str, Any]] | None:
+    """ConfigMap 하나를 (측정 시각의 정렬 키, 응답 줄)로. 모양이 다르면 None — 어떤 모양에도 예외를 내지 않는다."""
+    meta, data = item.get("metadata"), item.get("data")
+    if not isinstance(meta, dict) or not isinstance(data, dict):
+        return None
+    name, model, at = meta.get("name"), data.get("model"), data.get("measuredAt")
+    measured = _measured_time(at)
+    baseline = _baseline_json(data.get("baseline.json"))
+    if (measured is None or baseline is None or not isinstance(name, str) or not name
+            or not isinstance(model, str) or not model or len(model) > MAX_BENCHMARK_MODEL):
+        return None
+    sla = baseline.get("sla")
+    if not isinstance(sla, dict):
+        return None
+    ttft, itl = _measure_number(sla.get("ttftMs")), _measure_number(sla.get("itlMs"))
+    input_tokens, output_tokens = _count_or_none(sla.get("inputTokens")), _count_or_none(sla.get("outputTokens"))
+    steps = _benchmark_steps(baseline.get("steps"))
+    if ttft is None or itl is None or input_tokens is None or output_tokens is None or not steps:
+        return None
+    return measured, {
+        "id": name,
+        "model": model,
+        "at": at,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "sla": {"ttft_p95_ms": ttft, "itl_p95_ms": itl},
+        "steps": steps,
+        "gpus": _count_text_or_none(data.get("gpus")),
+        "partial": data.get("partial") == "true",
+        "max_concurrency": _count_text_or_none(data.get("maxConcurrency")),
+    }
+
+
+def _benchmark_steps(raw: Any) -> list[dict[str, Any]] | None:
+    """baseline.json 의 steps 를 응답 칸으로. p95 가 명시적 null 인 단계만 빼고, 그 밖에 모양이 다른 단계(키가 없는 것 포함)가
+    있으면 None 이다 — 가운데 단계가 빠진 표를 온전한 측정처럼 보이지 않게 (agent#144 리뷰)."""
+    if not isinstance(raw, list) or len(raw) > MAX_BENCHMARK_STEPS:
+        return None
+    rows: list[dict[str, Any]] = []
+    for step in raw:
+        if not isinstance(step, dict) or "ttft95" not in step or "itl95" not in step:
+            return None
+        if step["ttft95"] is None or step["itl95"] is None:
+            continue
+        row = {"concurrency": _count_or_none(step.get("c")), "ttft_p95_ms": _measure_number(step["ttft95"]),
+               "itl_p95_ms": _measure_number(step["itl95"]), "output_tokens_per_s": _measure_number(step.get("tps"))}
+        if any(value is None for value in row.values()):
+            return None
+        rows.append(row)
+    return rows
+
+
+def _baseline_json(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except (ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _measured_time(value: Any) -> tuple[datetime, int] | None:
+    """RFC3339 측정 시각의 정렬 키 — (시각, 나노초). 형식이 다르면 None. datetime 은 마이크로초 아래를 버리므로 소수 초를
+    따로 견주어 그 아래 자리까지 순서를 지킨다 (agent#144 리뷰)."""
+    match = _RFC3339.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        return None
+    try:
+        return datetime.fromisoformat(value), int((match[1] or "").ljust(9, "0"))
+    except ValueError:      # 13월처럼 모양만 맞는 값
+        return None
+
+
+def _measure_number(value: Any) -> int | float | None:
+    """0 이상의 유한한 숫자만. json.loads 는 NaN·Infinity 를 받고, 이런 값은 JSON 응답을 만들 때 예외를 낸다."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:   # float 로 못 바꾸는 큰 정수
+        return None
+    return value if finite and value >= 0 else None
+
+
+def _count_text_or_none(value: Any) -> int | None:
+    """ConfigMap data 의 숫자 칸(문자열). 1 이상 정수만, 나머지는 null 이다."""
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,9}", value):
+        return None
+    return _count_or_none(int(value))
 
 
 # ── Karpenter GPU 풀 ─────────────────────────────────────
@@ -498,7 +629,7 @@ def merge_pod_lists(outputs: list[str]) -> str:
 
 
 def proxy_command(namespace: str, pod: str, port: int) -> list[str]:
-    """API 서버 파드 프록시로 /metrics 를 읽는 kubectl 인자 (모듈 설명 "읽는 순서" 5)."""
+    """API 서버 파드 프록시로 /metrics 를 읽는 kubectl 인자 (모듈 설명 "읽는 순서" 6)."""
     return ["get", "--raw", f"/api/v1/namespaces/{namespace}/pods/{pod}:{port}/proxy/metrics"]
 
 
@@ -728,14 +859,15 @@ def _ms(seconds: float | None) -> float | None:
 def build(nodes: list[dict[str, Any]], serving: list[dict[str, Any]],
           waiting: list[dict[str, Any]] | None = None,
           served_models: list[dict[str, Any]] | None = None,
-          node_pools: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+          node_pools: list[dict[str, Any]] | None = None,
+          benchmarks: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     """ClusterGpu. GPU 노드도 GPU 를 기다리는 파드도 GPU 풀도 없고 ServedModel 도 못 읽었으면 None — 앱은 "GPU 노드가 없어요" 를 띄운다.
     노드는 없고 기다리는 파드나 GPU 풀, 읽어 낸 ServedModel(빈 배열 포함)이 있으면 꺼진 GPU 클러스터다(nodes 빈 배열).
     served_models·node_pools 의 null 은 "못 읽었다", 빈 배열은 "없다" 다. 빈 node_pools 는 served_models 와 달리 gpu 칸을 만들지
-    않는다 — CPU 풀만 있는 Karpenter 클러스터는 GPU 클러스터가 아니다."""
+    않는다 — CPU 풀만 있는 Karpenter 클러스터는 GPU 클러스터가 아니다. benchmarks 는 칸을 만드는 근거가 아니다."""
     if not nodes and not waiting and served_models is None and not node_pools:
         return None
-    return {"nodes": nodes, "serving": serving, "benchmarks": [], "waiting": waiting or [],
+    return {"nodes": nodes, "serving": serving, "benchmarks": benchmarks or [], "waiting": waiting or [],
             "served_models": served_models, "node_pools": node_pools}
 
 
