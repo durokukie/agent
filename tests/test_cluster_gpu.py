@@ -200,7 +200,7 @@ def test_NodePool_목록에서_GPU_풀만_이름순으로_싣는다():
     _pool(taints=[{"key": "amd.com/gpu", "effect": "NoSchedule"}]),
     _pool(requirements=_picks("karpenter.k8s.aws/instance-category", "g", "p")),
     _pool(requirements=_picks("karpenter.k8s.aws/instance-gpu-count", "0", operator="Gt")),
-    _pool(requirements=_picks("karpenter.k8s.aws/instance-gpu-count", "1", operator="Gte")),
+    _pool(requirements=_picks("karpenter.k8s.aws/instance-gpu-memory", "24000", operator="Lt")),   # 큰 GPU 를 빼도 GPU 풀이다
     _pool(requirements=_picks("karpenter.k8s.aws/instance-gpu-manufacturer", "nvidia")),
     _pool(requirements=[{"key": "karpenter.k8s.aws/instance-gpu-name", "operator": "Exists"}]),
 ])
@@ -219,18 +219,23 @@ def test_GPU_풀로_본다(pool):
     _pool(requirements=_picks("karpenter.k8s.aws/instance-category", "g", "p", operator="NotIn")),
     _pool(requirements=[{"key": "karpenter.k8s.aws/instance-gpu-count", "operator": "DoesNotExist"}]),   # GPU 를 뺀다
     _pool(requirements=_picks("karpenter.k8s.aws/instance-gpu-manufacturer", "nvidia", operator="NotIn")),
-    _pool(limits={"nvidia.com/gpu": 0}, taints=[{"key": "nvidia.com/gpu", "effect": "NoSchedule"}]),     # 꺼 둔 풀
-    _pool(limits={"nvidia.com/gpu": "0"}, requirements=_picks(FAMILY, "g6e")),
     {"spec": {"limits": {"nvidia.com/gpu": 1}}},                             # 이름이 없다
 ])
 def test_GPU_풀로_보지_않는다(pool):
     assert gpu.node_pools(_list(pool)) == []
 
 
-@pytest.mark.parametrize(("limit", "expected"), [(2, 2), ("2", 2), ("1k", None), (1.5, None), (True, None),
+@pytest.mark.parametrize(("limit", "expected"), [(2, 2), ("2", 2), (0, 0), ("0", 0), ("1k", None), (1.5, None), (True, None),
                                                  (-1, None), (None, None), ("", None)])
 def test_GPU_상한은_정수로_읽히는_것만_싣는다(limit, expected):
     assert gpu.node_pools(_list(_pool(limits={"nvidia.com/gpu": limit}))) == [{"name": "p", "gpu_limit": expected}]
+
+
+def test_꺼_둔_풀은_응답에서_뺀다():
+    rows = gpu.node_pools(_list(_pool("off", limits={"nvidia.com/gpu": "0"}), _pool("on", limits={"nvidia.com/gpu": 2}),
+                                _pool("open", requirements=_picks(FAMILY, "g6e"))))
+    assert [row["name"] for row in rows] == ["off", "on", "open"]
+    assert gpu.usable_pools(rows) == [{"name": "on", "gpu_limit": 2}, {"name": "open", "gpu_limit": None}]
 
 
 @pytest.mark.parametrize("broken", ["", "not json", "{}", '{"items": {}}', '{"items": ["x"]}', "[]"])
@@ -1008,12 +1013,76 @@ def test_GPU_노드가_있는_클러스터도_node_pools를_싣고_못_읽으면
     assert has_gpu is True and body["node_pools"] is None and len(body["nodes"]) == 2
 
 
-def test_GPU_풀을_꺼_두면_GPU_클러스터로_올리지_않는다():
-    """limits 0 인 풀만 남은 곳 — 앱이 "모델을 시작하면 노드가 켜진다" 고 안내하면 모델이 영구 Pending 이다 (agent#139 리뷰)."""
-    pools = _result(_list(_pool("gpu", limits={"nvidia.com/gpu": 0}, taints=[{"key": "nvidia.com/gpu"}])))
-    run, _ = _served_models_cluster(_result(stderr=NO_CRD, success=False), nodes="nodes.json", pools=pools)
-    assert clusters_api._collect_gpu(run, namespace_pods="{}", cache_key="pool-off:fp:ns", known=None,
-                                     clock=lambda: 0.0) == (None, False)
+OFF_POOLS = _result(_list(_pool("gpu", limits={"nvidia.com/gpu": 0}, taints=[{"key": "nvidia.com/gpu"}])))
+
+
+@pytest.mark.parametrize("known", [None, False, True])
+def test_GPU_풀을_꺼_두면_칸을_만들지_않고_GPU_여부도_덮지_않는다(known):
+    """앱이 "모델을 시작하면 노드가 켜진다" 고 안내하면 모델이 영구 Pending 이다. 그렇다고 "GPU 풀 없음" 도 아니다 —
+    밤에 상한을 0 으로 내린 GPU 클러스터가 false 로 덮여 목록에서 빠지면 안 된다 (agent#139 리뷰)."""
+    run, _ = _served_models_cluster(_result(stderr=NO_CRD, success=False), nodes="nodes.json", pools=OFF_POOLS)
+    assert clusters_api._collect_gpu(run, namespace_pods="{}", cache_key=f"pool-off:{known}", known=known,
+                                     clock=lambda: 0.0) == (None, None)
+
+
+def test_GPU_풀을_꺼_둔_곳도_ServedModel이_읽히면_node_pools는_빈_배열이다():
+    """Karpenter 방식 안내를 띄우지 않는다 — 앱은 빈 배열을 "GPU 풀 없음" 으로 읽는다."""
+    run, _ = _served_models_cluster(_result('{"items": []}'), nodes="nodes.json", pools=OFF_POOLS)
+    body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", known=True, clock=lambda: 0.0)
+    assert has_gpu is True and body["node_pools"] == [] and body["served_models"] == []
+
+
+@pytest.mark.parametrize("found", ["pools", "waiting"])
+def test_GPU_클러스터를_처음_찾은_라운드도_namespace_탐색이_ServedModel을_읽을_예산을_남긴다(monkeypatch, found):
+    """known 이 아직 true 가 아니어도 — 탐색과 NodePool 이 다 쓰면 첫 응답의 served_models 가 null 이다 (agent#139 Codex 리뷰)."""
+    monkeypatch.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
+    now = [0.0]
+    served: list[int] = []
+
+    def run(args, timeout):
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        if args == gpu.PODS_COMMAND:
+            return _result(stderr=FORBIDDEN, success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces("llm", *(f"ns-{i}" for i in range(20))))
+        if args == gpu.NODE_POOLS_COMMAND:
+            now[0] += timeout
+            return GPU_POOLS if found == "pools" else _result(stderr="timed out", success=False)
+        if args == gpu.SERVED_MODELS_COMMAND:
+            served.append(timeout)
+            return _result(fixture("served_models.json"))
+        if args[:4] == ["get", "pods", "-n", "llm"] and found == "waiting":
+            return _result(_list(_vllm_pending()))
+        now[0] += timeout
+        return _result(stderr="timed out", success=False)
+
+    body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", cache_key=f"first-round:{found}", known=False,
+                                              clock=lambda: now[0])
+    assert served == [clusters_api.GPU_SERVED_MODELS_TIMEOUT]
+    assert has_gpu is True and len(body["served_models"]) == 4
+
+
+def test_파드_조회가_매달려_모자란_라운드도_NodePool은_읽는다():
+    """GPU 풀만 있는 클러스터를 찾는 길이라 ServedModel 몫을 남기느라 건너뛰지 않는다 — 5초 남으면 2초, 나머지가 ServedModel 몫이다."""
+    now = [0.0]
+    timeouts: dict[str, int] = {}
+
+    def run(args, timeout):
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        if args == gpu.PODS_COMMAND:
+            now[0] = clusters_api.GPU_BUDGET - 5
+            return _result(stderr="timed out", success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(stderr="timed out", success=False)
+        timeouts[args[1]] = timeout
+        now[0] += timeout
+        return GPU_POOLS if args == gpu.NODE_POOLS_COMMAND else _result(stderr=NO_CRD, success=False)
+
+    body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", cache_key="slow-pods:fp:ns", known=False, clock=lambda: now[0])
+    assert timeouts == {"nodepools.karpenter.sh": 2, "servedmodels.serving.kukie.io": 3}
+    assert has_gpu is True and body["node_pools"] == [{"name": "gpu", "gpu_limit": 2}]
 
 
 def test_NodePool과_ServedModel이_함께_매달려도_지표_몫은_남은_예산의_절반이다(monkeypatch):

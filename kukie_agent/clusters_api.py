@@ -685,10 +685,10 @@ def _collect_gpu(
     else:
         logger.debug("GPU 지표 파드를 namespace 마다 찾는다: %s", _failure_status(pods_result.stderr or pods_result.stdout))
         # 탐색은 남은 예산의 절반까지만 — 지표를 읽을 시간을 남긴다 (agent#120 리뷰). GPU 노드가 없으면 지표를 읽지 않으니
-        # 다 쓴다 — 기다리는 파드를 찾는 길이 이것뿐이다 (agent#121 리뷰). 다만 NodePool 을 읽을 시간은 남기고, GPU 로 알려진
-        # 꺼진 클러스터는 ServedModel 을 읽을 시간도 남긴다 (agent#138 리뷰)
+        # 쓴다 — 기다리는 파드를 찾는 길이 이것뿐이다 (agent#121 리뷰). 다만 NodePool·ServedModel 을 읽을 시간은 남긴다 —
+        # 이 라운드에 GPU 클러스터를 처음 찾아도 ServedModel 까지 답하게 (agent#138·#139 리뷰)
         search_deadline = (clock() + max(0.0, deadline - clock()) / 2 if nodes
-                           else deadline - GPU_NODE_POOLS_TIMEOUT - (GPU_SERVED_MODELS_TIMEOUT if known is True else 0))
+                           else deadline - GPU_NODE_POOLS_TIMEOUT - GPU_SERVED_MODELS_TIMEOUT)
 
         def search_budget(limit: int) -> int:
             return min(limit, int(search_deadline - clock()))
@@ -715,9 +715,10 @@ def _collect_gpu(
     reads_deadline = clock() + max(0.0, deadline - clock()) / 2 if nodes else deadline
 
     def pools_budget(limit: int) -> int:
-        """GPU 노드가 있으면 합친 몫의 절반, GPU 로 알려진 꺼진 클러스터는 ServedModel 을 읽을 시간을 남기고."""
+        """GPU 노드가 있으면 합친 몫의 절반. 없으면 ServedModel 몫을 남기되, 파드 조회가 매달려 모자란 라운드도 절반은 쓴다 —
+        GPU 풀만 있는 클러스터를 찾는 길이 이것뿐이다."""
         remaining = reads_deadline - clock()
-        return min(limit, int(remaining / 2 if nodes else remaining - (GPU_SERVED_MODELS_TIMEOUT if known is True else 0)))
+        return min(limit, int(remaining / 2 if nodes else max(remaining - GPU_SERVED_MODELS_TIMEOUT, remaining / 2)))
 
     node_pools, pools_absent = _read_node_pools(run, pools_budget)
 
@@ -788,7 +789,8 @@ def _read_served_models(run, budget) -> tuple[list[dict[str, Any]] | None, bool]
 
 def _read_node_pools(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:
     """(GPU 풀 줄, GPU 풀이 없다고 확인했나) — clusters/gpu.py "Karpenter GPU 풀". 못 읽으면 줄은 None 이고 개요를 실패시키지 않는다.
-    둘째 값은 CRD 없음·거부이거나 읽었는데 GPU 풀이 없을 때만 True 다 — 시간 초과·예산 부족·깨진 출력은 있는지 모른다."""
+    둘째 값은 CRD 없음·거부이거나 읽었는데 GPU 풀이 없을 때만 True 다 — 시간 초과·예산 부족·깨진 출력은 있는지 모른다.
+    꺼 둔 풀(gpu_limit 0)은 줄에 싣지 않지만 "없다" 도 아니다 — 상한을 잠깐 0 으로 내린 클러스터의 hasGpu 를 덮지 않는다."""
     timeout = budget(GPU_NODE_POOLS_TIMEOUT)
     if timeout < 1:
         return None, False
@@ -798,11 +800,11 @@ def _read_node_pools(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:
         logger.debug("NodePool 을 읽지 못했다: %s", _failure_status(text))
         return None, gpu.node_pools_absent(text)
     try:
-        rows = gpu.node_pools(result.stdout)
+        pools = gpu.node_pools(result.stdout)
     except (ValueError, AttributeError, TypeError):
         logger.debug("NodePool 을 읽지 못했다 (목록 모양이 아니다)")
         return None, False
-    return rows, not rows
+    return gpu.usable_pools(pools), not pools
 
 
 def _latency_memory(cache_key: str | None, now: float) -> dict[str, gpu.LatencySample]:
