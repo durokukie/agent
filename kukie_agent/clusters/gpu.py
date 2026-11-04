@@ -238,8 +238,8 @@ def _memory_label_mib(labels: dict[str, Any]) -> int:
 def served_models(stdout: str) -> list[dict[str, Any]]:
     """ServedModel 목록을 응답 줄로 (모듈 설명 "ServedModel"). 이름 없는 항목은 뺀다. 모양이 다르면 ValueError —
     부르는 쪽이 served_models 를 null 로 둔다. 빈 목록은 "없다" 라는 뜻이라 gpu_nodes 처럼 엄격하게 읽는다.
-    download_percent·download_bytes·download_total_bytes·max_concurrency·gpus 는 CRD 스키마가 integer 라 오퍼레이터가 정수로만 쓴다 —
-    다른 값은 null 이다. 오븐이 전체 크기를 모르면 totalBytes 가 없어 download_total_bytes 가 null 이고, 옛 오븐은 둘 다 null 이다."""
+    download_percent·download_bytes·download_total_bytes·max_concurrency 는 CRD 스키마가 integer 라 오퍼레이터가 정수로만 쓴다 —
+    다른 값은 null 이다. gpus 는 모델을 만드는 쪽이 쓰는 값이고 CRD 가 정수 1~8 로 검사한다. 다른 값은 똑같이 null 이다. 오븐이 전체 크기를 모르면 totalBytes 가 없어 download_total_bytes 가 null 이고, 옛 오븐은 둘 다 null 이다."""
     rows: list[dict[str, Any]] = []
     for item in _strict_items(stdout):
         meta = item.get("metadata")
@@ -307,7 +307,8 @@ def node_pools(stdout: str) -> tuple[list[dict[str, Any]], bool]:
 
 def _instance_types(spec: dict[str, Any]) -> list[str] | None:
     """NodePool 이 instance-type 을 In 으로 고른 값 (모듈 설명 "Karpenter GPU 풀"). 어떤 모양에도 예외를 내지 않는다 —
-    GPU 상한이 있는 풀은 GPU 풀 판별이 템플릿을 읽지 않아, 여기서 예외가 나면 지금까지 읽히던 풀이 node_pools 째 null 이 된다."""
+    GPU 풀 판별은 GPU 상한이나 taint, 앞쪽 조건이 맞으면 requirements 를 끝까지 읽지 않는다. 그런 풀은 뒤쪽 모양이 이상해도
+    지금까지 읽혔으니, 여기서 예외가 나면 그 풀이 node_pools 째 null 이 된다."""
     template = spec.get("template")
     template_spec = template.get("spec") if isinstance(template, dict) else None
     requirements = template_spec.get("requirements") if isinstance(template_spec, dict) else None

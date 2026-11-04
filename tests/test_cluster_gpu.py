@@ -350,6 +350,16 @@ def test_GPU_상한이_있는_풀은_템플릿_모양이_이상해도_ValueError
     assert gpu.node_pools(_list(pool)) == ([{"name": "p", "gpu_limit": 2, "instance_types": None}], False)
 
 
+@pytest.mark.parametrize("template", [
+    {"taints": TEMPLATE_TAINT, "requirements": "x"},                         # taint 로 판별이 끝나 requirements 를 읽지 않는다
+    {"taints": TEMPLATE_TAINT, "requirements": [None]},
+    {"requirements": [*_picks(FAMILY, "g6e"), None]},                        # 앞쪽 조건으로 판별이 끝나 뒤를 읽지 않는다
+])
+def test_GPU_판별이_읽지_않은_requirements_모양이_이상해도_instance_types만_null이다(template):
+    pool = {"metadata": {"name": "p"}, "spec": {"template": {"spec": template}}}
+    assert gpu.node_pools(_list(pool)) == ([{"name": "p", "gpu_limit": None, "instance_types": None}], False)
+
+
 @pytest.mark.parametrize("requirements", [
     [{"key": INSTANCE_TYPE, "operator": "In", "values": ["g6e.xlarge", 3]}],    # 값이 이상해도 GPU 계열을 고른 풀이다
     _picks(INSTANCE_TYPE, "g6e.xlarge") + _picks(INSTANCE_TYPE, "g6e.12xlarge"),
