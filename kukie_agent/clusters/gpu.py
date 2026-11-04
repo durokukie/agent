@@ -71,10 +71,12 @@ Karpenter GPU 풀 — node_pools
   거부는 응답에서는 null 이지만 hasGpu 판단에서는 CRD 없음과 같다 — 볼 수 없는 곳은 못 본 곳으로 치지 않는다(node_pools_absent).
   [] 는 "노드를 띄울 수 있는 GPU 풀이 없다" 만 말한다. CRD 없음·CPU 풀만 있음·GPU 풀을 다 꺼 둠(아래)이 같은 값이라, Karpenter 가
   깔렸는지까지 가려 주지는 않는다 (agent#139 리뷰). 가르려면 칸을 더해야 하고 그것은 약속을 고치는 일이다.
-  instance_types  spec.template.spec.requirements 의 node.kubernetes.io/instance-type 이 In 으로 고른 값, 적힌 순서 그대로 (DURO-186).
+  instance_types  spec.template.spec.requirements 의 node.kubernetes.io/instance-type 이 In 으로 고른 값. 적힌 순서를 지키고 중복은 뺀다 (DURO-186).
     앱이 시작 창에서 고를 수 있는 GPU 수를 이 목록으로 정한다. null 은 "제한을 모른다" 다 — 앱은 1장만 보낸다
       키가 없다(instance-family 같은 다른 조건만 있어도 그렇다), In 이 아니다, 키가 여러 번 나온다(Karpenter 가 합친 결과를 여기서 계산하지 않는다),
-      requirements·values 모양이 이상하다(문자열이 아닌 값, 빈 문자열, 빈 목록)
+      requirements·values 모양이 이상하다(문자열이 아닌 값, 빈 문자열, 빈 목록),
+      GPU 장수를 안 바꾼다고 아는 키(_GPU_COUNT_NEUTRAL_KEYS) 밖의 조건이 같이 있다(karpenter.k8s.aws/instance-gpu-count In [1] 처럼
+      고를 범위를 좁힐 수 있다. Karpenter 는 모든 조건의 교집합만 띄우므로 앱이 띄울 수 없는 칸을 보여 주지 않게 한다. 모르는 키도 같다)
     GPU 풀 판별과 hasGpu 판단에는 쓰지 않는다. 그래서 모양이 이상해도 ValueError 를 내지 않고 이 칸만 null 이다 — 예외를 내면
     node_pools 전체가 null 이 되어 hasGpu 판단이 바뀐다.
   GPU 풀 판별 — 넷 중 하나면 된다. 빈 목록은 hasGpu 를 false 로 덮는 근거라 GPU 풀을 고르는 흔한 설정을 빠뜨리지 않는다
@@ -97,7 +99,7 @@ ServedModel — served_models
   kukie-gpu-operator 의 CRD. 한 줄이 ServedModel 하나다: namespace·name(metadata), model(spec.source.huggingface),
   phase·reason·message(status), download_percent(status.download.percent), download_bytes(status.download.downloadedBytes),
   download_total_bytes(status.download.totalBytes), max_concurrency(status.baseline.maxConcurrency),
-  engine_image(spec.engine.image), gpus(spec.engine.gpus — 파드 하나의 GPU 수, 없으면 null. DURO-186),
+  engine_image(spec.engine.image), gpus(spec.engine.gpus — 파드 하나의 GPU 수, 1 이상 정수가 아니면 null. DURO-186),
   started_at(status.startedAt), stops_at(status.stopsAt). 두 시각은 오퍼레이터가 쓴 RFC3339 문자열 그대로이고, 없으면 null 이다.
   여기서 계산하지 않는다 — 언제 멈추는지는 spec.maxRuntime·차트 기본값·연장 annotation 을 모두 아는 오퍼레이터가 정한다.
   namespace·이름순. 오퍼레이터가 아직 status 를 쓰지 않았으면 문자열 칸은 "", 숫자·시각 칸은 null 이다.
@@ -149,6 +151,9 @@ _GPU_INSTANCE = re.compile(r"(?:gr?|p)(?:\d|$)")
 #: GPU 인스턴스에만 붙는 라벨의 앞부분과, 그 라벨을 요구하지 않는 연산자 (모듈 설명 "Karpenter GPU 풀")
 _GPU_LABEL_PREFIX = "karpenter.k8s.aws/instance-gpu-"
 _GPU_LABEL_EXCLUDING: tuple[str, ...] = ("NotIn", "DoesNotExist")
+#: instance_types 와 같이 있어도 되는 requirements 키 — GPU 장수를 바꾸지 않는다. 그 밖의 키가 있으면 instance_types 는 null 이다
+_GPU_COUNT_NEUTRAL_KEYS: tuple[str, ...] = ("karpenter.sh/capacity-type", "topology.kubernetes.io/zone", "topology.k8s.aws/zone-id",
+                                            "kubernetes.io/arch", "kubernetes.io/os")
 
 #: NodePool limits 의 0 — 0·"0"·"0Gi"·"0.0"
 _ZERO_QUANTITY = re.compile(r"0+(?:\.0+)?[A-Za-z]*")
@@ -239,7 +244,8 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
     """ServedModel 목록을 응답 줄로 (모듈 설명 "ServedModel"). 이름 없는 항목은 뺀다. 모양이 다르면 ValueError —
     부르는 쪽이 served_models 를 null 로 둔다. 빈 목록은 "없다" 라는 뜻이라 gpu_nodes 처럼 엄격하게 읽는다.
     download_percent·download_bytes·download_total_bytes·max_concurrency 는 CRD 스키마가 integer 라 오퍼레이터가 정수로만 쓴다 —
-    다른 값은 null 이다. gpus 는 모델을 만드는 쪽이 쓰는 값이고 CRD 가 정수 1~8 로 검사한다. 다른 값은 똑같이 null 이다. 오븐이 전체 크기를 모르면 totalBytes 가 없어 download_total_bytes 가 null 이고, 옛 오븐은 둘 다 null 이다."""
+    다른 값은 null 이다. gpus 는 모델을 만드는 쪽이 쓰는 값이라 1 이상 정수만 싣고, 0·음수·정수가 아닌 값은 null 이다.
+    오븐 CRD 는 gpus 1~8 을 모두 받고 서버는 시작 요청에서 1, 2, 4, 8 만 받는다 — 여기서는 거르지 않아 3 도 그대로 싣는다. 오븐이 전체 크기를 모르면 totalBytes 가 없어 download_total_bytes 가 null 이고, 옛 오븐은 둘 다 null 이다."""
     rows: list[dict[str, Any]] = []
     for item in _strict_items(stdout):
         meta = item.get("metadata")
@@ -261,7 +267,7 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
             "download_total_bytes": _int_or_none(download.get("totalBytes")),
             "max_concurrency": _int_or_none((status.get("baseline") or {}).get("maxConcurrency")),
             "engine_image": _text_or_none(engine.get("image")),
-            "gpus": _int_or_none(engine.get("gpus")),
+            "gpus": _count_or_none(engine.get("gpus")),
             "started_at": _text_or_none(status.get("startedAt")),
             "stops_at": _text_or_none(status.get("stopsAt")),
         })
@@ -317,10 +323,12 @@ def _instance_types(spec: dict[str, Any]) -> list[str] | None:
     picks = [req for req in requirements if req.get("key") == _INSTANCE_TYPE_KEY]
     if len(picks) != 1 or picks[0].get("operator") != "In":
         return None
+    if any(req.get("key") not in (_INSTANCE_TYPE_KEY, *_GPU_COUNT_NEUTRAL_KEYS) for req in requirements):
+        return None
     values = picks[0].get("values")
     if not isinstance(values, list) or not values or not all(isinstance(value, str) and value for value in values):
         return None
-    return values
+    return list(dict.fromkeys(values))
 
 
 def _gpu_template(template: dict[str, Any]) -> bool:
@@ -791,6 +799,12 @@ def _strict_items(stdout: str) -> list[dict[str, Any]]:
 
 def _int_or_none(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _count_or_none(value: Any) -> int | None:
+    """1 이상 정수만. 0·음수·문자열·소수·bool 은 null 이다."""
+    number = _int_or_none(value)
+    return number if number is not None and number >= 1 else None
 
 
 def _text_or_none(value: Any) -> str | None:

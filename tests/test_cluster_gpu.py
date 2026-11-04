@@ -181,11 +181,13 @@ def test_엔진_이미지가_없으면_null이다(spec):
 
 @pytest.mark.parametrize(("spec", "expected"), [
     ({"engine": {"gpus": 4}}, 4), ({"engine": {"gpus": 1}}, 1),
+    ({"engine": {"gpus": 3}}, 3),                                            # CRD 는 받지만 서버 시작 요청은 안 받는 값 — 여기서는 거르지 않는다
     ({}, None), ({"engine": None}, None), ({"engine": {}}, None),
     ({"engine": {"gpus": None}}, None), ({"engine": {"gpus": "4"}}, None),
     ({"engine": {"gpus": True}}, None), ({"engine": {"gpus": 1.5}}, None),
+    ({"engine": {"gpus": 0}}, None), ({"engine": {"gpus": -1}}, None),       # 앱은 null 만 1장으로 본다 — 0장으로 다시 시작하지 않게
 ])
-def test_ServedModel의_GPU_수는_spec_engine_gpus의_정수만_싣고_없으면_null이다(spec, expected):
+def test_ServedModel의_GPU_수는_spec_engine_gpus의_1_이상_정수만_싣고_나머지는_null이다(spec, expected):
     """[다시 시작] 이 같은 GPU 수로 시작하는 값이다. null 이면 앱이 1장으로 본다 (DURO-186)."""
     [row] = gpu.served_models(_list({"metadata": {"name": "m"}, "spec": spec}))
     assert row["gpus"] == expected
@@ -314,6 +316,52 @@ def test_instance_type_In_값을_적힌_순서대로_싣는다():
     pool = _pool(limits={"nvidia.com/gpu": "5"}, taints=[{"key": "nvidia.com/gpu"}], requirements=requirements)
     assert gpu.node_pools(_list(pool)) == (
         [{"name": "p", "gpu_limit": 5, "instance_types": ["g6e.xlarge", "g6e.12xlarge"]}], False)
+
+
+def test_instance_types는_적힌_순서를_지키며_중복을_뺀다():
+    requirements = _picks(INSTANCE_TYPE, "g6e.12xlarge", "g6e.xlarge", "g6e.12xlarge", "g6e.xlarge")
+    [row], _ = gpu.node_pools(_list(_pool(limits={"nvidia.com/gpu": 2}, requirements=requirements)))
+    assert row["instance_types"] == ["g6e.12xlarge", "g6e.xlarge"]
+
+
+TWO_TYPES = _picks(INSTANCE_TYPE, "g6e.xlarge", "g6e.12xlarge")
+
+
+@pytest.mark.parametrize("other", [
+    _picks("karpenter.sh/capacity-type", "on-demand"),
+    _picks("karpenter.sh/capacity-type", "spot", operator="NotIn"),
+    _picks("topology.kubernetes.io/zone", "ap-northeast-2a", "ap-northeast-2c"),
+    _picks("topology.k8s.aws/zone-id", "apne2-az1"),
+    _picks("kubernetes.io/arch", "amd64"),
+    _picks("kubernetes.io/os", "linux"),
+    [{"key": "topology.kubernetes.io/zone", "operator": "Exists"}],
+])
+def test_GPU_장수를_안_바꾸는_조건은_같이_있어도_instance_types를_싣는다(other):
+    [row], _ = gpu.node_pools(_list(_pool(limits={"nvidia.com/gpu": 2}, requirements=[*other, *TWO_TYPES])))
+    assert row["instance_types"] == ["g6e.xlarge", "g6e.12xlarge"]
+
+
+@pytest.mark.parametrize("other", [
+    _picks("karpenter.k8s.aws/instance-gpu-count", "1"),                     # 12xlarge(4장)를 뺀다 — 앱이 4장 칸을 보여 주면 Unschedulable 에 머문다
+    _picks("karpenter.k8s.aws/instance-gpu-count", "2", operator="Lt"),
+    _picks("karpenter.k8s.aws/instance-size", "12xlarge", operator="NotIn"),
+    _picks(FAMILY, "g6"),
+    _picks(FAMILY, "g6", operator="NotIn"),
+    _picks("karpenter.k8s.aws/instance-category", "g"),
+    _picks("karpenter.k8s.aws/instance-memory", "100000", operator="Lt"),
+    _picks(INSTANCE_TYPE, "g6e.12xlarge", operator="NotIn"),
+    _picks("karpenter.k8s.aws/capacity-reservation-id", "cr-1"),             # instance- 로 시작하지 않아도 좁힌다
+    _picks("example.com/team", "ml"),                                        # 좁히는지 모르는 키는 제한을 모르는 것이다
+    [{"operator": "In", "values": ["x"]}],                                   # 키가 없거나 문자열이 아니다
+    [{"key": None, "operator": "In", "values": ["x"]}],
+    [{"key": ["x"], "operator": "In", "values": ["x"]}],
+    [{"key": {"x": 1}, "operator": "In", "values": ["x"]}],
+])
+def test_고를_범위를_좁힐_수_있는_조건이_같이_있으면_instance_types는_null이고_풀은_그대로다(other):
+    """Karpenter 는 모든 조건의 교집합만 띄운다. 키가 앞에 있어도 뒤에 있어도 같다."""
+    for requirements in ([*TWO_TYPES, *other], [*other, *TWO_TYPES]):
+        pool = _pool(limits={"nvidia.com/gpu": 2}, taints=[{"key": "nvidia.com/gpu"}], requirements=requirements)
+        assert gpu.node_pools(_list(pool)) == ([{"name": "p", "gpu_limit": 2, "instance_types": None}], False)
 
 
 TEMPLATE_TAINT = [{"key": "nvidia.com/gpu", "effect": "NoSchedule"}]
