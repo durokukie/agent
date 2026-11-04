@@ -27,6 +27,10 @@ GPU 노드 — nodes
   product  라벨 nvidia.com/gpu.product (AMD 는 amd.com/gpu.product-name), 없으면 인스턴스 종류 라벨, 그것도 없으면 ""
   memory_mib  노드 전체 GPU 메모리 = GPU 하나 메모리(라벨 nvidia.com/gpu.memory, MiB) × count.
               라벨이 없으면 DCGM 의 FB_USED + FB_FREE + FB_RESERVED 합, 그것도 없으면 0
+  instance_type  라벨 node.kubernetes.io/instance-type, 없으면 null
+  zone           라벨 topology.kubernetes.io/zone, 없으면 null
+  capacity_type  on-demand·spot 처럼 소문자와 - 로. 라벨 karpenter.sh/capacity-type, 없으면 eks.amazonaws.com/capacityType(ON_DEMAND·SPOT),
+                 둘 다 없으면 null. 앱이 온디맨드 단가를 스팟 노드에 말하지 않게 하는 값이다
   실시간 값(DCGM) — GPU 마다 나오는 줄을 노드 하나로 모은다: 사용률은 평균, 메모리 사용·전력은 합, 온도는 가장 높은 것.
   MIG 인스턴스는 부모 GPU 의 UUID 를 같이 쓰고 GPU_I_ID 로만 갈리므로 (UUID, GPU_I_ID) 로 묶는다.
   AMD 는 DCGM 이 없어 실시간 값이 늘 null 이다.
@@ -85,7 +89,9 @@ Karpenter GPU 풀 — node_pools
 
 ServedModel — served_models
   kukie-gpu-operator 의 CRD. 한 줄이 ServedModel 하나다: namespace·name(metadata), model(spec.source.huggingface),
-  phase·reason·message(status), download_percent(status.download.percent), max_concurrency(status.baseline.maxConcurrency),
+  phase·reason·message(status), download_percent(status.download.percent), download_bytes(status.download.downloadedBytes),
+  download_total_bytes(status.download.totalBytes), max_concurrency(status.baseline.maxConcurrency),
+  engine_image(spec.engine.image),
   started_at(status.startedAt), stops_at(status.stopsAt). 두 시각은 오퍼레이터가 쓴 RFC3339 문자열 그대로이고, 없으면 null 이다.
   여기서 계산하지 않는다 — 언제 멈추는지는 spec.maxRuntime·차트 기본값·연장 annotation 을 모두 아는 오퍼레이터가 정한다.
   namespace·이름순. 오퍼레이터가 아직 status 를 쓰지 않았으면 문자열 칸은 "", 숫자·시각 칸은 null 이다.
@@ -170,6 +176,9 @@ def gpu_nodes(stdout: str) -> list[dict[str, Any]]:
             "product": _product(labels, resource),
             "count": count,
             "memory_mib": per_gpu * count if per_gpu else 0,
+            "instance_type": _text_or_none(labels.get("node.kubernetes.io/instance-type")),
+            "zone": _text_or_none(labels.get("topology.kubernetes.io/zone")),
+            "capacity_type": _capacity_type(labels),
             "utilization_pct": None,
             "memory_used_mib": None,
             "temperature_c": None,
@@ -177,6 +186,12 @@ def gpu_nodes(stdout: str) -> list[dict[str, Any]]:
         })
     rows.sort(key=lambda r: r["node"])
     return rows
+
+
+def _capacity_type(labels: dict[str, Any]) -> str | None:
+    """Karpenter 는 on-demand, 관리형 노드 그룹은 ON_DEMAND 로 적는다 — 한 가지 말로 맞춘다."""
+    value = _text_or_none(labels.get("karpenter.sh/capacity-type")) or _text_or_none(labels.get("eks.amazonaws.com/capacityType"))
+    return value.lower().replace("_", "-") if value else None
 
 
 def _gpu_resource(status: dict[str, Any]) -> tuple[str | None, int]:
@@ -216,22 +231,28 @@ def _memory_label_mib(labels: dict[str, Any]) -> int:
 def served_models(stdout: str) -> list[dict[str, Any]]:
     """ServedModel 목록을 응답 줄로 (모듈 설명 "ServedModel"). 이름 없는 항목은 뺀다. 모양이 다르면 ValueError —
     부르는 쪽이 served_models 를 null 로 둔다. 빈 목록은 "없다" 라는 뜻이라 gpu_nodes 처럼 엄격하게 읽는다.
-    download_percent·max_concurrency 는 CRD 스키마가 integer 라 오퍼레이터가 정수로만 쓴다 — 다른 값은 null 이다."""
+    download_percent·download_bytes·download_total_bytes·max_concurrency 는 CRD 스키마가 integer 라 오퍼레이터가 정수로만 쓴다 —
+    다른 값은 null 이다. 오븐이 전체 크기를 모르면 totalBytes 가 없어 download_total_bytes 가 null 이고, 옛 오븐은 둘 다 null 이다."""
     rows: list[dict[str, Any]] = []
     for item in _strict_items(stdout):
         meta = item.get("metadata")
         if not isinstance(meta, dict) or not meta.get("name"):
             continue
         status = item.get("status") or {}
+        download = status.get("download") or {}
+        spec = item.get("spec") or {}
         rows.append({
             "namespace": meta.get("namespace") or "default",
             "name": meta["name"],
-            "model": ((item.get("spec") or {}).get("source") or {}).get("huggingface") or "",
+            "model": (spec.get("source") or {}).get("huggingface") or "",
             "phase": status.get("phase") or "",
             "reason": status.get("reason") or "",
             "message": status.get("message") or "",
-            "download_percent": _int_or_none((status.get("download") or {}).get("percent")),
+            "download_percent": _int_or_none(download.get("percent")),
+            "download_bytes": _int_or_none(download.get("downloadedBytes")),
+            "download_total_bytes": _int_or_none(download.get("totalBytes")),
             "max_concurrency": _int_or_none((status.get("baseline") or {}).get("maxConcurrency")),
+            "engine_image": _text_or_none((spec.get("engine") or {}).get("image")),
             "started_at": _text_or_none(status.get("startedAt")),
             "stops_at": _text_or_none(status.get("stopsAt")),
         })
