@@ -116,25 +116,30 @@ def test_노드_목록이_깨졌으면_ValueError():
 
 # ── ServedModel (DURO-182) ─────────────────────────────────
 
+VLLM_IMAGE = 'vllm/vllm-openai:v0.32.0@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+A_TEAM_IMAGE = 'vllm/vllm-openai:v0.32.0@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+JUST_CREATED_IMAGE = 'vllm/vllm-openai:v0.32.0@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+
+
 def test_ServedModel을_namespace_이름순으로_응답_줄로_바꾼다():
     assert gpu.served_models(fixture("served_models.json")) == [
         {"namespace": "a-team", "name": "gpt-oss-20b", "model": "openai/gpt-oss-20b", "phase": "Failed",
          "reason": "Unschedulable", "message": "0/2 nodes are available: 2 Insufficient nvidia.com/gpu.",
          "download_percent": 100, "download_bytes": None, "download_total_bytes": None,
-         "max_concurrency": None, "started_at": None, "stops_at": None},
+         "max_concurrency": None, "engine_image": A_TEAM_IMAGE, "started_at": None, "stops_at": None},
         {"namespace": "llm", "name": "gpt-oss-20b", "model": "openai/gpt-oss-20b", "phase": "Ready",
          "reason": "", "message": "", "download_percent": 100, "download_bytes": 44452911104,
-         "download_total_bytes": 44452911104, "max_concurrency": 12,
+         "download_total_bytes": 44452911104, "max_concurrency": 12, "engine_image": VLLM_IMAGE,
          "started_at": "2026-11-04T01:00:00Z", "stops_at": "2026-11-04T03:00:00Z"},
         # 오퍼레이터가 아직 status 를 쓰지 않았다 — 문자열은 "", 숫자는 null
         {"namespace": "llm", "name": "just-created", "model": "org/just-created", "phase": "",
          "reason": "", "message": "", "download_percent": None, "download_bytes": None, "download_total_bytes": None,
-         "max_concurrency": None,
+         "max_concurrency": None, "engine_image": JUST_CREATED_IMAGE,
          "started_at": None, "stops_at": None},
         # 내려받기 0% 는 값이다 — null 이 아니다. 전체 크기를 모르면 받은 용량만 있다 (약속: percent 0, totalBytes 없음)
         {"namespace": "llm", "name": "qwen3", "model": "Qwen/Qwen3.6-35B-A3B", "phase": "Downloading",
          "reason": "Downloading", "message": "download Job is running", "download_percent": 0,
-         "download_bytes": 1073741824, "download_total_bytes": None, "max_concurrency": None,
+         "download_bytes": 1073741824, "download_total_bytes": None, "max_concurrency": None, "engine_image": VLLM_IMAGE,
          "started_at": None, "stops_at": None},
     ]
 
@@ -166,6 +171,12 @@ def test_내려받은_용량과_전체_용량은_정수만_싣는다(value, expe
     item = {"metadata": {"name": "m"}, "status": {"download": {"downloadedBytes": value, "totalBytes": value}}}
     [row] = gpu.served_models(_list(item))
     assert (row["download_bytes"], row["download_total_bytes"]) == (expected, expected)
+
+
+@pytest.mark.parametrize("spec", [{}, {"engine": {}}, {"engine": {"image": ""}}, {"engine": {"image": 3}}, {"engine": None}])
+def test_엔진_이미지가_없으면_null이다(spec):
+    [row] = gpu.served_models(_list({"metadata": {"name": "m"}, "spec": spec}))
+    assert row["engine_image"] is None
 
 
 def test_옛_오븐은_용량_칸이_null이고_퍼센트와_이유는_그대로다():

@@ -91,6 +91,7 @@ ServedModel — served_models
   kukie-gpu-operator 의 CRD. 한 줄이 ServedModel 하나다: namespace·name(metadata), model(spec.source.huggingface),
   phase·reason·message(status), download_percent(status.download.percent), download_bytes(status.download.downloadedBytes),
   download_total_bytes(status.download.totalBytes), max_concurrency(status.baseline.maxConcurrency),
+  engine_image(spec.engine.image),
   started_at(status.startedAt), stops_at(status.stopsAt). 두 시각은 오퍼레이터가 쓴 RFC3339 문자열 그대로이고, 없으면 null 이다.
   여기서 계산하지 않는다 — 언제 멈추는지는 spec.maxRuntime·차트 기본값·연장 annotation 을 모두 아는 오퍼레이터가 정한다.
   namespace·이름순. 오퍼레이터가 아직 status 를 쓰지 않았으면 문자열 칸은 "", 숫자·시각 칸은 null 이다.
@@ -239,10 +240,11 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
             continue
         status = item.get("status") or {}
         download = status.get("download") or {}
+        spec = item.get("spec") or {}
         rows.append({
             "namespace": meta.get("namespace") or "default",
             "name": meta["name"],
-            "model": ((item.get("spec") or {}).get("source") or {}).get("huggingface") or "",
+            "model": (spec.get("source") or {}).get("huggingface") or "",
             "phase": status.get("phase") or "",
             "reason": status.get("reason") or "",
             "message": status.get("message") or "",
@@ -250,6 +252,7 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
             "download_bytes": _int_or_none(download.get("downloadedBytes")),
             "download_total_bytes": _int_or_none(download.get("totalBytes")),
             "max_concurrency": _int_or_none((status.get("baseline") or {}).get("maxConcurrency")),
+            "engine_image": _text_or_none((spec.get("engine") or {}).get("image")),
             "started_at": _text_or_none(status.get("startedAt")),
             "stops_at": _text_or_none(status.get("stopsAt")),
         })
