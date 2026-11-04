@@ -31,6 +31,8 @@
       "status": {
         "observedGeneration": 1,
         "phase": "Ready",
+        "startedAt": "2026-11-04T01:00:00Z",
+        "stopsAt": "2026-11-04T03:00:00Z",
         "download": {"percent": 100},
         "baseline": {"maxConcurrency": 12, "maxWaiting": 4, "maxKvPercent": 80, "generation": 1}
       }
