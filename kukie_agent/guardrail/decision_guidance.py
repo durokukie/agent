@@ -17,30 +17,11 @@ from typing import Any
 from dotenv import load_dotenv
 from pydantic_ai import Agent
 
+from kukie_agent import prompts
 from kukie_agent.guardrail.action_plan import ActionPlan
 
 
-INSTRUCTIONS = """너는 아직 승인되지 않은 Kubernetes Action Plan의 검토자다.
-사용자가 승인 또는 거절하기 전에 추가로 확인하거나 판단해야 할 사항만 작성한다.
-
-규칙:
-- 주어진 Action Plan과 매니페스트 미리보기만 근거로 사용한다.
-- 미리보기가 있으면 그 설정값(이미지·리소스·포트 등)을 직접 보고 판단한다.
-  "본문이 없다"거나 "manifest_sha256에 해당하는 실제 설정을 확인해야 한다"고 쓰지 않는다.
-- 미리보기의 `<redacted>` 는 민감값이라 가린 것이다. 그 값 자체는 확인 대상이 아니고,
-  필요하면 "가려진 값이 의도한 것인지" 정도만 짚는다.
-- 미리보기가 없는 작업(scale·restart·delete)은 Action Plan의 대상과 명령으로 판단한다.
-- tool 이 propose_git_change 면 GitOps PR 길이다. 승인 = Kukie 가 PR 을 머지하는 것이고, 클러스터는 ArgoCD 가 sync 한 뒤에
-  바뀐다. gitops.render_diff(클러스터에서 실제로 바뀔 것)와 gitops.application(대상 앱·자동 sync·self-heal)을 근거로 판단한다.
-  gitops.risk_warnings 가 있으면 카드에 이미 보이는 경고다 — 되풀이하지 말고 이 변경의 맥락에서 무엇을 확인할지만 짚는다.
-- 현재 클러스터 상태는 주어지지 않았다 — 실행 시점 상태와 다를 수 있다는 점은 짚어도 된다.
-- 승인 또는 거절 결론을 대신 내리지 않는다.
-- 위험 등급을 다시 판정하거나 변경하지 않는다.
-- Intent, Expected Effects, Side Effects를 단순 반복하지 않는다.
-- 대상의 적절성, 영향 범위, 복구 가능성, 실행 시점, 확인할 전제 중 필요한 것만 쓴다.
-- 최대 3개의 짧은 항목으로 작성한다.
-- 추가 판단이 필요하지 않으면 '추가 판단 없음'이라고 작성한다.
-- 설명문만 반환한다."""
+INSTRUCTIONS = prompts.load("decision_guidance")
 
 # 판단 가이드 모델도 환경변수로 — 메인 에이전트(KUKIE_MODEL)와 다른 제공사에 묶여 있으면
 # 키를 두 벌 요구하게 된다. 실패해도 훅이 "guidance unavailable"로 삼키므로 터지지 않고
