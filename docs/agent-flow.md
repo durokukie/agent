@@ -11,7 +11,7 @@ flowchart TD
 
     subgraph CLI_["server.py — 로컬 FastAPI (DURO-49)"]
         CLI["POST /chat {text}<br/>(승인 대기 중이면 409)"]
-        CLI --> R["router.pick_skill(msg, current)<br/>→ 학습 스킬 (코드가 결정, LLM 아님)"]
+        CLI --> R["session.skill<br/>→ 대화의 공개 범위로 정한 Private / Shared (대화 안에서 고정, LLM 아님)"]
         R --> RUN["agent.run(msg,<br/>deps=Deps(context, namespace, skill),<br/>output_type=[skill.output_fn, DeferredToolRequests],<br/>message_history=session.history)"]
     end
 
@@ -38,7 +38,7 @@ flowchart TD
 
     KR -.-> T
     V -->|"통과"| OUT["result.output (KukieResponse)<br/>narration + suggested_next_action<br/>+ steps[command, output, explanations]"]
-    OUT --> CLI2["server._to_payload → {kind: answer}<br/>앱이 [학습 모드] + 명령 블록 + 설명 표 렌더링"]
+    OUT --> CLI2["server._to_payload → {kind: answer}<br/>앱이 답변 + 명령 블록 + 설명 표 렌더링"]
     CLI2 --> U
 
     style CLI_ fill:#f5f5f5,stroke:#999,stroke-dasharray: 5 5
@@ -57,10 +57,11 @@ flowchart TD
         direction TB
         H1["① 실행 args 정규화·보관<br/>apply_manifest는 원문 대신 manifest_sha256"]
         H1 --> H2["② RISK_STICKERS[tool_name]<br/>→ DESTRUCTIVE (미등록이면 fail-closed)"]
-        H2 --> H3["③ ActionPlan.create_draft(tool, args, command, risk,<br/>skill, target, intent, effects, side_effects)<br/>→ tbl_action_plan 행 + ~/.kukie/plans/ap-YYMMDD-HHMM-tool.md (DRAFT)"]
+        H2 --> H2A["ArgoCD 판별 argocd.inspect(target)<br/>관리 리소스면 경고(level·warning) — 못 하면 None, 막지 않는다"]
+        H2A --> H3["③ ActionPlan.create_draft(tool, args, command, risk,<br/>skill, target, intent, effects, side_effects, argocd)<br/>→ 대화 경로: kukie-server POST /internal/runs/{runId}/plans (DRAFT, id=UUID·code=ap-YYMMDD-HHMM-tool)<br/>→ flat 개발 엔드포인트: ~/.kukie/plans/ap-YYMMDD-HHMM-tool.md"]
         H3 --> H4["④ run_kubectl(command, context, dry_run=True)<br/>plan.record_dry_run(status, stdout, stderr)"]
-        H4 -->|"실패"| H4F["plan.mark_failed('DRY_RUN_FAILED')<br/>raise ToolFailed"]
-        H4 -->|"성공·미지원"| H5["⑤ decision guidance 기록<br/>plan.offer_for_approval() → WAITING_APPROVAL<br/>raise ApprovalRequired(plan_id)"]
+        H4 -->|"실패"| H4F["기록하는 자리에서 FAILED + DRY_RUN_FAILED<br/>raise ToolFailed"]
+        H4 -->|"성공·미지원"| H5["⑤ plan.offer(decision guidance) → WAITING_APPROVAL<br/>raise ApprovalRequired(plan_id)"]
         H5 --> P["DeferredToolRequests<br/>metadata(plan_id)"]
         P --> E["Electron 승인 화면<br/>apply_manifest: 민감값을 가린 구조적 preview + SHA-256"]
         E --> A["POST /approve<br/>{call_id, approved}"]
@@ -93,7 +94,7 @@ flowchart TD
 flowchart LR
     S["POST /session"] --> K["kubectl/config.read_kubeconfig()<br/>current-context / namespace"]
     K --> C["사용자 확인<br/>'kind-dev / study 맞나요?'"]
-    C -->|"y"| D["Deps(context, namespace,<br/>skill=DEFAULT_SKILL)"]
+    C -->|"y"| D["Deps(context, namespace,<br/>skill=SHARED)<br/>로컬 개발엔 방이 없다"]
     D --> LOOP["대화 루프 진입<br/>(그림 1)"]
 ```
 
@@ -104,17 +105,21 @@ flowchart LR
 | 세션 시작 | `start_session()`, `read_kubeconfig()` | `server.py`, `kubectl/config.py` | ✅ DURO-49 |
 | 채팅·결과 분기·승인 재개 | `chat()`, `_to_payload()`, `approve()` | `server.py` | ✅ DURO-49 + #27 승인 연결 |
 | 렌더링 | — | 앱 (2단계) | ❌ |
-| 스킬 결정 | `pick_skill()` | `router.py` | ✅ (/mode + sticky) |
+| 스킬 결정 | `skill_for(room.shared)` | `skills/__init__.py`, `conversations.py` | ✅ DURO-100 (공개 범위로 고정, 모드 없음) |
 | 에이전트 설정 | `Agent(...)`, `add_target()`, `add_skill_prompt()` | `agent.py` | ✅ |
-| 툴 등록 | `FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS]).filtered(_only_skill_tools)` | `agent.py` | ✅ 스킬별 필터; 변경 4종은 실습만 + Hook |
+| 툴 등록 | `FunctionToolset([*READ_TOOLS, *REPO_TOOLS, *MUTATE_TOOLS, *GITOPS_TOOLS]).filtered(_only_skill_tools)` | `agent.py` | ✅ 스킬별 필터; 변경 4종·PR 길 1종은 Shared 만 + Hook |
 | 읽기 툴 5종 | `list_resources` 등 | `tools/read.py` | ✅ |
-| 변경 툴 4종 | `delete_resource` 등 | `tools/mutate.py` | ✅ 실습에만 노출, 가드레일 훅 대상 |
+| 레포 읽기 툴 3종 | `list_repo_dir`·`read_repo_file`·`render_app` — 대화의 클러스터에 연결된 매니페스트 레포만, 가림·상한·렌더 안전장치는 `gitops/browse.py` 그대로 | `tools/repo.py` | ✅ DURO-151, Private·Shared 모두, 훅 없음 |
+| 변경 툴 4종 | `delete_resource` 등 | `tools/mutate.py` | ✅ Shared 대화에만 노출, 가드레일 훅 대상 |
+| PR 길 변경 툴 | `propose_git_change` — 승인 전 PR, 승인 = 머지, 뒤에서 sync·health 지켜보기·재시작 복구, 승인 순간 STALE 판단 | `tools/gitops.py`, `guardrail/gitops_hook.py`, `guardrail/gitops_after_merge.py`, `gitops/` | ✅ DURO-134 · DURO-158 |
+| 새 리소스 PR | `propose_git_change` 의 `new_resource` — 고른 앱 폴더에 새 파일(Kustomize 는 `resources:` 한 줄 더). 기본 허용, 막음·경고는 코드가 렌더 결과로 본다 | `manifests/new_resource.py`, `gitops/route.py`, `guardrail/gitops_hook.py` | ✅ DURO-154 |
+| 옛 답변 끌림 막기 | kubectl 훅이 PR 길 리소스면 한 번 `ModelRetry`(같은 호출을 다시 하면 경고 카드), `ProcessHistory` 가 레포 연결이 바뀐 때만 기록 끝에 메모 한 줄 + 숨은 칸 갱신 | `guardrail/hook.py`, `gitops/memo.py` | ✅ DURO-135 |
 | 명령 조립 | `assemble()` | `kubectl/assemble.py` | 부분 (apply TODO) |
 | 실행 | `run_kubectl()` | `kubectl/runner.py` | ✅ |
 | 훅 파이프라인 | `guardrail()` | `guardrail/hook.py` | ✅ 2-pass 승인·실행·기록 |
-| Action Plan | `create_draft()`, `offer_for_approval()`, `approve_for_execution()`, `record_execution()` | `guardrail/action_plan.py` + `tbl_action_plan` | ✅ |
-| 클러스터 | `parse_kubeconfig()` → 암호화 저장 → 실행 직전 임시 kubeconfig | `clusters/` + `tbl_cluster` | ✅ |
-| 팀 권한 | 사용자 토큰으로 Spring `GET /teams` → 역할 판단 (15초 기억, fail-closed) | `membership.py` | ✅ |
+| Action Plan | `create_draft()`, `offer()`, `approve_for_execution()`, `mark_executing()`, `record_execution()` — 대화 경로는 kukie-server 의 plan 동작, 다음 상태는 server 가 정한다 | `guardrail/action_plan.py` → `server_api.py` | ✅ DURO-113 |
+| 저장·권한 판단 | 대화 컨텍스트·run·plan·클러스터 연결 정보 — kukie-server `/internal/**` (agent 는 DB 없음) | `server_api.py` | ✅ DURO-113 |
+| 클러스터 | 실행 직전 `GET /internal/clusters/{id}/connection` → 임시 kubeconfig (등록·암호화는 kukie-server) | `clusters/` | ✅ |
 | 승인 | `DeferredToolRequests → Electron → /approve → DeferredToolResults` | `server.py`, `guardrail/approval.py` | ✅ #27 |
 | 응답 조립 (steps·설명) | `build_response_for()`, `collect_steps()` + `FLAG_GLOSSARY` | `response.py`, `glossary.py` | ✅ DURO-44 |
 | 사전 미등록 플래그 로그 | `log_unregistered_flags()` | `validators.py` | ✅ DURO-44 |
@@ -124,7 +129,7 @@ flowchart LR
 
 | 결정 | 주체 | 시점 |
 |---|---|---|
-| 어떤 스킬 | 코드 (`router`) / 사용자 (`/mode`) | run 전 |
+| 어떤 스킬 | 코드 (`skill_for` — 방의 공개 범위) | 방을 열 때 |
 | 어떤 툴, 어떤 값, intent | LLM | ② (1차 호출) |
 | kubectl 명령 문장 | 코드 (`assemble` / 툴 내부) | ③ |
 | 위험도 | 코드 (`RISK_STICKERS`) | 훅 ② |
@@ -134,9 +139,12 @@ flowchart LR
 | 해석 (narration, 다음 행동 안내) | LLM | ④ (2차 호출) |
 
 `suggested_next_action: str | None = None`은 현재 답변과 실행 결과에 근거한 짧은 다음 행동 안내다.
-현재 모드에서 가능한 행동이면 전환을 제안하지 않고, 다른 모드가 필요하면 모드 이름과 이유를 안내한다.
-추가 행동이 필요하지 않으면 `null`이다. 제안 자체는 모드를 바꾸거나 작업을 실행하거나 사용자 승인을 대신하지 않는다.
-모드는 `/mode`로 선택하고, 변경 작업의 승인·거절은 기존 `/approve` 절차를 따른다.
+추가 행동이 필요하지 않으면 `null`이다. 제안 자체는 작업을 실행하거나 사용자 승인을 대신하지 않는다.
+변경 작업의 승인·거절은 기존 `/approve` 절차를 따른다.
+
+학습/진단/실습 모드는 없앴다 (DURO-100). Private 대화는 읽기(kubectl 5종 + 레포 3종)만, Shared 대화는 읽기 + 변경 4종 + PR 길 1종을 받는다.
+공개 범위는 대화 안에서 바뀌지 않으므로 한 대화의 툴 목록·응답 스키마·지시문은 턴마다 같다 (프롬프트 캐시).
+`/mode …` 입력은 모드 버튼이 남은 옛 앱을 위해서만 받아 `{kind: "mode", known: false}` 로 답하고 아무것도 바꾸지 않는다.
 
 API 변경(#48): 기존 `suggested_transition`을 참조하는 소비자는 `suggested_next_action`으로 변경해야 한다.
 구 필드는 응답에 함께 제공하지 않는다.

@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: shop-dev
+resources:
+  - ../../base
+images:
+  - name: kukie-agent
+    newName: 320343233643.dkr.ecr.ap-northeast-2.amazonaws.com/kukie-agent
+    newTag: dev-latest

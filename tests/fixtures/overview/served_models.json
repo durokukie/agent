@@ -1,0 +1,67 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "serving.kukie.io/v1alpha1",
+      "kind": "ServedModel",
+      "metadata": {"name": "qwen3", "namespace": "llm", "generation": 1},
+      "spec": {
+        "source": {"huggingface": "Qwen/Qwen3.6-35B-A3B"},
+        "engine": {"image": "vllm/vllm-openai:v0.32.0@sha256:0000000000000000000000000000000000000000000000000000000000000000", "gpus": 1},
+        "storage": {"size": "120Gi", "retainOnDelete": true}
+      },
+      "status": {
+        "observedGeneration": 1,
+        "phase": "Downloading",
+        "reason": "Downloading",
+        "message": "download Job is running",
+        "download": {"percent": 0, "downloadedBytes": 1073741824}
+      }
+    },
+    {
+      "apiVersion": "serving.kukie.io/v1alpha1",
+      "kind": "ServedModel",
+      "metadata": {"name": "gpt-oss-20b", "namespace": "llm", "generation": 1},
+      "spec": {
+        "source": {"huggingface": "openai/gpt-oss-20b"},
+        "engine": {"image": "vllm/vllm-openai:v0.32.0@sha256:0000000000000000000000000000000000000000000000000000000000000000", "gpus": 1},
+        "storage": {"size": "40Gi", "retainOnDelete": true}
+      },
+      "status": {
+        "observedGeneration": 1,
+        "phase": "Ready",
+        "startedAt": "2026-11-04T01:00:00Z",
+        "stopsAt": "2026-11-04T03:00:00Z",
+        "download": {"percent": 100, "downloadedBytes": 44452911104, "totalBytes": 44452911104},
+        "baseline": {"maxConcurrency": 12, "maxWaiting": 4, "maxKvPercent": 80, "generation": 1, "measuredAt": "2026-11-04T01:30:00Z"}
+      }
+    },
+    {
+      "apiVersion": "serving.kukie.io/v1alpha1",
+      "kind": "ServedModel",
+      "metadata": {"name": "gpt-oss-20b", "namespace": "a-team", "generation": 1},
+      "spec": {
+        "source": {"huggingface": "openai/gpt-oss-20b"},
+        "engine": {"image": "vllm/vllm-openai:v0.32.0@sha256:0000000000000000000000000000000000000000000000000000000000000000", "gpus": 1},
+        "storage": {"size": "40Gi"}
+      },
+      "status": {
+        "phase": "Failed",
+        "reason": "Unschedulable",
+        "message": "0/2 nodes are available: 2 Insufficient nvidia.com/gpu.",
+        "download": {"percent": 100}
+      }
+    },
+    {
+      "apiVersion": "serving.kukie.io/v1alpha1",
+      "kind": "ServedModel",
+      "metadata": {"name": "just-created", "namespace": "llm", "generation": 1},
+      "spec": {
+        "source": {"huggingface": "org/just-created"},
+        "engine": {"image": "vllm/vllm-openai:v0.32.0@sha256:0000000000000000000000000000000000000000000000000000000000000000"},
+        "storage": {"size": "40Gi"}
+      }
+    }
+  ]
+}

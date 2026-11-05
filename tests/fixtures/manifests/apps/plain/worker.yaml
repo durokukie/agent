@@ -1,0 +1,29 @@
+# 일감 처리기. 레플리카는 아래 HPA 가 정한다
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  selector:
+    matchLabels: {app: worker}
+  template:
+    metadata:
+      labels: {app: worker}
+    spec:
+      containers:
+        - name: worker
+          image: public.ecr.aws/docker/library/busybox:1.37
+        - name: metrics
+          image: public.ecr.aws/docker/library/busybox:1.37
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  minReplicas: 2
+  maxReplicas: 5

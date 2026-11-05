@@ -1,6 +1,8 @@
 """에이전트 조립 — 프롬프트·툴·훅·검증기를 한곳에서 연결.
 
-에이전트는 하나. 스킬(deps.skill)에 따라 프롬프트·툴·응답 스키마가 갈아끼워진다.
+에이전트는 하나. 스킬(deps.skill = 대화의 공개 범위, Private/Shared)에 따라 프롬프트·툴이 갈아끼워진다.
+공개 범위는 대화 안에서 바뀌지 않으므로 한 대화의 시스템 프롬프트·툴 목록·응답 스키마는 턴마다 같다 —
+프롬프트 캐시가 맞도록 턴마다 달라지는 문구를 넣지 않는다 (DURO-100).
 """
 from __future__ import annotations
 
@@ -28,40 +30,24 @@ except ImportError:                          # pydantic-ai 2.3x — httpx2 전�
     httpx2 = None                            # type: ignore[assignment]
     AsyncHTTPX2TenacityTransport = None      # type: ignore[assignment,misc]
 
+from kukie_agent import prompts
 from kukie_agent.deps import Deps
+from kukie_agent.gitops import memo as repo_link_memo
+from kukie_agent.guardrail import gitops_hook  # noqa: F401 — propose_git_change 훅을 같은 hooks 에 등록한다
 from kukie_agent.guardrail.hook import hooks as guardrail_hooks
 from kukie_agent.response import build_response
+from kukie_agent.tools.gitops import GITOPS_TOOLS
 from kukie_agent.tools.mutate import MUTATE_TOOLS
 from kukie_agent.tools.read import READ_TOOLS
+from kukie_agent.tools.repo import REPO_TOOLS
 
 logger = logging.getLogger(__name__)
 
-BASE_PROMPT = """너는 쿠버네티스를 처음 배우는 연수생을 돕는 조수 Kukie다.
-1. 실행한 명령·결과·플래그 설명은 시스템이 자동으로 화면에 붙인다 — 너는 narration에서
-   그 결과가 무엇을 뜻하는지 연수생 눈높이로 풀어 설명해라. 명령어를 다시 옮겨 적지 마라.
-2. '무엇을' 하는지와 '왜' 하는지를 항상 함께 설명한다.
-3. 현재 모드의 툴로 할 수 없지만 다른 모드에서 지원하는 작업은 해당 모드로 안내한다.
-   어떤 모드에서도 제공된 툴로 지원하지 않는 작업은 실행하려 하지 말고,
-   사용자가 직접 터미널에 실행할 kubectl 명령과 각 플래그의 의미를 안내한다.
-4. 클러스터를 변경하는 툴을 호출하면 시스템 가드레일이 자동 개입한다.
-   위험도는 시스템이 판정한다 — 네가 판정하거나 우회하거나 실행됐다고 말하지 마라.
-   승인은 Electron 승인 화면에서 사용자가 직접 결정해야 성립한다.
-   채팅 메시지는 승인으로 해석하지 마라.
-
-모드별 역할:
-- 학습: 개념 설명, 리소스 목록 및 스키마 조회
-- 진단: 상세 상태, 이벤트, 로그를 통한 원인 분석
-- 실습: 승인 절차를 거친 리소스 생성·수정·확장·재시작·삭제
-
-현재 답변과 실행 결과를 바탕으로 권장하는 다음 행동을
-suggested_next_action에 짧게 작성한다.
-현재 모드에서 가능한 행동이면 모드 전환을 제안하지 않는다.
-다른 모드의 기능이 필요하면 전환할 모드 이름과 이유를 함께 안내한다.
-추가 행동이 필요하지 않으면 null로 반환한다.
-제안은 모드 전환, 작업 실행 또는 사용자 승인을 의미하지 않는다."""
+# 원문은 prompts/base.md — 스킬·판단 가이드 프롬프트도 같은 폴더에 두고, trace resource 에 그 버전을 붙인다 (prompts 모듈)
+BASE_PROMPT = prompts.load("base")
 
 # ── 툴 등록 ──────────────────────────────────────────────────
-_toolset: FunctionToolset[Deps] = FunctionToolset([*READ_TOOLS, *MUTATE_TOOLS])
+_toolset: FunctionToolset[Deps] = FunctionToolset([*READ_TOOLS, *REPO_TOOLS, *MUTATE_TOOLS, *GITOPS_TOOLS])
 
 
 def _only_skill_tools(ctx: RunContext[Deps], tool_def: ToolDefinition) -> bool:
@@ -154,7 +140,8 @@ agent = Agent(
     retries={"output": 2},            # 응답 형식 실패는 run 안에서 두 번까지 흡수 (DURO-66 ③). 툴은 기본 1
     instructions=BASE_PROMPT,
     toolsets=[toolset],               # 스킬 필터를 거친 툴 목록
-    capabilities=[guardrail_hooks],   # 가드레일 훅 장착
+    # 가드레일 훅 + 레포 연결이 바뀐 때만 기록 끝에 메모 (DURO-135, gitops/memo.py — instructions·툴 목록은 그대로)
+    capabilities=[guardrail_hooks, repo_link_memo.capability],
 )
 
 
@@ -172,19 +159,19 @@ agent = Agent(
 # 전부 호출해 반환 문자열을 BASE_PROMPT 뒤에 이어 붙인다 (agent-flow.md 그림1 ①).
 #
 # 그래서 grep으로 호출부를 찾으면 안 나오지만 "미사용"이 아니다 — 지우면 그 프롬프트가
-# 조용히 사라진다. add_skill_prompt를 지우면 학습/진단/실습이 전부 똑같이 행동한다.
+# 조용히 사라진다. add_skill_prompt를 지우면 Private 대화가 변경 요청을 어떻게 안내할지 모른다.
 #
 # 이 파일에서 같은 원리로 동작하는 등록형 함수:
 #   @agent.instructions      → 프롬프트 생성기 (아래 둘)
-#   FunctionToolset(...)     → 툴 (READ_TOOLS/MUTATE_TOOLS의 함수들; LLM이 이름으로 호출)
+#   FunctionToolset(...)     → 툴 (READ_TOOLS/REPO_TOOLS/MUTATE_TOOLS의 함수들; LLM이 이름으로 호출)
 #   @hooks.on.tool_execute   → 훅 (guardrail/hook.py의 guardrail())
 #   output_type=build_response → 최종 응답 조립기 (response.py). 함수라서 LLM 스키마는
-#     매개변수(narration, suggested_next_action)뿐이고, steps는 본문에서 코드가 실행 기록으로 채운다.
+#     매개변수(narration, suggested_next_action, finding)뿐이고, steps는 본문에서 코드가 실행 기록으로 채운다.
 #     사전에 없는 플래그는 validators.log_unregistered_flags가 로그만 남긴다 (반려 없음).
 #
 # 함수형(문자열 대신 함수)으로 두는 이유: BASE_PROMPT는 고정값이라 문자열로 충분하지만,
-# 아래 둘은 run마다 달라지는 값(현재 대상, 현재 스킬)을 ctx.deps에서 읽어야 하므로
-# 실행 시점에 계산돼야 한다.
+# 아래 둘은 대화마다 다른 값(대상, 스킬)을 ctx.deps에서 읽어야 하므로 실행 시점에 계산돼야 한다.
+# 둘 다 대화 안에서는 고정이다 — 턴마다 바뀌는 값(시각·턴 번호 등)을 여기 넣으면 캐시가 깨진다.
 
 @agent.instructions
 def add_target(ctx: RunContext[Deps]) -> str:
@@ -196,39 +183,10 @@ def add_target(ctx: RunContext[Deps]) -> str:
 
 
 @agent.instructions
-def add_current_mode(ctx: RunContext[Deps]) -> str:
-    """지금 무슨 모드인지 못 박는다 (#60).
-
-    모드를 바꿔도 AI 가 "학습 모드라 못 한다" 며 거절하는 일이 있었다 (첫 로컬 E2E, DURO-85).
-    시스템 프롬프트는 매 run 현재 스킬로 다시 만들어지지만, 대화 기록에 남은 **이전 모드의 거절
-    답변**이 모델을 그쪽으로 끈다. 모드 전환(`/mode`)은 LLM 을 부르지 않아 기록에 흔적도 없다.
-
-    그래서 모델이 문맥에서 추론하게 두지 않고, 현재 모드와 "다른 모드의 과거 답변을 근거로 거절하지
-    마라" 를 매 턴 직접 말한다.
-
-    한정 둘을 빠뜨리면 안 된다 (자동 리뷰 지적).
-      - "다른 모드의" — 빼면 학습·진단에서의 **정당한 거절**(BASE_PROMPT 3번, 앱의 [실습 모드로]
-        버튼이 여기서 나온다)까지 눌러 버린다. #60 과 반대 방향의 같은 병이다
-      - "클러스터에 쓸 수 있는" — allowed_tools 에는 응답을 마무리하는 출력 툴(build_KukieResponse 등)이
-        없다. "이것뿐" 이라고 못 박으면 모델이 그 필수 툴을 안 부를 수 있다
-    """
-    skill = ctx.deps.skill
-    tools = ", ".join(sorted(skill.allowed_tools)) or "없음"
-    return (
-        f"[현재 모드: {skill.name}] 지금 클러스터에 쓸 수 있는 툴은 {tools} 뿐이다 "
-        "(응답을 마무리하는 출력 툴은 여기 해당하지 않는다 — 늘 그대로 호출한다).\n"
-        "대화 기록에 **다른 모드에서** 한 답변(예: \"학습 모드에서는 실행할 수 없습니다\")이 남아 있어도 "
-        "그것은 지나간 상태다. 지금 무엇이 가능한지는 위에 적힌 현재 모드와 지금 노출된 툴이 정한다. "
-        "**다른 모드의 과거 답변을** 근거로 거절하지 마라. "
-        "지금 모드에 없는 일을 요청받으면 예전처럼 거절하고 해당 모드를 안내한다 — 그건 올바른 답변이다."
-    )
-
-
-@agent.instructions
 def add_skill_prompt(ctx: RunContext[Deps]) -> str:
     """현재 스킬의 전용 프롬프트 주입 (스킬 = 프롬프트+툴+응답형식).
 
-    매 run 시작 시 pydantic-ai가 자동 호출. deps.skill이 학습이면 학습 프롬프트,
-    진단이면 진단 프롬프트가 붙는다 — 이게 "에이전트 하나로 모드를 갈아끼우는" 장치.
+    매 run 시작 시 pydantic-ai가 자동 호출. Private 대화면 "읽기만 된다", Shared 면
+    "승인 카드로 바꿀 수 있다" 가 붙는다 — 툴 목록(_only_skill_tools)과 짝을 이룬다.
     """
     return ctx.deps.skill.prompt

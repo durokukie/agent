@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 
 from anyio import CapacityLimiter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 _limiters: dict[str, CapacityLimiter] = {}
 
@@ -31,10 +31,13 @@ class KubectlResult(BaseModel):
     stderr: str
     success: bool
     exit_code: int | None = None
+    # kubectl 출력 밖에서 모델에게 같이 알릴 것 (예: ArgoCD 가 관리하는 리소스 — DURO-129). 화면의 출력 칸에는 실리지 않는다.
+    # 없으면 칸 자체가 빠진다 — 툴 결과가 예전과 같은 모양이다
+    note: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def run_kubectl(args: list[str], *, context: str, dry_run: bool = False,
-                stdin: str | None = None, timeout: int = 30,
+                stdin: str | None = None, timeout: float = 30,
                 kubeconfig: "Path | None" = None) -> KubectlResult:
     """조립된 args를 실행한다.
 

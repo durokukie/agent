@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [develop]
   push:
-    branches: [develop]
+    branches: [develop, main]
 
 permissions:
   contents: read
@@ -23,32 +23,18 @@ jobs:
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - run: uv sync --locked
-      - run: uv run python -m pytest
-
-  # 배포 DB 는 Postgres 다 (kukie-electron deploy/ 컴포즈 · 팀 Aurora). 마이그레이션이 Postgres 에서도 같은 결과인지 —
-  # SQLite 에서만 맞는 리비전을 못 넣게 (agent #67, DURO-110)
-  migrations-postgres:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    services:
-      postgres:
-        image: postgres:18
+      # 렌더 비교 테스트(tests/test_manifests.py)가 진짜 kustomize build 를 돌린다. 버전·sha256 은 Dockerfile 과 같다 (ArgoCD v3.5.3 에 맞춘 값).
+      # 러너에 깔려 있는 kustomize 는 버전이 따로 놀아 덮어쓴다. CI 에서는 kustomize 가 없으면 그 테스트가 건너뛰지 않고 실패한다
+      - name: Install kustomize
         env:
-          POSTGRES_PASSWORD: postgres
-        ports: ['5432:5432']
-        options: >-
-          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s --health-retries 12
-    env:
-      KUKIE_TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
-      # 테스트 모듈이 GITHUB_JOB(이 잡 이름)으로도, 이 변수로도 "URL 없이 전부 skip" 을 실패로 만든다 — 잡 이름을 바꿔도, env: 를 지워도 잡히게 둘 다
-      KUKIE_REQUIRE_POSTGRES_TESTS: '1'
-    steps:
-      - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
-        with:
-          version: ${{ env.SETUP_UV_VERSION }}
-      - run: uv sync --locked
-      - run: uv run python -m pytest -q -ra tests/test_migrations_postgres.py
+          KUSTOMIZE_VERSION: v5.8.1
+          KUSTOMIZE_SHA256: 029a7f0f4e1932c52a0476cf02a0fd855c0bb85694b82c338fc648dcb53a819d
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/kustomize.tar.gz" "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          echo "${KUSTOMIZE_SHA256}  $RUNNER_TEMP/kustomize.tar.gz" | sha256sum -c -
+          sudo tar -xzf "$RUNNER_TEMP/kustomize.tar.gz" -C /usr/local/bin kustomize
+          kustomize version
+      - run: uv run python -m pytest
 
   e2e:
     runs-on: ubuntu-latest
@@ -75,12 +61,12 @@ jobs:
         run: kind delete cluster --name kukie-e2e
 
   # develop 에 머지되고 위 검사가 모두 통과하면 개발환경 이미지를 구워 ECR kukie-agent 에 올린다.
-  # 출입증: kukie-infra 의 kukie-dev-github-agent 역할 — 이 레포 develop 에서만, kukie-agent 창고에만 push 할 수 있다.
-  # 레포 Variables 의 AWS_ROLE_ARN 이 그 역할이다. 창고가 IMMUTABLE 이라 태그는 커밋 SHA 하나만 쓴다.
-  # 버전은 kukie-manifest envs/dev/kustomization.yaml 의 digest 로 올린다 — 아래 요약에 나오는 값.
+  # 출입증: kukie-infra 의 kukie-dev-github-agent 역할 — 이 레포 develop · main 에서만, kukie-agent 창고에만 쓸 수 있다.
+  # 레포 Variables 의 AWS_ROLE_ARN 이 그 역할이다. 창고가 IMMUTABLE 이라 태그는 dev-<커밋 SHA> 하나만 쓴다.
+  # 버전은 kukie-manifest envs/dev/kustomization.yaml 의 digest 로 올린다 — 아래 알림 단계가 kukie-manifest 에 이 digest 를 알린다.
   image:
-    if: github.event_name == 'push'
-    needs: [test, migrations-postgres, e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    needs: [test, e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -90,6 +76,8 @@ jobs:
       AWS_REGION: ap-northeast-2
       REGISTRY: 320343233643.dkr.ecr.ap-northeast-2.amazonaws.com
       REPOSITORY: kukie-agent
+      # 개발환경 이미지는 dev- 로 시작한다. kukie-infra 의 ECR 수명 규칙(적용 후)이 dev- 태그는 최근 push 4개만 남긴다(prod- 는 6개).
+      TAG: dev-${{ github.sha }}
     steps:
       - uses: actions/checkout@v6
       - uses: aws-actions/configure-aws-credentials@v6
@@ -104,18 +92,19 @@ jobs:
       # 역할에 ecr:DescribeImages 가 없어서 BatchGetImage 로 확인한다. 받는 매니페스트 종류를 명시해야
       # buildx · attestation 으로 OCI image index 가 올라가도 "태그 없음" 으로 오판하지 않는다.
       - name: Build and push unless this commit is already in ECR
+        id: push
         shell: bash
         run: |
           digest() {
-            aws ecr batch-get-image --repository-name "$REPOSITORY" --image-ids imageTag="$GITHUB_SHA" \
+            aws ecr batch-get-image --repository-name "$REPOSITORY" --image-ids imageTag="$TAG" \
               --accepted-media-types application/vnd.oci.image.index.v1+json application/vnd.oci.image.manifest.v1+json \
                 application/vnd.docker.distribution.manifest.list.v2+json application/vnd.docker.distribution.manifest.v2+json \
               --query 'images[0].imageId.imageDigest' --output text
           }
           existing=$(digest)
           if [ "$existing" = "None" ]; then
-            DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -t "$REGISTRY/$REPOSITORY:$GITHUB_SHA" .
-            docker push "$REGISTRY/$REPOSITORY:$GITHUB_SHA"
+            DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -t "$REGISTRY/$REPOSITORY:$TAG" .
+            docker push "$REGISTRY/$REPOSITORY:$TAG"
             # ECR 은 push 직후 조회가 늦게 보일 수 있다 — 간격을 늘려 가며 다시 본다 (push 뒤 0·2·6·14·30초, 최대 30초)
             for wait in 0 2 4 8 16; do
               sleep "$wait"
@@ -125,11 +114,166 @@ jobs:
           else
             echo "이미 있는 태그 — 굽지 않는다"
           fi
-          # 요약의 digest 는 사람이 manifest 에 옮겨 적는 값이다 — 모양이 아니면 잡을 실패시킨다
+          # 이 digest 를 요약에 적고 아래 알림 단계에 넘긴다 — 모양이 아니면 잡을 실패시킨다
           case "$existing" in
             sha256:*) ;;
             *) echo "digest 를 읽지 못했다: $existing" >&2; exit 1 ;;
           esac
           echo "### $REPOSITORY 이미지" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 태그: \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- digest: \`$existing\` — kukie-manifest envs/dev 의 kukie-agent 줄에 넣는 값" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 태그: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: \`$existing\` — develop HEAD 이면 아래 알림 단계가 kukie-manifest 에 보내는 값" >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=$existing" >> "$GITHUB_OUTPUT"
+      # 개발환경 반영 알림 — kukie-manifest 에 image-pushed 이벤트를 보내면 그쪽 수신 워크플로가 envs/dev 의 digest 를 바꿔 커밋한다.
+      # 먼저 develop 이 이 커밋보다 앞서 있는지 본다. 앞서 있으면 그 커밋의 실행이 알리므로 여기서는 건너뛴다 — 늦게 끝난 옛 실행이 새 digest 를 덮지 않게.
+      # 건너뛰는 실행은 아래 토큰도 받지 않는다.
+      - name: Check develop HEAD
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/develop" --jq .sha)
+          if [ "$head" = "$GITHUB_SHA" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::develop 이 ${head:0:7} 로 앞서가 manifest 알림을 건너뛴다"
+            echo "- manifest 알림 건너뜀: develop 이 \`${head:0:7}\` 로 앞서가 있다 — 그 커밋의 실행이 알린다" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # 신분: kukie-manifest 에만 설치된 GitHub App kukie-manifest-bot (Variables MANIFEST_APP_CLIENT_ID · Secrets MANIFEST_APP_PRIVATE_KEY).
+      # dispatch 에는 Contents 쓰기가 필요해 그 권한 하나만 받는다. 이 잡은 develop push 에서만 돌아 비밀 값이 PR 실행에 닿지 않는다.
+      - name: Get kukie-manifest bot token
+        if: steps.guard.outputs.latest == 'true'
+        id: bot
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.MANIFEST_APP_CLIENT_ID }}
+          private-key: ${{ secrets.MANIFEST_APP_PRIVATE_KEY }}
+          owner: durokukie
+          repositories: kukie-manifest
+          permission-contents: write
+      # 수신 워크플로는 kukie-manifest 기본 브랜치(main)에 있어야 이 이벤트로 돈다
+      - name: Notify kukie-manifest
+        if: steps.guard.outputs.latest == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          APP: kukie-agent
+          DIGEST: ${{ steps.push.outputs.digest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api repos/durokukie/kukie-manifest/dispatches \
+            -f event_type=image-pushed \
+            -f "client_payload[app]=$APP" \
+            -f "client_payload[digest]=$DIGEST" \
+            -f "client_payload[source_repo]=$GITHUB_REPOSITORY" \
+            -f "client_payload[source_sha]=$GITHUB_SHA" \
+            -f "client_payload[run_url]=$RUN_URL"
+          echo "- manifest 알림 보냄 — 반영은 [kukie-manifest Actions](https://github.com/durokukie/kukie-manifest/actions?query=event%3Arepository_dispatch) 에서 확인" >> "$GITHUB_STEP_SUMMARY"
+
+  # develop 에서 시험한 이미지를 prod 로 올린다 — 다시 굽지 않고 dev-<커밋> 이미지에 prod-<커밋> 태그만 더 붙인다.
+  # 찾는 커밋은 main 과 트리가 같은 커밋이다 — main 커밋 자신(fast-forward), 마지막 부모(머지 커밋), develop 끝(squash).
+  # 트리가 다른 커밋의 이미지는 main 코드가 아니므로 쓰지 않는다. 머지 뒤 develop 이 앞서간 squash 는 찾지 못해 실패한다.
+  # 아래 알림을 받은 kukie-manifest update-image.yml 이 envs/prod digest 를 커밋한다. 이 저장소의 main 병합이 곧 prod 승인이다.
+  # 출입증: develop 과 같은 AWS_ROLE_ARN 역할 (kukie-infra 가 이 레포 main 도 믿게 했다).
+  promote:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ap-northeast-2
+      REPOSITORY: kukie-agent
+      TAG: prod-${{ github.sha }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-northeast-2
+          allowed-account-ids: "320343233643"
+      # 다시 돌려도 태그가 이미 있으면 그 digest 를 쓴다(IMMUTABLE). 매니페스트는 한 바이트만 달라도 digest 가 바뀌므로
+      # 파일로 그대로 옮기고, 옮긴 뒤 digest 가 원본과 같은지 본다.
+      - name: Tag the develop image for prod
+        id: tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image() {
+            aws ecr batch-get-image --repository-name "$REPOSITORY" --image-ids imageTag="$1" \
+              --accepted-media-types application/vnd.oci.image.index.v1+json application/vnd.oci.image.manifest.v1+json \
+                application/vnd.docker.distribution.manifest.list.v2+json application/vnd.docker.distribution.manifest.v2+json \
+              --output json
+          }
+          found=$(image "$TAG")
+          digest=$(jq -r '.images[0].imageId.imageDigest // empty' <<<"$found")
+          if [ -z "$digest" ]; then
+            tree() { gh api "repos/$GITHUB_REPOSITORY/commits/$1" --jq .commit.tree.sha; }
+            main_tree=$(tree "$GITHUB_SHA")
+            parent=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" --jq '.parents[-1].sha')
+            develop=$(gh api "repos/$GITHUB_REPOSITORY/commits/develop" --jq .sha)
+            for sha in "$GITHUB_SHA" "$parent" "$develop"; do
+              [ "$(tree "$sha")" = "$main_tree" ] || continue
+              found=$(image "dev-$sha")
+              digest=$(jq -r '.images[0].imageId.imageDigest // empty' <<<"$found")
+              [ -n "$digest" ] && break
+            done
+            if [ -z "$digest" ]; then
+              echo "::error::main 과 트리가 같은 dev- 이미지가 ECR 에 없다 — develop 빌드가 안 끝났으면 끝난 뒤 다시 실행한다. 그 밖에는 빌드 실패, 머지 뒤 develop 이 앞서감, 수명 규칙 만료 중 하나다"
+              exit 1
+            fi
+            jq -j '.images[0].imageManifest' <<<"$found" > "$RUNNER_TEMP/manifest.json"
+            media=$(jq -r '.images[0].imageManifestMediaType' <<<"$found")
+            tagged=$(aws ecr put-image --repository-name "$REPOSITORY" --image-tag "$TAG" \
+              --image-manifest "file://$RUNNER_TEMP/manifest.json" --image-manifest-media-type "$media" \
+              --query image.imageId.imageDigest --output text)
+            if [ "$tagged" != "$digest" ]; then
+              echo "::error::태그를 붙인 digest 가 원본과 다르다: $tagged != $digest"
+              exit 1
+            fi
+          fi
+          echo "### $REPOSITORY prod 이미지" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 태그: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: \`$digest\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      # 늦게 끝난 옛 실행이 새 digest 를 덮지 않게, main 이 앞서가 있으면 알리지 않는다. 그 커밋의 실행이 알린다
+      - name: Check main HEAD
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$head" = "$GITHUB_SHA" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::main 이 ${head:0:7} 로 앞서가 manifest 알림을 건너뛴다"
+          fi
+      - name: Get kukie-manifest bot token
+        if: steps.guard.outputs.latest == 'true'
+        id: bot
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.MANIFEST_APP_CLIENT_ID }}
+          private-key: ${{ secrets.MANIFEST_APP_PRIVATE_KEY }}
+          owner: durokukie
+          repositories: kukie-manifest
+          permission-contents: write
+      - name: Notify kukie-manifest
+        if: steps.guard.outputs.latest == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          APP: kukie-agent
+          DIGEST: ${{ steps.tag.outputs.digest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api repos/durokukie/kukie-manifest/dispatches \
+            -f event_type=prod-image-pushed \
+            -f "client_payload[app]=$APP" \
+            -f "client_payload[digest]=$DIGEST" \
+            -f "client_payload[source_repo]=$GITHUB_REPOSITORY" \
+            -f "client_payload[source_sha]=$GITHUB_SHA" \
+            -f "client_payload[run_url]=$RUN_URL"
+          echo "- manifest 알림 보냄 — kukie-manifest 가 envs/prod digest 를 커밋한다" >> "$GITHUB_STEP_SUMMARY"

@@ -242,19 +242,59 @@ class ApprovalRequest(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    # ArgoCD 가 관리하는 리소스면 경고 (DURO-129) — {summary, level, warning, applications, resources}, 모양은
+    # kukie_agent/argocd.py inspect. 아니거나 판별을 못 했으면 칸이 없다 (옛 카드와 같은 모양)
+    argocd: dict[str, Any] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    # PR 길(propose_git_change)의 "PR 머지 승인" 카드 칸 (DURO-134) — 모양은 gitops_card. kubectl 카드에는 칸이 없다
+    gitops: dict[str, Any] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
-def build_approval_request(
+#: 승인 카드에 싣는 Plan 의 gitops 칸 — 여기 없는 칸(base_sha·route·merge_methods·conflict_keys 같은 승인 순간 다시 볼 때
+#: 쓰는 내부 값)은 카드로 나가지 않는다. 칸을 더하는 쪽이 카드에 싣겠다고 명시해야 한다 (fail-closed, agent#126 리뷰)
+_GITOPS_CARD = ("repository", "base", "branch", "application", "file_diff", "render_diff", "warnings", "notice",
+                "risk_warnings", "new_resources")
+
+
+def gitops_card(plan: ActionPlan) -> dict[str, Any] | None:
+    """PR 머지 승인 카드 칸. 앱(kukie-electron DURO-136)이 그린다.
+
+        {"repository": "acme/manifests", "base": "main", "branch": "kukie/…",
+         "pull_request": {"number": 12, "url": "https://github.com/acme/manifests/pull/12"},
+         "application": {name, namespace, repo_url, path, chart, target_revision, source_type, sync_status,
+                         auto_sync, self_heal, prune},
+         "files": ["apps/api/deployment.yaml", …], "file_diff": "git diff", "render_diff": "클러스터에서 바뀔 것",
+         "warnings": [...], "notice": "승인하면 Kukie 가 이 PR 을 머지해요. …"}
+
+    새 리소스 요청(DURO-154)이면 칸이 둘 더 있다. warnings 에는 risk_warnings 의 text 도 같이 든다 (옛 앱도 경고를 보게).
+        "new_resources": [{"api_version", "kind", "name", "namespace", "file"}, …],
+        "risk_warnings": [{"code", "location": {"file", "resource", "field", "value"}, "risk", "suggestion", "text"}, …]
+    """
+    if plan.gitops is None:
+        return None
+    card = {key: plan.gitops[key] for key in _GITOPS_CARD if key in plan.gitops}
+    card["files"] = [entry["path"] for entry in plan.gitops.get("files") or []]
+    card["pull_request"] = plan.pull_request
+    return card
+
+
+async def build_approval_request(
     call: ToolCallPart,
     metadata: dict[str, Any],
     *,
     default_namespace: str,
     run_id: str | None = None,
 ) -> ApprovalRequest:
+    """대기 중인 tool call 하나를 승인 카드로. plan_id 는 원본 Plan 의 id — 대화 경로면 server 의 UUID 다."""
     call_id = call.tool_call_id
     if not call_id:
         raise ValueError("pending approval mismatch: missing call_id")
-    plan = ActionPlan.find_by_call_id(call_id, run_id=run_id)
+    plan = await ActionPlan.find_by_call_id(call_id, run_id=run_id)
     canonical = canonicalize_mutation_args(
         call.tool_name,
         call.args_as_dict(raise_if_invalid=True),
@@ -300,4 +340,6 @@ def build_approval_request(
             if call.tool_name == "apply_manifest"
             else None
         ),
+        argocd=plan.argocd,
+        gitops=gitops_card(plan),
     )

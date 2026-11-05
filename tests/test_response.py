@@ -14,8 +14,7 @@ from kukie_agent.deps import Deps
 from kukie_agent.glossary import explain_command
 from kukie_agent.kubectl import KubectlResult
 from kukie_agent.response import build_response_for
-from kukie_agent.skills import SKILLS
-from kukie_agent.skills.diagnosis import DiagnosisResponse
+from kukie_agent.skills import PRIVATE, SHARED, KukieResponse
 from kukie_agent.tools import read as read_tools
 
 FAKE_COMMAND = "kubectl --context kind-dev get pods -n study -o wide"
@@ -35,8 +34,8 @@ def fake_kubectl(monkeypatch):
     return calls
 
 
-def _deps(skill="학습") -> Deps:
-    return Deps(context="kind-dev", namespace="study", skill=SKILLS[skill])
+def _deps(skill=PRIVATE) -> Deps:
+    return Deps(context="kind-dev", namespace="study", skill=skill)
 
 
 def _run(model, deps=None, **kw):
@@ -67,21 +66,20 @@ def test_툴을_안_부르면_steps는_비어있다(fake_kubectl):
 
 # ── 2. LLM 스키마와 다음 행동 안내 ─────────────────────────────
 
-@pytest.mark.parametrize("skill,extra_fields", [
-    ("학습", set()),
-    ("진단", {"finding"}),
-    ("실습", set()),
-])
+@pytest.mark.parametrize("skill", [PRIVATE, SHARED], ids=["Private", "Shared"])
 @pytest.mark.parametrize("values", [
     {},
     {"suggested_next_action": None},
-    {"suggested_next_action": "컨테이너 로그를 분석하려면 진단 모드로 전환해 주세요."},
+    {"suggested_next_action": "컨테이너 로그를 확인해 보세요."},
 ])
-def test_모든_모드의_다음_행동_스키마와_값(skill, extra_fields, values):
+def test_두_스킬의_응답_스키마와_다음_행동_값(skill, values):
+    """Private·Shared 는 같은 응답 스키마 — finding 은 늘 있는 선택 칸이다 (DURO-100)."""
     m = TestModel(call_tools=[], custom_output_args={"narration": "설명", **values})
-    result = _run(m, deps=_deps(skill), output_type=SKILLS[skill].output_fn)
+    result = _run(m, deps=_deps(skill), output_type=skill.output_fn)
     schema = m.last_model_request_parameters.output_tools[0].parameters_json_schema
-    assert set(schema["properties"]) == {"narration", "suggested_next_action"} | extra_fields
+    assert set(schema["properties"]) == {"narration", "suggested_next_action", "finding"}
+    assert "finding" not in schema.get("required", [])
+    assert result.output.finding is None
     field = schema["properties"]["suggested_next_action"]
     assert {item["type"] for item in field["anyOf"]} == {"string", "null"}
     assert field["default"] is None
@@ -203,22 +201,29 @@ def test_거부되거나_실패한_호출은_블록이_되지_않는다():
     assert response_mod.collect_steps(SimpleNamespace(messages=messages)) == []
 
 
-# ── 5. 스킬 특화 응답도 같은 방식 ──────────────────────────────
+# ── 5. finding 도 LLM 몫, steps 는 코드 몫 ───────────────────────
 
-def test_스킬_특화_응답은_특화_필드만_LLM이_채우고_steps는_코드가_채운다(fake_kubectl):
+def test_finding은_LLM이_채우고_steps는_코드가_채운다(fake_kubectl):
     m = TestModel(call_tools=["list_resources"], custom_output_args={
         "narration": "원인 찾았어요",
         "finding": {"cause": "OOM", "evidence": "Exit 137", "recommendation": "limits 상향"},
     })
-    result = _run(m, deps=_deps("진단"), output_type=SKILLS["진단"].output_fn)
-    assert isinstance(result.output, DiagnosisResponse)
+    result = _run(m, deps=_deps(PRIVATE), output_type=PRIVATE.output_fn)
+    assert isinstance(result.output, KukieResponse)
     assert result.output.finding.cause == "OOM"
     assert result.output.steps[0].command == FAKE_COMMAND
 
 
 def test_조립_함수는_응답_클래스마다_하나로_캐시된다():
-    assert build_response_for(DiagnosisResponse) is build_response_for(DiagnosisResponse)
-    assert build_response_for(DiagnosisResponse) is SKILLS["진단"].output_fn
+    assert build_response_for(KukieResponse) is build_response_for(KukieResponse)
+    assert build_response_for(KukieResponse) is PRIVATE.output_fn is SHARED.output_fn
+
+
+def test_앱이_그리는_JSON_모양은_예전_진단_응답과_같다():
+    """finding 칸 이름·모양이 바뀌면 앱의 원인 분석 블록이 사라진다."""
+    dumped = KukieResponse(narration="x", finding={"cause": "a", "evidence": "b", "recommendation": "c"}).model_dump()
+    assert dumped["finding"] == {"cause": "a", "evidence": "b", "recommendation": "c"}
+    assert set(dumped) == {"narration", "steps", "suggested_next_action", "finding"}
 
 
 # ── 6. 사전 파서 단위 ──────────────────────────────────────────

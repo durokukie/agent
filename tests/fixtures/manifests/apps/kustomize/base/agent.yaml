@@ -1,0 +1,16 @@
+# kukie-manifest 처럼 base 에는 이미지 이름만 둔다 — 레지스트리와 버전은 환경 overlay 의 images 가 정한다
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: agent}
+  template:
+    metadata:
+      labels: {app: agent}
+    spec:
+      containers:
+        - name: agent
+          image: kukie-agent

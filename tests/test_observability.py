@@ -58,6 +58,9 @@ def test_토큰이나_엔드포인트가_있으면_켠다(monkeypatch, key, valu
 
     assert observability.setup() is True
     assert seen["service_name"] == "kukie"
+    # 모든 span 에 프롬프트 버전이 붙는다 (kukie_agent/prompts)
+    assert seen["resource_attributes"]["kukie.prompt.version"].startswith("p-")
+    assert "base.md=" in seen["resource_attributes"]["kukie.prompt.files"]
     # 토큰이 없는 구성(OTLP 만)에서는 SaaS 로 보내지 않는다
     assert seen["send_to_logfire"] is (key == "LOGFIRE_TOKEN")
 

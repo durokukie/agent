@@ -1,310 +1,1094 @@
-"""클러스터 등록 엔드포인트 (기획 04 §8, issue #61).
+"""클러스터 연결 확인 엔드포인트 (기획 04 §8, issue #61).
 
-  POST   /clusters              kubeconfig 본문으로 등록
-  GET    /clusters?team_id=     목록
-  POST   /clusters/{id}/test    연결 확인 (kubectl version + auth can-i)
-  PATCH  /clusters/{id}         이름·namespace·자격증명 교체
-  DELETE /clusters/{id}         삭제 — 자격증명도 함께 사라진다
+  POST /clusters/{id}/test       연결 확인 (kubectl version + auth can-i)
+  GET  /clusters/{id}/overview   개요 — 웹 대시보드의 클러스터 지도·통계 (issue #102, kubectl get × 3 + CNI 조회 1 + GPU 조회)
+  GET  /clusters/{id}/argocd/applications   ArgoCD 화면의 Application 목록 (DURO-140, kubectl get × 1)
+  GET  /clusters/{id}/argocd/applications/{namespace}/{name}   ArgoCD 화면의 앱 상세 패널 (DURO-145, kubectl get × 1)
+  GET  /clusters/{id}/argocd/applications/{namespace}/{name}/rendered   앱 path 를 렌더한 결과 (DURO-148)
+  GET  /clusters/{id}/gitops/repos/{owner}/{repo}/tree · /file   ArgoCD 화면 "레포" 탭의 폴더·파일 (DURO-148)
 
-**자격증명은 어떤 응답에도 실리지 않는다** (기획 04 §4). 목록·상세는 접속 주소와 상태만 준다.
+등록·목록·수정·삭제는 Kukie API 서버(kukie-server)의 공개 API 다 (DURO-113) — kubeconfig 검사와 자격증명
+암호화도 그쪽에 있다. 연결 확인만 agent 에 남은 이유는 kubectl 이 여기서 돌기 때문이다.
 
-권한은 두 갈래다 (기획 02 §3, 04 §3).
-  - 팀에 속한 클러스터: 읽기는 팀 구성원, 쓰기(등록·수정·삭제)는 팀 Admin. 판단은 Spring 에 묻는다
-    (kukie_agent/membership.py — 사용자 토큰으로 GET /teams)
-  - 팀이 없는(개인) 클러스터: 등록한 사람만. 회원 서버가 없는 개발 모드도 이쪽이다
+권한은 server 가 본다. 연결 정보를 사용자 토큰으로 받으므로(clusters/access.py) 못 보는 클러스터는 그 호출이
+404 를 준다. 팀 구성원도 부를 수 있고, 결과(status·last_checked_at)를 `PATCH /internal/clusters/{id}/status` 로
+남긴다 — 연결 확인의 부산물이라 "쓰기는 Admin" 경계에서 일부러 빼 뒀다 (자동 리뷰 지적).
+GPU 노드 유무(hasGpu)도 같은 까닭으로 연결 확인·개요가 노드 목록을 읽었을 때 `PATCH /internal/clusters/{id}/gpu` 로
+남긴다 (DURO-118). 앱은 클러스터 목록의 그 값으로 GPU 아이콘을 띄운다 — 개요를 부르지 않고도.
 
-예외 하나: `POST /{id}/test` 는 구성원도 부를 수 있는데 안에서 status·last_checked_at 을 쓴다.
-연결 확인의 부산물이라 "쓰기는 Admin" 경계에서 일부러 빼 뒀다 (자동 리뷰 지적).
+**자격증명은 어떤 응답에도 실리지 않는다** (기획 04 §4).
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.exc import IntegrityError
-from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 import kukie_agent.server as _server   # 순환 import: 이름은 호출 시점에만 쓴다
+from kukie_agent import argocd, server_api
 from kukie_agent.auth import User, current_user
-from kukie_agent.clusters import crypto
-from kukie_agent.clusters.access import ClusterGone, kubeconfig_for
-from kukie_agent.clusters.kubeconfig import KubeconfigRejected, parse_kubeconfig
-from kukie_agent.clusters.settings import allow_local_clusters
-from kukie_agent.fields import blank_is_none, none_if_blank, stripped
-from kukie_agent import membership
-from kukie_agent.kubectl import run_kubectl, thread_limiter
-from kukie_agent.store import ChatStore, get_store
-from kukie_agent.store.chat_store import ClusterInUse, ClusterRow
+from kukie_agent.clusters import access, gpu, overview
+from kukie_agent.gitops import browse, github
+from kukie_agent.kubectl import KubectlResult, run_kubectl, thread_limiter
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/clusters", tags=["clusters"])
 
 #: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적, 이유는 thread_limiter).
-#: getaddrinfo 는 타임아웃을 줄 수 없고 kubectl 은 30초씩 잡는다.
-RESOLVE_WORKERS = 4          # kubeconfig 검사 (이름 해석)
-PROBE_WORKERS = 4            # 연결 확인 (kubectl × 2, 최대 60초)
-
-
-# ── 요청 본문 ──────────────────────────────────────────────
-
-class ClusterIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    kubeconfig: str = Field(min_length=1)
-    name: str = Field(min_length=1, max_length=100)
-    context: str | None = None            # 여러 context 중 하나를 고를 때
-    namespace: str | None = None
-    team_id: str | None = Field(default=None, max_length=64)
-
-    # `team_id: ""` 가 falsy 검사를 지나 팀 `''` 의 클러스터로 저장되면 목록·이름 공간이 갈라진다
-    _blank = field_validator("team_id", "context", "namespace", mode="before")(blank_is_none)
-    _name = field_validator("name", mode="before")(stripped)
-
-
-class ClusterPatch(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str | None = Field(default=None, min_length=1, max_length=100)
-    namespace: str | None = None
-    kubeconfig: str | None = None         # 자격증명 교체
-    context: str | None = None
-
-    # 등록과 같은 규칙 — 빈 값은 "안 정했다" = 안 바꾼다. 기본값으로 되돌리려면 "default" 를 보낸다.
-    _blank = field_validator("namespace", "context", mode="before")(blank_is_none)
-    _name = field_validator("name", mode="before")(stripped)
-
-
-# ── 응답 ───────────────────────────────────────────────────
-
-def _view(row: ClusterRow) -> dict[str, Any]:
-    """자격증명은 절대 넣지 않는다. 앱이 보여줄 값만."""
-    return {
-        "id": row.id,
-        "team_id": row.team_id,
-        "registered_by": row.registered_by,
-        "name": row.name,
-        "provider": row.provider,
-        "api_server": row.api_server,
-        "context": row.context_name,
-        "namespace": row.default_namespace,
-        "fingerprint": row.fingerprint,
-        "status": row.status,
-        "insecure": row.insecure,
-        "last_checked_at": row.last_checked_at.isoformat() if row.last_checked_at else None,
-        "created_at": row.created_at.isoformat(),
-        "updated_at": row.updated_at.isoformat(),
-    }
-
-
-def _error(status: int, code: str, message: str) -> HTTPException:
-    return HTTPException(status, {"code": code, "message": message})
-
-
-def _require_key() -> None:
-    if not crypto.available():
-        raise _error(
-            503, "SECRET_KEY_MISSING",
-            f"서버에 암호화 키({crypto.KEY_ENV})가 없어 클러스터를 등록할 수 없습니다",
-        )
-
-
-async def _readable(store: ChatStore, cluster_id: str, user: User) -> ClusterRow:
-    """볼 수 있는 클러스터인가. 못 보는 것은 없는 것처럼 404 — 있다는 사실 자체를 알려 주지 않는다."""
-    row = store.get_cluster(cluster_id)
-    if row is None:
-        raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}")
-    if row.team_id and membership.available():
-        # 팀 클러스터는 **등록한 사람이어도** 지금 소속을 확인한다. 등록자라는 이유로 통과시키면
-        # 팀에서 쫓겨난 뒤에도 계속 보고 만질 수 있고, 회원 서버가 죽었을 때도 통과한다 (자동 리뷰 P1).
-        if not await membership.is_member(user, row.team_id):
-            raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}")
-        return row
-    if row.registered_by == user.id:
-        return row          # 팀이 없는(개인) 클러스터 — 등록한 사람만
-    raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}")
-
-
-async def _writable(store: ChatStore, cluster_id: str, user: User) -> ClusterRow:
-    """바꾸거나 지울 수 있는가. 팀 클러스터는 Admin 만 (기획 02 §3)."""
-    row = await _readable(store, cluster_id, user)
-    if row.team_id and membership.available():
-        await membership.require_admin(user, row.team_id)
-    elif row.registered_by != user.id:
-        raise _error(403, "FORBIDDEN", "등록한 사람만 바꿀 수 있다")
-    return row
-
-
-
-async def _parse(body_text: str, context: str | None):
-    """kubeconfig 검사. 이름 해석(getaddrinfo)이 블로킹이라 스레드로 넘긴다 — 응답하지 않는
-    네임서버를 가진 도메인을 등록하면 그동안 서버 전체가 멈춘다 (자동 리뷰 지적)."""
-    def run():
-        return parse_kubeconfig(body_text, context_name=context, allow_local=allow_local_clusters())
-
-    try:
-        return await to_thread.run_sync(run, limiter=thread_limiter("resolve", RESOLVE_WORKERS))
-    except KubeconfigRejected as exc:
-        raise _error(400, "KUBECONFIG_REJECTED", str(exc)) from None
-
-
-# ── 엔드포인트 ─────────────────────────────────────────────
-
-@router.post("")
-async def register_cluster(
-    body: ClusterIn,
-    user: User = Depends(current_user),
-    store: ChatStore = Depends(get_store),
-) -> dict[str, Any]:
-    _require_key()
-    # 아래 PR 은 소속을 물을 방법이 없어 팀 지정 등록을 501 로 막아 뒀다. 여기서는 회원 서버에
-    # 물을 수 있으므로 연다 — 검사 없이 열면 409 가 남의 팀 이름을 떠보는 신호가 된다 (자동 리뷰).
-    if body.team_id:
-        if not membership.available():
-            raise _error(501, "TEAM_CLUSTER_UNSUPPORTED",
-                         "회원 서버가 없어 팀 클러스터를 등록할 수 없습니다")
-        await membership.require_admin(user, body.team_id)   # 팀 클러스터 등록은 Admin 만 (기획 02 §3)
-    parsed = await _parse(body.kubeconfig, body.context)
-    try:
-        row = store.create_cluster(
-            registered_by=user.id,
-            team_id=body.team_id,
-            name=body.name,      # 검증기가 이미 공백을 뗐다
-            api_server=parsed.api_server,
-            ca_data=parsed.ca_data,
-            insecure=parsed.insecure,
-            credential_encrypted=crypto.encrypt(parsed.credential),
-            context_name=parsed.context_name,
-            # 둘 다 검증기·parse_kubeconfig 를 거쳐 공백 아닌 값이거나 None 이다
-            # (parsed.namespace 는 kubeconfig.py 에서 이미 "default" 로 채워져 온다)
-            default_namespace=body.namespace or parsed.namespace,
-            fingerprint=parsed.fingerprint,
-        )
-    except IntegrityError:
-        raise _error(409, "CLUSTER_NAME_TAKEN", f"같은 이름의 클러스터가 이미 있습니다: {body.name}") from None
-    return _view(row)
-
-
-@router.get("")
-async def list_clusters(
-    team_id: str | None = None,
-    user: User = Depends(current_user),
-    store: ChatStore = Depends(get_store),
-) -> list[dict[str, Any]]:
-    team_id = none_if_blank(team_id)      # `?team_id=` 는 "좁히지 않는다" 로 읽는다
-    if team_id and membership.available():
-        await membership.require_member(user, team_id)
-    mine = list(await membership.team_roles(user)) if membership.available() else None
-    return [_view(row) for row in store.list_clusters(user.id, team_ids=mine, team_id=team_id)]
-
-
-@router.get("/{cluster_id}")
-async def get_cluster(
-    cluster_id: str,
-    user: User = Depends(current_user),
-    store: ChatStore = Depends(get_store),
-) -> dict[str, Any]:
-    return _view(await _readable(store, cluster_id, user))
+#: kubectl 은 30초씩 잡는다.
+PROBE_WORKERS = 4            # 연결 확인 (kubectl × 3 — version·can-i 30초씩 + 노드 OVERVIEW_TIMEOUT, 최대 75초)
+ARGOCD_WORKERS = 4           # ArgoCD 앱 목록·상세·레포 보기의 앱 목록 (kubectl × 1, OVERVIEW_TIMEOUT). ArgoCD 화면이 띄울 때 부른다 — 개요와 따로 묶는다
+OVERVIEW_WORKERS = 4         # 개요 (kubectl × 5, 노드를 읽고 GPU 가 없다고 이미 안 클러스터가 아니면 GPU_BUDGET 안에서 몇 번 더). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
+#: 개요의 kubectl 한 번 시간 제한(초). 기본 30초 × 4 면 한 요청이 슬롯을 2분 잡는다 — 닿지 않으면 첫 번째에서 15초로 끝난다 (자동 리뷰 지적)
+OVERVIEW_TIMEOUT = 15
+#: GPU 지표(/metrics 파드 프록시) 한 번 시간 제한(초). 파드마다 한 번씩이라 개요보다 더 짧게 끊는다
+GPU_METRICS_TIMEOUT = 5
+#: 모든 namespace 파드를 못 읽을 때 namespace 하나의 파드 목록 시간 제한(초). namespace 마다 한 번이라 지표처럼 짧게 끊는다
+GPU_PODS_TIMEOUT = 5
+#: ServedModel 목록 시간 제한(초). 지표보다 먼저 읽으므로 짧게 끊는다. GPU 노드가 있으면 NodePool 과 합쳐 남은 예산의 절반까지만 쓴다(_collect_gpu)
+GPU_SERVED_MODELS_TIMEOUT = 5
+#: Karpenter NodePool 목록 시간 제한(초). ServedModel 처럼 짧게 끊는다. GPU 노드가 있으면 ServedModel 과 합쳐 남은 예산의 절반까지만 쓴다(_collect_gpu)
+GPU_NODE_POOLS_TIMEOUT = 5
+#: 측정 기록 ConfigMap 목록 시간 제한(초). 없어도 되는 칸이라 더 짧게 끊는다. GPU 노드가 있으면 NodePool·ServedModel 이 쓰고 남은 절반 몫 안에서만 쓴다(_collect_gpu)
+GPU_BENCHMARKS_TIMEOUT = 3
+#: 마지막으로 성공한 측정 기록을 연결마다 기억하는 시간(초). 넘으면 어느 연결의 것이든 지운다 — 메모리를 지키고, 하루 넘게 못 읽은 표를 계속 보이지 않게
+GPU_BENCHMARKS_FORGET = 24 * 3600
+#: 파드를 읽을 수 있었던 namespace 를 연결마다 기억하는 시간(초). 그동안은 그 namespace 만 읽는다.
+#: 고객이 새 namespace 나 RoleBinding 을 더하면 이만큼 늦게 보인다 — 짧게 둔다
+READABLE_NAMESPACES_TTL = 120
+#: GPU 칸(노드·파드·지표 전부)에 쓰는 시간(초). 지표 파드가 16개 다 매달려도 개요 슬롯을 이 이상 더 잡지 않는다 (PR #118 리뷰).
+#: 다 쓰면 남은 조회는 건너뛰고 그 값만 null 이다
+GPU_BUDGET = 20
+#: 같은 연결의 개요를 여러 요청이 나눠 쓰는 시간(초). GPU 화면은 20초마다(앱 OVERVIEW_LIVE_MS) 개요를 다시 읽는데, 여러
+#: 사람·탭이 같은 클러스터를 보면 그 수만큼 kubectl 이 돌고 고객 API 서버 감사 로그에도 그만큼 쌓인다. 이 시간 안의 요청은
+#: 진행 중이거나 막 끝난 한 번의 결과를 같이 쓴다. 한 사람의 20초 주기보다 짧게 둬서 혼자 볼 때는 늘 새로 읽는다.
+#: 나눠 쓰려면 응답에 사람마다 다른 값이 없어야 한다 — 지금은 없다. 측정 기록(benchmarks)도 팀 누구나 같은 값이다.
+#: ArgoCD 앱 목록·상세(DURO-145)도 같은 시간·같은 헬퍼로 나눠 쓴다 — 화면을 켜 두고 여러 사람이 볼 때 같다
+OVERVIEW_SHARE_TTL = 10
+#: `?fresh=true`(화면의 "다시 읽기")여도 이보다 덜 된 결과(초)는 나눠 쓴다. 사람이 누른 다시 읽기는 늘 새로 읽은 것처럼 보이고,
+#: 화면이 fresh 로 폴링해도 kubectl 이 이 간격보다 자주 돌지 않는다 — 나눠 쓰기를 부르는 쪽만 믿지 않게 (agent#125 리뷰)
+FRESH_MIN_AGE = 2
+#: 지표를 동시에 읽는 수. 개요 슬롯(OVERVIEW_WORKERS) 하나 안에서 잠깐 쓰는 스레드라 limiter 밖이다 — 많아야 4 × 4
+GPU_METRICS_WORKERS = 4
+#: GPU 노드가 없고 server 값이 GPU 클러스터(true)가 아닌 연결은 이 간격(초)마다 한 번만 GPU 를 기다리는 파드를 찾는다.
+#:   false  GPU 가 없다고 남은 곳 — 노드 그룹을 0대로 둔 채 vLLM 같은 GPU 워크로드를 새로 올려도 노드가 뜨기 전에 GPU
+#:          클러스터로 바뀌게 (agent#121 Codex 리뷰)
+#:   null   아직 모르는 곳 — 끝까지 못 읽어 계속 모르는 곳(namespace 가 상한보다 많은 등)이 개요마다 파드를 전부 다시
+#:          읽지 않게 (agent#121 리뷰)
+#: 둘 다 이 프로세스에서 기록이 없으면(처음 봤거나 오래 안 불러 지웠으면) 바로 한 번 찾는다 — 오래 안 부른 연결이 다시
+#: 와도 미뤄지지 않게 (agent#121 리뷰). 재시작·하루 넘게 안 부른 연결마다 한 번 더 찾는 값이다.
+#: 파드 조회를 보낸 라운드만 센다 — 예산이 모자라 조회를 보내지 못하는 라운드는 창을 잡기 전에 끝난다. 보냈는데 거부·
+#: 시간 초과로 못 읽은 라운드는 센다 — 끝까지 못 읽는 곳(GPU 읽기 RBAC 가 없는 곳 등)이 개요마다 다시 묻지 않게 (agent#121 리뷰).
+#: 프로세스 안 시각이라 복제본마다·재시작마다 따로 센다
+GPU_ABSENT_RECHECK = 600
+GPU_ABSENT_RECHECK_FORGET = 24 * 3600   # 이만큼 안 부른 연결의 시각은 지운다 — 메모리만 지키려는 것이라 간격보다 훨씬 길게
+#: 서빙 TTFT·ITL p95 의 최근 구간 상한(초). 직전 수집이 이보다 오래됐으면 기억을 버리고 이번 p95 는 null 이다 — 화면을
+#: 20초마다 읽는 동안은 구간이 20초(여럿이 보면 OVERVIEW_SHARE_TTL)이고, 닫았다 한참 뒤에 열면 옛 값과 빼지 않는다 (DURO-124)
+LATENCY_WINDOW_MAX = 600
 
 
 @router.post("/{cluster_id}/test")
 async def test_cluster(
     cluster_id: str,
     user: User = Depends(current_user),
-    store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
     """연결 확인 (기획 04 §8). 서버 버전을 읽고 변경 권한이 있는지 물어본다."""
-    row = await _readable(store, cluster_id, user)
-    _require_key()
-    from datetime import datetime, timezone
+    conn = await access.connection(cluster_id, user)
 
-    def probe() -> tuple[Any, Any]:
-        with kubeconfig_for(store, cluster_id) as path:
-            return (
-                run_kubectl(["version", "-o", "json"], context=row.context_name, kubeconfig=path),
-                run_kubectl(
-                    ["auth", "can-i", "update", "deployments", "-n", row.default_namespace],
-                    context=row.context_name, kubeconfig=path,
-                ),
+    def probe() -> tuple[Any, Any, bool | None]:
+        with access.kubeconfig(conn) as path:
+            version = run_kubectl(["version", "-o", "json"], context=conn.context_name, kubeconfig=path)
+            can_edit = run_kubectl(
+                ["auth", "can-i", "update", "deployments", "-n", conn.namespace],
+                context=conn.context_name, kubeconfig=path,
             )
+            has_gpu = None
+            if version.success:
+                # 노드 목록만 본다 (지표는 개요의 일). 고객 EKS 는 Forbidden 이라 None — 남기지 않는다
+                nodes = run_kubectl(gpu.NODES_COMMAND, context=conn.context_name, kubeconfig=path,
+                                    timeout=OVERVIEW_TIMEOUT)
+                has_gpu = _has_gpu(nodes)
+                # GPU 노드가 없어도 0대로 내려 둔 GPU 클러스터일 수 있다 — GPU 를 기다리는 파드를 보는 개요가 정한다.
+                # 없다고 이미 안 클러스터만 그대로 false
+                if has_gpu is False and conn.has_gpu is not False:
+                    has_gpu = None
+            return version, can_edit, has_gpu
 
-    try:
-        # run_kubectl 은 subprocess.run 을 그대로 부른다. 여기서 직접 부르면 닿지 않는 주소일 때
-        # 최대 60초(version + can-i) 동안 서버 전체가 멈춘다 (자동 리뷰 지적). 스레드로 넘긴다.
-        version, can_edit = await to_thread.run_sync(probe, limiter=thread_limiter("probe", PROBE_WORKERS))
-    except ClusterGone:
-        raise _error(404, "NOT_FOUND", f"클러스터가 없다: {cluster_id}") from None
-    except crypto.CredentialUnreadable as exc:
-        raise _error(503, "CREDENTIAL_UNREADABLE", str(exc)) from None
+    # run_kubectl 은 subprocess.run 을 그대로 부른다. 여기서 직접 부르면 닿지 않는 주소일 때
+    # 최대 75초(version + can-i + 노드) 동안 서버 전체가 멈춘다 (자동 리뷰 지적). 스레드로 넘긴다.
+    version, can_edit, has_gpu = await to_thread.run_sync(probe, limiter=thread_limiter("probe", PROBE_WORKERS))
     status = "connected" if version.success else _failure_status(version.stderr)
-    store.update_cluster(cluster_id, status=status, last_checked_at=datetime.now(timezone.utc))
+    await server_api.update_cluster_status(cluster_id, status=status, checked_at=datetime.now(timezone.utc))
+    recorded = await _record_gpu(conn, has_gpu)
     return {
         "status": status,
         "reachable": version.success,
         # 실패 사유는 그대로 보여줘야 고칠 수 있다. 자격증명은 원래 stderr 에 실리지 않는다
         "detail": (version.stderr or version.stdout).strip()[:500],
         "can_change": can_edit.success and can_edit.stdout.strip() == "yes",
+        # 노드 목록으로 본 GPU 클러스터 여부. 못 읽었거나 server 에 남기지 못했으면 null — 앱은 이 값이 목록 값과 다를 때
+        # 클러스터 목록을 다시 받으므로, 못 남긴 값을 주면 다시 받아도 아이콘이 안 바뀐다 (PR #119 리뷰).
+        # GPU 노드가 없어도 0대로 내려 둔 GPU 클러스터일 수 있어, server 값이 false 가 아니면 null 이다(개요가 정한다)
+        "has_gpu": has_gpu if recorded else None,
     }
 
 
-@router.patch("/{cluster_id}")
-async def update_cluster(
-    cluster_id: str,
-    body: ClusterPatch,
-    user: User = Depends(current_user),
-    store: ChatStore = Depends(get_store),
-) -> dict[str, Any]:
-    row = await _writable(store, cluster_id, user)
-    fields: dict[str, Any] = {}
-    if body.name is not None:
-        fields["name"] = body.name
-    if body.namespace is not None:
-        fields["default_namespace"] = body.namespace       # 빈 값은 위에서 None 으로 접혔다
-    if body.kubeconfig is not None:
-        _require_key()
-        parsed = await _parse(body.kubeconfig, body.context)
-        if parsed.fingerprint != row.fingerprint:
-            raise _error(
-                409, "CLUSTER_MISMATCH",
-                "다른 클러스터의 kubeconfig 입니다 — 자격증명 교체는 같은 클러스터만 됩니다",
-            )
-        # context 이름은 바꾸지 않는다. 지문은 주소·CA 만 덮으므로 새 kubeconfig 의 context 이름이
-        # 달라도 통과하는데, 그 이름을 방마다 복사해 뒀기 때문에 바꾸면 기존 방이 전부 엉뚱한
-        # context 를 가리킨다 (자동 리뷰 지적). 이름을 바꿔야 하면 다시 등록한다.
-        fields.update(
-            credential_encrypted=crypto.encrypt(parsed.credential),
-            ca_data=parsed.ca_data,
-            insecure=parsed.insecure,
-            status="disconnected",       # 바꿨으니 다시 확인해야 한다
-        )
-    if not fields:
-        raise _error(400, "NOTHING_TO_UPDATE", "바꿀 내용이 없습니다")
-    try:
-        store.update_cluster(cluster_id, **fields)
-    except IntegrityError:
-        raise _error(409, "CLUSTER_NAME_TAKEN", f"같은 이름의 클러스터가 이미 있습니다: {fields.get('name')}") from None
-    updated = store.get_cluster(cluster_id)
-    assert updated is not None
-    return _view(updated)
-
-
-@router.delete("/{cluster_id}")
-async def delete_cluster(
+@router.get("/{cluster_id}/overview")
+async def cluster_overview(
     cluster_id: str,
     user: User = Depends(current_user),
-    store: ChatStore = Depends(get_store),
 ) -> dict[str, Any]:
-    await _writable(store, cluster_id, user)
+    """개요 (issue #102). 클러스터 namespace 의 워크로드·파드·최근 이벤트를 읽는다 — 응답 모양과 판정은 clusters/overview.py.
+
+    권한·자격증명은 연결 확인과 같은 길이다 — 못 보는 클러스터는 server 의 404, 팀 구성원 누구나 부른다.
+    읽기 전용이고 namespace 범위(`-n`)로만 조회한다. 상태(status)는 남기지 않는다 — 그건 연결 확인의 일이다.
+    CNI(network)는 세 조회가 다 된 뒤 kube-system DaemonSet 을 한 번 더 읽어 알아본다 (overview.NETWORK_COMMAND).
+    그 조회는 실패해도(Forbidden·시간 초과) 개요를 실패로 만들지 않고 network 만 null 로 둔다.
+    GPU(gpu)는 그 뒤에 노드 → 모든 파드 → 지표 순으로 읽는다 (clusters/gpu.py). 노드를 못 읽으면 gpu 만 null 이고 그 뒤는
+    읽지 않는다. GPU 노드가 없으면 GPU 를 기다리는 파드를 찾는다 — 있으면 nodes 가 빈 gpu 칸(꺼진 GPU 클러스터), 없으면 null.
+    server 값이 GPU 클러스터(true)가 아닌 곳은 이 파드를 GPU_ABSENT_RECHECK 초에 한 번만 찾는다. 알아낸 GPU 클러스터 여부를
+    server 에 남긴다(_record_gpu). Karpenter GPU 풀(gpu.node_pools)과 ServedModel(gpu.served_models)은 지표 전에 읽고, CRD 가 없거나
+    못 읽으면 그 칸만 null 이다. GPU 풀이 있으면 노드가 0대여도 gpu 칸을 주고 GPU 클러스터로 둔다. ServedModel 이 읽히면 측정 기록(gpu.benchmarks)도
+    읽는다. 잠깐 못 읽으면 마지막으로 성공한 값을, 그것도 없으면 빈 배열을 싣는다.
+
+    kubectl 이 실패하면 연결 확인과 같은 기준(_failure_status)으로 갈라 502 로 답한다.
+      CLUSTER_AUTH_EXPIRED  인증 실패·권한 없음 (연결 확인의 auth_expired)
+      CLUSTER_UNREACHABLE   그 밖의 실패 — 닿지 않음·시간 초과 (연결 확인의 disconnected)
+      CLUSTER_BAD_RESPONSE  kubectl 은 성공했는데 JSON 으로 읽지 못했다
+    401 이 아니라 502 인 이유: 앱은 401 을 사용자 토큰 만료로 읽고 로그아웃한다. 클러스터 자격증명 문제는 그게 아니다.
+    """
+    conn = await access.connection(cluster_id, user)
+    key = _connection_key(cluster_id, conn)
+
+    def collect() -> tuple[dict[str, Any], bool | None]:
+        outputs: dict[str, str] = {}
+        with access.kubeconfig(conn) as path:
+            for name, args in overview.READ_COMMANDS.items():
+                result = run_kubectl([*args, "-n", conn.namespace], context=conn.context_name,
+                                     kubeconfig=path, timeout=OVERVIEW_TIMEOUT)
+                if not result.success:
+                    _raise_kubectl_failure(result.stderr or result.stdout)   # 첫 실패에서 멈춘다
+                outputs[name] = result.stdout
+            # 앞의 세 조회가 다 된 뒤에만 돈다 — 닿지 않는 클러스터에서 시간을 더 쓰지 않는다
+            network = run_kubectl(overview.NETWORK_COMMAND, context=conn.context_name,
+                                  kubeconfig=path, timeout=OVERVIEW_TIMEOUT)
+
+            def run(args: list[str], timeout: int) -> KubectlResult:
+                return run_kubectl(args, context=conn.context_name, kubeconfig=path, timeout=timeout)
+
+            cluster_gpu, has_gpu = _collect_gpu(run, namespace_pods=outputs["pods"], namespace=conn.namespace,
+                                                 cache_key=key, known=conn.has_gpu)
+        if not network.success:
+            # 고객 클러스터는 kube-system 을 못 읽는 게 보통이라 대시보드가 부를 때마다 난다 — debug 로 둔다 (PR #117 리뷰).
+            # 원문(사용자·ARN 이 실린다)은 남기지 않고 갈래만 남긴다
+            logger.debug("개요의 CNI 조회를 건너뛴다 (kube-system DaemonSet): %s",
+                         _failure_status(network.stderr or network.stdout))
+        try:
+            return overview.build(context=conn.context_name, namespace=conn.namespace,
+                                  now=datetime.now(timezone.utc),
+                                  network=network.stdout if network.success else None, gpu=cluster_gpu,
+                                  **outputs), has_gpu
+        except ValueError as exc:
+            # JSON 이 아니거나 items 가 목록이 아닐 때만 (json.JSONDecodeError 도 ValueError). 우리 코드의 버그는 500 으로 둔다.
+            # 원문은 클러스터 내용이라 남기지 않고 예외 종류·위치만 남긴다
+            logger.warning("개요의 kubectl 출력을 읽지 못했다: %s", type(exc).__name__, exc_info=True)
+            raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
+                                      "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
+
+    async def compute() -> dict[str, Any]:
+        # 연결 확인과 같은 이유로 스레드로 넘긴다 — kubectl 이 도는 동안 서버 전체가 멈추지 않게
+        body, has_gpu = await to_thread.run_sync(collect, limiter=thread_limiter("overview", OVERVIEW_WORKERS))
+        await _record_gpu(conn, has_gpu)
+        return body
+
+    # 권한은 위에서 요청마다 본다(access.connection). 나눠 쓰는 것은 그 뒤의 kubectl 결과뿐이다
+    return await _shared_overview(key, compute)
+
+
+@router.get("/{cluster_id}/argocd/applications")
+async def argocd_applications(
+    cluster_id: str,
+    fresh: bool = False,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """ArgoCD 화면의 Application 목록 (DURO-140). 응답 모양은 kukie-electron docs/api-spec.md `ArgoApplications`.
+
+    권한·자격증명은 개요와 같은 길이다 — 못 보는 클러스터는 server 의 404, 팀 구성원 누구나 부른다.
+    `get applications.argoproj.io -A` 한 번이다(개요의 gpu 처럼 클러스터 namespace 밖). 한 줄 모양은 argocd.application_row.
+
+    status 로 클러스터에 ArgoCD 가 있는지도 알린다 — 셋 다 200 이고, ok 가 아니면 applications 는 빈 배열이다.
+      ok         Application 을 읽었다 (0개일 수 있다)
+      absent     applications.argoproj.io CRD 가 없다 — ArgoCD 없음
+      forbidden  읽을 권한이 없다 — 있는지 알 수 없다 (v4 제한 권한인 고객 클러스터)
+    그 밖의 kubectl 실패는 개요와 같이 502 CLUSTER_AUTH_EXPIRED·CLUSTER_UNREACHABLE, 출력을 못 읽으면 502 CLUSTER_BAD_RESPONSE.
+    같은 연결의 목록은 개요처럼 OVERVIEW_SHARE_TTL 초 동안 나눠 쓴다 (_shared_overview, 실패는 나눠 쓰지 않는다).
+    `?fresh=true` 는 화면의 "다시 읽기" 용이다 — 막 끝난 결과는 건너뛰고 새로 읽는다(진행 중인 한 번에는 같이 붙는다).
+    """
+    conn = await access.connection(cluster_id, user)
+
+    def collect() -> dict[str, Any]:
+        with access.kubeconfig(conn) as path:
+            result = run_kubectl(argocd.LIST_COMMAND, context=conn.context_name, kubeconfig=path,
+                                 timeout=OVERVIEW_TIMEOUT)
+        now = overview.iso(datetime.now(timezone.utc))
+        if not result.success:
+            kind = argocd.failure_kind(result.stderr or result.stdout)
+            if kind == "error":
+                _raise_kubectl_failure(result.stderr or result.stdout)
+            return {"status": kind, "at": now, "applications": []}
+        try:
+            applications = argocd.applications_response(result.stdout)
+        except (ValueError, AttributeError, TypeError) as exc:
+            # 원문은 클러스터 내용이라 남기지 않는다 (개요와 같다). spec·status 가 객체가 아닌 응답도 모양이 다른 것이다 (agent#125 리뷰)
+            logger.warning("ArgoCD 앱 목록을 읽지 못했다: %s", type(exc).__name__)
+            raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
+                                      "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
+        return {"status": "ok", "at": now, "applications": applications}
+
+    async def compute() -> dict[str, Any]:
+        # 개요와 같은 이유로 스레드로 넘긴다 — kubectl 이 도는 동안 서버 전체가 멈추지 않게
+        return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+
+    # 권한은 위에서 요청마다 본다. 응답에 사람마다 다른 값이 없어 나눠 써도 된다 (개요와 같다)
+    return await _shared_overview(_share_key(_connection_key(cluster_id, conn), "argocd"), compute, fresh=fresh)
+
+
+@router.get("/{cluster_id}/argocd/applications/{namespace}/{name}")
+async def argocd_application(
+    cluster_id: str,
+    namespace: str,
+    name: str,
+    fresh: bool = False,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """ArgoCD 화면의 앱 상세 패널 (DURO-145). namespace 는 Application 이 있는 곳(목록의 namespace, 보통 argocd)이다.
+
+    권한·자격증명·갈래는 목록 API 와 같다 — `get applications.argoproj.io <name> -n <namespace>` 한 번이다.
+    응답 {status, at, application} 의 application 모양은 argocd.application_detail (목록의 한 줄 + 상세 칸).
+      ok         읽었다
+      absent     applications.argoproj.io CRD 가 없다 — ArgoCD 없음 (application null)
+      forbidden  읽을 권한이 없다 (application null)
+    그 Application 이 없으면 404 ARGOCD_APP_NOT_FOUND — 클러스터를 못 볼 때의 404 NOT_FOUND 와 code 로 가른다.
+    그 밖의 실패는 목록과 같이 502 CLUSTER_AUTH_EXPIRED·CLUSTER_UNREACHABLE·CLUSTER_BAD_RESPONSE.
+    같은 연결·같은 앱의 상세는 목록처럼 OVERVIEW_SHARE_TTL 초 동안 나눠 쓴다. 404·502 는 나눠 쓰지 않는다 — 다음 요청이 새로 읽는다.
+    `?fresh=true` 도 목록과 같다 — 패널을 열 때·"다시 읽기" 를 누를 때 쓴다 (agent#125 리뷰).
+    """
+    conn = await access.connection(cluster_id, user)
+    if not argocd.valid_ref(namespace, name):
+        raise _app_not_found(namespace, name)
+
+    def collect() -> dict[str, Any]:
+        with access.kubeconfig(conn) as path:
+            result = run_kubectl(argocd.get_command(namespace, name), context=conn.context_name, kubeconfig=path,
+                                 timeout=OVERVIEW_TIMEOUT)
+        now = overview.iso(datetime.now(timezone.utc))
+        if not result.success:
+            stderr = result.stderr or result.stdout
+            kind = argocd.detail_failure(stderr, namespace=namespace, name=name)
+            if kind == "not_found":
+                raise _app_not_found(namespace, name)
+            if kind == "error":
+                _raise_kubectl_failure(stderr)
+            return {"status": kind, "at": now, "application": None}
+        try:
+            application = argocd.application_detail_response(result.stdout)
+        except (ValueError, AttributeError, TypeError) as exc:
+            logger.warning("ArgoCD 앱 상세를 읽지 못했다: %s", type(exc).__name__)
+            raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
+                                      "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
+        return {"status": "ok", "at": now, "application": application}
+
+    async def compute() -> dict[str, Any]:
+        return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+
+    key = _share_key(_connection_key(cluster_id, conn), "argocd", namespace, name)
+    return await _shared_overview(key, compute, fresh=fresh)
+
+
+@router.get("/{cluster_id}/argocd/applications/{namespace}/{name}/rendered")
+async def argocd_application_rendered(
+    cluster_id: str,
+    namespace: str,
+    name: str,
+    ref: str = "",
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """앱 path 를 ArgoCD 처럼 렌더한 결과 — "클러스터에 실제로 들어가는 것" (DURO-148). 렌더는 gitops/browse.py.
+
+    Application 을 읽는 길·갈래는 앱 상세와 같다(absent·forbidden 200, 없는 앱 404 ARGOCD_APP_NOT_FOUND, 502).
+    ref 를 주지 않으면 Application 의 targetRevision 을 렌더한다 — 클러스터가 맞춰 있는 커밋을 보려면 sync_revision 을 ref 로 준다.
+      ok             렌더했다. resources 는 객체마다 kind·name·namespace·yaml, Secret 은 값을 가린다
+      unsupported    Helm·Plugin·여러 소스·GitHub 가 아닌 소스 — message 에 까닭 (레포를 읽지 않는다)
+      render_failed  레포를 읽었는데 렌더가 안 된다 — message 에 까닭. kustomize 오류·path 가 없음 말고도:
+                     레포 밖 주소(원격 base·http 파일)를 가져오는 Kustomize, 파일에 이 컴퓨터 안 주소(localhost 등)가
+                     있는 레포, 레포 검사가 시간(10초)을 넘은 레포 — 렌더는 네트워크 없이 돈다 (manifests/render.py)
+    레포 쪽 실패는 레포 보기(tree·file)와 같은 코드다 — 409 GITOPS_REPO_NOT_CONNECTED, 404 GITOPS_REF_NOT_FOUND, 502 GITHUB_UNAVAILABLE.
+    Application 조회는 상세처럼 OVERVIEW_SHARE_TTL 초 나눠 쓰고, 같은 커밋·같은 path 의 렌더는 기억해 다시 하지 않는다 (browse.render).
+    """
+    conn = await access.connection(cluster_id, user)
+    if not argocd.valid_ref(namespace, name):
+        raise _app_not_found(namespace, name)
+
+    def collect() -> dict[str, Any]:
+        with access.kubeconfig(conn) as path:
+            result = run_kubectl(argocd.get_command(namespace, name), context=conn.context_name, kubeconfig=path,
+                                 timeout=OVERVIEW_TIMEOUT)
+        if not result.success:
+            stderr = result.stderr or result.stdout
+            kind = argocd.detail_failure(stderr, namespace=namespace, name=name)
+            if kind == "not_found":
+                raise _app_not_found(namespace, name)
+            if kind == "error":
+                _raise_kubectl_failure(stderr)
+            return {"status": kind}
+        try:
+            item = json.loads(result.stdout or "")
+            if not isinstance(item, dict) or not isinstance(item.get("metadata"), dict):
+                raise ValueError("Application 모양이 아니다")
+            return {"status": "ok", "item": item, "source": browse.render_source(item)}
+        except (ValueError, AttributeError, TypeError) as exc:
+            logger.warning("렌더할 ArgoCD 앱을 읽지 못했다: %s", type(exc).__name__)
+            raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
+                                      "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
+
+    async def compute() -> dict[str, Any]:
+        return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+
+    # 상세처럼 같은 연결·같은 앱의 Application 조회는 나눠 쓴다 — 패널을 다시 열 때마다 kubectl 이 돌지 않게 (agent#128 리뷰).
+    # 404·502 는 _shared_overview 가 나눠 쓰지 않는다. 나눠 쓰는 값은 고치지 않고 읽기만 한다
+    read = await _shared_overview(_share_key(_connection_key(cluster_id, conn), "argocd-rendered", namespace, name),
+                                  compute)
+    body: dict[str, Any] = {
+        "status": read["status"], "application": {"namespace": namespace, "name": name}, "message": None,
+        "repository": None, "repo_url": None, "path": None, "source_type": None, "target_revision": None,
+        "ref": None, "sha": None, "sync_revision": None, "destination_namespace": None, "html_url": None,
+        "notes": [], "resources": [], "total": 0, "truncated": False,
+    }
+    if read["status"] != "ok":
+        return body
+    item, source = read["item"], read["source"]
+    status = item.get("status") if isinstance(item.get("status"), dict) else {}
+    spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
+    sync = status.get("sync") if isinstance(status.get("sync"), dict) else {}
+    destination = spec.get("destination") if isinstance(spec.get("destination"), dict) else {}
+    body.update(
+        repository=source.repository, repo_url=source.repo_url or None, path=source.path,
+        source_type=source.source_type or None, target_revision=source.target_revision,
+        sync_revision=sync.get("revision") if isinstance(sync.get("revision"), str) else None,
+        destination_namespace=destination.get("namespace") if isinstance(destination.get("namespace"), str) else None,
+        notes=list(source.notes),
+    )
+    if source.unsupported:
+        return {**body, "status": "unsupported", "message": source.unsupported}
+    wanted = browse.clean_ref(ref or source.target_revision)
+    if wanted is None:
+        raise _ref_not_found(ref or source.target_revision)
+    assert source.repository is not None
+    token = await _repo_token(cluster_id, source.repository)
     try:
-        store.delete_cluster(cluster_id)
-    except ClusterInUse:
-        raise _error(
-            409, "CLUSTER_IN_USE",
-            "이 클러스터를 쓰는 대화가 남아 있습니다 — 대화를 먼저 정리하세요",
-        ) from None
-    return {"deleted": cluster_id}
+        revision, result = await browse.render_at(source.repository, token.token, wanted, source)
+    except browse.NotFound as exc:
+        raise _browse_not_found(exc) from None
+    except github.GitHubError as exc:
+        raise _github_failed(exc) from None
+    return {**body, **result, "ref": revision.ref, "sha": revision.sha,
+            "html_url": browse.html_url(source.repository, revision.sha, source.path or "", folder=True)}
+
+
+@router.get("/{cluster_id}/gitops/repos/{owner}/{repo}/tree")
+async def gitops_repo_tree(
+    cluster_id: str,
+    owner: str,
+    repo: str,
+    ref: str = "",
+    path: str = "",
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """연결된 매니페스트 레포의 폴더 하나 (DURO-148). 앱이 폴더를 펼칠 때마다 부른다 — 아래 폴더까지 읽지 않는다.
+
+    ref 는 브랜치·태그·커밋(빈 값이면 기본 브랜치), path 는 레포 루트 기준(빈 값이면 루트). 응답의 sha 를 다음 폴더·파일의 ref 로
+    주면 같은 커밋을 계속 본다. 항목은 폴더 먼저·이름순, browse.MAX_ENTRIES 개까지(넘으면 truncated).
+    폴더 항목과 지금 폴더에 그 경로를 쓰는 ArgoCD Application 을 붙인다 (browse.apps_for_folder·apps_around).
+    Application 을 못 읽어도 폴더는 준다 — applications_status 가 ok 가 아니고 앱 배지가 빈다.
+
+    권한은 개요와 같다(못 보는 클러스터 404). 레포는 그 클러스터에 연결된 것만 — 토큰은 server 가 주는 레포 범위 설치 토큰이다.
+      409 GITOPS_REPO_NOT_CONNECTED   이 클러스터에 연결된 레포가 아니다 — 앱은 "레포를 연결하면 볼 수 있어요"
+      409 GITHUB_APP_NOT_INSTALLED·GITHUB_APP_SUSPENDED   server 가 토큰을 못 줬다 (그대로 전한다)
+      404 GITOPS_REF_NOT_FOUND·GITOPS_PATH_NOT_FOUND       그 ref·경로가 레포에 없다 (폴더가 아닌 경로도)
+      502 GITHUB_UNAVAILABLE         GitHub 가 거절했거나 닿지 않았다 (호출 한도 포함)
+    """
+    conn = await access.connection(cluster_id, user)
+    repository, wanted, folder = _repo_request(owner, repo, ref, path)
+    token = await _repo_token(cluster_id, repository)
+
+    read = browse.open_folder(repository, token.token, wanted, folder)
+    (revision, listing), (apps_status, items) = await _with_apps(read, cluster_id, conn)
+    apps = browse.app_paths(items, repository)
+    for entry in listing["entries"]:
+        entry["applications"] = browse.apps_for_folder(apps, entry["path"], revision) if entry["type"] == "dir" else []
+    return {
+        **_revision_body(repository, revision, folder),
+        "html_url": browse.html_url(repository, revision.sha, folder, folder=True),
+        **listing,
+        "applications": browse.apps_around(apps, folder, revision, is_file=False),
+        "applications_status": apps_status,
+    }
+
+
+@router.get("/{cluster_id}/gitops/repos/{owner}/{repo}/file")
+async def gitops_repo_file(
+    cluster_id: str,
+    owner: str,
+    repo: str,
+    path: str,
+    ref: str = "",
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """연결된 매니페스트 레포의 파일 하나 — 읽기 전용 (DURO-148). 권한·ref·오류 코드는 tree 와 같다.
+
+    status
+      ok           content 에 내용 (UTF-8 글자)
+      masked       Secret 처럼 보여 내용 대신 가림 — masked_reason 에 까닭 (kind: Secret · stringData · sops · *.enc …)
+      too_large    browse.MAX_FILE_BYTES 를 넘는다 — html_url 로 GitHub 에서 본다
+      binary       글자 파일이 아니다
+      unsupported  심볼릭 링크·서브모듈
+    objects 는 YAML 문서마다 api_version·kind·name·namespace (가린 파일도 준다 — 이름은 비밀이 아니다). 그 파일을 쓰는 앱을 붙인다.
+    """
+    conn = await access.connection(cluster_id, user)
+    repository, wanted, file_path = _repo_request(owner, repo, ref, path)
+    token = await _repo_token(cluster_id, repository)
+
+    read = browse.open_file(repository, token.token, wanted, file_path)
+    (revision, view), (apps_status, items) = await _with_apps(read, cluster_id, conn)
+    apps = browse.app_paths(items, repository)
+    return {
+        **_revision_body(repository, revision, file_path),
+        "name": file_path.rsplit("/", 1)[-1],
+        "html_url": browse.html_url(repository, revision.sha, file_path, folder=False),
+        **view,
+        "applications": browse.apps_around(apps, file_path, revision, is_file=True),
+        "applications_status": apps_status,
+    }
+
+
+def _repo_request(owner: str, repo: str, ref: str, path: str) -> tuple[str, str, str]:
+    """URL 의 레포·ref·경로를 본다 — GitHub 경로에 넣기 전에. (소문자 owner/repo, ref, 경로)."""
+    repository = browse.repository_of(owner, repo)
+    if repository is None:
+        raise _repo_not_connected(f"{owner}/{repo}")
+    wanted = browse.clean_ref(ref)
+    if wanted is None:
+        raise _ref_not_found(ref)
+    cleaned = browse.clean_path(path)
+    if cleaned is None:
+        raise HTTPException(404, {"code": "GITOPS_PATH_NOT_FOUND", "message": f"레포 안 경로가 아니에요: {path}"})
+    return repository, wanted, cleaned
+
+
+async def _repo_token(cluster_id: str, repository: str) -> server_api.RepoToken:
+    """그 레포의 설치 토큰 — 이 클러스터에 연결된 레포인지도 여기서 본다. 토큰은 응답·로그에 싣지 않는다.
+    server 의 404 MANIFEST_REPO_NOT_CONNECTED 만 409 로 바꾼다 — 클러스터를 못 볼 때의 404 와 가르려고. 나머지는 그대로 전한다."""
+    try:
+        return await server_api.repo_token(cluster_id, repository)
+    except server_api.ServerError as exc:
+        if exc.code == "MANIFEST_REPO_NOT_CONNECTED":
+            raise _repo_not_connected(repository) from None
+        raise
+
+
+async def _with_apps(read, cluster_id: str, conn: server_api.ClusterConnection) -> tuple[Any, tuple[str, list]]:
+    """GitHub 읽기와 클러스터의 Application 목록을 나란히 기다린다. GitHub 쪽 실패만 오류로 올린다."""
+    try:
+        result, apps = await asyncio.gather(read, _gitops_apps(cluster_id, conn))
+    except browse.NotFound as exc:
+        raise _browse_not_found(exc) from None
+    except github.GitHubError as exc:
+        raise _github_failed(exc) from None
+    return result, (apps["status"], apps["items"])
+
+
+async def _gitops_apps(cluster_id: str, conn: server_api.ClusterConnection) -> dict[str, Any]:
+    """레포 보기에 붙일 Application 들 — {status, items}. 실패해도 올리지 않는다 (status: absent·forbidden·error).
+    앱 목록처럼 같은 연결이면 OVERVIEW_SHARE_TTL 초 나눠 쓴다 — 폴더를 펼칠 때마다 kubectl 이 돌지 않게."""
+    def collect() -> dict[str, Any]:
+        with access.kubeconfig(conn) as path:
+            result = run_kubectl(argocd.LIST_COMMAND, context=conn.context_name, kubeconfig=path,
+                                 timeout=OVERVIEW_TIMEOUT)
+        if not result.success:
+            kind = argocd.failure_kind(result.stderr or result.stdout)
+            logger.debug("레포 보기의 ArgoCD 앱 목록을 건너뛴다: %s", kind)
+            return {"status": kind, "items": []}
+        try:
+            return {"status": "ok", "items": argocd.parse_applications(result.stdout)}
+        except ValueError:
+            logger.debug("레포 보기의 ArgoCD 앱 목록을 읽지 못했다")
+            return {"status": "error", "items": []}
+
+    async def compute() -> dict[str, Any]:
+        return await to_thread.run_sync(collect, limiter=thread_limiter("argocd", ARGOCD_WORKERS))
+
+    return await _shared_overview(_share_key(_connection_key(cluster_id, conn), "gitops-apps"), compute)
+
+
+def _revision_body(repository: str, revision: browse.Revision, path: str) -> dict[str, Any]:
+    return {"repository": repository, "ref": revision.ref, "sha": revision.sha,
+            "default_branch": revision.default_branch, "path": path}
+
+
+def _repo_not_connected(repository: str) -> HTTPException:
+    return HTTPException(409, {"code": "GITOPS_REPO_NOT_CONNECTED",
+                               "message": f"레포 {repository} 가 이 클러스터에 연결돼 있지 않아요. 레포를 연결하면 볼 수 있어요."})
+
+
+def _ref_not_found(ref: str) -> HTTPException:
+    return HTTPException(404, {"code": "GITOPS_REF_NOT_FOUND", "message": f"브랜치·태그·커밋 이름이 아니에요: {ref}"})
+
+
+def _browse_not_found(exc: browse.NotFound) -> HTTPException:
+    code = "GITOPS_REF_NOT_FOUND" if exc.what == "ref" else "GITOPS_PATH_NOT_FOUND"
+    return HTTPException(404, {"code": code, "message": exc.message})
+
+
+def _github_failed(exc: github.GitHubError) -> HTTPException:
+    """GitHub 실패 → 502 GITHUB_UNAVAILABLE (server 의 토큰 발급 실패와 같은 코드). 문구는 HTTP 상태와 GitHub 의 message 뿐이다."""
+    logger.warning("레포 보기의 GitHub 호출이 실패했다: %s", exc)
+    return HTTPException(502, {"code": "GITHUB_UNAVAILABLE", "message": f"GitHub 를 읽지 못했어요 — {exc}"})
+
+
+def _share_key(key: str | None, *parts: str) -> str | None:
+    """_shared_overview 의 키를 읽는 것마다 가른다 — 개요는 연결 키 그대로, ArgoCD 목록·상세는 뒤에 붙인다.
+    `|` 는 클러스터 id·지문·쿠버네티스 이름에 없어 섞이지 않는다."""
+    return "|".join((key, *parts)) if key is not None else None
+
+
+def _app_not_found(namespace: str, name: str) -> HTTPException:
+    return HTTPException(404, {"code": "ARGOCD_APP_NOT_FOUND",
+                               "message": f"ArgoCD 앱 {namespace}/{name} 이 없다"})
+
+
+def _connection_key(cluster_id: str, conn: server_api.ClusterConnection) -> str | None:
+    """연결 하나의 키 — 클러스터 id·연결 지문·클러스터 namespace. namespace 기억(_readable_namespaces)과 나눠 쓰는
+    개요(_shared_overviews)가 같은 키를 쓴다. 지문이 없으면 연결이 바뀐 걸 모르니 None — 둘 다 기억하지 않는다."""
+    return f"{cluster_id}:{conn.fingerprint}:{conn.namespace}" if conn.fingerprint else None
+
+
+@dataclass
+class _SharedOverview:
+    """연결 하나의 개요 한 번 — _shared_overview."""
+    task: asyncio.Future | None              # 진행 중인 한 번. 끝나면 놓는다 — 코루틴이 연결(평문 자격증명)을 붙잡지 않게
+    body: dict[str, Any] | None = None       # 성공한 결과 (클러스터 내용뿐, 자격증명은 없다)
+    finished_at: float | None = None         # 성공으로 끝난 시각
+
+
+#: 연결(클러스터 id·연결 지문·클러스터 namespace)마다 진행 중이거나 막 끝난 개요 — ArgoCD 목록·상세는 _share_key 로 가른 키.
+#: 프로세스 안 값이라 복제본마다 따로다
+_shared_overviews: dict[str, _SharedOverview] = {}
+
+
+async def _shared_overview(key: str | None, compute, *, fresh: bool = False, clock=time.monotonic) -> dict[str, Any]:
+    """같은 연결의 개요를 OVERVIEW_SHARE_TTL 초 동안 나눠 쓴다 — 진행 중이면 그 한 번을 같이 기다리고, 막 끝났으면 그 결과.
+
+    실패(502 등)는 나눠 쓰지 않는다 — 같이 기다리던 요청은 같은 실패를 받고, 다음 요청은 새로 읽는다. 실패한 한 번이
+    아직 치워지기 전(완료 콜백은 다음 루프 바퀴에 돈다)에 온 요청도 새로 읽는다 (agent#122 리뷰).
+    기다리던 요청이 끊겨도(브라우저 탭 닫힘) 그 한 번은 끝까지 돈다 — 다른 요청이 같이 기다릴 수 있다.
+    끝나면 결과만 남기고 task 를 놓는다. 결과도 OVERVIEW_SHARE_TTL 뒤에 치운다 — 다음 요청이 안 와도 (agent#122 리뷰).
+    TTL 이 0 이면 나눠 쓰지 않는다.
+    fresh 면 FRESH_MIN_AGE 초보다 오래된 결과는 쓰지 않고 새로 읽는다 — 사람이 누른 "다시 읽기" 가 같은 몸통을 받지 않게.
+    진행 중인 한 번에는 같이 붙는다(누르기 전에 시작한 한 번이라도 kubectl 한 번 시간만큼만 앞선다). 새로 읽은 결과가 다음
+    요청들이 나눠 쓸 값이 된다.
+    """
+    if key is None or OVERVIEW_SHARE_TTL <= 0:
+        return await compute()
+    now = clock()
+    for stale in [k for k, e in _shared_overviews.items()
+                  if e.finished_at is not None and now - e.finished_at >= OVERVIEW_SHARE_TTL]:
+        del _shared_overviews[stale]
+    entry = _shared_overviews.get(key)
+    if entry is not None and entry.body is not None and (
+            not fresh or entry.finished_at is None or now - entry.finished_at < FRESH_MIN_AGE):
+        return entry.body
+    task = entry.task if entry is not None else None
+    if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+        task = asyncio.ensure_future(compute())
+        entry = _SharedOverview(task=task)
+        _shared_overviews[key] = entry
+        loop = asyncio.get_running_loop()
+
+        def drop(entry: _SharedOverview = entry) -> None:
+            if _shared_overviews.get(key) is entry:
+                del _shared_overviews[key]
+
+        def finished(done: asyncio.Future, entry: _SharedOverview = entry) -> None:
+            entry.task = None
+            if done.cancelled() or done.exception() is not None:
+                drop()
+                return
+            entry.body, entry.finished_at = done.result(), clock()
+            loop.call_later(OVERVIEW_SHARE_TTL, drop)
+
+        task.add_done_callback(finished)
+    return await asyncio.shield(task)
+
+
+def _collect_gpu(
+    run, *, namespace_pods: str, namespace: str | None = None, cache_key: str | None = None,
+    known: bool | None = None, clock=time.monotonic,
+) -> tuple[dict[str, Any] | None, bool | None]:
+    """(개요의 gpu 칸, GPU 클러스터인가) — clusters/gpu.py 의 "읽는 순서". 어느 단계가 실패해도 오류로 올리지 않는다.
+
+    GPU 노드가 있거나, 노드는 없어도 GPU 를 기다리는 파드가 있으면(0대로 내려 둔 GPU 클러스터) True 다. known 이 True 인 곳에서
+    ServedModel 이 읽혔을 때도(하나도 없어도 — 애드온이 깔린 꺼진 GPU 클러스터다) True 다. Karpenter GPU 풀이 있어도 True 다 —
+    노드 0대에 기다리는 파드도 모델도 없는 곳을 찾아내는 길은 이것뿐이다. 풀은 파드를 읽은 라운드마다 읽으므로, known 이 True 가
+    아닌 곳은 GPU_ABSENT_RECHECK 초에 한 번만 읽는다.
+    노드 목록을 못 읽었으면 None(모른다)이다. 노드가 없을 때 False 는 파드를 끝까지 읽어 기다리는 파드가 없다고 확인했을
+    때만이다 — 모든 namespace 파드를 읽었거나, namespace 마다 읽은 것이 전부 성공·거부로 끝났을 때. 시간 초과·예산 부족·
+    파드 목록 파싱 실패로 못 본 곳이 있으면 None 이다(꺼진 GPU 클러스터를 한 번의 실패로 "GPU 없음" 으로 덮지 않게).
+    known 이 True 인 곳은 ServedModel 조회도 CRD 없음·거부로 끝나야 False 다 — 시간 초과·예산 부족이면 None 이다.
+    NodePool 조회도 CRD 없음·거부·GPU 풀 없음으로 끝나야 False 다 — 못 읽은 풀이 GPU 풀일 수 있다.
+    gpu 칸의 waiting 은 늘 배열이다 — 파드 목록이 깨져 못 읽은 라운드도 빈 배열로 나간다(노드가 있을 때도, ServedModel 만 읽힌 꺼진
+    클러스터도). ServedModel 만 읽혔다고 그 라운드의 served_models 까지 버리지 않는다.
+    known 은 server 에 남은 값이다. True(GPU 클러스터)가 아니면 노드가 없을 때 파드를 GPU_ABSENT_RECHECK 초에 한 번만
+    찾는다(_absent_search_due) — 이 프로세스에서 기록이 없으면 바로 한 번. 그 사이에는 (None, 지금 값) 이다.
+
+    run(args, timeout) 은 개요와 같은 임시 kubeconfig 로 kubectl 을 돌린다. 실패 원문(사용자·ARN 이 실린다)은
+    남기지 않고 갈래만 debug 로 남긴다 — 고객 클러스터는 노드를 못 읽는 게 보통이라 대시보드가 부를 때마다 난다.
+    전체를 GPU_BUDGET 초 안에 끝낸다 — 조회마다 남은 시간만큼만 기다리고, 1초도 안 남으면 건너뛴다.
+    """
+    deadline = clock() + GPU_BUDGET
+
+    def budget(limit: int) -> int:
+        return min(limit, int(deadline - clock()))
+
+    nodes_result = run(gpu.NODES_COMMAND, budget(OVERVIEW_TIMEOUT))
+    if not nodes_result.success:
+        logger.debug("개요의 GPU 조회를 건너뛴다 (노드): %s", _failure_status(nodes_result.stderr or nodes_result.stdout))
+        return None, None
+    try:
+        nodes = gpu.gpu_nodes(nodes_result.stdout)
+    except (ValueError, AttributeError, TypeError):
+        logger.debug("개요의 GPU 조회를 건너뛴다 (노드 목록을 읽지 못했다)")
+        return None, None
+    if budget(OVERVIEW_TIMEOUT) < 1:
+        return gpu.build(nodes, [], benchmarks=_remembered_benchmarks(cache_key, clock)), (True if nodes else None)
+    # 예산을 본 뒤에 창을 잡는다 — 바로 아래에서 파드 조회를 늘 보내므로, 잡은 창은 조회를 보낸 라운드다
+    if not nodes and known is not True and not _absent_search_due(cache_key, unknown=known is None, clock=clock):
+        return None, (False if known is False else None)
+    gpu_node_names = {row["node"] for row in nodes}
+    pods_result = run(gpu.PODS_COMMAND, budget(OVERVIEW_TIMEOUT))
+    if pods_result.success:
+        pods_stdout, pods_complete = pods_result.stdout, True
+    else:
+        logger.debug("GPU 지표 파드를 namespace 마다 찾는다: %s", _failure_status(pods_result.stderr or pods_result.stdout))
+        # 탐색은 남은 예산의 절반까지만 — 지표를 읽을 시간을 남긴다 (agent#120 리뷰). GPU 노드가 없으면 지표를 읽지 않으니
+        # 쓴다 — 기다리는 파드를 찾는 길이 이것뿐이다 (agent#121 리뷰). 다만 NodePool 을 읽을 시간은 남긴다 — pools_budget 이 그
+        # 몫을 ServedModel 과 나눠, 이 라운드에 GPU 클러스터를 처음 찾아도 ServedModel 까지 답한다. GPU 로 알려진 꺼진 클러스터는
+        # ServedModel·측정 기록 몫을 따로 남긴다 (agent#138·#139·#144 리뷰). 일반 클러스터는 둘 다 읽지 않으니 그 몫을 떼지 않는다
+        search_deadline = (clock() + max(0.0, deadline - clock()) / 2 if nodes
+                           else deadline - GPU_NODE_POOLS_TIMEOUT
+                           - (GPU_SERVED_MODELS_TIMEOUT + GPU_BENCHMARKS_TIMEOUT if known is True else 0))
+
+        def search_budget(limit: int) -> int:
+            return min(limit, int(search_deadline - clock()))
+
+        pods_stdout, pods_complete = _pods_by_namespace(
+            run, search_budget, namespace_pods, namespace=namespace, gpu_node_names=gpu_node_names,
+            cache_key=cache_key, clock=clock)
+    try:
+        pods = gpu.running_pods(pods_stdout)
+        dcgm = gpu.dcgm_targets(pods, gpu_node_names)
+        vllm = gpu.vllm_targets(pods, gpu_node_names)
+    except (ValueError, AttributeError, TypeError):
+        logger.debug("GPU 지표 파드를 찾지 못했다 (파드 목록을 읽지 못했다)")
+        dcgm, vllm = {}, []
+    waiting: list[dict[str, Any]] | None
+    try:
+        waiting = gpu.waiting_pods(pods_stdout)
+    except (ValueError, AttributeError, TypeError):
+        logger.debug("GPU 를 기다리는 파드를 찾지 못했다 (파드 목록을 읽지 못했다)")
+        waiting = None                                      # 못 읽은 것과 "없다" 는 다르다 — 아래에서 None(모른다)
+
+    # GPU 노드가 있으면 NodePool·ServedModel 을 합쳐 남은 예산의 절반까지만 — namespace 탐색처럼 지표를 읽을 시간을 남긴다.
+    # 따로 절반씩 깎으면 지표 몫이 네 번째로 줄어 서빙 중인 모델이 화면에서 빠진다 (agent#138·#139 리뷰)
+    reads_deadline = clock() + max(0.0, deadline - clock()) / 2 if nodes else deadline
+
+    def pools_budget(limit: int) -> int:
+        """GPU 노드가 있으면 합친 몫의 절반. 없으면 ServedModel 몫을 남기되, 파드 조회가 매달려 모자란 라운드도 절반은 쓴다 —
+        GPU 풀만 있는 클러스터를 찾는 길이 이것뿐이다."""
+        remaining = reads_deadline - clock()
+        return min(limit, int(remaining / 2 if nodes else max(remaining - GPU_SERVED_MODELS_TIMEOUT, remaining / 2)))
+
+    node_pools, pools_absent = _read_node_pools(run, pools_budget)
+
+    def served_budget(limit: int) -> int:
+        return min(limit, int(reads_deadline - clock()))
+
+    # GPU 노드가 없으면 기다리는 파드나 GPU 풀이 있거나 GPU 클러스터로 알려진 곳만 읽는다 — GPU 없는 일반 클러스터에 조회를 늘리지 않는다
+    served_models, served_absent = None, True
+    read_served = nodes or waiting or node_pools or known is True
+    if read_served:
+        served_models, served_absent = _read_served_models(run, served_budget)
+    # 같은 몫 안에서 ServedModel 뒤에 읽는다 — 매달려도 지표 몫은 그대로다. 못 읽은 라운드는 기억해 둔 값을 쓴다
+    if served_models is not None:
+        benchmarks = _read_benchmarks(run, served_budget, cache_key=cache_key, clock=clock)
+    else:
+        if read_served and served_absent:                   # CRD 없음·거부 — 잠깐의 실패가 아니다
+            _forget_benchmarks(cache_key)
+        benchmarks = _remembered_benchmarks(cache_key, clock)
+    if not nodes:
+        if waiting or node_pools or served_models is not None:
+            return gpu.build([], [], waiting or [], served_models, node_pools, benchmarks), True
+        return None, (False if waiting is not None and pods_complete and served_absent and pools_absent else None)
+
+    def metrics(target: tuple[str, str, int]) -> tuple[str | None, float]:
+        """(/metrics 본문, 읽은 시각) — 시각은 서빙 p95 구간의 끝이라 파드마다 따로 잰다 (agent#137 리뷰)."""
+        namespace, pod, port = target
+        timeout = budget(GPU_METRICS_TIMEOUT)
+        if timeout < 1:
+            return None, clock()
+        result = run(gpu.proxy_command(namespace, pod, port), timeout)
+        if not result.success:
+            logger.debug("GPU 지표를 읽지 못했다 (%s/%s): %s", namespace, pod,
+                         _failure_status(result.stderr or result.stdout))
+            return None, clock()
+        return result.stdout, clock()
+
+    dcgm_rows = [row for row in nodes if row["node"] in dcgm]
+    targets = [dcgm[row["node"]] for row in dcgm_rows] + [(ns, pod, port) for ns, pod, port, _, _ in vllm]
+    with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
+        texts = list(pool.map(metrics, targets))
+    for row, (text, _) in zip(dcgm_rows, texts):
+        if text is not None:
+            gpu.apply_dcgm(row, text)
+    serving: list[dict[str, Any]] = []
+    remembered = _latency_memory(cache_key, clock())
+    for (namespace, pod, _, node, identity), (text, at) in zip(vllm, texts[len(dcgm_rows):]):
+        if text is None:
+            continue                                        # 이번에 못 읽은 파드의 기억은 둔다 — 다음 구간이 그만큼 길어질 뿐
+        pod_key = f"{namespace}/{pod}/{identity}"
+        rows, sample = gpu.serving_rows(text, pod=pod, node=node, previous=remembered.get(pod_key), at=at)
+        serving.extend(rows)
+        remembered[pod_key] = sample
+    if cache_key:
+        with _latency_lock:
+            _latency_samples[cache_key] = remembered
+    return gpu.build(nodes, serving, waiting or [], served_models, node_pools, benchmarks), True
+
+
+def _read_served_models(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:
+    """(ServedModel 줄, 없다고 확인했나) — clusters/gpu.py "ServedModel". 못 읽으면 줄은 None 이고 개요를 실패시키지 않는다.
+    둘째 값은 CRD 없음·거부일 때만 True 다 — 시간 초과·예산 부족·깨진 출력은 있는지 모른다."""
+    timeout = budget(GPU_SERVED_MODELS_TIMEOUT)
+    if timeout < 1:
+        return None, False
+    result = run(gpu.SERVED_MODELS_COMMAND, timeout)
+    if not result.success:
+        text = result.stderr or result.stdout or ""
+        logger.debug("ServedModel 을 읽지 못했다: %s", _failure_status(text))
+        return None, gpu.served_models_absent(text)
+    try:
+        return gpu.served_models(result.stdout), False
+    except (ValueError, AttributeError, TypeError):
+        logger.debug("ServedModel 을 읽지 못했다 (목록 모양이 아니다)")
+        return None, False
+
+
+def _read_benchmarks(run, budget, *, cache_key: str | None = None, clock=time.monotonic) -> list[dict[str, Any]]:
+    """측정 기록 줄 — clusters/gpu.py "측정 기록". 어떤 실패도 개요를 실패시키지 않는다. 시간 초과·예산 부족·깨진 출력은
+    마지막으로 성공한 값을 준다 — 한 번 실패로 표가 깜빡이지 않게 (agent#144 리뷰). 처음부터 실패면 [] 다.
+    거부는 잠깐의 실패가 아니라 "볼 수 없다" 는 답이라 기억을 지운다 — 권한을 거둔 고객의 값을 계속 보이지 않게."""
+    timeout = budget(GPU_BENCHMARKS_TIMEOUT)
+    if timeout < 1:
+        return _remembered_benchmarks(cache_key, clock)
+    result = run(gpu.BENCHMARKS_COMMAND, timeout)
+    if not result.success:
+        text = result.stderr or result.stdout or ""
+        logger.debug("측정 기록을 읽지 못했다: %s", _failure_status(text))
+        if gpu.served_models_absent(text):
+            _forget_benchmarks(cache_key)
+        return _remembered_benchmarks(cache_key, clock, timed_out=_timed_out(text))
+    try:
+        rows = gpu.benchmarks(result.stdout)
+    except (ValueError, AttributeError, TypeError, RecursionError):
+        logger.debug("측정 기록을 읽지 못했다 (목록 모양이 아니다)")
+        return _remembered_benchmarks(cache_key, clock)
+    if cache_key:
+        now = clock()
+        with _benchmarks_lock:
+            _forget_old_benchmarks(now)
+            _benchmarks_memory[cache_key] = _BenchmarksMemo(rows, now)
+    return rows
+
+
+def _timed_out(stderr: str) -> bool:
+    """kubectl 을 시간 제한으로 끊었거나(subprocess) kubectl 이 시간 초과로 끝났나 — 측정 기록 목록이 너무 커졌다는 신호일 수 있다."""
+    lowered = stderr.lower()
+    return "timed out" in lowered or "deadline exceeded" in lowered
+
+
+def _remembered_benchmarks(cache_key: str | None, clock=time.monotonic, *, timed_out: bool = False) -> list[dict[str, Any]]:
+    """연결의 마지막 성공 측정 기록, 없으면 []. 시간 초과면 다음 성공까지 경고를 한 번만 남긴다 — 표는 그대로라 로그 말고는
+    알아챌 길이 없고, 20초 주기마다 남기면 로그만 쌓인다. 연결 지문이 없으면(cache_key None) 기억이 없어 늘 [] 이고 경고도 매번이다."""
+    now = clock()
+    with _benchmarks_lock:
+        _forget_old_benchmarks(now)
+        memo = _benchmarks_memory.get(cache_key) if cache_key else None
+        warn = timed_out and not (memo and memo.warned)
+        if warn and cache_key:
+            memo = memo or _benchmarks_memory.setdefault(cache_key, _BenchmarksMemo([], now))
+            memo.warned = True
+        rows = memo.rows if memo else []
+    if warn:
+        logger.warning("측정 기록 조회가 시간 초과로 끝났다 — 기억해 둔 %d줄을 쓴다. ConfigMap 이 너무 많은지 본다", len(rows))
+    return rows
+
+
+def _forget_benchmarks(cache_key: str | None) -> None:
+    if cache_key:
+        with _benchmarks_lock:
+            _benchmarks_memory.pop(cache_key, None)
+
+
+def _forget_old_benchmarks(now: float) -> None:
+    """GPU_BENCHMARKS_FORGET 초보다 오래된 기억을 어느 연결의 것이든 지운다. _benchmarks_lock 안에서 부른다."""
+    for key in [key for key, memo in _benchmarks_memory.items() if now - memo.at >= GPU_BENCHMARKS_FORGET]:
+        del _benchmarks_memory[key]
+
+
+def _read_node_pools(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:
+    """(GPU 풀 줄, GPU 풀이 없다고 확인했나) — clusters/gpu.py "Karpenter GPU 풀". 못 읽으면 줄은 None 이고 개요를 실패시키지 않는다.
+    CRD 없음은 못 읽은 것이 아니라 줄이 [] 다 — 앱이 Karpenter 설치를 안내한다. 거부는 줄이 None 이다.
+    둘째 값은 CRD 없음·거부이거나 읽었는데 GPU 풀이 없을 때만 True 다 — 시간 초과·예산 부족·깨진 출력은 있는지 모른다.
+    꺼 둔 풀은 줄에 싣지 않지만 "없다" 도 아니다 — 상한을 잠깐 0 으로 내린 클러스터의 hasGpu 를 덮지 않는다."""
+    timeout = budget(GPU_NODE_POOLS_TIMEOUT)
+    if timeout < 1:
+        return None, False
+    result = run(gpu.NODE_POOLS_COMMAND, timeout)
+    if not result.success:
+        text = result.stderr or result.stdout or ""
+        if gpu.node_pools_crd_missing(text):
+            return [], True
+        logger.debug("NodePool 을 읽지 못했다: %s", _failure_status(text))
+        return None, gpu.node_pools_absent(text)
+    try:
+        rows, disabled = gpu.node_pools(result.stdout)
+    except (ValueError, AttributeError, TypeError):
+        logger.debug("NodePool 을 읽지 못했다 (목록 모양이 아니다)")
+        return None, False
+    return rows, not rows and not disabled
+
+
+def _latency_memory(cache_key: str | None, now: float) -> dict[str, gpu.LatencySample]:
+    """연결 하나의 vLLM 파드별 직전 누적 히스토그램 (복사본) — 최근 구간 p95 (DURO-124, clusters/gpu.py "서빙").
+
+    LATENCY_WINDOW_MAX 초보다 오래된 기억은 어느 연결의 것이든 지운다 — 대시보드를 닫았다 한참 뒤에 열면 "최근" 이 아니고,
+    사라진 파드·지운 클러스터의 기억이 쌓이지 않게. 연결 지문이 없으면(cache_key None) 기억하지 않아 p95 는 늘 null 이다.
+    """
+    with _latency_lock:
+        for key, samples in list(_latency_samples.items()):
+            live = {pod: sample for pod, sample in samples.items() if now - sample.at < LATENCY_WINDOW_MAX}
+            if live:
+                _latency_samples[key] = live
+            else:
+                del _latency_samples[key]
+        return dict(_latency_samples.get(cache_key, {})) if cache_key else {}
+
+
+@dataclass(frozen=True)
+class _NamespaceMemo:
+    """연결 하나의 namespace 기억 — _pods_by_namespace."""
+    at: float                          # 목록을 마지막으로 읽어 본 시각
+    names: tuple[str, ...]             # 다시 읽을 namespace (Forbidden 은 빠진다)
+    productive: frozenset[str]         # GPU 지표 파드(DCGM·vLLM)나, GPU 노드 0대 라운드의 기다리는 파드가 나온 namespace
+    cursors: tuple[int, int] = (0, 0)  # 앞 줄·뒤 줄에서 다음에 읽기 시작할 자리
+    whole: bool = True                 # names 가 목록 전부다 — MAX_POD_NAMESPACES 로 자르지 않았다
+
+
+@dataclass
+class _BenchmarksMemo:
+    rows: list[dict[str, Any]]
+    at: float                          # 마지막으로 읽은 시각. 처음부터 시간 초과면 그 시각이고 rows 는 비어 있다
+    warned: bool = False               # 이 실패가 이어지는 동안 시간 초과 경고를 남겼다
+
+
+#: 연결(클러스터 id·연결 지문·클러스터 namespace)마다의 기억. 프로세스 안 기억이라 복제본마다 따로 채운다.
+#: 연결을 바꾸면 키가 달라져 옛 기억을 쓰지 않는다
+_readable_namespaces: dict[str, _NamespaceMemo] = {}
+_readable_lock = threading.Lock()
+#: 연결마다 GPU 노드 없는 곳에서 기다리는 파드를 마지막으로 찾은 시각 — _absent_search_due
+_gpu_absent_checked: dict[str, float] = {}
+#: 연결마다 vLLM 파드(namespace/파드/정체)별 직전 수집의 누적 히스토그램 — _latency_memory. 프로세스 안 기억이라
+#: 복제본마다 따로고, 재시작하면 첫 수집은 다시 null 이다
+_latency_samples: dict[str, dict[str, gpu.LatencySample]] = {}
+_latency_lock = threading.Lock()
+#: 연결마다 마지막으로 성공한 측정 기록 — _read_benchmarks. 한 연결에 많아야 MAX_BENCHMARKS 줄이고 GPU_BENCHMARKS_FORGET 뒤에 지운다
+_benchmarks_memory: dict[str, _BenchmarksMemo] = {}
+_benchmarks_lock = threading.Lock()
+
+
+def _absent_search_due(cache_key: str | None, *, unknown: bool, clock=time.monotonic) -> bool:
+    """GPU 노드가 없는 연결에서 지금 기다리는 파드를 찾을 때인가 (GPU_ABSENT_RECHECK). 기록이 없으면 바로, 있으면 마지막으로
+    찾은 뒤 간격이 지났을 때. True 면 그 자리에서 시각을 남긴다 — 잠금 안이라 같은 연결의 개요가 동시에 와도 한 번만
+    찾는다 (agent#121 리뷰). 부르는 쪽은 예산을 본 뒤에 불러 True 면 반드시 파드 조회를 보낸다.
+    연결 지문이 없으면(cache_key None) 셀 키가 없다 — 모르는 곳(unknown, server 값 null)은 찾고, false 는 찾지 않는다
+    (지금 서버는 등록한 클러스터마다 지문을 준다)."""
+    if cache_key is None:
+        return unknown
+    now = clock()
+    with _readable_lock:
+        for key in [key for key, at in _gpu_absent_checked.items()
+                    if key != cache_key and now - at >= GPU_ABSENT_RECHECK_FORGET]:
+            del _gpu_absent_checked[key]
+        last = _gpu_absent_checked.get(cache_key)
+        if last is not None and now - last < GPU_ABSENT_RECHECK:
+            return False
+        _gpu_absent_checked[cache_key] = now
+        return True
+
+
+def _rotate(names: list[str], start: int) -> list[str]:
+    if not names:
+        return names
+    start %= len(names)
+    return names[start:] + names[:start]
+
+
+def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | None, gpu_node_names: set[str],
+                       cache_key: str | None, clock=time.monotonic) -> tuple[str, bool]:
+    """(파드 목록, 끝까지 읽었나) — 모든 namespace 파드를 못 읽을 때의 길, clusters/gpu.py "읽는 순서" 2.
+
+    끝까지 읽었다는 것은 namespace 목록 전부를 알았고(TTL 안의 기억도 된다) 그 전부가 성공이나 거부(Forbidden)로 끝났다는
+    것이다. 거부된 곳은 Kukie 가 볼 수 없는 곳이라 "못 본 곳" 으로 치지 않는다. 시간 초과·예산 부족이 하나라도 있거나,
+    목록이 MAX_POD_NAMESPACES 로 잘렸거나, 목록을 못 읽어 TTL 지난 기억으로 읽었으면 False 다 (agent#121 리뷰).
+
+    namespace 목록을 읽고 namespace 마다 파드를 읽어(동시에, 하나에 GPU_PODS_TIMEOUT 초) 읽힌 것만 개요의 클러스터
+    namespace 파드와 합친다. 클러스터 namespace(개요가 이미 읽었다)는 다시 읽지 않는다. 고객이 지표 RoleBinding 을
+    걸지 않은 namespace 는 Forbidden 이라 조용히 빠진다. 찾은 것으로 일찍 멈추지 않는다 — vLLM 은 몇 개인지 정해져
+    있지 않고, vLLM·DCGM 이 없는 클러스터(학습용, AMD)도 있다.
+
+    거부되는 조회가 대시보드를 부를 때마다 고객 감사 로그에 쌓이지 않게, 연결마다 READABLE_NAMESPACES_TTL 초 기억한다
+    (agent#120 리뷰). 그동안은 목록을 다시 읽지 않고 기억한 namespace 만 읽고, Forbidden 으로 확인된 것은 그때그때 뺀다.
+    읽는 순서는 두 줄이다 — 앞 줄: GPU 지표 파드(노드 0대 라운드는 기다리는 파드)가 나온 적 있는 것과 GPU 쪽 이름, 뒤 줄: 나머지. 줄마다 지난번에 멈춘
+    자리부터 돌아가며 읽고(라운드 로빈), 앞 줄 첫째 다음에 뒤 줄 하나를 끼운다 — 예산이 모자라도 어느 줄도 굶지 않는다.
+    목록을 다시 읽다 실패하면 지난 기억으로 읽는다. 연결 지문이 없으면(cache_key None) 기억하지 않는다.
+    namespace 목록도 기억도 없으면(GPU 읽기 RBAC 를 적용하지 않은 클러스터) 클러스터 namespace 파드만 쓴다.
+    """
+    def read(name: str) -> tuple[str | None, str]:
+        """(파드 목록, 결과) — 결과는 ok · forbidden · unknown(시간 초과 등) · skipped(예산 부족)."""
+        timeout = budget(GPU_PODS_TIMEOUT)
+        if timeout < 1:
+            return None, "skipped"
+        result = run(gpu.namespace_pods_command(name), timeout)
+        if result.success:
+            return result.stdout, "ok"
+        return None, "forbidden" if "forbidden" in (result.stderr or result.stdout or "").lower() else "unknown"
+
+    now = clock()
+    with _readable_lock:
+        memo = _readable_namespaces.get(cache_key) if cache_key else None
+    productive = set(memo.productive) if memo else set()
+    names, listed_at = None, memo.at if memo else now
+    whole = False                                           # names 가 지금 목록 전부인가 — 끝까지 읽었나의 조건
+    if memo and now - memo.at < READABLE_NAMESPACES_TTL:
+        names, whole = list(memo.names), memo.whole
+    elif budget(OVERVIEW_TIMEOUT) >= 1:
+        listed_at = now                                     # 목록을 실제로 읽어 본 라운드만 시각을 새로 한다
+        names_result = run(gpu.NAMESPACES_COMMAND, budget(OVERVIEW_TIMEOUT))
+        if names_result.success:
+            try:
+                names, whole = gpu.namespace_names(names_result.stdout, skip=namespace, prefer=productive)
+            except (ValueError, AttributeError, TypeError):
+                logger.debug("namespace 목록을 읽지 못했다")
+        else:
+            logger.debug("namespace 목록을 읽지 못했다: %s", _failure_status(names_result.stderr or names_result.stdout))
+    if names is None:
+        if not memo:
+            return namespace_pods, False
+        names = list(memo.names)                            # 목록만 못 읽었으면 지난 기억으로 읽는다
+
+    cursors = memo.cursors if memo else (0, 0)
+    front = [name for name in names if name in productive or gpu.hinted_namespace(name)]
+    back = [name for name in names if name not in front]
+    # 줄마다 돌린 뒤 앞 줄 첫째 다음에 뒤 줄 하나를 끼운다 — 앞 줄이 예산을 다 써도 뒤 줄이 매 라운드 한 칸은 돈다
+    first, second = _rotate(front, cursors[0]), _rotate(back, cursors[1])
+    order = first[:1] + second[:1] + first[1:] + second[1:]
+    with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
+        results = dict(zip(order, pool.map(read, order)))
+
+    if cache_key:
+        tried = [sum(results[name][1] != "skipped" for name in line) for line in (front, back)]
+        for name, (stdout, outcome) in results.items():
+            if outcome == "ok" and (gpu.has_gpu_targets(stdout, gpu_node_names)
+                                    or (not gpu_node_names and gpu.has_waiting_pods(stdout))):
+                # GPU 노드가 0대인 라운드는 기다리는 파드가 나온 곳을 기억한다 — 노드가 뜨면 거기서 지표 파드가 돈다
+                productive.add(name)
+            elif outcome == "forbidden" or (outcome == "ok" and gpu_node_names):
+                # 읽었는데 GPU 파드가 없거나 거부 — 한 번 느렸다고 빼지 않는다. GPU 노드가 0대인 라운드(꺼진 GPU
+                # 클러스터)는 지표 파드가 없는 게 당연하니 지난 기억을 지우지 않는다
+                productive.discard(name)
+        keep = tuple(name for name in names if results[name][1] != "forbidden")
+        next_memo = _NamespaceMemo(at=listed_at, names=keep, productive=frozenset(productive & set(keep)),
+                                   cursors=(cursors[0] + tried[0], cursors[1] + tried[1]), whole=whole)
+        with _readable_lock:
+            # 지운 클러스터·바뀐 연결의 옛 기억이 쌓이지 않게. TTL 두 배까지는 남겨 목록을 못 읽을 때 쓴다
+            for key in [key for key, old in _readable_namespaces.items() if now - old.at >= 2 * READABLE_NAMESPACES_TTL]:
+                del _readable_namespaces[key]
+            _readable_namespaces[cache_key] = next_memo
+    settled = [outcome in ("ok", "forbidden") for _, outcome in results.values()]
+    merged = gpu.merge_pod_lists([namespace_pods, *(stdout for stdout, _ in results.values() if stdout is not None)])
+    return merged, whole and all(settled)
+
+
+def _has_gpu(nodes: KubectlResult) -> bool | None:
+    """연결 확인의 노드 목록으로 본 GPU 노드 유무. 못 읽었으면 None."""
+    if not nodes.success:
+        return None
+    try:
+        return bool(gpu.gpu_nodes(nodes.stdout))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+async def _record_gpu(conn: server_api.ClusterConnection, has_gpu: bool | None) -> bool:
+    """알아낸 GPU 노드 유무가 server 에 남은 값과 다를 때만 남긴다 — 개요는 대시보드가 띄울 때마다 부른다.
+
+    모르면(None) 남기지 않는다 — 권한이 없어진 클러스터의 마지막 값을 지우지 않는다. 읽는 사이 kubeconfig 가 바뀌었으면
+    server 가 지문으로 가려 409 CLUSTER_CHANGED 다 (kukie-server#82 리뷰). 남기지 못해도 오류로 올리지 않는다:
+    부가 정보라 개요·연결 확인을 실패로 만들 까닭이 없고, 다음 호출이 다시 남긴다.
+    server 의 값이 이제 has_gpu 와 같은가(이미 같았거나 남겼다)를 준다.
+    """
+    if has_gpu is None:
+        return False
+    if has_gpu == conn.has_gpu:
+        return True
+    if not conn.fingerprint:
+        # server 가 늘 409 로 거절할 호출이다 — 부르지 않되 동기화가 멈춘 것은 남긴다
+        logger.warning("클러스터 %s 의 GPU 여부를 남기지 못했다: 연결 정보에 지문이 없다", conn.cluster_id)
+        return False
+    try:
+        await server_api.update_cluster_gpu(conn.cluster_id, has_gpu=has_gpu, fingerprint=conn.fingerprint)
+    except server_api.ServerError as exc:
+        logger.warning("클러스터 %s 의 GPU 여부를 남기지 못했다: %s", conn.cluster_id, exc.code)
+        return False
+    return True
+
+
+def _raise_kubectl_failure(stderr: str) -> None:
+    # 실패 사유는 그대로 보여줘야 고칠 수 있다 (연결 확인의 detail 과 같다). 자격증명은 원래 stderr 에 실리지 않는다
+    reason = stderr.strip()[:500]
+    if _failure_status(stderr) == "auth_expired":
+        raise HTTPException(502, {"code": "CLUSTER_AUTH_EXPIRED",
+                                  "message": f"클러스터 인증에 실패했거나 권한이 없다: {reason}"})
+    raise HTTPException(502, {"code": "CLUSTER_UNREACHABLE", "message": f"클러스터에 연결할 수 없다: {reason}"})
 
 
 def _failure_status(stderr: str) -> str:

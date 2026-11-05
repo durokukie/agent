@@ -1,54 +1,43 @@
 """등록된 클러스터로 kubectl 을 실행할 준비 (기획 04 §8 "실행 방식").
 
-요청마다 자격증명을 풀어 임시 kubeconfig 파일을 만들고, 블록을 벗어나면 지운다.
-푼 값은 이 모듈과 그 파일 밖으로 나가지 않는다 — 로그·LLM 입력·승인 카드에 실리지 않는다.
+자격증명은 Kukie API 서버(kukie-server)가 암호화해 보관한다 (DURO-113). agent 는 실행 직전에 내부 API
+`GET /internal/clusters/{id}/connection` 으로 평문을 받아 임시 kubeconfig 를 만들고, 블록을 벗어나면 지운다.
+받은 값은 이 모듈과 그 파일 밖으로 나가지 않는다 — 로그·LLM 입력·승인 카드에 실리지 않는다.
+
+"이 사용자가 이 클러스터를 써도 되나" 와 "승인한 대상 = 실행 대상"(방이 복사해 둔 지문 대조)은 server 가
+그 호출에서 판단한다 — 못 보는 클러스터는 404 NOT_FOUND, 지문이 다르면 409 CLUSTER_CHANGED (ServerError).
+
+받기(connection)와 파일 만들기(kubeconfig)를 나눠 둔 이유: 대화 경로는 권한 판단을 **방 잠금을 잡기 전에**
+끝내야 하고(잠금 검사와 획득 사이에 await 가 있으면 안 된다), 파일은 실행하는 동안만 있어야 한다.
 """
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
 
-from kukie_agent.clusters import crypto, runtime
-
-
-class ClusterGone(LookupError):
-    """방이 가리키는 클러스터가 없다 — 지워졌다."""
+from kukie_agent import server_api
+from kukie_agent.auth import User
+from kukie_agent.clusters import runtime
 
 
-class ClusterChanged(LookupError):
-    """방이 승인한 대상과 지금 등록된 클러스터가 다르다 (지문 불일치)."""
+async def connection(
+    cluster_id: str, user: User, *, expected_fingerprint: str | None = None,
+) -> server_api.ClusterConnection:
+    """사용자 토큰으로 연결 정보를 받는다. 권한·지문 검사는 server 가 한다."""
+    return await server_api.cluster_connection(cluster_id, user, expected_fingerprint=expected_fingerprint)
 
 
 @contextmanager
-def kubeconfig_for(store: Any, cluster_id: str, *, expect_fingerprint: str | None = None) -> Iterator[Path]:
-    """expect_fingerprint 를 주면 방이 복사해 둔 지문과 지금 행을 대조한다 (기획 04 §8).
-
-    "승인한 대상 = 실행 대상" 을 지키는 검사다. 지금은 PATCH 가 지문 바뀜을 막고 있지만,
-    방어가 한 곳뿐이면 그 한 곳이 뚫릴 때 조용히 다른 클러스터를 건드리게 된다 (자동 리뷰 지적).
-    """
-    row = store.get_cluster(cluster_id)
-    encrypted = store.cluster_credential(cluster_id)
-    if row is None or encrypted is None:
-        raise ClusterGone(cluster_id)
-    if expect_fingerprint and row.fingerprint != expect_fingerprint:
-        raise ClusterChanged(cluster_id)
-    credential = crypto.decrypt(encrypted)      # CredentialUnreadable 은 부르는 쪽이 안내로 바꾼다
+def kubeconfig(conn: server_api.ClusterConnection) -> Iterator[Path]:
+    """받은 연결 정보로 임시 kubeconfig 를 만들고 경로를 준다. 블록을 벗어나면 지운다."""
     body = runtime.build(
-        context_name=row.context_name,
-        api_server=row.api_server,
-        ca_data=row.ca_data,
-        namespace=row.default_namespace,
-        credential=credential,
-        insecure=row.insecure,
+        context_name=conn.context_name,
+        api_server=conn.api_server,
+        ca_data=conn.ca_data,
+        namespace=conn.namespace,
+        credential=conn.credential,
+        insecure=conn.insecure,
     )
     with runtime.temporary_kubeconfig(body) as path:
         yield path
-
-
-def kubeconfig_or_none(store: Any, cluster_id: str | None, *, expect_fingerprint: str | None = None):
-    """방에 등록된 클러스터가 없으면(옛 방·로컬 개발) 아무것도 안 하는 블록을 준다."""
-    if cluster_id is None:
-        return nullcontext(None)
-    return kubeconfig_for(store, cluster_id, expect_fingerprint=expect_fingerprint)

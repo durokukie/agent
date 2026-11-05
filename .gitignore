@@ -5,5 +5,5 @@ __pycache__/
 *.egg-info/
 dist/
 
-# 로컬 SQLite (kukie_agent/store, 기본 ~/.kukie/kukie.db — 레포 안에 두면 무시)
+# 예전 로컬 SQLite 파일 (DURO-113 전에 agent 가 DB 를 가졌을 때) — 레포 안에 남아 있어도 커밋되지 않게
 *.db
