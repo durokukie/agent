@@ -249,9 +249,8 @@ async def chat(
                 payload, result = await _server._chat_turn(session, body.text)
         except HTTPException as exc:
             await repo_link_memo.settle(session.deps, saved=False)
-            wrapped = _wrap(exc)
-            await _fail_run(run, wrapped)
-            raise wrapped
+            await _fail_run(run, exc)
+            raise
         except Exception as exc:                 # 모델·툴 예외 — run 은 실패로 남기고 세션은 유지
             await repo_link_memo.settle(session.deps, saved=False)
             logger.exception("run 실패 (conversation=%s, run=%s)", conversation_id, run.id)
@@ -424,13 +423,13 @@ async def approve(
 
     async def work() -> dict[str, Any]:
         _bind_run(session, run, user)
-        # 결정 검사·기록은 server._approve 가 한다 (문자열 detail). 여기서는 코드 객체로 감싼다.
+        # 결정 검사·기록은 server._approve 가 한다. 오류는 거기서 이미 {code, message} 로 나온다.
         try:
             with _with_cluster(session, conn):
                 outcome, result = await _server._approve(session, body.call_id, body.approved)
         except HTTPException as exc:
             await repo_link_memo.settle(session.deps, saved=False)
-            raise await _record_failure(run, _wrap(exc))
+            raise await _record_failure(run, exc)
         return await _continue_run(conversation, run, outcome, result, plan_ids)
 
     return await _finish_locked(conversation, work, plan_ids, detach=detach)
@@ -463,7 +462,7 @@ async def resume(
                 outcome, result = await _server._resume(session)
         except HTTPException as exc:
             await repo_link_memo.settle(session.deps, saved=False)
-            raise await _record_failure(run, _wrap(exc))
+            raise await _record_failure(run, exc)
         return await _continue_run(conversation, run, outcome, result, plan_ids)
 
     return await _finish_locked(conversation, work, plan_ids, detach=detach)
@@ -577,32 +576,6 @@ async def _record_failure(run: server_api.Run, exc: HTTPException) -> HTTPExcept
 def _error_record(exc: HTTPException) -> dict[str, Any]:
     detail = dict(exc.detail)
     return error_payload(detail.pop("code", "ERROR"), detail.pop("message", ""), exc.status_code, **detail)
-
-
-# ── server.py 의 문자열 detail 을 {code, message} 로 ─────────
-
-_CODES: list[tuple[str, str]] = [
-    ("세션이 없다", "NO_SESSION"),
-    ("이전 요청 처리 중", "BUSY"),
-    ("요청 처리 중", "BUSY"),
-    ("승인 대기 중", "PENDING_APPROVAL"),
-    ("이미 결정한", "ALREADY_DECIDED"),
-    ("대기 중인 승인 건이 아니다", "NOT_PENDING"),
-    ("재개할 승인 건이 없다", "NOT_PENDING"),
-    ("아직 결정하지 않은", "PENDING_APPROVAL"),
-    ("거절을 기록하지 못했다", "REJECT_FAILED"),
-    ("kubeconfig", "KUBECONFIG"),
-    ("pending approval mismatch", "APPROVAL_MISMATCH"),
-]
-
-
-def _wrap(exc: HTTPException) -> HTTPException:
-    """server.py 가 던진 문자열 detail 을 코드 객체로. 이미 객체면(RESUME_RETRYABLE, server 오류) 그대로."""
-    if isinstance(exc.detail, dict):
-        return exc
-    text = str(exc.detail)
-    code = next((c for prefix, c in _CODES if text.startswith(prefix) or prefix in text), "ERROR")
-    return HTTPException(exc.status_code, {"code": code, "message": text})
 
 
 _server.app.include_router(router)   # server.py 맨 아래의 plain import 가 이 줄을 실행시킨다
