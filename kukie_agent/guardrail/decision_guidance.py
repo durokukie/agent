@@ -30,7 +30,7 @@ INSTRUCTIONS = prompts.load("decision_guidance")
 # get(키, 기본값)은 그때 빈 문자열을 돌려줘 Agent("") 가 import 시점에 UserError 로
 # 터진다 (CodeRabbit 지적). 빈 값을 미설정과 같게 취급한다 — observability 와 같은 패턴.
 def _guidance_model() -> str:
-    return os.environ.get("KUKIE_GUIDANCE_MODEL") or "openai:gpt-5.6-luna"
+    return os.environ.get("KUKIE_GUIDANCE_MODEL") or "openai:gpt-6-luna"
 
 
 GUIDANCE_MODEL = _guidance_model()
