@@ -93,17 +93,17 @@ def test_GPU_노드도_기다리는_파드도_없으면_build는_None이다():
     assert gpu.gpu_nodes(fixture("nodes.json")) == []
     assert gpu.build([], []) is None and gpu.build([], [], []) is None
     assert gpu.build([{"node": "n"}], []) == {"nodes": [{"node": "n"}], "serving": [], "benchmarks": [], "waiting": [],
-                                              "served_models": None, "node_pools": None}
+                                              "served_models": None, "node_pools": None, "counter": None}
     waiting = [{"namespace": "llm", "pod": "vllm-0", "gpus": 1, "phase": "Pending"}]
     assert gpu.build([], [], waiting) == {"nodes": [], "serving": [], "benchmarks": [], "waiting": waiting,
-                                          "served_models": None, "node_pools": None}
+                                          "served_models": None, "node_pools": None, "counter": None}
     # ServedModel 을 읽었으면 하나도 없어도 칸이 있다 — null(못 읽음)과 빈 배열(없음)은 다르다
     assert gpu.build([], [], [], []) == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [], "served_models": [],
-                                         "node_pools": None}
+                                         "node_pools": None, "counter": None}
     # GPU 풀이 있으면 그것만으로 칸이 있다. 빈 배열은 "GPU 풀 없음" 이라 칸을 만들지 않는다
     pool = [{"name": "gpu", "gpu_limit": 2}]
     assert gpu.build([], [], [], None, pool) == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [],
-                                                 "served_models": None, "node_pools": pool}
+                                                 "served_models": None, "node_pools": pool, "counter": None}
     assert gpu.build([], [], [], None, []) is None
 
 
@@ -125,21 +125,21 @@ def test_ServedModel을_namespace_이름순으로_응답_줄로_바꾼다():
     assert gpu.served_models(fixture("served_models.json")) == [
         {"namespace": "a-team", "name": "gpt-oss-20b", "model": "openai/gpt-oss-20b", "phase": "Failed",
          "reason": "Unschedulable", "message": "0/2 nodes are available: 2 Insufficient nvidia.com/gpu.",
-         "download_percent": 100, "download_bytes": None, "download_total_bytes": None,
+         "hint": "GPU 노드가 모자라요. 노드를 늘리거나 다른 모델을 멈춰 주세요.", "download_percent": 100, "download_bytes": None, "download_total_bytes": None,
          "max_concurrency": None, "engine_image": A_TEAM_IMAGE, "gpus": 1, "started_at": None, "stops_at": None,
          "measured_at": None},
         {"namespace": "llm", "name": "gpt-oss-20b", "model": "openai/gpt-oss-20b", "phase": "Ready",
-         "reason": "", "message": "", "download_percent": 100, "download_bytes": 44452911104,
+         "reason": "", "message": "", "hint": "", "download_percent": 100, "download_bytes": 44452911104,
          "download_total_bytes": 44452911104, "max_concurrency": 12, "engine_image": VLLM_IMAGE, "gpus": 1,
          "started_at": "2026-11-04T01:00:00Z", "stops_at": "2026-11-04T03:00:00Z", "measured_at": "2026-11-04T01:30:00Z"},
         # 오퍼레이터가 아직 status 를 쓰지 않았다 — 문자열은 "", 숫자는 null
         {"namespace": "llm", "name": "just-created", "model": "org/just-created", "phase": "",
-         "reason": "", "message": "", "download_percent": None, "download_bytes": None, "download_total_bytes": None,
+         "reason": "", "message": "", "hint": "", "download_percent": None, "download_bytes": None, "download_total_bytes": None,
          "max_concurrency": None, "engine_image": JUST_CREATED_IMAGE, "gpus": None,
          "started_at": None, "stops_at": None, "measured_at": None},
         # 내려받기 0% 는 값이다 — null 이 아니다. 전체 크기를 모르면 받은 용량만 있다 (약속: percent 0, totalBytes 없음)
         {"namespace": "llm", "name": "qwen3", "model": "Qwen/Qwen3.6-35B-A3B", "phase": "Downloading",
-         "reason": "Downloading", "message": "download Job is running", "download_percent": 0,
+         "reason": "Downloading", "message": "download Job is running", "hint": "", "download_percent": 0,
          "download_bytes": 1073741824, "download_total_bytes": None, "max_concurrency": None, "engine_image": VLLM_IMAGE, "gpus": 1,
          "started_at": None, "stops_at": None, "measured_at": None},
     ]
@@ -192,6 +192,20 @@ def test_ServedModel의_GPU_수는_spec_engine_gpus의_1_이상_정수만_싣고
     """[다시 시작] 이 같은 GPU 수로 시작하는 값이다. null 이면 앱이 1장으로 본다 (DURO-186)."""
     [row] = gpu.served_models(_list({"metadata": {"name": "m"}, "spec": spec}))
     assert row["gpus"] == expected
+
+
+def test_ServedModel의_hint는_오퍼레이터가_쓴_그대로_싣고_없으면_빈_문자열이다():
+    """오븐이 실패를 가르고 "다음에 할 일" 을 status.hint 에 쓴다 (DURO-171·173). 옛 오븐·할 일이 없는 실패는 칸이 없다."""
+    item = {"metadata": {"name": "m"},
+            "status": {"phase": "Failed", "reason": "HfAuth", "message": "Hugging Face 토큰이 이 모델을 받을 수 없어요.",
+                       "hint": "토큰에 이 모델의 접근 권한을 주고 다시 시작해 주세요."}}
+    [row] = gpu.served_models(_list(item))
+    assert (row["reason"], row["message"], row["hint"]) == (
+        "HfAuth", "Hugging Face 토큰이 이 모델을 받을 수 없어요.", "토큰에 이 모델의 접근 권한을 주고 다시 시작해 주세요.")
+    [row] = gpu.served_models(_list({"metadata": {"name": "m"}, "status": {"phase": "Loading", "reason": "StillLoading"}}))
+    assert (row["reason"], row["hint"]) == ("StillLoading", "")
+    [row] = gpu.served_models(_list({"metadata": {"name": "m"}, "status": {"hint": None}}))
+    assert row["hint"] == ""
 
 
 def test_옛_오븐은_용량_칸이_null이고_퍼센트와_이유는_그대로다():
@@ -871,6 +885,129 @@ def test_Prometheus_글_형식():
     assert gpu.parse_metrics("x +Inf\ny -Inf\nz Inf") == []
 
 
+# ── 카운터 (DURO-173) ─────────────────────────────────────
+
+def _counter_pod(name: str = "kukie-gpu-counter-7d9f-abcde", *, namespace: str = "gpu-metrics", node: str = CPU,
+                 labels: dict | None = None, image: str = "durokukie/kukie-counter:0.3.0", ports: list | None = None,
+                 created: str = "2026-11-10T00:00:00Z", uid: str = "c1", restarts: int = 0, **meta) -> dict:
+    """차트 templates/counter.yaml 의 카운터 파드 모양 — CPU 노드에서 돈다."""
+    return {"metadata": {"name": name, "namespace": namespace, "uid": uid, "creationTimestamp": created,
+                         "labels": {"app.kubernetes.io/name": "kukie-counter"} if labels is None else labels, **meta},
+            "spec": {"nodeName": node, "containers": [{"name": "counter", "image": image, "ports": [
+                {"name": "http", "containerPort": 8080}, {"name": "metrics", "containerPort": 9090}] if ports is None else ports}]},
+            "status": {"phase": "Running", "containerStatuses": [{"name": "counter", "restartCount": restarts}]}}
+
+
+def test_카운터_파드는_GPU_노드로_좁히지_않고_라벨이나_이미지로_찾는다():
+    assert gpu.counter_target(gpu.running_pods(_list(_counter_pod()))) == ("gpu-metrics", "kukie-gpu-counter-7d9f-abcde", 9090, "c1:0")
+    # 라벨이 없어도 이미지로 찾는다. 포트 이름이 metrics 가 아니면 첫 포트, 포트가 없으면 9090
+    by_image = _counter_pod(labels={}, ports=[{"containerPort": 9191}])
+    assert gpu.counter_target(gpu.running_pods(_list(by_image)))[2] == 9191
+    assert gpu.counter_target(gpu.running_pods(_list(_counter_pod(ports=[]))))[2] == gpu.COUNTER_PORT
+    # 라벨도 이미지도 아니면 카운터가 아니다
+    other = _counter_pod(labels={"app.kubernetes.io/name": "kukie-oven"}, image="durokukie/kukie-oven:0.6.0")
+    assert gpu.counter_target(gpu.running_pods(_list(other))) is None
+    assert gpu.counter_target(pods()) is None                              # GPU 픽스처에는 카운터가 없다
+
+
+def test_카운터_파드가_여럿이면_지우는_중인_것을_빼고_가장_늦게_만든_것이다():
+    """롤링 업데이트 중 — 새 파드가 준비된 뒤 옛 파드를 내린다(차트 replicas 1)."""
+    old = _counter_pod("counter-old", created="2026-11-09T00:00:00Z", uid="old")
+    new = _counter_pod("counter-new", created="2026-11-10T00:00:00Z", uid="new")
+    leaving = _counter_pod("counter-leaving", created="2026-11-11T00:00:00Z", uid="leaving",
+                           deletionTimestamp="2026-11-11T00:01:00Z")
+    assert gpu.counter_target(gpu.running_pods(_list(old, leaving, new)))[1] == "counter-new"
+    assert gpu.counter_target(gpu.running_pods(_list(leaving))) is None
+
+
+def test_카운터_파드의_정체는_counter_컨테이너의_재시작_수를_센다():
+    pod = _counter_pod(restarts=3)
+    pod["spec"]["containers"].append({"name": "istio-proxy", "image": "istio/proxyv2"})
+    pod["status"]["containerStatuses"].append({"name": "istio-proxy", "restartCount": 9})
+    assert gpu.counter_target(gpu.running_pods(_list(pod)))[3] == "c1:3"
+
+
+def test_카운터_파드가_있는_namespace도_먼저_읽을_곳으로_기억한다():
+    assert gpu.has_gpu_targets(_list(_counter_pod()), {L40S_1}) is True
+
+
+def _counter_metrics(requests: dict[tuple[str, str, str], float], rejected: dict[tuple[str, str], float]) -> str:
+    lines = ["# HELP kukie_counter_requests_total Requests by HTTP status.", "# TYPE kukie_counter_requests_total counter"]
+    lines += [f'kukie_counter_requests_total{{code="{code}",key="{key}",model="{model}"}} {value}'
+              for (model, key, code), value in requests.items()]
+    lines += [f'kukie_counter_rejected_total{{model="{model}",reason="{reason}"}} {value}'
+              for (model, reason), value in rejected.items()]
+    lines.append('kukie_counter_in_flight{model="qwen"} 3')
+    return "\n".join(lines) + "\n"
+
+
+def _zeros(*models: str) -> dict[tuple[str, str], float]:
+    """카운터는 설정한 모델의 rejected_total 을 reason 셋 모두 0 으로 미리 만든다 (counter/metrics.go initModel)."""
+    return {(model, reason): 0 for model in models for reason in ("limit", "unavailable", "brake")}
+
+
+def test_카운터_지표로_모델마다_최근_구간_429_비율을_낸다():
+    """첫 수집은 기억이 없어 null. 두 번째부터 직전 수집과의 차이 — key 는 더하고 싣지 않는다. 429 는 requests_total 에도
+    code="429" 로 들어 있어(counter/server.go 의 defer finishRequest) 분모에 그대로 둔다. unavailable(503)은 429 가 아니다."""
+    first_text = _counter_metrics({("qwen", "k1", "200"): 100, ("qwen", "k2", "200"): 50, ("qwen", "k1", "429"): 10,
+                                   ("unknown", "unknown", "401"): 7},
+                                  _zeros("qwen", "gpt") | {("qwen", "limit"): 8, ("qwen", "brake"): 2})
+    rows, first = gpu.counter_rows(first_text, at=100.0)
+    assert rows == [
+        {"model": "gpt", "requests": None, "rejected": None, "rejected_ratio": None, "window_seconds": None},
+        {"model": "qwen", "requests": None, "rejected": None, "rejected_ratio": None, "window_seconds": None},
+    ]                                                                      # 모델을 정하기 전에 끝난 요청(unknown)은 빠진다
+    assert first == gpu.CounterSample(at=100.0, requests={"qwen": 160.0}, rejected={"qwen": 10.0, "gpt": 0.0})
+
+    later = _counter_metrics({("qwen", "k1", "200"): 130, ("qwen", "k2", "200"): 60, ("qwen", "k1", "429"): 30,
+                              ("qwen", "k2", "503"): 5, ("unknown", "unknown", "401"): 9},
+                             _zeros("qwen", "gpt") | {("qwen", "limit"): 25, ("qwen", "brake"): 5, ("qwen", "unavailable"): 5})
+    rows, second = gpu.counter_rows(later, previous=first, at=120.0)
+    assert rows == [
+        {"model": "gpt", "requests": 0, "rejected": 0, "rejected_ratio": None, "window_seconds": 20.0},   # 구간에 요청이 없다
+        {"model": "qwen", "requests": 65, "rejected": 20, "rejected_ratio": 0.3077, "window_seconds": 20.0},
+    ]
+    assert second.requests == {"qwen": 225.0}                              # 기억은 늘 누적값 그대로
+
+
+def test_카운터_값이_줄었으면_다시_뜬_것이라_이번은_null이고_다음부터_잇는다():
+    big = _counter_metrics({("qwen", "k", "200"): 100}, _zeros("qwen") | {("qwen", "limit"): 10})
+    small = _counter_metrics({("qwen", "k", "200"): 5}, _zeros("qwen"))
+    _, before = gpu.counter_rows(big, at=0.0)
+    [row], restarted = gpu.counter_rows(small, previous=before, at=20.0)
+    assert row == {"model": "qwen", "requests": None, "rejected": None, "rejected_ratio": None, "window_seconds": None}
+    [row], _ = gpu.counter_rows(big, previous=restarted, at=40.0)
+    assert (row["requests"], row["rejected"], row["rejected_ratio"]) == (95, 10, 0.1053)
+
+
+def test_카운터_한_모델의_series가_사라져도_다시_뜬_것으로_본다():
+    """요청 줄이 있던 모델이 rejected 줄만 남았다 — 0 으로 읽혀 줄어든 것이다. 음수 구간을 내지 않는다."""
+    _, before = gpu.counter_rows(_counter_metrics({("qwen", "k", "200"): 100}, _zeros("qwen")), at=0.0)
+    [row], _ = gpu.counter_rows(_counter_metrics({}, _zeros("qwen")), previous=before, at=20.0)
+    assert row["requests"] is None and row["window_seconds"] is None
+
+
+def test_카운터_직전에_없던_모델은_다음_수집부터_구간이_있다():
+    _, before = gpu.counter_rows(_counter_metrics({("a", "k", "200"): 10}, _zeros("a")), at=0.0)
+    rows, _ = gpu.counter_rows(_counter_metrics({("a", "k", "200"): 12, ("b", "k", "200"): 3}, _zeros("a", "b")),
+                               previous=before, at=20.0)
+    assert [(r["model"], r["requests"], r["window_seconds"]) for r in rows] == [("a", 2, 20.0), ("b", None, None)]
+
+
+def test_거절이_요청보다_앞서_읽히면_요청_수까지만_센다():
+    """rejected_total 은 거절하는 자리에서, requests_total 은 응답이 끝난 뒤 오른다 — 그 사이에 읽은 구간."""
+    _, before = gpu.counter_rows(_counter_metrics({("q", "k", "200"): 10}, _zeros("q")), at=0.0)
+    [row], _ = gpu.counter_rows(_counter_metrics({("q", "k", "200"): 11}, _zeros("q") | {("q", "limit"): 2}),
+                                previous=before, at=20.0)
+    assert (row["requests"], row["rejected"], row["rejected_ratio"]) == (1, 1, 1.0)
+
+
+def test_카운터_지표가_없으면_줄이_없다():
+    rows, sample = gpu.counter_rows("garbage {{{\n" + fixture("vllm.txt"), at=0.0)
+    assert rows == [] and sample.requests == {} and sample.rejected == {}
+
+
+
 # ── 엔드포인트 ─────────────────────────────────────────────
 
 @pytest.fixture
@@ -1050,8 +1187,8 @@ def test_GPU_노드가_0대여도_GPU를_기다리는_파드가_있으면_꺼진
     monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
     r = client.get(f"/clusters/{cluster}/overview", headers=USER)
     assert r.status_code == 200
-    assert r.json()["gpu"] == {"nodes": [], "serving": [], "benchmarks": [], "served_models": None, "node_pools": [], "waiting": [
-        {"namespace": "llm", "pod": "vllm-gpt-oss-20b-b897b5d97-kkjsq", "gpus": 1, "phase": "Pending"}]}
+    assert r.json()["gpu"] == {"nodes": [], "serving": [], "benchmarks": [], "served_models": None, "node_pools": [], "counter": None,
+        "waiting": [{"namespace": "llm", "pod": "vllm-gpt-oss-20b-b897b5d97-kkjsq", "gpus": 1, "phase": "Pending"}]}
     assert not any(args[1] == "--raw" for args in seen)
     assert [body["hasGpu"] for body in _gpu_calls(fake_server)] == ([True] if stored is None else [])
     assert fake_server.clusters[cluster]["hasGpu"] is True
@@ -1512,7 +1649,8 @@ def test_GPU로_알려진_꺼진_클러스터에_ServedModel이_하나도_없어
     run, _ = _served_models_cluster(_result('{"items": []}'), nodes="nodes.json")
     body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", known=True, clock=lambda: 0.0)
     assert has_gpu is True
-    assert body == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [], "served_models": [], "node_pools": []}
+    assert body == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [], "served_models": [], "node_pools": [],
+                    "counter": None}
 
 
 @pytest.mark.parametrize(("served", "expected"), [
@@ -1573,7 +1711,7 @@ def test_노드도_대기_파드도_모델도_없어도_GPU_풀이_있으면_GPU
                                               clock=lambda: 0.0)
     assert has_gpu is True
     assert body == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [], "served_models": None,
-                    "node_pools": [GPU_POOL_ROW]}
+                    "node_pools": [GPU_POOL_ROW], "counter": None}
     assert [args for args, _ in seen] == [gpu.NODES_COMMAND, gpu.PODS_COMMAND, gpu.NODE_POOLS_COMMAND,
                                           gpu.SERVED_MODELS_COMMAND]   # GPU 풀을 찾은 라운드에 ServedModel 도 읽는다
 
@@ -2660,6 +2798,114 @@ def test_지표_값이_무한대여도_개요는_200(client, fake_server, monkey
     monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
     r = client.get(f"/clusters/{cluster}/overview", headers=USER)
     assert r.status_code == 200 and r.json()["gpu"]["nodes"][0]["memory_used_mib"] is None
+
+
+# ── 개요의 카운터 429 비율 (DURO-173) ─────────────────────
+
+def _counter_cluster(monkeypatch, *, nodes: str = "gpu_nodes.json", served: KubectlResult = _result('{"items": []}')):
+    """(수집 함수, 시계, 상태, 부른 명령) — GPU 클러스터에 카운터 파드 하나(CPU 노드)가 더 있다. 카운터 지표는 round 마다 바꾼다."""
+    monkeypatch.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
+    now = [0.0]
+    items = json.loads(fixture("gpu_pods.json"))["items"] + [_counter_pod()]
+    state = {"pods": _list(*items), "fail": False,
+             "counter": _counter_metrics({("qwen", "k1", "200"): 100}, _zeros("qwen"))}
+    seen: list[tuple[list[str], int]] = []
+
+    def run(args, timeout):
+        seen.append((args, timeout))
+        if args[1] == "--raw" and "counter" in args[2]:
+            return _result(stderr="timed out", success=False) if state["fail"] else _result(state["counter"])
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture(nodes))
+        if args == gpu.PODS_COMMAND:
+            return _result(state["pods"])
+        if args == gpu.SERVED_MODELS_COMMAND:
+            return served
+        return _gpu_cluster(args)
+
+    def collect(key="c:fp:ns", known=None):
+        body, _ = clusters_api._collect_gpu(run, namespace_pods="{}", cache_key=key, known=known, clock=lambda: now[0])
+        return body["counter"]
+
+    return collect, now, state, seen
+
+
+COUNTER_PROXY = gpu.proxy_command("gpu-metrics", "kukie-gpu-counter-7d9f-abcde", 9090)
+
+
+def test_개요는_카운터_파드의_직전_수집을_기억해_최근_구간_429_비율을_낸다(monkeypatch):
+    collect, now, state, seen = _counter_cluster(monkeypatch)
+    assert collect() == [{"model": "qwen", "requests": None, "rejected": None, "rejected_ratio": None, "window_seconds": None}]
+    # 지표와 같은 시간 제한으로 파드 프록시를 읽는다. CPU 노드 위에 있어도 찾는다
+    assert [timeout for args, timeout in seen if args == COUNTER_PROXY] == [clusters_api.GPU_METRICS_TIMEOUT]
+    now[0] += 20
+    state["counter"] = _counter_metrics({("qwen", "k1", "200"): 130, ("qwen", "k2", "429"): 10},
+                                        _zeros("qwen") | {("qwen", "limit"): 10})
+    assert collect() == [{"model": "qwen", "requests": 40, "rejected": 10, "rejected_ratio": 0.25, "window_seconds": 20.0}]
+    assert set(clusters_api._counter_samples) == {"c:fp:ns"}
+
+
+def test_카운터를_한_번_못_읽으면_그_칸만_null이고_기억은_두어_다음_구간이_그만큼_길다(monkeypatch):
+    collect, now, state, _ = _counter_cluster(monkeypatch)
+    collect()
+    now[0] += 20
+    state["fail"] = True
+    assert collect() is None
+    now[0] += 20
+    state["fail"] = False
+    state["counter"] = _counter_metrics({("qwen", "k1", "200"): 110}, _zeros("qwen"))
+    assert collect() == [{"model": "qwen", "requests": 10, "rejected": 0, "rejected_ratio": 0.0, "window_seconds": 40.0}]
+
+
+def test_카운터_파드가_바뀌면_기억을_잇지_않는다(monkeypatch):
+    collect, now, state, _ = _counter_cluster(monkeypatch)
+    collect()
+    now[0] += 20
+    items = json.loads(fixture("gpu_pods.json"))["items"] + [_counter_pod(restarts=1)]
+    state["pods"] = _list(*items)
+    state["counter"] = _counter_metrics({("qwen", "k1", "200"): 120}, _zeros("qwen"))
+    assert collect()[0]["window_seconds"] is None
+    now[0] += 20
+    assert collect()[0]["window_seconds"] == 20.0                          # 새 정체로 다시 잇는다
+
+
+def test_카운터_기억도_너무_오래되면_버리고_연결_지문이_없으면_두지_않는다(monkeypatch):
+    collect, now, state, _ = _counter_cluster(monkeypatch)
+    collect()
+    now[0] += clusters_api.LATENCY_WINDOW_MAX
+    assert collect()[0]["window_seconds"] is None
+    assert collect(None)[0]["window_seconds"] is None
+    now[0] += 20
+    assert collect(None)[0]["window_seconds"] is None
+    assert set(clusters_api._counter_samples) == {"c:fp:ns"}
+
+
+def test_ServedModel을_못_읽은_라운드는_카운터를_읽지_않는다(monkeypatch):
+    collect, _, _, seen = _counter_cluster(monkeypatch, served=_result(stderr=NO_CRD, success=False))
+    assert collect() is None
+    assert not any(args == COUNTER_PROXY for args, _ in seen)
+
+
+def test_카운터_파드가_없으면_null이고_조회가_늘지_않는다(monkeypatch):
+    collect, _, state, seen = _counter_cluster(monkeypatch)
+    state["pods"] = fixture("gpu_pods.json")
+    assert collect() is None
+    assert not any("counter" in args[2] for args, _ in seen if args[1] == "--raw")
+
+
+def test_카운터를_읽었는데_모델이_없으면_빈_배열이다(monkeypatch):
+    collect, _, state, _ = _counter_cluster(monkeypatch)
+    state["counter"] = "# 아직 모델이 없다\n"
+    assert collect() == []
+
+
+def test_꺼진_GPU_클러스터도_ServedModel이_읽혔으면_카운터를_읽어_기억을_잇는다(monkeypatch):
+    collect, now, state, seen = _counter_cluster(monkeypatch, nodes="nodes.json")
+    assert collect(known=True)[0]["window_seconds"] is None
+    now[0] += 20
+    state["counter"] = _counter_metrics({("qwen", "k1", "503"): 104}, _zeros("qwen") | {("qwen", "unavailable"): 4})
+    assert collect(known=True) == [
+        {"model": "qwen", "requests": 4, "rejected": 0, "rejected_ratio": 0.0, "window_seconds": 20.0}]   # 503 은 429 가 아니다
 
 
 # ── GPU 여부를 server 에 남기기 ─────────────────────────────

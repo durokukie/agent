@@ -1,5 +1,5 @@
 """클러스터 개요의 gpu 칸 — GPU 노드, 그 위의 DCGM 지표, 서빙 중인 vLLM 모델 (DURO-118), ServedModel 상태 (DURO-182),
-Karpenter GPU NodePool (DURO-184), 측정 기록 (DURO-188).
+Karpenter GPU NodePool (DURO-184), 측정 기록 (DURO-188), 카운터의 429 비율 (DURO-173).
 
 overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순수 함수만 둔다. kubectl 은 clusters_api.py 가 돌린다.
 
@@ -17,7 +17,8 @@ overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순�
   5. BENCHMARKS_COMMAND  측정 기록 ConfigMap. ServedModel 이 읽힌 라운드에만 읽는다 — 아래 "측정 기록"
   6. proxy_command   찾은 파드의 /metrics 를 API 서버 **파드 프록시**로 읽는다 (Prometheus 없이 kubectl 권한만으로).
                      서비스 프록시가 아니라 파드 프록시인 이유: DCGM exporter 는 노드마다 하나인 DaemonSet 이라 서비스로
-                     부르면 아무 파드 하나에 붙어 다른 노드의 값을 받는다. vLLM 도 레플리카마다 값이 다르다
+                     부르면 아무 파드 하나에 붙어 다른 노드의 값을 받는다. vLLM 도 레플리카마다 값이 다르다.
+                     카운터(kukie-counter) 파드도 같은 길로 같은 시간 예산 안에서 읽는다 — ServedModel 이 읽힌 라운드에만, 아래 "카운터"
   지표를 못 읽으면 그 노드의 실시간 값만 null, 그 파드만 serving 에서 빠진다 — 개요는 그대로 200.
 
 GPU 노드 — nodes
@@ -98,12 +99,15 @@ Karpenter GPU 풀 — node_pools
 
 ServedModel — served_models
   kukie-gpu-operator 의 CRD. 한 줄이 ServedModel 하나다: namespace·name(metadata), model(spec.source.huggingface),
-  phase·reason·message(status), download_percent(status.download.percent), download_bytes(status.download.downloadedBytes),
+  phase·reason·message·hint(status), download_percent(status.download.percent), download_bytes(status.download.downloadedBytes),
   download_total_bytes(status.download.totalBytes), max_concurrency(status.baseline.maxConcurrency),
   engine_image(spec.engine.image), gpus(spec.engine.gpus — 파드 하나의 GPU 수, 1 이상 정수가 아니면 null. DURO-186),
   started_at(status.startedAt), stops_at(status.stopsAt), measured_at(status.baseline.measuredAt).
   세 시각은 오퍼레이터가 쓴 RFC3339 문자열 그대로이고, 없으면 null 이다. measured_at 은 측정 기록의 at 과 견주는 값이라 형식이 다르면 null 이다.
   여기서 계산하지 않는다 — 언제 멈추는지는 spec.maxRuntime·차트 기본값·연장 annotation 을 모두 아는 오퍼레이터가 정한다.
+  reason 은 오퍼레이터가 실패를 가른 이름(HfAuth·DiskShort·GpuMemoryShort·ImagePull 등, Loading 중이면 StillLoading),
+  message 는 그 한국어 문장, hint 는 "다음에 할 일" 한국어 문장이다(DURO-171·173). 셋 다 오퍼레이터가 쓴 그대로 싣고 없으면 "" 다 —
+  로그 원문은 status 에 없다(오퍼레이터가 싣지 않는다).
   namespace·이름순. 오퍼레이터가 아직 status 를 쓰지 않았으면 문자열 칸은 "", 숫자·시각 칸은 null 이다.
     null  CRD 가 없거나(애드온을 안 깐 곳) 거부·시간 초과·예산 부족·모양이 다른 출력으로 못 읽었다. 개요는 그대로 200
     []    읽었는데 하나도 없다
@@ -125,6 +129,38 @@ ServedModel — served_models
   읽는 조건은 ServedModel 과 같다 — served_models 가 null 이면(애드온이 없거나 못 읽었다) 조회하지 않는다. 그 라운드의 값은 아래 기억 규칙을 따른다. GPU 없는 일반 클러스터에 kubectl 이 늘지 않는다.
   시간 초과·예산 부족·깨진 출력이면 연결마다 기억해 둔 마지막 성공 값을 싣고(clusters_api._read_benchmarks — 한 번 실패로 표가 깜빡이지 않게),
   그것도 없으면 [] 다. 거부와 CRD 없음은 잠깐의 실패가 아니라 "볼 수 없다" 는 답이라 기억을 지우고 [] 다. 웹이 배열로 읽으므로 null 은 쓰지 않는다.
+  이 칸은 GPU 클러스터 판단(hasGpu)에 쓰지 않는다.
+
+카운터 — counter
+  애드온 차트가 설치 namespace 에 띄우는 키 발급제 입구 kukie-counter(Deployment, 파드 1개, CPU 노드)의 /metrics 로 낸 모델마다의
+  **최근 구간** 429(동시 수 한도에 걸려 거절) 비율이다 (DURO-173). 한 줄: model, requests, rejected, rejected_ratio, window_seconds. model 이름순.
+    requests        구간에 끝난 요청 수 — kukie_counter_requests_total{model,key,code} 의 차이를 key·code 를 모두 더해 모델마다.
+                    카운터는 끝난 요청을 상태 코드와 함께 하나도 빼지 않고 센다(server.go 의 defer finishRequest) — 429 로 거절한
+                    요청도 code="429" 로 여기 들어 있다. 503·499(클라이언트가 떠남)도 들어 있다
+    rejected        구간에 429 로 거절한 수 — kukie_counter_rejected_total 의 reason limit·brake 차이의 합.
+                    reason unavailable 은 모델 서버가 내려간 503 이라 세지 않는다
+    rejected_ratio  rejected / requests (0~1, 소수 넷째 자리). 분모에 429 가 들어 있으니 "끝난 요청 중 몇이 429 였나" 다
+    window_seconds  구간 길이(초) — 같은 카운터 파드의 직전 수집부터 이번 수집까지
+  key 라벨(키 id)은 싣지 않는다 — 모델마다 더한 값만 낸다. model 라벨이 비었거나 "unknown"(모델을 정하기 전에 끝난 요청 —
+  잘못된 키·경로·본문)인 줄은 뺀다. 카운터는 설정한 모델의 rejected_total 을 0 으로 미리 만들어 요청이 없던 모델도 줄이 있다.
+  rejected_total 은 거절하는 자리에서, requests_total 은 응답이 끝난 뒤에 올라서 그 사이에 읽으면 rejected 가 requests 보다
+  앞설 수 있다 — rejected 는 requests 를 넘지 않게 자른다 (다음 구간에서 맞춰진다).
+  서빙의 최근 구간 p95 와 같은 방식이다: 연결마다 카운터 파드(pod_identity — counter 컨테이너의 재시작 수)의 직전 누적값
+  (CounterSample)을 기억하고 두 수집의 차이를 낸다. 기억은 clusters_api 가 LATENCY_WINDOW_MAX 초까지 둔다.
+    기억이 없다(첫 수집·파드가 바뀜·직전이 너무 오래됨)  그 라운드는 모든 줄의 requests·rejected·rejected_ratio·window_seconds 가 null
+    값이 줄었다(카운터가 다시 떠 처음부터 센다)          기억을 버리고 이번은 모두 null — 다음 수집부터 다시 잇는다
+    직전 수집에 없던 모델                               그 줄만 모두 null — 다음 수집부터
+    구간에 요청이 없었다                               requests 0, rejected 0, rejected_ratio null, window_seconds 는 있다
+  칸 전체:
+    null  카운터 파드를 못 찾았다(애드온의 카운터를 끈 곳·파드 목록을 못 읽음)·/metrics 를 못 읽었다(거부·시간 초과·예산 부족)·
+          ServedModel 을 못 읽어 읽지 않았다
+    []    읽었는데 모델 줄이 없다
+  찾는 법: 파드 목록(2, Running) 중 라벨 app.kubernetes.io/name=kukie-counter 이거나 컨테이너 이미지에 kukie-counter 가 있는 파드.
+  GPU 노드로 좁히지 않는다(CPU 노드에서 돈다). 지우는 중(deletionTimestamp)인 파드는 빼고, 여럿이면(롤링 업데이트 중) 가장 늦게
+  만든 것 하나만 읽는다 — 차트는 레플리카 1 이다. 포트는 이름이 metrics 인 것(차트 9090), 없으면 첫 포트, 그것도 없으면 9090.
+  읽는 조건은 측정 기록과 같다 — served_models 가 null 이면(애드온이 없거나 못 읽었다) 읽지 않는다. GPU 없는 일반 클러스터에
+  kubectl 이 늘지 않는다. GPU 노드가 없는 꺼진 클러스터도 ServedModel 이 읽혔으면 읽는다(기억을 이어 둔다).
+  권한: 애드온 차트가 설치 namespace 에도 Kukie 읽기 그룹의 파드 목록·파드 프록시 GET 을 준다 (DCGM·vLLM 과 같은 길).
   이 칸은 GPU 클러스터 판단(hasGpu)에 쓰지 않는다.
 """
 from __future__ import annotations
@@ -190,6 +226,12 @@ MAX_METRIC_TARGETS = 8
 
 DCGM_PORT = 9400
 VLLM_PORT = 8000
+#: 카운터 /metrics 포트 (차트의 metrics 포트) — 모듈 설명 "카운터"
+COUNTER_PORT = 9090
+#: kukie_counter_rejected_total 에서 429 로 거절한 reason. unavailable 은 503 이다 (counter/server.go errAtLimit·errUnavailable)
+_COUNTER_429_REASONS = frozenset({"limit", "brake"})
+#: 카운터가 모델을 정하기 전에 끝난 요청의 model 라벨 (counter/config.go labelUnknown)
+_COUNTER_UNKNOWN_MODEL = "unknown"
 
 
 # ── 노드 ─────────────────────────────────────────────────
@@ -290,6 +332,7 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
             "phase": status.get("phase") or "",
             "reason": status.get("reason") or "",
             "message": status.get("message") or "",
+            "hint": status.get("hint") or "",
             "download_percent": _int_or_none(download.get("percent")),
             "download_bytes": _int_or_none(download.get("downloadedBytes")),
             "download_total_bytes": _int_or_none(download.get("totalBytes")),
@@ -530,19 +573,34 @@ def vllm_targets(pods: list[dict[str, Any]], gpu_node_names: set[str]) -> list[t
     return targets[:MAX_METRIC_TARGETS]
 
 
-def pod_identity(item: dict[str, Any]) -> str:
+def pod_identity(item: dict[str, Any], *, match=None) -> str:
     """파드의 정체 — uid(없으면 시작 시각)와 vLLM 컨테이너의 재시작 수. 최근 구간 p95 의 기억(LatencySample)을 같은 서빙
     프로세스에만 잇는다: 같은 이름으로 다시 뜬 파드(StatefulSet 의 qwen-0)는 uid 가, 컨테이너만 다시 뜬 파드는 재시작 수가
     다르다. 둘 다 히스토그램을 처음부터 다시 세는 프로세스라 옛 기억과 빼면 안 된다.
     재시작 수는 vLLM 컨테이너(_vllm_container, spec.containers — vllm_targets 가 찾는 것과 같은 범위)의 것만 센다 —
     사이드카(메시·로그)가 다시 떠도 vLLM 프로세스와 히스토그램은 그대로라 기억을 버릴 까닭이 없다 (agent#137 Codex 리뷰).
-    native sidecar(initContainers + restartPolicy Always)로 띄운 vLLM 은 애초에 대상이 아니다 (_containers)."""
+    native sidecar(initContainers + restartPolicy Always)로 띄운 vLLM 은 애초에 대상이 아니다 (_containers).
+    match 로 셀 컨테이너를 바꾼다 — 카운터는 counter 컨테이너(_counter_container)의 재시작 수를 센다 (모듈 설명 "카운터")."""
     meta = item.get("metadata") or {}
     status = item.get("status") or {}
-    vllm_names = {c.get("name") for c in _containers(item) if _vllm_container(c)}
+    match = match or _vllm_container
+    names = {c.get("name") for c in _containers(item) if match(c)}
     restarts = sum(_positive_int(c.get("restartCount")) for c in status.get("containerStatuses") or []
-                   if isinstance(c, dict) and c.get("name") in vllm_names)
+                   if isinstance(c, dict) and c.get("name") in names)
     return f"{meta.get('uid') or status.get('startTime') or ''}:{restarts}"
+
+
+def counter_target(pods: list[dict[str, Any]]) -> tuple[str, str, int, str] | None:
+    """카운터 파드 하나 — (namespace, 파드, 포트, 정체), 없으면 None. pods 는 running_pods (모듈 설명 "카운터").
+    노드로 좁히지 않는다. 지우는 중인 파드는 빼고, 여럿이면 가장 늦게 만든 것(같으면 이름이 뒤인 것)."""
+    candidates = [item for item in pods if _is_counter(item) and not item["metadata"].get("deletionTimestamp")]
+    if not candidates:
+        return None
+    item = max(candidates, key=lambda i: (str(i["metadata"].get("creationTimestamp") or ""), str(i["metadata"]["name"])))
+    meta = item["metadata"]
+    return (meta.get("namespace") or "default", meta["name"],
+            _port(item, names=("metrics",), default=COUNTER_PORT, match=_counter_container),
+            pod_identity(item, match=_counter_container))
 
 
 def namespace_names(stdout: str, *, skip: str | None = None,
@@ -601,10 +659,11 @@ def has_waiting_pods(stdout: str) -> bool:
 
 
 def has_gpu_targets(stdout: str, gpu_node_names: set[str]) -> bool:
-    """파드 목록에 GPU 노드 위의 DCGM exporter 나 vLLM 파드가 있는가. 모양이 다르면 False (개요를 실패시키지 않는다)."""
+    """파드 목록에 GPU 노드 위의 DCGM exporter 나 vLLM 파드, 또는 카운터 파드가 있는가 — namespace 를 먼저 읽을 곳으로 기억할 때 쓴다.
+    모양이 다르면 False (개요를 실패시키지 않는다)."""
     try:
         pods = running_pods(stdout)
-        return bool(dcgm_targets(pods, gpu_node_names) or vllm_targets(pods, gpu_node_names))
+        return bool(dcgm_targets(pods, gpu_node_names) or vllm_targets(pods, gpu_node_names) or counter_target(pods))
     except (ValueError, AttributeError, TypeError):
         return False
 
@@ -652,6 +711,17 @@ def _vllm_container(container: dict[str, Any]) -> bool:
     words = [str(container.get("image") or ""), *map(str, container.get("command") or []),
              *map(str, container.get("args") or [])]
     return any("vllm" in word.lower() for word in words)
+
+
+def _counter_container(container: dict[str, Any]) -> bool:
+    """카운터 컨테이너 — 이미지에 kukie-counter 가 있거나 이름이 counter (차트의 컨테이너 이름)."""
+    return "kukie-counter" in str(container.get("image") or "").lower() or container.get("name") == "counter"
+
+
+def _is_counter(item: dict[str, Any]) -> bool:
+    labels = (item.get("metadata") or {}).get("labels") or {}
+    return (labels.get("app.kubernetes.io/name") == "kukie-counter"
+            or any("kukie-counter" in str(c.get("image") or "").lower() for c in _containers(item)))
 
 
 def _vllm_port(item: dict[str, Any]) -> int:
@@ -854,21 +924,74 @@ def _ms(seconds: float | None) -> float | None:
     return None if seconds is None else round(seconds * 1000, 1)
 
 
+# ── 카운터 ───────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class CounterSample:
+    """카운터 파드의 /metrics 를 한 번 읽어 둔 누적값 — 모델마다 끝난 요청 수와 429 로 거절한 수 (모듈 설명 "카운터").
+
+    at 은 읽은 시각(부르는 쪽의 시계 — clusters_api 는 time.monotonic). 다음 수집이 이것과의 차이로 최근 구간 비율을 낸다.
+    """
+    at: float
+    requests: dict[str, float]
+    rejected: dict[str, float]
+
+
+def counter_rows(text: str, *, previous: CounterSample | None = None,
+                 at: float = 0.0) -> tuple[list[dict[str, Any]], CounterSample]:
+    """(카운터 /metrics 에서 모델마다 한 줄, 이번에 읽은 누적값) — 모듈 설명 "카운터". 카운터 지표가 없으면 빈 목록.
+
+    값은 previous(같은 카운터 파드의 직전 수집)와의 차이다. previous 가 없거나, 어느 모델의 값이든 줄었으면(카운터가 다시 떴다)
+    모든 줄이 null 이다 — 부르는 쪽은 돌려준 CounterSample 을 다음 기억으로 두면 된다.
+    """
+    requests: dict[str, float] = {}
+    rejected: dict[str, float] = {}
+    for name, labels, value in parse_metrics(text):
+        model = labels.get("model") or ""
+        if not model or model == _COUNTER_UNKNOWN_MODEL:
+            continue
+        if name == "kukie_counter_requests_total":
+            requests[model] = requests.get(model, 0.0) + value
+        elif name == "kukie_counter_rejected_total":
+            rejected[model] = rejected.get(model, 0.0) + (value if labels.get("reason") in _COUNTER_429_REASONS else 0.0)
+
+    sample = CounterSample(at=at, requests=requests, rejected=rejected)
+    models = sorted(set(requests) | set(rejected))
+    # 지금 있는 모델의 어느 값이든 직전보다 작으면(series 가 사라져 0 으로 읽힌 것도) 카운터가 다시 뜬 것이다.
+    # 설정에서 빠져 줄이 아예 없어진 모델은 보지 않는다
+    connected = previous is not None and not any(
+        now.get(model, 0.0) < before.get(model, 0.0)
+        for now, before in ((requests, previous.requests), (rejected, previous.rejected))
+        for model in models)
+    rows = []
+    for model in models:
+        row: dict[str, Any] = {"model": model, "requests": None, "rejected": None, "rejected_ratio": None, "window_seconds": None}
+        if connected and (model in previous.requests or model in previous.rejected):
+            done = round(requests.get(model, 0.0) - previous.requests.get(model, 0.0))
+            refused = min(done, round(rejected.get(model, 0.0) - previous.rejected.get(model, 0.0)))
+            row.update(requests=done, rejected=refused, rejected_ratio=round(refused / done, 4) if done else None,
+                       window_seconds=round(at - previous.at, 1))
+        rows.append(row)
+    return rows, sample
+
+
 # ── 합치기 ───────────────────────────────────────────────
 
 def build(nodes: list[dict[str, Any]], serving: list[dict[str, Any]],
           waiting: list[dict[str, Any]] | None = None,
           served_models: list[dict[str, Any]] | None = None,
           node_pools: list[dict[str, Any]] | None = None,
-          benchmarks: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+          benchmarks: list[dict[str, Any]] | None = None,
+          counter: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     """ClusterGpu. GPU 노드도 GPU 를 기다리는 파드도 GPU 풀도 없고 ServedModel 도 못 읽었으면 None — 앱은 "GPU 노드가 없어요" 를 띄운다.
     노드는 없고 기다리는 파드나 GPU 풀, 읽어 낸 ServedModel(빈 배열 포함)이 있으면 꺼진 GPU 클러스터다(nodes 빈 배열).
     served_models·node_pools 의 null 은 "못 읽었다", 빈 배열은 "없다" 다. 빈 node_pools 는 served_models 와 달리 gpu 칸을 만들지
-    않는다 — CPU 풀만 있는 Karpenter 클러스터는 GPU 클러스터가 아니다. benchmarks 는 칸을 만드는 근거가 아니다."""
+    않는다 — CPU 풀만 있는 Karpenter 클러스터는 GPU 클러스터가 아니다. benchmarks·counter 는 칸을 만드는 근거가 아니다.
+    counter 의 null 은 "못 찾았거나 못 읽었다", 빈 배열은 "읽었는데 모델이 없다" 다."""
     if not nodes and not waiting and served_models is None and not node_pools:
         return None
     return {"nodes": nodes, "serving": serving, "benchmarks": benchmarks or [], "waiting": waiting or [],
-            "served_models": served_models, "node_pools": node_pools}
+            "served_models": served_models, "node_pools": node_pools, "counter": counter}
 
 
 # ── Prometheus 글 형식 ────────────────────────────────────

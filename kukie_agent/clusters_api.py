@@ -159,7 +159,8 @@ async def cluster_overview(
     server 값이 GPU 클러스터(true)가 아닌 곳은 이 파드를 GPU_ABSENT_RECHECK 초에 한 번만 찾는다. 알아낸 GPU 클러스터 여부를
     server 에 남긴다(_record_gpu). Karpenter GPU 풀(gpu.node_pools)과 ServedModel(gpu.served_models)은 지표 전에 읽고, CRD 가 없거나
     못 읽으면 그 칸만 null 이다. GPU 풀이 있으면 노드가 0대여도 gpu 칸을 주고 GPU 클러스터로 둔다. ServedModel 이 읽히면 측정 기록(gpu.benchmarks)도
-    읽는다. 잠깐 못 읽으면 마지막으로 성공한 값을, 그것도 없으면 빈 배열을 싣는다.
+    읽는다. 잠깐 못 읽으면 마지막으로 성공한 값을, 그것도 없으면 빈 배열을 싣는다. ServedModel 이 읽히고 카운터 파드가 있으면
+    그 /metrics 도 지표와 같이 읽어 모델마다 최근 구간 429 비율(gpu.counter)을 낸다 — 못 찾거나 못 읽으면 그 칸만 null 이다.
 
     kubectl 이 실패하면 연결 확인과 같은 기준(_failure_status)으로 갈라 502 로 답한다.
       CLUSTER_AUTH_EXPIRED  인증 실패·권한 없음 (연결 확인의 auth_expired)
@@ -707,9 +708,10 @@ def _collect_gpu(
         pods = gpu.running_pods(pods_stdout)
         dcgm = gpu.dcgm_targets(pods, gpu_node_names)
         vllm = gpu.vllm_targets(pods, gpu_node_names)
+        counter_pod = gpu.counter_target(pods)
     except (ValueError, AttributeError, TypeError):
         logger.debug("GPU 지표 파드를 찾지 못했다 (파드 목록을 읽지 못했다)")
-        dcgm, vllm = {}, []
+        dcgm, vllm, counter_pod = {}, [], None
     waiting: list[dict[str, Any]] | None
     try:
         waiting = gpu.waiting_pods(pods_stdout)
@@ -744,10 +746,8 @@ def _collect_gpu(
         if read_served and served_absent:                   # CRD 없음·거부 — 잠깐의 실패가 아니다
             _forget_benchmarks(cache_key)
         benchmarks = _remembered_benchmarks(cache_key, clock)
-    if not nodes:
-        if waiting or node_pools or served_models is not None:
-            return gpu.build([], [], waiting or [], served_models, node_pools, benchmarks), True
-        return None, (False if waiting is not None and pods_complete and served_absent and pools_absent else None)
+    # 카운터는 측정 기록처럼 ServedModel 이 읽힌 라운드에만 읽는다 — 애드온이 없는 일반 클러스터에 kubectl 이 늘지 않는다
+    counter_pod = counter_pod if served_models is not None else None
 
     def metrics(target: tuple[str, str, int]) -> tuple[str | None, float]:
         """(/metrics 본문, 읽은 시각) — 시각은 서빙 p95 구간의 끝이라 파드마다 따로 잰다 (agent#137 리뷰)."""
@@ -762,8 +762,17 @@ def _collect_gpu(
             return None, clock()
         return result.stdout, clock()
 
+    if not nodes:
+        if waiting or node_pools or served_models is not None:
+            # 꺼진 GPU 클러스터도 카운터 기억을 이어 둔다 — 노드가 뜬 첫 라운드부터 구간이 있게
+            counter = _counter_rows(cache_key, counter_pod, *metrics(counter_pod[:3])) if counter_pod else None
+            return gpu.build([], [], waiting or [], served_models, node_pools, benchmarks, counter), True
+        return None, (False if waiting is not None and pods_complete and served_absent and pools_absent else None)
+
     dcgm_rows = [row for row in nodes if row["node"] in dcgm]
     targets = [dcgm[row["node"]] for row in dcgm_rows] + [(ns, pod, port) for ns, pod, port, _, _ in vllm]
+    if counter_pod:
+        targets.append(counter_pod[:3])                     # 지표와 같은 풀·같은 예산으로 읽는다
     with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
         texts = list(pool.map(metrics, targets))
     for row, (text, _) in zip(dcgm_rows, texts):
@@ -781,7 +790,29 @@ def _collect_gpu(
     if cache_key:
         with _latency_lock:
             _latency_samples[cache_key] = remembered
-    return gpu.build(nodes, serving, waiting or [], served_models, node_pools, benchmarks), True
+    counter = _counter_rows(cache_key, counter_pod, *texts[-1]) if counter_pod else None
+    return gpu.build(nodes, serving, waiting or [], served_models, node_pools, benchmarks, counter), True
+
+
+def _counter_rows(cache_key: str | None, target: tuple[str, str, int, str], text: str | None,
+                  at: float) -> list[dict[str, Any]] | None:
+    """카운터 줄 — clusters/gpu.py "카운터". 못 읽었으면 None 이고 기억은 둔다(다음 구간이 그만큼 길어질 뿐, 서빙 p95 와 같다).
+    기억은 연결마다 카운터 파드 하나(namespace/파드/정체)의 직전 누적값이다. 파드가 바뀌면 잇지 않는다.
+    LATENCY_WINDOW_MAX 초보다 오래된 기억은 어느 연결의 것이든 지운다. 연결 지문이 없으면(cache_key None) 기억하지 않아 값은 늘 null 이다."""
+    if text is None:
+        return None
+    namespace, pod, _, identity = target
+    pod_key = f"{namespace}/{pod}/{identity}"
+    with _latency_lock:
+        for key in [key for key, (_, sample) in _counter_samples.items() if at - sample.at >= LATENCY_WINDOW_MAX]:
+            del _counter_samples[key]
+        remembered = _counter_samples.get(cache_key) if cache_key else None
+    previous = remembered[1] if remembered and remembered[0] == pod_key else None
+    rows, sample = gpu.counter_rows(text, previous=previous, at=at)
+    if cache_key:
+        with _latency_lock:
+            _counter_samples[cache_key] = (pod_key, sample)
+    return rows
 
 
 def _read_served_models(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:
@@ -930,6 +961,8 @@ _gpu_absent_checked: dict[str, float] = {}
 #: 복제본마다 따로고, 재시작하면 첫 수집은 다시 null 이다
 _latency_samples: dict[str, dict[str, gpu.LatencySample]] = {}
 _latency_lock = threading.Lock()
+#: 연결마다 카운터 파드(namespace/파드/정체)와 그 직전 수집의 누적값 — _counter_rows. 서빙 p95 기억과 같은 잠금을 쓴다
+_counter_samples: dict[str, tuple[str, gpu.CounterSample]] = {}
 #: 연결마다 마지막으로 성공한 측정 기록 — _read_benchmarks. 한 연결에 많아야 MAX_BENCHMARKS 줄이고 GPU_BENCHMARKS_FORGET 뒤에 지운다
 _benchmarks_memory: dict[str, _BenchmarksMemo] = {}
 _benchmarks_lock = threading.Lock()
