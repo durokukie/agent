@@ -206,6 +206,9 @@ def test_ServedModel의_hint는_오퍼레이터가_쓴_그대로_싣고_없으�
     assert (row["reason"], row["hint"]) == ("StillLoading", "")
     [row] = gpu.served_models(_list({"metadata": {"name": "m"}, "status": {"hint": None}}))
     assert row["hint"] == ""
+    # 문자열이 아닌 값은 웹에 보내지 않는다 (agent#147 리뷰)
+    [row] = gpu.served_models(_list({"metadata": {"name": "m"}, "status": {"reason": {"x": 1}, "message": ["a"], "hint": 3}}))
+    assert (row["reason"], row["message"], row["hint"]) == ("", "", "")
 
 
 def test_옛_오븐은_용량_칸이_null이고_퍼센트와_이유는_그대로다():
@@ -2860,7 +2863,7 @@ def test_개요는_카운터의_직전_수집을_기억해_최근_구간_429_비
                                                              _zeros("qwen") | {("qwen", "limit"): 10}))
     assert collect() == [{"model": "qwen", "requests": 40, "rejected": 10, "rejected_ratio": 0.25, "window_seconds": 20.0}]
     assert set(clusters_api._counter_samples) == {"c:fp:ns"}
-    assert clusters_api._counter_places == {}                              # 파드 목록으로 찾은 곳은 기억하지 않는다
+    assert clusters_api._counter_memos == {}                               # 파드 목록으로 찾은 곳은 기억하지 않는다
 
 
 def test_카운터를_한_번_못_읽으면_그_칸만_null이고_기억은_두어_다음_구간이_그만큼_길다(monkeypatch):
@@ -2916,6 +2919,35 @@ def test_카운터를_읽었는데_모델이_없으면_빈_배열이다(monkeypa
     assert collect() == []
 
 
+def test_파드_목록으로_찾은_곳도_Service가_없으면_간격_동안_읽지_않는다(monkeypatch):
+    """차트를 RBAC 없이 깔아 kukie-counter-metrics 가 없다 — 개요마다 NotFound 로 끝나는 조회를 보내지 않는다 (agent#147 리뷰)."""
+    collect, now, state, seen = _counter_cluster(monkeypatch)
+    state["answers"] = {}
+    assert collect() is None and _counter_reads(seen) == ["kukie-gpu"]
+    seen.clear()
+    now[0] += clusters_api.COUNTER_SEARCH_TTL - 1
+    assert collect() is None and _counter_reads(seen) == []
+    now[0] += 1
+    assert collect() is None and _counter_reads(seen) == ["kukie-gpu"]
+
+
+def test_모든_namespace_파드를_읽었어도_파싱하지_못했으면_없다고_보지_않는다(monkeypatch):
+    collect, _, state, seen = _counter_cluster(monkeypatch)
+    state["pods"] = '{"items": {}}'
+    assert collect()[0]["model"] == "qwen"                                 # 이름으로 찾아봤다
+    assert _counter_reads(seen) == ["kukie-gpu"]
+
+
+def test_찾아볼_후보가_여럿이어도_라운드마다_하나씩만_읽는다(monkeypatch):
+    """매달린 후보 셋이 지표 풀을 막지 않게 (agent#147 리뷰). 후보 목록은 기억해 namespace 목록을 다시 읽지 않는다."""
+    collect, now, state, seen = _counter_cluster(monkeypatch, pods_ok=False)
+    state["namespaces"] = _list(*({"metadata": {"name": n}} for n in ["a-kukie", "b-kukie", "kukie-gpu", "llm", "shop"]))
+    assert collect() is None and _counter_reads(seen) == ["a-kukie"]
+    assert collect() is None and _counter_reads(seen) == ["a-kukie", "b-kukie"]
+    assert collect()[0]["model"] == "qwen" and _counter_reads(seen) == ["a-kukie", "b-kukie", "kukie-gpu"]
+    assert sum(args == gpu.NAMESPACES_COMMAND for args, _ in seen) == 2   # 파드를 namespace 마다 읽는 길의 한 번 + 후보를 고른 한 번
+
+
 def test_꺼진_GPU_클러스터는_카운터를_읽지_않는다():
     run, seen = _served_models_cluster(_result('{"items": []}'), nodes="nodes.json", pods=_list(_counter_pod()))
     body, _ = clusters_api._collect_gpu(run, namespace_pods="{}", known=True, clock=lambda: 0.0)
@@ -2927,7 +2959,7 @@ def test_파드를_namespace마다_읽는_곳은_이름으로_찾아보고_답�
     collect, now, state, seen = _counter_cluster(monkeypatch, pods_ok=False)
     assert collect()[0]["window_seconds"] is None
     assert _counter_reads(seen) == ["kukie-gpu"]
-    assert clusters_api._counter_places["c:fp:ns"][0] == "kukie-gpu"
+    assert clusters_api._counter_memos["c:fp:ns"].namespace == "kukie-gpu"
     seen.clear()
     now[0] += 20
     assert collect()[0]["window_seconds"] == 20.0                          # 기억한 곳만 읽는다
@@ -2950,7 +2982,8 @@ def test_시간_초과는_모르는_실패라_없다고_기억하지_않는다(m
     collect, _, state, seen = _counter_cluster(monkeypatch, pods_ok=False)
     state["answers"] = {"kukie-gpu": _result(stderr="Command 'kubectl' timed out after 5 seconds", success=False)}
     assert collect() is None
-    assert "c:fp:ns" not in clusters_api._counter_places
+    memo = clusters_api._counter_memos["c:fp:ns"]
+    assert (memo.namespace, memo.absent) == (None, {})
     seen.clear()
     collect()
     assert _counter_reads(seen) == ["kukie-gpu"]                           # 다음 라운드에 다시 찾는다
@@ -2963,7 +2996,7 @@ def test_기억한_namespace가_여기_없다로_바뀌면_기억을_지우고_�
     state["answers"] = {"my-kukie": state["answers"]["kukie-gpu"]}         # 다른 namespace 로 다시 깔았다
     state["namespaces"] = _list(*({"metadata": {"name": n}} for n in ["gpu-operator", "llm", "my-kukie", "shop"]))
     assert collect() is None
-    assert "c:fp:ns" not in clusters_api._counter_places
+    assert clusters_api._counter_memos["c:fp:ns"].namespace is None
     seen.clear()
     now[0] += 20
     assert collect()[0]["window_seconds"] is None                          # 다른 namespace 라 잇지 않는다

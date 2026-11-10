@@ -165,12 +165,14 @@ ServedModel — served_models
   카운터 namespace 의 파드 목록·파드 프록시 권한은 일부러 주지 않는다(kukie-gpu-operator runbooks/counter.md). 그래서 kubectl get --raw /api/v1/namespaces/<ns>/services/kukie-counter-metrics/proxy/metrics 로 읽는다.
   찾는 법 — 설치 namespace 는 고객이 고른다(우리는 kukie-gpu):
     1. 파드 목록(2, Running)에 라벨 app.kubernetes.io/name=kukie-counter 이거나 이미지에 kukie-counter 가 있는 파드가 있으면 그 namespace.
-       모든 namespace 파드를 읽었는데 없으면 카운터가 없다 — 더 찾지 않는다
+       모든 namespace 파드를 읽고 파싱했는데 없으면 카운터가 없다 — 더 찾지 않는다
     2. 모든 namespace 파드를 못 읽었으면 연결마다 기억한 namespace(전에 답한 곳)를 읽는다. 기억이 없으면 namespace 목록에서 이름에
-       kukie 나 gpu 가 들어간 것을 COUNTER_SEARCH_MAX 개까지 읽어 본다(counter_search_namespaces) — 파드를 읽은 namespace(목록에 파드가
-       있다)는 1에서 이미 봤으니 뺀다. 답한 곳을 기억한다. 거부(Forbidden)·없음(NotFound)은 "여기 없다" 다(counter_absent) —
-       다 그렇게 끝나면 "없다" 를 기억해 clusters_api.COUNTER_SEARCH_TTL 동안 다시 찾지 않는다. 기억한 곳이 "여기 없다" 로 바뀌면 기억을 지운다.
-       시간 초과처럼 모르는 실패는 기억을 바꾸지 않는다
+       kukie 나 gpu 가 들어간 것을 COUNTER_SEARCH_MAX 개까지 골라(counter_search_namespaces) 라운드마다 **하나씩** 읽어 본다 —
+       매달린 후보 여럿이 지표 풀을 막지 않게. 파드를 읽은 namespace(목록에 파드가 있다)는 1에서 이미 봤으니 뺀다. 답한 곳을 기억한다.
+       고른 후보는 clusters_api.COUNTER_SEARCH_TTL 동안 기억해 namespace 목록을 라운드마다 다시 읽지 않는다
+    거부(Forbidden)·없음(NotFound)은 "여기 없다" 다(counter_absent). 1·2 어느 길이든 그 namespace 를 COUNTER_SEARCH_TTL 동안 읽지
+    않는다 — 차트를 RBAC 없이 깔아 Service 가 없는 곳도 개요마다 조회하지 않게. 기억한 곳이 "여기 없다" 로 바뀌면 다음 후보를 찾는다.
+    시간 초과처럼 모르는 실패는 기억을 바꾸지 않는다
   읽는 조건: GPU 노드가 있고 served_models 가 null 이 아닌 라운드(애드온이 있고 읽혔다)만. GPU 없는 일반 클러스터에 kubectl 이
   늘지 않는다. GPU 노드가 없는 꺼진 클러스터는 읽지 않아 null 이다 — 돌고 있는 모델이 없고, 그 길은 지표 몫을 따로 남기지 않는다.
   찾는 법 2의 namespace 목록은 ServedModel·측정 기록과 같은 몫(지표 전)에서 읽고, Service 읽기는 지표와 같은 풀에서 맨 앞에 둔다.
@@ -345,9 +347,9 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
             "name": meta["name"],
             "model": (spec.get("source") or {}).get("huggingface") or "",
             "phase": status.get("phase") or "",
-            "reason": status.get("reason") or "",
-            "message": status.get("message") or "",
-            "hint": status.get("hint") or "",
+            "reason": _text_or_none(status.get("reason")) or "",
+            "message": _text_or_none(status.get("message")) or "",
+            "hint": _text_or_none(status.get("hint")) or "",
             "download_percent": _int_or_none(download.get("percent")),
             "download_bytes": _int_or_none(download.get("downloadedBytes")),
             "download_total_bytes": _int_or_none(download.get("totalBytes")),
@@ -367,8 +369,14 @@ def served_models_absent(stderr: str) -> bool:
     거부(Forbidden)는 _pods_by_namespace 와 같이 Kukie 가 볼 수 없는 곳이라 못 본 곳으로 치지 않는다.
     server 의 hasGpu 를 false 로 덮는 근거라 kubectl 문구로 좁힌다 — 사이 프록시의 `403 Forbidden` 본문은 모르는 실패다.
     그 밖의 문구(NotFound 등)도 모르는 실패다: hasGpu 를 덮지 않는 안전한 쪽이다."""
+    return "doesn't have a resource type" in stderr.lower() or kubectl_forbidden(stderr)
+
+
+def kubectl_forbidden(stderr: str) -> bool:
+    """kubectl 이 거부(Forbidden)로 끝났나 — `Error from server (Forbidden)` 나 `... is forbidden:`. 사이 프록시의 `403 Forbidden`
+    본문은 거부로 보지 않는다(모르는 실패다). ServedModel·NodePool·namespace 마다 파드·카운터 조회가 같이 쓴다."""
     lowered = stderr.lower()
-    return "doesn't have a resource type" in lowered or "(forbidden)" in lowered or " is forbidden" in lowered
+    return "(forbidden)" in lowered or " is forbidden" in lowered
 
 
 # ── 측정 기록 ─────────────────────────────────────────────
@@ -626,10 +634,9 @@ def counter_proxy_command(namespace: str) -> list[str]:
 
 
 def counter_absent(stderr: str) -> bool:
-    """카운터 Service 읽기 실패가 "여기 없다" 인가 — 거부(Forbidden)나 없음(NotFound). kubectl 문구로 좁힌다:
+    """카운터 Service 읽기 실패가 "여기 없다" 인가 — 거부(kubectl_forbidden)나 없음(NotFound). kubectl 문구로 좁힌다:
     시간 초과·닿지 않음·카운터가 낸 오류는 모르는 실패라 그 namespace 를 버리지 않는다."""
-    lowered = stderr.lower()
-    return "error from server (forbidden)" in lowered or "error from server (notfound)" in lowered
+    return kubectl_forbidden(stderr) or "(notfound)" in stderr.lower()
 
 
 def namespace_names(stdout: str, *, skip: str | None = None,
@@ -960,48 +967,54 @@ class CounterSample:
     series: dict[tuple[str, ...], float]
 
 
-def counter_rows(text: str, *, previous: CounterSample | None = None,
-                 at: float = 0.0) -> tuple[list[dict[str, Any]], CounterSample]:
-    """(카운터 /metrics 에서 모델마다 한 줄, 이번에 읽은 누적값) — 모듈 설명 "카운터". 카운터 지표가 없으면 빈 목록.
-
-    값은 previous(같은 카운터 namespace 의 직전 수집)와의 차이다. 줄(series)마다 뺀다 — 직전에 있던 줄이 하나라도 줄었으면 카운터가
-    다시 뜬 것이라 모든 줄이 null 이다. 직전에 있다 사라진 줄은 빼고 본다(카운터는 지우지 않지만 지워도 다른 모델을 비우지 않게).
-    부르는 쪽은 돌려준 CounterSample 을 다음 기억으로 두면 된다.
-    """
+def counter_sample(text: str, *, at: float = 0.0) -> CounterSample:
+    """카운터 /metrics 를 누적값으로 (모듈 설명 "카운터"). 카운터 지표가 없으면 빈 series. 모델은 series 의 둘째 칸이다 —
+    카운터가 설정한 모델마다 rejected_total 의 limit·brake 줄을 0 으로 미리 만들어 요청이 없던 모델도 남는다."""
     series: dict[tuple[str, ...], float] = {}
-    models: set[str] = set()
     for name, labels, value in parse_metrics(text):
         model = labels.get("model") or ""
         if not model or model == _COUNTER_UNKNOWN_MODEL:
             continue
         if name == "kukie_counter_requests_total":
             key: tuple[str, ...] = ("requests", model, labels.get("key") or "", labels.get("code") or "")
-        elif name == "kukie_counter_rejected_total":
-            models.add(model)               # 카운터가 0 으로 미리 만든 줄 — 요청이 없던 모델도 줄이 있다
-            if labels.get("reason") not in _COUNTER_429_REASONS:
-                continue
+        elif name == "kukie_counter_rejected_total" and labels.get("reason") in _COUNTER_429_REASONS:
             key = ("rejected", model, labels.get("reason") or "")
         else:
             continue
-        models.add(model)
         series[key] = series.get(key, 0.0) + value
+    return CounterSample(at=at, series=series)
 
-    sample = CounterSample(at=at, series=series)
+
+def counter_window(sample: CounterSample, previous: CounterSample | None) -> list[dict[str, Any]]:
+    """모델마다 한 줄 — sample 과 previous(같은 카운터 namespace 의 직전 수집)의 차이 (모듈 설명 "카운터").
+
+    줄(series)마다 뺀다 — 직전에 있던 줄이 하나라도 줄었으면 카운터가 다시 뜬 것이라 모든 줄이 null 이다. 직전에 있다 사라진 줄은
+    빼고 본다(카운터는 지우지 않지만 지워도 다른 모델을 비우지 않게). previous 가 없으면 모든 줄이 null 이다.
+    """
     before = previous.series if previous is not None else {}
-    connected = previous is not None and not any(value < before[key] for key, value in series.items() if key in before)
+    connected = previous is not None and not any(value < before[key] for key, value in sample.series.items() if key in before)
     known = {key[1] for key in before}
+    deltas: dict[tuple[str, str], float] = {}
+    for key, value in sample.series.items():
+        deltas[(key[0], key[1])] = deltas.get((key[0], key[1]), 0.0) + value - before.get(key, 0.0)
     rows = []
-    for model in sorted(models):
+    for model in sorted({key[1] for key in sample.series}):
         row: dict[str, Any] = {"model": model, "requests": None, "rejected": None, "rejected_ratio": None, "window_seconds": None}
         if connected and model in known:
-            def window(kind: str) -> int:
-                return round(sum(value - before.get(key, 0.0) for key, value in series.items() if key[:2] == (kind, model)))
-            done = window("requests")
-            refused = min(done, window("rejected"))
+            done = round(deltas.get(("requests", model), 0.0))
+            refused = min(done, round(deltas.get(("rejected", model), 0.0)))
             row.update(requests=done, rejected=refused, rejected_ratio=round(refused / done, 4) if done else None,
-                       window_seconds=round(at - previous.at, 1))
+                       window_seconds=round(sample.at - previous.at, 1))
         rows.append(row)
-    return rows, sample
+    return rows
+
+
+def counter_rows(text: str, *, previous: CounterSample | None = None,
+                 at: float = 0.0) -> tuple[list[dict[str, Any]], CounterSample]:
+    """(모델마다 한 줄, 이번에 읽은 누적값) — counter_sample 과 counter_window 를 잇는다. 부르는 쪽은 돌려준 CounterSample 을
+    다음 기억으로 두면 된다."""
+    sample = counter_sample(text, at=at)
+    return counter_window(sample, previous), sample
 
 
 # ── 합치기 ───────────────────────────────────────────────
