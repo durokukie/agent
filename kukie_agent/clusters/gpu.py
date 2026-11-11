@@ -165,16 +165,17 @@ ServedModel — served_models
   컨테이너 metrics 포트)와, Kukie 읽기 그룹에 그 Service 하나의 services/proxy get 만 주는 Role·RoleBinding 을 만든다.
   카운터 namespace 의 파드 목록·파드 프록시 권한은 일부러 주지 않는다(kukie-gpu-operator runbooks/counter.md). 그래서 kubectl get --raw /api/v1/namespaces/<ns>/services/kukie-counter-metrics/proxy/metrics 로 읽는다.
   찾는 법 — 설치 namespace 는 고객이 고른다(우리는 kukie-gpu):
-    1. 파드 목록(2, Running)에 라벨 app.kubernetes.io/name=kukie-counter 이거나 이미지에 kukie-counter 가 있는 파드가 있으면 그 namespace.
+    1. 파드 목록(2, Running)에 라벨 app.kubernetes.io/name=kukie-counter 이거나 이미지에 kukie-counter 가 있는 파드가 있으면 그 namespace
+       (여럿이면 "여기 없다" 가 아닌 이름순 첫째, 다 "여기 없다" 면 2로).
        모든 namespace 파드를 읽고 파싱했는데 없으면 카운터가 없다 — 더 찾지 않는다
     2. 모든 namespace 파드를 못 읽었으면 연결마다 기억한 namespace(전에 답한 곳)를 읽는다. 기억이 없으면 namespace 목록에서 이름에
        kukie 나 gpu 가 들어간 것을 COUNTER_SEARCH_MAX 개까지 골라(counter_search_namespaces) 라운드마다 **하나씩** 읽어 본다 —
-       매달린 후보 여럿이 지표 풀을 막지 않게. 파드를 읽은 namespace(목록에 파드가 있다)는 1에서 이미 봤으니 뺀다.
+       매달린 후보 여럿이 지표 풀을 막지 않게.
        namespace 목록은 같은 라운드에 파드를 namespace 마다 읽는 길(2)이 읽은(기억한) 것을 쓰고, 없을 때만 읽는다. 고른 후보는
-       clusters_api.COUNTER_SEARCH_TTL 동안 기억한다(목록을 못 읽었으면 빈 후보로) — 목록을 라운드마다 다시 읽지 않게.
+       clusters_api.COUNTER_SEARCH_TTL 동안 기억한다(목록이 거부됐으면 빈 후보로, 시간 초과처럼 모르는 실패면 기억하지 않는다).
        후보가 모르는 실패(시간 초과·503 등)로 끝나면 맨 뒤로 보낸다 — 죽은 후보 하나가 다른 후보를 막지 않게
     답한 곳은 1·2 어느 길이든 기억한다 — 다음에 파드 목록을 못 읽어도 바로 그곳을 읽는다
-    거부(Forbidden)·Service 나 namespace 없음(NotFound)은 "여기 없다" 다(counter_absent). 뒤쪽이 낸 404 는 아니다. 1·2 어느 길이든 그 namespace 를 COUNTER_SEARCH_TTL 동안 읽지
+    API 서버의 RBAC 거부·Service 나 namespace 없음(NotFound)은 "여기 없다" 다(counter_absent). 뒤쪽이 낸 403·404 는 아니다. 1·2 어느 길이든 그 namespace 를 COUNTER_SEARCH_TTL 동안 읽지
     않는다 — 차트를 RBAC 없이 깔아 Service 가 없는 곳도 개요마다 조회하지 않게. 기억한 곳이 "여기 없다" 로 바뀌면 다음 후보를 찾는다.
     시간 초과처럼 모르는 실패는 기억을 바꾸지 않는다
   읽는 조건: GPU 노드가 있고 served_models 가 null 이 아닌 라운드(애드온이 있고 읽혔다)만. GPU 없는 일반 클러스터에 kubectl 이
@@ -350,7 +351,7 @@ def served_models(stdout: str) -> list[dict[str, Any]]:
             "namespace": meta.get("namespace") or "default",
             "name": meta["name"],
             "model": (spec.get("source") or {}).get("huggingface") or "",
-            "phase": status.get("phase") or "",
+            "phase": _text_or_none(status.get("phase")) or "",
             "reason": _text_or_none(status.get("reason")) or "",
             "message": _text_or_none(status.get("message")) or "",
             "hint": _text_or_none(status.get("hint")) or "",
@@ -615,9 +616,9 @@ def pod_identity(item: dict[str, Any]) -> str:
     return f"{meta.get('uid') or status.get('startTime') or ''}:{restarts}"
 
 
-def counter_namespace(pods: list[dict[str, Any]]) -> str | None:
-    """카운터 파드가 도는 namespace, 없으면 None. pods 는 running_pods (모듈 설명 "카운터" 의 찾는 법 1).
-    노드로 좁히지 않는다(CPU 노드에서 돈다). 여러 곳이면 이름순 첫째."""
+def counter_namespaces(pods: list[dict[str, Any]]) -> list[str]:
+    """카운터 파드가 도는 namespace 들, 이름순. pods 는 running_pods (모듈 설명 "카운터" 의 찾는 법 1).
+    노드로 좁히지 않는다(CPU 노드에서 돈다)."""
     names: set[str] = set()
     for item in pods:
         try:
@@ -625,15 +626,13 @@ def counter_namespace(pods: list[dict[str, Any]]) -> str | None:
                 names.add(str(item["metadata"].get("namespace") or "default"))
         except (ValueError, AttributeError, TypeError):
             continue                                        # 모양이 이상한 파드 하나로 개요를 깨지 않는다
-    return min(names) if names else None
+    return sorted(names)
 
 
 def counter_search_namespaces(listed, *, skip: set[str] | frozenset[str] = frozenset()) -> list[str]:
-    """카운터를 찾아볼 namespace — 이름에 kukie 나 gpu 가 들어간 것(kukie 가 먼저, 그다음 이름순)에서 kube-* 와 skip 을 빼고
-    COUNTER_SEARCH_MAX 개까지 (모듈 설명 "카운터" 의 찾는 법 2). listed 는 namespace 이름들(namespace_names(everything=True))."""
-    names = sorted({name for name in listed
-                    if isinstance(name, str) and ("kukie" in name or "gpu" in name)
-                    and not name.startswith("kube-") and name not in skip})
+    """카운터를 찾아볼 namespace — 이름에 kukie 나 gpu 가 들어간 것(kukie 가 먼저, 그다음 이름순)에서 skip 을 빼고
+    COUNTER_SEARCH_MAX 개까지 (모듈 설명 "카운터" 의 찾는 법 2). listed 는 namespace_names(everything=True) — kube-* 는 이미 빠졌다."""
+    names = sorted({name for name in listed if isinstance(name, str) and ("kukie" in name or "gpu" in name) and name not in skip})
     names.sort(key=lambda name: "kukie" not in name)
     return names[:COUNTER_SEARCH_MAX]
 
@@ -644,12 +643,13 @@ def counter_proxy_command(namespace: str) -> list[str]:
 
 
 def counter_absent(stderr: str) -> bool:
-    """카운터 Service 읽기 실패가 "여기 없다" 인가 — 거부(kubectl_forbidden)나, Service·namespace 가 없다는 API 서버의 NotFound.
+    """카운터 Service 읽기 실패가 "여기 없다" 인가 — API 서버의 RBAC 거부(`... is forbidden: User ... cannot get`)나, Service·namespace 가
+    없다는 API 서버의 NotFound. 뒤쪽(인증 사이드카 등)이 낸 403 은 `(Forbidden)` 으로만 찍혀 거부로 보지 않는다.
     kubectl 문구로 좁힌다: 시간 초과·닿지 않음·카운터(뒤쪽)가 낸 오류는 모르는 실패라 그 namespace 를 버리지 않는다.
     Service 가 있는데 뒤쪽이 404 를 내면 kubectl 은 `(NotFound): the server could not find the requested resource` 를 찍는다 —
     "여기 없다" 가 아니다 (agent#147 리뷰)."""
     lowered = stderr.lower()
-    return kubectl_forbidden(stderr) or (
+    return " is forbidden:" in lowered or (
         "(notfound)" in lowered and (f'services "{COUNTER_SERVICE}" not found' in lowered or 'namespaces "' in lowered))
 
 

@@ -900,11 +900,11 @@ def _counter_pod(name: str = "kukie-gpu-counter-7d9f-abcde", *, namespace: str =
 
 
 def test_카운터_namespace는_GPU_노드로_좁히지_않고_라벨이나_이미지로_찾는다():
-    assert gpu.counter_namespace(gpu.running_pods(_list(_counter_pod()))) == "kukie-gpu"
-    assert gpu.counter_namespace(gpu.running_pods(_list(_counter_pod(labels={}, namespace="addons")))) == "addons"
+    assert gpu.counter_namespaces(gpu.running_pods(_list(_counter_pod()))) == ["kukie-gpu"]
+    assert gpu.counter_namespaces(gpu.running_pods(_list(_counter_pod(labels={}, namespace="addons")))) == ["addons"]
     other = _counter_pod(labels={"app.kubernetes.io/name": "kukie-oven"}, image="durokukie/kukie-oven:0.6.0")
-    assert gpu.counter_namespace(gpu.running_pods(_list(other))) is None
-    assert gpu.counter_namespace(pods()) is None                           # GPU 픽스처에는 카운터가 없다
+    assert gpu.counter_namespaces(gpu.running_pods(_list(other))) == []
+    assert gpu.counter_namespaces(pods()) == []                           # GPU 픽스처에는 카운터가 없다
 
 
 def test_카운터는_파드_프록시가_아니라_지표_Service의_서비스_프록시로_읽는다():
@@ -926,6 +926,7 @@ def test_카운터를_찾아볼_namespace는_kukie_gpu가_든_이름을_kukie_�
     # Service 는 있는데 뒤쪽(카운터)이 404 — 여기 없는 게 아니다 (agent#147 리뷰)
     ("Error from server (NotFound): the server could not find the requested resource", False),
     ("Command 'kubectl' timed out after 5 seconds", False),
+    ("Error from server (Forbidden): <html>403 Forbidden</html>", False),          # 뒤쪽(인증 사이드카 등)이 낸 403
     ('Error from server (ServiceUnavailable): no endpoints available for service "kukie-counter-metrics"', False),
 ])
 def test_카운터_읽기_실패는_여기_없다와_모르는_것을_가른다(stderr, expected):
@@ -2980,11 +2981,11 @@ def test_namespace_목록을_못_읽어도_간격_동안_다시_읽지_않는다
     state["namespaces"] = None
     plan = clusters_api._counter_plan(
         lambda args, timeout: (seen.append((args, timeout)), _result(stderr=FORBIDDEN, success=False))[1],
-        lambda limit: limit, [], found=None, whole=False, cache_key="k", clock=lambda: now[0])
+        lambda limit: limit, found=[], whole=False, cache_key="k", clock=lambda: now[0])
     assert plan is None and clusters_api._counter_memos["k"].names == ()
     seen.clear()
     now[0] += clusters_api.COUNTER_SEARCH_TTL - 1
-    assert clusters_api._counter_plan(lambda args, timeout: seen.append(args), lambda limit: limit, [], found=None,
+    assert clusters_api._counter_plan(lambda args, timeout: seen.append(args), lambda limit: limit, found=[],
                                       whole=False, cache_key="k", clock=lambda: now[0]) is None
     assert seen == []
 
@@ -2993,7 +2994,7 @@ def test_모양이_이상한_파드가_있어도_지표_대상을_잃지_않는�
     odd = {"metadata": {"name": "odd", "namespace": "x", "labels": "not-a-dict"}, "spec": {"containers": []},
            "status": {"phase": "Running"}}
     items = json.loads(fixture("gpu_pods.json"))["items"] + [odd]
-    assert gpu.counter_namespace(gpu.running_pods(_list(*items))) is None
+    assert gpu.counter_namespaces(gpu.running_pods(_list(*items))) == []
     assert gpu.dcgm_targets(gpu.running_pods(_list(*items)), {L40S_1, L40S_4})
 
 
@@ -3017,7 +3018,22 @@ def test_기억한_namespace가_잇달아_모르는_실패면_다시_찾는다(m
 
 def test_CPU_노드의_모양이_이상한_파드도_카운터_찾기에서_개요를_깨지_않는다():
     odd = {"metadata": {"name": "odd", "namespace": "x"}, "spec": "x", "status": {"phase": "Running"}}
-    assert gpu.counter_namespace(gpu.running_pods(_list(odd, _counter_pod()))) == "kukie-gpu"
+    assert gpu.counter_namespaces(gpu.running_pods(_list(odd, _counter_pod()))) == ["kukie-gpu"]
+
+
+def test_파드_목록으로_찾은_곳이_여기_없다면_다른_카운터_namespace를_읽는다(monkeypatch):
+    collect, _, state, seen = _counter_cluster(monkeypatch)
+    items = json.loads(state["pods"])["items"] + [_counter_pod("old", namespace="dev-kukie")]
+    state["pods"] = _list(*items)
+    assert collect() is None and _counter_reads(seen) == ["dev-kukie"]
+    assert collect()[0]["model"] == "qwen" and _counter_reads(seen) == ["dev-kukie", "kukie-gpu"]
+
+
+def test_namespace_목록이_시간_초과면_빈_후보로_기억하지_않는다():
+    run = lambda args, timeout: _result(stderr="Command 'kubectl' timed out after 5 seconds", success=False)
+    assert clusters_api._counter_plan(run, lambda limit: limit, found=[], whole=False, cache_key="k",
+                                      clock=lambda: 0.0) is None
+    assert "k" not in clusters_api._counter_memos
 
 
 def test_꺼진_GPU_클러스터는_카운터를_읽지_않는다():
@@ -3041,8 +3057,8 @@ def test_파드를_namespace마다_읽는_곳은_이름으로_찾아보고_답�
 def test_찾아봤는데_다_여기_없다면_간격_동안_다시_찾지_않는다(monkeypatch):
     collect, now, state, seen = _counter_cluster(monkeypatch, pods_ok=False)
     state["answers"] = {}
-    assert collect() is None
-    assert _counter_reads(seen) == ["kukie-gpu"]
+    assert collect() is None and collect() is None
+    assert _counter_reads(seen) == ["kukie-gpu", "gpu-operator"]          # 후보마다 한 라운드
     seen.clear()
     now[0] += clusters_api.COUNTER_SEARCH_TTL - 1
     assert collect() is None and _counter_reads(seen) == []
@@ -3058,7 +3074,8 @@ def test_시간_초과는_모르는_실패라_없다고_기억하지_않는다(m
     assert (memo.namespace, memo.absent) == (None, {})
     seen.clear()
     collect()
-    assert _counter_reads(seen) == ["kukie-gpu"]                           # 다음 라운드에 다시 찾는다
+    collect()
+    assert _counter_reads(seen) == ["gpu-operator", "kukie-gpu"]           # 맨 뒤로 갔다가 다시 찾는다
 
 
 def test_기억한_namespace가_여기_없다로_바뀌면_기억을_지우고_다시_찾는다(monkeypatch):

@@ -718,7 +718,6 @@ def _collect_gpu(
     except (ValueError, AttributeError, TypeError):
         logger.debug("GPU 지표 파드를 찾지 못했다 (파드 목록을 읽지 못했다)")
         pods, dcgm, vllm, pods_parsed = [], {}, [], False
-    counter_found = gpu.counter_namespace(pods)             # 모양이 이상한 파드는 건너뛴다 — 지표 대상을 잃지 않게
     waiting: list[dict[str, Any]] | None
     try:
         waiting = gpu.waiting_pods(pods_stdout)
@@ -771,7 +770,8 @@ def _collect_gpu(
 
     # 카운터는 측정 기록처럼 ServedModel 이 읽힌 라운드에만, 같은 몫 안에서 어디를 읽을지 정한다 — 애드온이 없는 일반 클러스터에
     # kubectl 이 늘지 않는다. 읽기는 지표와 같은 풀·같은 예산이고 맨 앞에 둔다 — 매달린 지표 파드 뒤에서 예산이 떨어지지 않게 (agent#147 리뷰)
-    counter_plan = (_counter_plan(run, served_budget, pods, found=counter_found, whole=pods_result.success and pods_parsed,
+    counter_plan = (_counter_plan(run, served_budget, found=gpu.counter_namespaces(pods),
+                                  whole=pods_result.success and pods_parsed,
                                   listed=_listed_namespaces(cache_key) if not pods_result.success else None,
                                   cache_key=cache_key, clock=clock)
                     if served_models is not None else None)
@@ -838,7 +838,7 @@ def _update_counter_memo(cache_key: str | None, now: float, change) -> None:
         _counter_memos[cache_key] = memo
 
 
-def _counter_plan(run, budget, pods: list[dict[str, Any]], *, found: str | None, whole: bool,
+def _counter_plan(run, budget, *, found: list[str], whole: bool,
                   listed: tuple[str, ...] | None = None, cache_key: str | None,
                   clock=time.monotonic) -> tuple[str, str] | None:
     """(이번 라운드에 카운터 Service 를 읽을 namespace, 근거), 읽지 않으면 None. 근거는
@@ -846,11 +846,13 @@ def _counter_plan(run, budget, pods: list[dict[str, Any]], *, found: str | None,
       remembered  전에 답한 namespace
       search      후보 중 아직 "여기 없다" 가 아닌 첫째 (찾는 법 2)
     후보는 기억이 없거나 COUNTER_SEARCH_TTL 이 지났을 때만 고른다. listed 는 이 라운드에 _pods_by_namespace 가 읽은(기억한)
-    namespace 목록이다 — 있으면 다시 읽지 않는다. 없을 때만 목록을 읽고(budget — 지표 전의 몫), 못 읽었어도 빈 후보를 기억한다."""
+    namespace 목록이다 — 있으면 다시 읽지 않는다. 없을 때만 목록을 읽고(budget — 지표 전의 몫), 거부됐으면 빈 후보를 기억한다.
+    found 는 파드 목록에서 본 카운터 namespace 들이다 — "여기 없다" 인 것을 빼고 남은 게 없으면 2로 넘어간다."""
     now = clock()
     memo = _counter_memo(cache_key, now)
+    found = [name for name in found if name not in memo.absent]
     if found:
-        return None if found in memo.absent else (found, "found")
+        return found[0], "found"
     if whole:
         return None                                         # 모든 namespace 파드를 읽었는데 카운터 파드가 없다
     if memo.namespace and memo.namespace not in memo.absent:
@@ -862,15 +864,19 @@ def _counter_plan(run, budget, pods: list[dict[str, Any]], *, found: str | None,
             if timeout < 1:
                 return None                                 # 읽어 보지 않았다 — 기억하지 않는다
             result = run(gpu.NAMESPACES_COMMAND, timeout)
-            try:
-                listed = tuple(gpu.namespace_names(result.stdout, everything=True)[0]) if result.success else ()
-            except (ValueError, AttributeError, TypeError):
-                listed = ()
-            if not listed:
-                logger.debug("카운터를 찾을 namespace 목록을 읽지 못했다: %s",
-                             _failure_status(result.stderr or result.stdout) if not result.success else "목록 모양이 아니다")
-        seen = {str((item.get("metadata") or {}).get("namespace") or "default") for item in pods}
-        names = tuple(gpu.counter_search_namespaces(listed, skip=seen))
+            if result.success:
+                try:
+                    listed = tuple(gpu.namespace_names(result.stdout, everything=True)[0])
+                except (ValueError, AttributeError, TypeError):
+                    logger.debug("카운터를 찾을 namespace 목록을 읽지 못했다 (목록 모양이 아니다)")
+                    return None
+            else:
+                text = result.stderr or result.stdout or ""
+                logger.debug("카운터를 찾을 namespace 목록을 읽지 못했다: %s", _failure_status(text))
+                if not gpu.kubectl_forbidden(text):
+                    return None                             # 모르는 실패 — 기억하지 않고 다음 라운드에 다시 본다
+                listed = ()                                 # 거부 — 빈 후보로 간격 동안 다시 묻지 않는다
+        names = tuple(gpu.counter_search_namespaces(listed))
 
         def chosen(memo: _CounterMemo, names: tuple[str, ...] = names) -> None:
             memo.names, memo.names_at = names, now
