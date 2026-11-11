@@ -165,9 +165,11 @@ ServedModel — served_models
   카운터 namespace 의 파드 목록·파드 프록시 권한은 일부러 주지 않는다(kukie-gpu-operator runbooks/counter.md). 그래서
   kubectl get --raw /api/v1/namespaces/<ns>/services/kukie-counter-metrics/proxy/metrics 로 읽는다 (counter_proxy_command).
   어느 namespace 를 읽나 — 짐작하지 않는다:
-    1. 이 라운드에 모든 namespace 파드 목록을 읽고 파싱했으면, 라벨 app.kubernetes.io/name=kukie-counter 이거나 이미지에 kukie-counter 가
-       있는 Running 파드의 namespace(여럿이면 이름순 첫째, counter_namespaces). 노드로 좁히지 않는다(CPU 노드에서 돈다). 없으면 null
-    2. 못 읽었으면 COUNTER_DEFAULT_NAMESPACE(kukie-gpu, 우리가 차트를 까는 namespace) 하나만 읽는다. 어떤 실패든 그 라운드는 null 이다
+    1. 읽은 파드 목록(2)에 라벨 app.kubernetes.io/name=kukie-counter 이거나 이미지 저장소 이름이 kukie-counter 인 Running 파드가 있으면
+       그 namespace(counter_namespaces — 여럿이면 COUNTER_DEFAULT_NAMESPACE 가 먼저, 그다음 이름순 첫째). 노드로 좁히지 않는다(CPU 노드에서
+       돈다). 모든 namespace 파드를 읽고 파싱했는데 없으면 null
+    2. 그 밖(모든 파드를 못 읽었고 읽은 namespace 에도 없다)이면 COUNTER_DEFAULT_NAMESPACE(kukie-gpu, 우리가 차트를 까는 namespace)
+       하나만 읽는다. 어떤 실패든 그 라운드는 null 이다
     그래서 모든 파드를 못 읽는 클러스터에서 다른 namespace 에 깐 카운터는 찾지 못한다 — 차트가 설치 namespace 를 읽기 그룹이 볼 수
     있는 곳에 적는 것이 후속이다. 실패를 기억해 다음 라운드를 바꾸지 않는다(찾기 상태가 없다).
   읽기는 지표 대상 하나로 DCGM·vLLM 과 같은 풀(GPU_METRICS_WORKERS)·같은 시간 예산에서 맨 앞에 둔다.
@@ -733,7 +735,14 @@ def _is_counter(item: dict[str, Any]) -> bool:
     labels = (item.get("metadata") or {}).get("labels")
     labels = labels if isinstance(labels, dict) else {}
     return (labels.get("app.kubernetes.io/name") == "kukie-counter"
-            or any("kukie-counter" in str(c.get("image") or "").lower() for c in _containers(item)))
+            or any(_image_repository(c.get("image")) == "kukie-counter" for c in _containers(item)))
+
+
+def _image_repository(image: Any) -> str:
+    """이미지의 저장소 이름 마지막 조각 — `registry/durokukie/kukie-counter:0.3.0@sha256:…` → `kukie-counter`.
+    `kukie-counter-loadtest` 같은 다른 이미지를 카운터로 보지 않게 (agent#147 리뷰)."""
+    name = str(image or "").lower().split("@", 1)[0].rsplit("/", 1)[-1]
+    return name.split(":", 1)[0]
 
 
 def _vllm_port(item: dict[str, Any]) -> int:

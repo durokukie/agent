@@ -2914,6 +2914,25 @@ def test_namespace가_바뀌면_기억을_잇지_않는다():
     assert row["window_seconds"] is None
 
 
+def test_카운터_파드가_여럿이면_정해_둔_namespace가_먼저고_이미지는_저장소_이름으로_본다():
+    stray = _counter_pod("stray", namespace="default")
+    loadtest = _counter_pod("lt", namespace="bench", labels={}, image="durokukie/kukie-counter-loadtest:1")
+    mirrored = _counter_pod("m", namespace="mirror", labels={}, image="registry.local:5000/ops/kukie-counter:0.3.0@sha256:ab")
+    pods_ = gpu.running_pods(_list(stray, loadtest, mirrored, _counter_pod()))
+    assert gpu.counter_namespaces(pods_) == ["default", "kukie-gpu", "mirror"]
+    assert clusters_api._counter_namespace(pods_, listed_all=True) == "kukie-gpu"
+    assert clusters_api._counter_namespace(gpu.running_pods(_list(stray)), listed_all=False) == "default"   # 읽은 namespace 에서 찾았다
+    assert clusters_api._counter_namespace([], listed_all=False) == gpu.COUNTER_DEFAULT_NAMESPACE
+    assert clusters_api._counter_namespace([], listed_all=True) is None
+
+
+def test_먼저_읽은_다른_namespace_값도_나중에_읽은_기억을_덮지_않는다():
+    text = _counter_metrics({("q", "k", "200"): 10}, _zeros("q"))
+    clusters_api._counter_rows("c", "kukie-gpu", text, 11.0)
+    clusters_api._counter_rows("c", "addons", text, 10.0)
+    assert clusters_api._counter_samples["c"][0] == "kukie-gpu"
+
+
 def test_ServedModel을_못_읽은_라운드는_카운터를_읽지_않는다(monkeypatch):
     collect, _, _, seen = _counter_cluster(monkeypatch, served=_result(stderr=NO_CRD, success=False))
     assert collect() is None

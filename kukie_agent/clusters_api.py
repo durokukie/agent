@@ -796,11 +796,12 @@ def _collect_gpu(
 
 
 def _counter_namespace(pods: list[dict[str, Any]], *, listed_all: bool) -> str | None:
-    """카운터 지표 Service 를 읽을 namespace — clusters/gpu.py "카운터" 의 찾는 법. 모든 namespace 파드를 읽고 파싱했으면(listed_all)
-    그 목록의 카운터 파드 namespace(이름순 첫째), 없으면 None. 못 읽었으면 COUNTER_DEFAULT_NAMESPACE 하나."""
-    if listed_all:
-        return next(iter(gpu.counter_namespaces(pods)), None)
-    return gpu.COUNTER_DEFAULT_NAMESPACE
+    """카운터 지표 Service 를 읽을 namespace — clusters/gpu.py "카운터" 의 찾는 법. 읽은 파드에 카운터 파드가 있으면 그 namespace
+    (COUNTER_DEFAULT_NAMESPACE 가 먼저). 없을 때 모든 namespace 파드를 읽고 파싱했으면(listed_all) None, 아니면 COUNTER_DEFAULT_NAMESPACE."""
+    found = gpu.counter_namespaces(pods)
+    if found:
+        return gpu.COUNTER_DEFAULT_NAMESPACE if gpu.COUNTER_DEFAULT_NAMESPACE in found else found[0]
+    return None if listed_all else gpu.COUNTER_DEFAULT_NAMESPACE
 
 
 def _counter_rows(cache_key: str | None, namespace: str, text: str, at: float) -> list[dict[str, Any]]:
@@ -812,11 +813,11 @@ def _counter_rows(cache_key: str | None, namespace: str, text: str, at: float) -
     sample = gpu.counter_sample(text, at=at)
     with _latency_lock:
         remembered = _counter_samples.get(cache_key) if cache_key else None
+        if remembered and remembered[1].at >= at:
+            return gpu.counter_window(sample, None)         # 나중에 읽은 값이 이미 있다 — namespace 가 달라도 덮지 않는다
         previous = remembered[1] if remembered and remembered[0] == namespace else None
         if previous is not None and at - previous.at >= LATENCY_WINDOW_MAX:
             previous = None                                 # 너무 오래됐다 — 최근 구간이 아니다 (_latency_memory 를 먼저 안 불러도)
-        if previous is not None and previous.at >= at:
-            return gpu.counter_window(sample, None)
         if cache_key:
             _counter_samples[cache_key] = (namespace, sample)
     return gpu.counter_window(sample, previous)
