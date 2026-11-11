@@ -28,7 +28,6 @@ def _forget_readable_namespaces(monkeypatch):
     monkeypatch.setattr(clusters_api, "_gpu_absent_checked", {})
     monkeypatch.setattr(clusters_api, "_latency_samples", {})
     monkeypatch.setattr(clusters_api, "_counter_samples", {})
-    monkeypatch.setattr(clusters_api, "_counter_memos", {})
     monkeypatch.setattr(clusters_api, "_benchmarks_memory", {})
     # 나눠 쓰는 개요도 비우고 끈다(TTL 0 이면 진행 중인 것도 나눠 쓰지 않는다) — 같은 개요를 두 번 불러 다른 kubectl
     # 결과를 보는 테스트가 많다. 나눠 쓰기를 보는 테스트(test_cluster_overview_share.py)만 켠다

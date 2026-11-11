@@ -26,7 +26,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -78,7 +78,7 @@ OVERVIEW_SHARE_TTL = 10
 #: `?fresh=true`(화면의 "다시 읽기")여도 이보다 덜 된 결과(초)는 나눠 쓴다. 사람이 누른 다시 읽기는 늘 새로 읽은 것처럼 보이고,
 #: 화면이 fresh 로 폴링해도 kubectl 이 이 간격보다 자주 돌지 않는다 — 나눠 쓰기를 부르는 쪽만 믿지 않게 (agent#125 리뷰)
 FRESH_MIN_AGE = 2
-#: 지표를 동시에 읽는 수. 개요 슬롯(OVERVIEW_WORKERS) 하나 안에서 잠깐 쓰는 스레드라 limiter 밖이다 — 많아야 4 × 4 (카운터를 읽는 라운드는 한 칸 더)
+#: 지표를 동시에 읽는 수. 개요 슬롯(OVERVIEW_WORKERS) 하나 안에서 잠깐 쓰는 스레드라 limiter 밖이다 — 많아야 4 × 4
 GPU_METRICS_WORKERS = 4
 #: GPU 노드가 없고 server 값이 GPU 클러스터(true)가 아닌 연결은 이 간격(초)마다 한 번만 GPU 를 기다리는 파드를 찾는다.
 #:   false  GPU 가 없다고 남은 곳 — 노드 그룹을 0대로 둔 채 vLLM 같은 GPU 워크로드를 새로 올려도 노드가 뜨기 전에 GPU
@@ -95,12 +95,6 @@ GPU_ABSENT_RECHECK_FORGET = 24 * 3600   # 이만큼 안 부른 연결의 시각�
 #: 서빙 TTFT·ITL p95 의 최근 구간 상한(초). 직전 수집이 이보다 오래됐으면 기억을 버리고 이번 p95 는 null 이다 — 화면을
 #: 20초마다 읽는 동안은 구간이 20초(여럿이 보면 OVERVIEW_SHARE_TTL)이고, 닫았다 한참 뒤에 열면 옛 값과 빼지 않는다 (DURO-124)
 LATENCY_WINDOW_MAX = 600
-#: 카운터 Service 가 "여기 없다"(거부·없음)로 끝난 namespace 를 이 시간(초) 동안 다시 읽지 않는다 — 거부되는 조회가 개요마다
-#: 고객 감사 로그에 쌓이지 않게. 찾아볼 후보(namespace 목록에서 고른 것)도 이만큼 기억한다. 카운터를 새로 켜면 이만큼 늦게 보인다
-#: (clusters/gpu.py "카운터")
-COUNTER_SEARCH_TTL = READABLE_NAMESPACES_TTL
-#: 기억한 곳이나 파드 목록으로 찾은 카운터 namespace 가 이만큼 잇달아 모르는 실패(시간 초과·503 등)로 끝나면 "여기 없다" 로 친다
-COUNTER_MISSES = 3
 
 
 @router.post("/{cluster_id}/test")
@@ -752,39 +746,35 @@ def _collect_gpu(
         if read_served and served_absent:                   # CRD 없음·거부 — 잠깐의 실패가 아니다
             _forget_benchmarks(cache_key)
         benchmarks = _remembered_benchmarks(cache_key, clock)
-    def read(args: list[str]) -> tuple[KubectlResult | None, float]:
-        """(결과, 읽은 시각) — 예산이 없으면 결과는 None. 시각은 서빙 p95 구간의 끝이라 파드마다 따로 잰다 (agent#137 리뷰)."""
-        timeout = budget(GPU_METRICS_TIMEOUT)
-        if timeout < 1:
-            return None, clock()
-        result = run(args, timeout)
-        if not result.success:
-            logger.debug("GPU 지표를 읽지 못했다 (%s): %s", args[-1], _failure_status(result.stderr or result.stdout))
-        return result, clock()
-
     if not nodes:
         # 카운터는 읽지 않는다 — 돌고 있는 모델이 없고, 이 길은 지표 몫을 따로 남기지 않는다 (agent#147 리뷰)
         if waiting or node_pools or served_models is not None:
             return gpu.build([], [], waiting or [], served_models, node_pools, benchmarks), True
         return None, (False if waiting is not None and pods_complete and served_absent and pools_absent else None)
 
-    # 카운터는 측정 기록처럼 ServedModel 이 읽힌 라운드에만, 같은 몫 안에서 어디를 읽을지 정한다 — 애드온이 없는 일반 클러스터에
-    # kubectl 이 늘지 않는다. 읽기는 지표와 같은 풀·같은 예산이고 맨 앞에 둔다 — 매달린 지표 파드 뒤에서 예산이 떨어지지 않게 (agent#147 리뷰)
-    counter_plan = (_counter_plan(run, served_budget, found=gpu.counter_namespaces(pods),
-                                  whole=pods_result.success and pods_parsed,
-                                  listed=_listed_namespaces(cache_key) if not pods_result.success else None,
-                                  cache_key=cache_key, clock=clock)
-                    if served_models is not None else None)
-    counter_commands = [gpu.counter_proxy_command(counter_plan[0])] if counter_plan else []
+    def read(args: list[str]) -> tuple[str | None, float]:
+        """(/metrics 본문, 읽은 시각) — 시각은 서빙 p95 구간의 끝이라 파드마다 따로 잰다 (agent#137 리뷰)."""
+        timeout = budget(GPU_METRICS_TIMEOUT)
+        if timeout < 1:
+            return None, clock()
+        result = run(args, timeout)
+        if not result.success:
+            logger.debug("GPU 지표를 읽지 못했다 (%s): %s", args[-1], _failure_status(result.stderr or result.stdout))
+            return None, clock()
+        return result.stdout, clock()
+
+    # 카운터는 측정 기록처럼 ServedModel 이 읽힌 라운드에만 읽는다 — 애드온이 없는 일반 클러스터에 kubectl 이 늘지 않는다.
+    # 지표 대상 하나로 같은 풀·같은 예산에서 읽고 맨 앞에 둔다 — 매달린 지표 파드 뒤에서 예산이 떨어지지 않게 (agent#147 리뷰)
+    counter_namespace = (_counter_namespace(pods, listed_all=pods_result.success and pods_parsed)
+                         if served_models is not None else None)
+    counter_commands = [gpu.counter_proxy_command(counter_namespace)] if counter_namespace else []
     dcgm_rows = [row for row in nodes if row["node"] in dcgm]
     targets = [gpu.proxy_command(*dcgm[row["node"]]) for row in dcgm_rows] + [
         gpu.proxy_command(ns, pod, port) for ns, pod, port, _, _ in vllm]
-    # 카운터 몫으로 한 칸을 더 둔다 — 매달린 카운터가 DCGM·vLLM 의 칸을 뺏지 않게 (agent#147 리뷰)
-    with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS + len(counter_commands)) as pool:
+    with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
         reads = list(pool.map(read, counter_commands + targets))
-    counter_reads = reads[:len(counter_commands)]
-    texts = [(result.stdout if result is not None and result.success else None, at)
-             for result, at in reads[len(counter_commands):]]
+    counter_text, counter_at = reads[0] if counter_commands else (None, 0.0)
+    texts = reads[len(counter_commands):]
     for row, (text, _) in zip(dcgm_rows, texts):
         if text is not None:
             gpu.apply_dcgm(row, text)
@@ -800,145 +790,17 @@ def _collect_gpu(
     if cache_key:
         with _latency_lock:
             _latency_samples[cache_key] = remembered
-    counter = _counter_result(cache_key, *counter_plan, *counter_reads[0], clock=clock) if counter_plan else None
+    counter = (_counter_rows(cache_key, counter_namespace, counter_text, counter_at)
+               if counter_namespace and counter_text is not None else None)
     return gpu.build(nodes, serving, waiting or [], served_models, node_pools, benchmarks, counter), True
 
 
-@dataclass
-class _CounterMemo:
-    """연결 하나의 카운터 찾기 기억 — clusters/gpu.py "카운터" 의 찾는 법. _update_counter_memo 로만 고친다."""
-    at: float                                               # 마지막으로 고친 시각 (오래 안 부른 연결을 지운다)
-    namespace: str | None = None                            # 답한 곳 (찾는 법 1·2 어느 쪽이든)
-    absent: dict[str, float] = field(default_factory=dict)  # "여기 없다" 로 끝난 namespace → 그 시각 (COUNTER_SEARCH_TTL)
-    names: tuple[str, ...] | None = None                    # 찾는 법 2의 후보 — 읽어 볼 차례대로. 모르는 실패는 맨 뒤로 보낸다
-    names_at: float = 0.0                                   # 후보를 고른 시각. 목록을 못 읽었어도 남긴다(빈 후보) — 간격 동안 다시 읽지 않게
-    misses: dict[str, int] = field(default_factory=dict)    # namespace 가 모르는 실패로 끝난 연속 횟수 (COUNTER_MISSES)
-
-
-def _counter_memo(cache_key: str | None, now: float) -> _CounterMemo:
-    """연결의 카운터 찾기 기억 (복사본). COUNTER_SEARCH_TTL 이 지난 "여기 없다" 는 뺀다. 오래 안 부른 연결의 기억은 지운다."""
-    with _counter_lock:
-        for key in [key for key, memo in _counter_memos.items() if now - memo.at >= GPU_ABSENT_RECHECK_FORGET]:
-            del _counter_memos[key]
-        memo = _counter_memos.get(cache_key) if cache_key else None
-        if memo is None:
-            return _CounterMemo(at=now)
-        memo.absent = {name: at for name, at in memo.absent.items() if now - at < COUNTER_SEARCH_TTL}
-        return replace(memo, absent=dict(memo.absent), misses=dict(memo.misses))
-
-
-def _update_counter_memo(cache_key: str | None, now: float, change) -> None:
-    """지금 남은 기억에 change(memo) 를 한 잠금 안에서 적용한다 — 겹친 두 라운드가 서로의 고침을 옛 복사본으로 덮지 않게 (agent#147 리뷰)."""
-    if not cache_key:
-        return
-    with _counter_lock:
-        memo = _counter_memos.get(cache_key) or _CounterMemo(at=now)
-        change(memo)
-        memo.at = now
-        _counter_memos[cache_key] = memo
-
-
-def _counter_plan(run, budget, *, found: list[str], whole: bool,
-                  listed: tuple[str, ...] | None = None, cache_key: str | None,
-                  clock=time.monotonic) -> tuple[str, str] | None:
-    """(이번 라운드에 카운터 Service 를 읽을 namespace, 근거), 읽지 않으면 None. 근거는
-      found       파드 목록에서 카운터 파드를 봤다 (찾는 법 1)
-      remembered  전에 답한 namespace
-      search      후보 중 아직 "여기 없다" 가 아닌 첫째 (찾는 법 2)
-    후보는 기억이 없거나 COUNTER_SEARCH_TTL 이 지났을 때만 고른다. listed 는 이 라운드에 _pods_by_namespace 가 읽은(기억한)
-    namespace 목록이다 — 있으면 다시 읽지 않는다. 없을 때만 목록을 읽고(budget — 지표 전의 몫), 거부됐으면 빈 후보를 기억한다.
-    found 는 파드 목록에서 본 카운터 namespace 들이다 — "여기 없다" 인 것을 빼고 남은 게 없으면 2로 넘어간다."""
-    now = clock()
-    memo = _counter_memo(cache_key, now)
-    found = [name for name in found if name not in memo.absent]
-    if memo.namespace in found:
-        return memo.namespace, "found"                      # 답한 적 있는 곳을 먼저 — 떠돌이 카운터 파드에 막히지 않게
-    if found:
-        return found[0], "found"
-    if memo.namespace and memo.namespace not in memo.absent:
-        return memo.namespace, "remembered"             # 롤링 재시작으로 파드가 잠깐 안 보여도 읽는다
-    if whole:
-        return None                                         # 모든 namespace 파드를 읽었는데 카운터 파드가 없다
-    names = memo.names
-    exhausted = bool(names) and all(name in memo.absent for name in names)
-    if names is None or exhausted or now - memo.names_at >= COUNTER_SEARCH_TTL:
-        if listed is None:
-            timeout = budget(GPU_PODS_TIMEOUT)
-            if timeout < 1:
-                return _counter_candidate(memo)             # 읽어 보지 않았다 — 기억하지 않고 남은 후보를 쓴다
-            result = run(gpu.NAMESPACES_COMMAND, timeout)
-            if result.success:
-                try:
-                    listed = tuple(gpu.all_namespaces(result.stdout))
-                except (ValueError, AttributeError, TypeError):
-                    logger.debug("카운터를 찾을 namespace 목록을 읽지 못했다 (목록 모양이 아니다)")
-                    return _counter_candidate(memo)
-            else:
-                text = result.stderr or result.stdout or ""
-                logger.debug("카운터를 찾을 namespace 목록을 읽지 못했다: %s", _failure_status(text))
-                if not gpu.kubectl_forbidden(text):
-                    return _counter_candidate(memo)         # 모르는 실패 — 기억하지 않고 남은 후보를 쓴다
-                listed = ()                                 # 거부 — 빈 후보로 간격 동안 다시 묻지 않는다
-        names = tuple(gpu.counter_search_namespaces(listed, skip=set(memo.absent)))
-
-        def chosen(memo: _CounterMemo, names: tuple[str, ...] = names) -> None:
-            memo.names, memo.names_at = names, now
-        _update_counter_memo(cache_key, now, chosen)
-    memo.names = names
-    return _counter_candidate(memo)
-
-
-def _counter_candidate(memo: _CounterMemo) -> tuple[str, str] | None:
-    """후보 중 "여기 없다" 가 아닌 첫째."""
-    candidate = next((name for name in memo.names or () if name not in memo.absent), None)
-    return (candidate, "search") if candidate else None
-
-
-def _counter_result(cache_key: str | None, namespace: str, source: str, result: KubectlResult | None, at: float,
-                    *, clock=time.monotonic) -> list[dict[str, Any]] | None:
-    """카운터 줄 — 못 읽었으면 None. 찾기 기억을 고친다: 답한 곳은 기억하고(찾는 법 1·2 모두 — 다음에 파드 목록을 못 읽어도 바로 읽게),
-    "여기 없다" 는 그 namespace 를 COUNTER_SEARCH_TTL 동안 읽지 않는다. 후보를 읽다 모르는 실패(시간 초과·503 등)로 끝나면 그 후보를
-    맨 뒤로 보낸다 — 죽은 후보 하나가 다른 후보를 막지 않게 (agent#147 리뷰). 기억한 곳이나 파드 목록으로 찾은 곳이 COUNTER_MISSES 번
-    잇달아 모르는 실패면 "여기 없다" 로 친다 — 다른 카운터 namespace·기억·찾기로 넘어간다. 예산이 없어 안 읽은 것은 고치지 않는다."""
-    if result is not None and result.success:
-        def answered(memo: _CounterMemo) -> None:
-            memo.namespace = namespace
-            memo.absent.pop(namespace, None)
-            memo.misses.pop(namespace, None)
-        _update_counter_memo(cache_key, at, answered)
-        return _counter_rows(cache_key, namespace, result.stdout, at)
-    if result is None:
-        return None
-    now = clock()
-    if gpu.counter_absent(result.stderr or result.stdout or ""):
-        def gone(memo: _CounterMemo) -> None:
-            memo.absent[namespace] = now
-            memo.misses.pop(namespace, None)
-            if memo.namespace == namespace:
-                memo.namespace, memo.names = None, None     # 옮겼거나 껐다 — namespace 목록부터 다시 찾는다
-        _update_counter_memo(cache_key, now, gone)
-    elif source == "search":
-        def later(memo: _CounterMemo) -> None:
-            if memo.names and namespace in memo.names:
-                memo.names = tuple(name for name in memo.names if name != namespace) + (namespace,)
-        _update_counter_memo(cache_key, now, later)
-    else:
-        def missed(memo: _CounterMemo) -> None:
-            memo.misses[namespace] = memo.misses.get(namespace, 0) + 1
-            if memo.misses[namespace] >= COUNTER_MISSES:   # 엔드포인트 없는 옛 Service 처럼 계속 모른다 — 여기 없는 것으로 친다
-                memo.misses.pop(namespace)
-                memo.absent[namespace] = now
-                if memo.namespace == namespace:
-                    memo.namespace, memo.names = None, None
-        _update_counter_memo(cache_key, now, missed)
-    return None
-
-
-def _listed_namespaces(cache_key: str | None) -> tuple[str, ...] | None:
-    """_pods_by_namespace 가 읽은(기억한) namespace 목록 전부, 없으면 None."""
-    with _readable_lock:
-        memo = _readable_namespaces.get(cache_key) if cache_key else None
-    return memo.listed if memo else None
+def _counter_namespace(pods: list[dict[str, Any]], *, listed_all: bool) -> str | None:
+    """카운터 지표 Service 를 읽을 namespace — clusters/gpu.py "카운터" 의 찾는 법. 모든 namespace 파드를 읽고 파싱했으면(listed_all)
+    그 목록의 카운터 파드 namespace(이름순 첫째), 없으면 None. 못 읽었으면 COUNTER_DEFAULT_NAMESPACE 하나."""
+    if listed_all:
+        return next(iter(gpu.counter_namespaces(pods)), None)
+    return gpu.COUNTER_DEFAULT_NAMESPACE
 
 
 def _counter_rows(cache_key: str | None, namespace: str, text: str, at: float) -> list[dict[str, Any]]:
@@ -1090,7 +952,6 @@ class _NamespaceMemo:
     productive: frozenset[str]         # GPU 지표 파드(DCGM·vLLM)나, GPU 노드 0대 라운드의 기다리는 파드가 나온 namespace
     cursors: tuple[int, int] = (0, 0)  # 앞 줄·뒤 줄에서 다음에 읽기 시작할 자리
     whole: bool = True                 # names 가 목록 전부다 — MAX_POD_NAMESPACES 로 자르지 않았다
-    listed: tuple[str, ...] | None = None  # 마지막으로 읽은 namespace 목록 전부 — 카운터 찾기가 다시 읽지 않고 쓴다(_counter_plan)
 
 
 @dataclass
@@ -1112,9 +973,6 @@ _latency_samples: dict[str, dict[str, gpu.LatencySample]] = {}
 _latency_lock = threading.Lock()
 #: 연결마다 카운터 namespace 와 그 직전 수집의 누적값 — _counter_rows. 서빙 p95 기억과 같은 잠금을 쓴다
 _counter_samples: dict[str, tuple[str, gpu.CounterSample]] = {}
-#: 연결마다 카운터 찾기 기억 — _counter_plan·_counter_result
-_counter_memos: dict[str, _CounterMemo] = {}
-_counter_lock = threading.Lock()
 #: 연결마다 마지막으로 성공한 측정 기록 — _read_benchmarks. 한 연결에 많아야 MAX_BENCHMARKS 줄이고 GPU_BENCHMARKS_FORGET 뒤에 지운다
 _benchmarks_memory: dict[str, _BenchmarksMemo] = {}
 _benchmarks_lock = threading.Lock()
@@ -1182,7 +1040,6 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
         memo = _readable_namespaces.get(cache_key) if cache_key else None
     productive = set(memo.productive) if memo else set()
     names, listed_at = None, memo.at if memo else now
-    listed = memo.listed if memo else None
     whole = False                                           # names 가 지금 목록 전부인가 — 끝까지 읽었나의 조건
     if memo and now - memo.at < READABLE_NAMESPACES_TTL:
         names, whole = list(memo.names), memo.whole
@@ -1191,8 +1048,7 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
         names_result = run(gpu.NAMESPACES_COMMAND, budget(OVERVIEW_TIMEOUT))
         if names_result.success:
             try:
-                listed = tuple(gpu.all_namespaces(names_result.stdout))
-                names, whole = gpu.namespace_names(list(listed), skip=namespace, prefer=productive)
+                names, whole = gpu.namespace_names(names_result.stdout, skip=namespace, prefer=productive)
             except (ValueError, AttributeError, TypeError):
                 logger.debug("namespace 목록을 읽지 못했다")
         else:
@@ -1224,7 +1080,7 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
                 productive.discard(name)
         keep = tuple(name for name in names if results[name][1] != "forbidden")
         next_memo = _NamespaceMemo(at=listed_at, names=keep, productive=frozenset(productive & set(keep)),
-                                   cursors=(cursors[0] + tried[0], cursors[1] + tried[1]), whole=whole, listed=listed)
+                                   cursors=(cursors[0] + tried[0], cursors[1] + tried[1]), whole=whole)
         with _readable_lock:
             # 지운 클러스터·바뀐 연결의 옛 기억이 쌓이지 않게. TTL 두 배까지는 남겨 목록을 못 읽을 때 쓴다
             for key in [key for key, old in _readable_namespaces.items() if now - old.at >= 2 * READABLE_NAMESPACES_TTL]:
