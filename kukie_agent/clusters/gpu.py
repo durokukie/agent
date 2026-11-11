@@ -153,7 +153,7 @@ ServedModel — served_models
     기억이 없다(첫 수집·namespace 가 바뀜·직전이 너무 오래됨)  그 라운드는 모든 줄의 requests·rejected·rejected_ratio·window_seconds 가 null
     값이 줄었다(카운터가 다시 떠 처음부터 센다)                기억을 버리고 이번은 모두 null — 다음 수집부터 다시 잇는다
     직전 수집에 없던 모델                                     그 줄만 모두 null — 다음 수집부터
-    줄(model·key·code)마다 견주므로 직전에 있다 사라진 줄은 빼고 본다
+    줄(model·key·code)마다 견준다. 직전에 있던 줄이 사라져도 다시 뜬 것으로 본다 — 카운터는 요청 줄을 지우지 않는다
     구간에 요청이 없었다                                     requests 0, rejected 0, rejected_ratio null, window_seconds 는 있다
   롤링 업데이트로 카운터 파드가 잠깐 둘이면 Service 가 어느 쪽에 붙을지 몰라 그동안 값이 줄었다 늘었다 한다 — 줄면 위처럼 null 이고,
   새 파드가 옛 파드의 마지막 값보다 커진 채 붙으면 그 구간 하나는 틀린 값일 수 있다 (차트는 레플리카 1, 겹치는 것은 잠깐이다).
@@ -378,7 +378,7 @@ def served_models_absent(stderr: str) -> bool:
 
 def kubectl_forbidden(stderr: str) -> bool:
     """kubectl 이 거부(Forbidden)로 끝났나 — `Error from server (Forbidden)` 나 `... is forbidden:`. 사이 프록시의 `403 Forbidden`
-    본문은 거부로 보지 않는다(모르는 실패다). ServedModel·NodePool·namespace 마다 파드·카운터 조회가 같이 쓴다."""
+    본문은 거부로 보지 않는다(모르는 실패다). ServedModel·NodePool·카운터 조회가 같이 쓴다."""
     lowered = stderr.lower()
     return "(forbidden)" in lowered or " is forbidden" in lowered
 
@@ -618,9 +618,14 @@ def pod_identity(item: dict[str, Any]) -> str:
 def counter_namespace(pods: list[dict[str, Any]]) -> str | None:
     """카운터 파드가 도는 namespace, 없으면 None. pods 는 running_pods (모듈 설명 "카운터" 의 찾는 법 1).
     노드로 좁히지 않는다(CPU 노드에서 돈다). 여러 곳이면 이름순 첫째."""
-    names = sorted({str(item["metadata"].get("namespace") or "default") for item in pods
-                    if isinstance(item.get("metadata"), dict) and _is_counter(item)})
-    return names[0] if names else None
+    names: set[str] = set()
+    for item in pods:
+        try:
+            if isinstance(item.get("metadata"), dict) and _is_counter(item):
+                names.add(str(item["metadata"].get("namespace") or "default"))
+        except (ValueError, AttributeError, TypeError):
+            continue                                        # 모양이 이상한 파드 하나로 개요를 깨지 않는다
+    return min(names) if names else None
 
 
 def counter_search_namespaces(listed, *, skip: set[str] | frozenset[str] = frozenset()) -> list[str]:
@@ -1001,11 +1006,13 @@ def counter_sample(text: str, *, at: float = 0.0) -> CounterSample:
 def counter_window(sample: CounterSample, previous: CounterSample | None) -> list[dict[str, Any]]:
     """모델마다 한 줄 — sample 과 previous(같은 카운터 namespace 의 직전 수집)의 차이 (모듈 설명 "카운터").
 
-    줄(series)마다 뺀다 — 직전에 있던 줄이 하나라도 줄었으면 카운터가 다시 뜬 것이라 모든 줄이 null 이다. 직전에 있다 사라진 줄은
-    빼고 본다(카운터는 지우지 않지만 지워도 다른 모델을 비우지 않게). previous 가 없으면 모든 줄이 null 이다.
+    줄(series)마다 뺀다 — 직전에 있던 줄이 하나라도 줄었거나 사라졌으면 카운터가 다시 뜬 것이라 모든 줄이 null 이다. 카운터는 요청 줄을
+    지우지 않으므로(counter/metrics.go) 사라진 줄은 다시 떠 아직 그 요청이 없다는 뜻이다 — 다시 뜬 뒤 끝난 요청이 하나도 없어도
+    0 으로 내지 않게 (agent#147 리뷰). previous 가 없으면 모든 줄이 null 이다.
     """
     before = previous.series if previous is not None else {}
-    connected = previous is not None and not any(value < before[key] for key, value in sample.series.items() if key in before)
+    connected = previous is not None and all(key in sample.series and sample.series[key] >= value
+                                             for key, value in before.items())
     done: dict[str, float] = {}
     refused: dict[str, float] = {}
     for key, value in sample.series.items():

@@ -26,7 +26,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -78,7 +78,7 @@ OVERVIEW_SHARE_TTL = 10
 #: `?fresh=true`(화면의 "다시 읽기")여도 이보다 덜 된 결과(초)는 나눠 쓴다. 사람이 누른 다시 읽기는 늘 새로 읽은 것처럼 보이고,
 #: 화면이 fresh 로 폴링해도 kubectl 이 이 간격보다 자주 돌지 않는다 — 나눠 쓰기를 부르는 쪽만 믿지 않게 (agent#125 리뷰)
 FRESH_MIN_AGE = 2
-#: 지표를 동시에 읽는 수. 개요 슬롯(OVERVIEW_WORKERS) 하나 안에서 잠깐 쓰는 스레드라 limiter 밖이다 — 많아야 4 × 4
+#: 지표를 동시에 읽는 수. 개요 슬롯(OVERVIEW_WORKERS) 하나 안에서 잠깐 쓰는 스레드라 limiter 밖이다 — 많아야 4 × 4 (카운터를 읽는 라운드는 한 칸 더)
 GPU_METRICS_WORKERS = 4
 #: GPU 노드가 없고 server 값이 GPU 클러스터(true)가 아닌 연결은 이 간격(초)마다 한 번만 GPU 를 기다리는 파드를 찾는다.
 #:   false  GPU 가 없다고 남은 곳 — 노드 그룹을 0대로 둔 채 vLLM 같은 GPU 워크로드를 새로 올려도 노드가 뜨기 전에 GPU
@@ -99,6 +99,8 @@ LATENCY_WINDOW_MAX = 600
 #: 고객 감사 로그에 쌓이지 않게. 찾아볼 후보(namespace 목록에서 고른 것)도 이만큼 기억한다. 카운터를 새로 켜면 이만큼 늦게 보인다
 #: (clusters/gpu.py "카운터")
 COUNTER_SEARCH_TTL = READABLE_NAMESPACES_TTL
+#: 기억한 카운터 namespace 가 이만큼 잇달아 모르는 실패(시간 초과·503 등)로 끝나면 기억을 지우고 다시 찾는다
+COUNTER_MISSES = 3
 
 
 @router.post("/{cluster_id}/test")
@@ -777,7 +779,8 @@ def _collect_gpu(
     dcgm_rows = [row for row in nodes if row["node"] in dcgm]
     targets = [gpu.proxy_command(*dcgm[row["node"]]) for row in dcgm_rows] + [
         gpu.proxy_command(ns, pod, port) for ns, pod, port, _, _ in vllm]
-    with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS) as pool:
+    # 카운터 몫으로 한 칸을 더 둔다 — 매달린 카운터가 DCGM·vLLM 의 칸을 뺏지 않게 (agent#147 리뷰)
+    with ThreadPoolExecutor(max_workers=GPU_METRICS_WORKERS + len(counter_commands)) as pool:
         reads = list(pool.map(read, counter_commands + targets))
     counter_reads = reads[:len(counter_commands)]
     texts = [(result.stdout if result is not None and result.success else None, at)
@@ -809,6 +812,7 @@ class _CounterMemo:
     absent: dict[str, float] = field(default_factory=dict)  # "여기 없다" 로 끝난 namespace → 그 시각 (COUNTER_SEARCH_TTL)
     names: tuple[str, ...] | None = None                    # 찾는 법 2의 후보 — 읽어 볼 차례대로. 모르는 실패는 맨 뒤로 보낸다
     names_at: float = 0.0                                   # 후보를 고른 시각. 목록을 못 읽었어도 남긴다(빈 후보) — 간격 동안 다시 읽지 않게
+    misses: int = 0                                         # 기억한 namespace 가 모르는 실패로 끝난 연속 횟수 (COUNTER_MISSES)
 
 
 def _counter_memo(cache_key: str | None, now: float) -> _CounterMemo:
@@ -819,8 +823,8 @@ def _counter_memo(cache_key: str | None, now: float) -> _CounterMemo:
         memo = _counter_memos.get(cache_key) if cache_key else None
         if memo is None:
             return _CounterMemo(at=now)
-        return _CounterMemo(at=memo.at, namespace=memo.namespace, names=memo.names, names_at=memo.names_at,
-                            absent={name: at for name, at in memo.absent.items() if now - at < COUNTER_SEARCH_TTL})
+        memo.absent = {name: at for name, at in memo.absent.items() if now - at < COUNTER_SEARCH_TTL}
+        return replace(memo, absent=dict(memo.absent))
 
 
 def _update_counter_memo(cache_key: str | None, now: float, change) -> None:
@@ -879,10 +883,11 @@ def _counter_result(cache_key: str | None, namespace: str, source: str, result: 
                     *, clock=time.monotonic) -> list[dict[str, Any]] | None:
     """카운터 줄 — 못 읽었으면 None. 찾기 기억을 고친다: 답한 곳은 기억하고(찾는 법 1·2 모두 — 다음에 파드 목록을 못 읽어도 바로 읽게),
     "여기 없다" 는 그 namespace 를 COUNTER_SEARCH_TTL 동안 읽지 않는다. 후보를 읽다 모르는 실패(시간 초과·503 등)로 끝나면 그 후보를
-    맨 뒤로 보낸다 — 죽은 후보 하나가 다른 후보를 막지 않게 (agent#147 리뷰). 예산이 없어 안 읽은 것은 고치지 않는다."""
+    맨 뒤로 보낸다 — 죽은 후보 하나가 다른 후보를 막지 않게 (agent#147 리뷰). 기억한 곳이 COUNTER_MISSES 번 잇달아 모르는 실패면
+    기억을 지우고 다시 찾는다. 예산이 없어 안 읽은 것은 고치지 않는다."""
     if result is not None and result.success:
         def answered(memo: _CounterMemo) -> None:
-            memo.namespace = namespace
+            memo.namespace, memo.misses = namespace, 0
             memo.absent.pop(namespace, None)
         _update_counter_memo(cache_key, at, answered)
         return _counter_rows(cache_key, namespace, result.stdout, at)
@@ -900,6 +905,14 @@ def _counter_result(cache_key: str | None, namespace: str, source: str, result: 
             if memo.names and namespace in memo.names:
                 memo.names = tuple(name for name in memo.names if name != namespace) + (namespace,)
         _update_counter_memo(cache_key, now, later)
+    elif source == "remembered":
+        def missed(memo: _CounterMemo) -> None:
+            if memo.namespace != namespace:
+                return
+            memo.misses += 1
+            if memo.misses >= COUNTER_MISSES:               # 엔드포인트 없는 옛 Service 처럼 계속 모른다 — 다시 찾는다
+                memo.namespace, memo.names, memo.misses = None, None, 0
+        _update_counter_memo(cache_key, now, missed)
     return None
 
 

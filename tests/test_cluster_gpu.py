@@ -987,13 +987,13 @@ def test_카운터_값이_줄었으면_다시_뜬_것이라_이번은_null이고
     assert (row["requests"], row["rejected"], row["rejected_ratio"]) == (105, 10, 0.0952)
 
 
-def test_카운터_줄_하나가_사라져도_다른_모델을_비우지_않는다():
-    """줄마다 견준다 — 사라진 줄은 빼고 본다(agent#147 리뷰). 카운터는 요청 줄을 지우지 않지만 지워도 재시작으로 읽지 않는다."""
-    _, before = _counter_rows(_counter_metrics({("a", "k1", "200"): 100, ("a", "k2", "200"): 50, ("b", "k", "200"): 10},
-                                                  _zeros("a", "b")), at=0.0)
-    rows, _ = _counter_rows(_counter_metrics({("a", "k1", "200"): 104, ("b", "k", "200"): 12}, _zeros("a", "b")),
-                               previous=before, at=20.0)
-    assert [(r["model"], r["requests"]) for r in rows] == [("a", 4), ("b", 2)]
+def test_카운터_요청_줄이_사라졌으면_다시_뜬_것이라_null이다():
+    """카운터는 요청 줄을 지우지 않는다 — 다시 뜬 뒤 끝난 요청이 없으면 rejected_total 0 줄만 남는다. 0 으로 내지 않는다 (agent#147 리뷰)."""
+    _, before = _counter_rows(_counter_metrics({("a", "k", "200"): 100, ("a", "k", "429"): 40}, _zeros("a")), at=0.0)
+    [row], restarted = _counter_rows(_counter_metrics({}, _zeros("a")), previous=before, at=20.0)
+    assert (row["requests"], row["window_seconds"]) == (None, None)
+    [row], _ = _counter_rows(_counter_metrics({("a", "k", "200"): 2}, _zeros("a")), previous=restarted, at=40.0)
+    assert (row["requests"], row["rejected"]) == (2, 0)
 
 
 def test_카운터_직전에_없던_모델은_다음_수집부터_구간이_있다():
@@ -2995,6 +2995,29 @@ def test_모양이_이상한_파드가_있어도_지표_대상을_잃지_않는�
     items = json.loads(fixture("gpu_pods.json"))["items"] + [odd]
     assert gpu.counter_namespace(gpu.running_pods(_list(*items))) is None
     assert gpu.dcgm_targets(gpu.running_pods(_list(*items)), {L40S_1, L40S_4})
+
+
+def test_기억한_namespace가_잇달아_모르는_실패면_다시_찾는다(monkeypatch):
+    """카운터를 옮긴 뒤 옛 namespace 에 엔드포인트 없는 Service 가 남았다 (agent#147 리뷰)."""
+    collect, now, state, seen = _counter_cluster(monkeypatch, pods_ok=False)
+    collect()
+    dead = _result(stderr='Error from server (ServiceUnavailable): no endpoints available for service "kukie-counter-metrics"',
+                   success=False)
+    state["answers"] = {"kukie-gpu": dead, "my-kukie": state["answers"]["kukie-gpu"]}
+    state["namespaces"] = _list(*({"metadata": {"name": n}} for n in ["kukie-gpu", "llm", "my-kukie", "shop"]))
+    now[0] += clusters_api.READABLE_NAMESPACES_TTL
+    for _ in range(clusters_api.COUNTER_MISSES):
+        assert collect() is None
+    assert clusters_api._counter_memos["c:fp:ns"].namespace is None
+    seen.clear()
+    collect()                                                              # 첫 후보 kukie-gpu 는 또 모른다 — 맨 뒤로
+    assert collect()[0]["model"] == "qwen"
+    assert _counter_reads(seen) == ["kukie-gpu", "my-kukie"]
+
+
+def test_CPU_노드의_모양이_이상한_파드도_카운터_찾기에서_개요를_깨지_않는다():
+    odd = {"metadata": {"name": "odd", "namespace": "x"}, "spec": "x", "status": {"phase": "Running"}}
+    assert gpu.counter_namespace(gpu.running_pods(_list(odd, _counter_pod()))) == "kukie-gpu"
 
 
 def test_꺼진_GPU_클러스터는_카운터를_읽지_않는다():
