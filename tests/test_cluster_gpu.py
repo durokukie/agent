@@ -3036,6 +3036,26 @@ def test_namespace_목록이_시간_초과면_빈_후보로_기억하지_않는�
     assert "k" not in clusters_api._counter_memos
 
 
+def test_여기_없다인_곳을_빼고_후보를_골라_네_번째_namespace도_읽는다(monkeypatch):
+    """후보 상한(세 곳)이 "여기 없다" 로 막히지 않게 (agent#147 리뷰)."""
+    collect, now, state, seen = _counter_cluster(monkeypatch, pods_ok=False)
+    state["namespaces"] = _list(*({"metadata": {"name": n}} for n in
+                                  ["kukie-a", "kukie-b", "kukie-c", "kukie-gpu", "llm", "shop"]))
+    for _ in range(3):
+        assert collect() is None
+    assert collect()[0]["model"] == "qwen"
+    assert _counter_reads(seen) == ["kukie-a", "kukie-b", "kukie-c", "kukie-gpu"]
+
+
+def test_기억한_곳은_파드_목록에서_카운터가_잠깐_안_보여도_읽는다(monkeypatch):
+    collect, now, state, seen = _counter_cluster(monkeypatch)
+    collect()
+    state["pods"] = fixture("gpu_pods.json")                               # 롤링 재시작 중
+    seen.clear()
+    now[0] += 20
+    assert collect()[0]["window_seconds"] == 20.0 and _counter_reads(seen) == ["kukie-gpu"]
+
+
 def test_꺼진_GPU_클러스터는_카운터를_읽지_않는다():
     run, seen = _served_models_cluster(_result('{"items": []}'), nodes="nodes.json", pods=_list(_counter_pod()))
     body, _ = clusters_api._collect_gpu(run, namespace_pods="{}", known=True, clock=lambda: 0.0)
@@ -3061,8 +3081,8 @@ def test_찾아봤는데_다_여기_없다면_간격_동안_다시_찾지_않는
     assert _counter_reads(seen) == ["kukie-gpu", "gpu-operator"]          # 후보마다 한 라운드
     seen.clear()
     now[0] += clusters_api.COUNTER_SEARCH_TTL - 1
-    assert collect() is None and _counter_reads(seen) == []
-    now[0] += 1
+    assert collect() is None and _counter_reads(seen) == []                # 남은 곳에서 다시 골랐지만 후보가 없다 — 빈 후보로 기억
+    now[0] += clusters_api.COUNTER_SEARCH_TTL
     assert collect() is None and _counter_reads(seen) == ["kukie-gpu"]     # 간격이 지나면 다시 찾는다
 
 

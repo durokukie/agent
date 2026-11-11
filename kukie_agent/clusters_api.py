@@ -853,12 +853,13 @@ def _counter_plan(run, budget, *, found: list[str], whole: bool,
     found = [name for name in found if name not in memo.absent]
     if found:
         return found[0], "found"
+    if memo.namespace and memo.namespace not in memo.absent:
+        return memo.namespace, "remembered"             # 롤링 재시작으로 파드가 잠깐 안 보여도 읽는다
     if whole:
         return None                                         # 모든 namespace 파드를 읽었는데 카운터 파드가 없다
-    if memo.namespace and memo.namespace not in memo.absent:
-        return memo.namespace, "remembered"
     names = memo.names
-    if names is None or now - memo.names_at >= COUNTER_SEARCH_TTL:
+    exhausted = bool(names) and all(name in memo.absent for name in names)
+    if names is None or exhausted or now - memo.names_at >= COUNTER_SEARCH_TTL:
         if listed is None:
             timeout = budget(GPU_PODS_TIMEOUT)
             if timeout < 1:
@@ -866,7 +867,7 @@ def _counter_plan(run, budget, *, found: list[str], whole: bool,
             result = run(gpu.NAMESPACES_COMMAND, timeout)
             if result.success:
                 try:
-                    listed = tuple(gpu.namespace_names(result.stdout, everything=True)[0])
+                    listed = tuple(gpu.all_namespaces(result.stdout))
                 except (ValueError, AttributeError, TypeError):
                     logger.debug("카운터를 찾을 namespace 목록을 읽지 못했다 (목록 모양이 아니다)")
                     return None
@@ -876,7 +877,7 @@ def _counter_plan(run, budget, *, found: list[str], whole: bool,
                 if not gpu.kubectl_forbidden(text):
                     return None                             # 모르는 실패 — 기억하지 않고 다음 라운드에 다시 본다
                 listed = ()                                 # 거부 — 빈 후보로 간격 동안 다시 묻지 않는다
-        names = tuple(gpu.counter_search_namespaces(listed))
+        names = tuple(gpu.counter_search_namespaces(listed, skip=set(memo.absent)))
 
         def chosen(memo: _CounterMemo, names: tuple[str, ...] = names) -> None:
             memo.names, memo.names_at = names, now
@@ -1177,8 +1178,8 @@ def _pods_by_namespace(run, budget, namespace_pods: str, *, namespace: str | Non
         names_result = run(gpu.NAMESPACES_COMMAND, budget(OVERVIEW_TIMEOUT))
         if names_result.success:
             try:
-                names, whole = gpu.namespace_names(names_result.stdout, skip=namespace, prefer=productive)
-                listed = tuple(gpu.namespace_names(names_result.stdout, everything=True)[0])
+                listed = tuple(gpu.all_namespaces(names_result.stdout))
+                names, whole = gpu.namespace_names(list(listed), skip=namespace, prefer=productive)
             except (ValueError, AttributeError, TypeError):
                 logger.debug("namespace 목록을 읽지 못했다")
         else:
