@@ -99,7 +99,7 @@ LATENCY_WINDOW_MAX = 600
 #: 고객 감사 로그에 쌓이지 않게. 찾아볼 후보(namespace 목록에서 고른 것)도 이만큼 기억한다. 카운터를 새로 켜면 이만큼 늦게 보인다
 #: (clusters/gpu.py "카운터")
 COUNTER_SEARCH_TTL = READABLE_NAMESPACES_TTL
-#: 기억한 카운터 namespace 가 이만큼 잇달아 모르는 실패(시간 초과·503 등)로 끝나면 기억을 지우고 다시 찾는다
+#: 기억한 곳이나 파드 목록으로 찾은 카운터 namespace 가 이만큼 잇달아 모르는 실패(시간 초과·503 등)로 끝나면 "여기 없다" 로 친다
 COUNTER_MISSES = 3
 
 
@@ -812,7 +812,7 @@ class _CounterMemo:
     absent: dict[str, float] = field(default_factory=dict)  # "여기 없다" 로 끝난 namespace → 그 시각 (COUNTER_SEARCH_TTL)
     names: tuple[str, ...] | None = None                    # 찾는 법 2의 후보 — 읽어 볼 차례대로. 모르는 실패는 맨 뒤로 보낸다
     names_at: float = 0.0                                   # 후보를 고른 시각. 목록을 못 읽었어도 남긴다(빈 후보) — 간격 동안 다시 읽지 않게
-    misses: int = 0                                         # 기억한 namespace 가 모르는 실패로 끝난 연속 횟수 (COUNTER_MISSES)
+    misses: dict[str, int] = field(default_factory=dict)    # namespace 가 모르는 실패로 끝난 연속 횟수 (COUNTER_MISSES)
 
 
 def _counter_memo(cache_key: str | None, now: float) -> _CounterMemo:
@@ -824,7 +824,7 @@ def _counter_memo(cache_key: str | None, now: float) -> _CounterMemo:
         if memo is None:
             return _CounterMemo(at=now)
         memo.absent = {name: at for name, at in memo.absent.items() if now - at < COUNTER_SEARCH_TTL}
-        return replace(memo, absent=dict(memo.absent))
+        return replace(memo, absent=dict(memo.absent), misses=dict(memo.misses))
 
 
 def _update_counter_memo(cache_key: str | None, now: float, change) -> None:
@@ -863,26 +863,32 @@ def _counter_plan(run, budget, *, found: list[str], whole: bool,
         if listed is None:
             timeout = budget(GPU_PODS_TIMEOUT)
             if timeout < 1:
-                return None                                 # 읽어 보지 않았다 — 기억하지 않는다
+                return _counter_candidate(memo)             # 읽어 보지 않았다 — 기억하지 않고 남은 후보를 쓴다
             result = run(gpu.NAMESPACES_COMMAND, timeout)
             if result.success:
                 try:
                     listed = tuple(gpu.all_namespaces(result.stdout))
                 except (ValueError, AttributeError, TypeError):
                     logger.debug("카운터를 찾을 namespace 목록을 읽지 못했다 (목록 모양이 아니다)")
-                    return None
+                    return _counter_candidate(memo)
             else:
                 text = result.stderr or result.stdout or ""
                 logger.debug("카운터를 찾을 namespace 목록을 읽지 못했다: %s", _failure_status(text))
                 if not gpu.kubectl_forbidden(text):
-                    return None                             # 모르는 실패 — 기억하지 않고 다음 라운드에 다시 본다
+                    return _counter_candidate(memo)         # 모르는 실패 — 기억하지 않고 남은 후보를 쓴다
                 listed = ()                                 # 거부 — 빈 후보로 간격 동안 다시 묻지 않는다
         names = tuple(gpu.counter_search_namespaces(listed, skip=set(memo.absent)))
 
         def chosen(memo: _CounterMemo, names: tuple[str, ...] = names) -> None:
             memo.names, memo.names_at = names, now
         _update_counter_memo(cache_key, now, chosen)
-    candidate = next((name for name in names if name not in memo.absent), None)
+    memo.names = names
+    return _counter_candidate(memo)
+
+
+def _counter_candidate(memo: _CounterMemo) -> tuple[str, str] | None:
+    """후보 중 "여기 없다" 가 아닌 첫째."""
+    candidate = next((name for name in memo.names or () if name not in memo.absent), None)
     return (candidate, "search") if candidate else None
 
 
@@ -890,12 +896,13 @@ def _counter_result(cache_key: str | None, namespace: str, source: str, result: 
                     *, clock=time.monotonic) -> list[dict[str, Any]] | None:
     """카운터 줄 — 못 읽었으면 None. 찾기 기억을 고친다: 답한 곳은 기억하고(찾는 법 1·2 모두 — 다음에 파드 목록을 못 읽어도 바로 읽게),
     "여기 없다" 는 그 namespace 를 COUNTER_SEARCH_TTL 동안 읽지 않는다. 후보를 읽다 모르는 실패(시간 초과·503 등)로 끝나면 그 후보를
-    맨 뒤로 보낸다 — 죽은 후보 하나가 다른 후보를 막지 않게 (agent#147 리뷰). 기억한 곳이 COUNTER_MISSES 번 잇달아 모르는 실패면
-    기억을 지우고 다시 찾는다. 예산이 없어 안 읽은 것은 고치지 않는다."""
+    맨 뒤로 보낸다 — 죽은 후보 하나가 다른 후보를 막지 않게 (agent#147 리뷰). 기억한 곳이나 파드 목록으로 찾은 곳이 COUNTER_MISSES 번
+    잇달아 모르는 실패면 "여기 없다" 로 친다 — 다른 카운터 namespace·기억·찾기로 넘어간다. 예산이 없어 안 읽은 것은 고치지 않는다."""
     if result is not None and result.success:
         def answered(memo: _CounterMemo) -> None:
-            memo.namespace, memo.misses = namespace, 0
+            memo.namespace = namespace
             memo.absent.pop(namespace, None)
+            memo.misses.pop(namespace, None)
         _update_counter_memo(cache_key, at, answered)
         return _counter_rows(cache_key, namespace, result.stdout, at)
     if result is None:
@@ -912,13 +919,14 @@ def _counter_result(cache_key: str | None, namespace: str, source: str, result: 
             if memo.names and namespace in memo.names:
                 memo.names = tuple(name for name in memo.names if name != namespace) + (namespace,)
         _update_counter_memo(cache_key, now, later)
-    elif source == "remembered":
+    else:
         def missed(memo: _CounterMemo) -> None:
-            if memo.namespace != namespace:
-                return
-            memo.misses += 1
-            if memo.misses >= COUNTER_MISSES:               # 엔드포인트 없는 옛 Service 처럼 계속 모른다 — 다시 찾는다
-                memo.namespace, memo.names, memo.misses = None, None, 0
+            memo.misses[namespace] = memo.misses.get(namespace, 0) + 1
+            if memo.misses[namespace] >= COUNTER_MISSES:   # 엔드포인트 없는 옛 Service 처럼 계속 모른다 — 여기 없는 것으로 친다
+                memo.misses.pop(namespace)
+                memo.absent[namespace] = now
+                if memo.namespace == namespace:
+                    memo.namespace, memo.names = None, None
         _update_counter_memo(cache_key, now, missed)
     return None
 
@@ -940,6 +948,8 @@ def _counter_rows(cache_key: str | None, namespace: str, text: str, at: float) -
     with _latency_lock:
         remembered = _counter_samples.get(cache_key) if cache_key else None
         previous = remembered[1] if remembered and remembered[0] == namespace else None
+        if previous is not None and at - previous.at >= LATENCY_WINDOW_MAX:
+            previous = None                                 # 너무 오래됐다 — 최근 구간이 아니다 (_latency_memory 를 먼저 안 불러도)
         if previous is not None and previous.at >= at:
             return gpu.counter_window(sample, None)
         if cache_key:

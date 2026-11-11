@@ -3010,10 +3010,10 @@ def test_기억한_namespace가_잇달아_모르는_실패면_다시_찾는다(m
     for _ in range(clusters_api.COUNTER_MISSES):
         assert collect() is None
     assert clusters_api._counter_memos["c:fp:ns"].namespace is None
+    assert "kukie-gpu" in clusters_api._counter_memos["c:fp:ns"].absent   # 여기 없는 것으로 친다
     seen.clear()
-    collect()                                                              # 첫 후보 kukie-gpu 는 또 모른다 — 맨 뒤로
     assert collect()[0]["model"] == "qwen"
-    assert _counter_reads(seen) == ["kukie-gpu", "my-kukie"]
+    assert _counter_reads(seen) == ["my-kukie"]
 
 
 def test_CPU_노드의_모양이_이상한_파드도_카운터_찾기에서_개요를_깨지_않는다():
@@ -3054,6 +3054,41 @@ def test_기억한_곳은_파드_목록에서_카운터가_잠깐_안_보여도_
     seen.clear()
     now[0] += 20
     assert collect()[0]["window_seconds"] == 20.0 and _counter_reads(seen) == ["kukie-gpu"]
+
+
+def test_파드_목록으로_찾은_곳이_잇달아_모르는_실패면_다른_namespace로_넘어간다(monkeypatch):
+    collect, _, state, seen = _counter_cluster(monkeypatch)
+    items = json.loads(state["pods"])["items"] + [_counter_pod("dev", namespace="dev-kukie")]
+    state["pods"] = _list(*items)
+    state["answers"]["dev-kukie"] = _result(
+        stderr='Error from server (ServiceUnavailable): no endpoints available for service "kukie-counter-metrics"', success=False)
+    for _ in range(clusters_api.COUNTER_MISSES):
+        assert collect() is None
+    assert collect()[0]["model"] == "qwen"
+    assert _counter_reads(seen) == ["dev-kukie"] * clusters_api.COUNTER_MISSES + ["kukie-gpu"]
+
+
+def test_프로세스_시작_시각이_바뀌면_값이_다_늘었어도_다시_뜬_것이다():
+    """다음 수집 전에 모든 줄이 직전 값보다 커진 재시작 (agent#147 리뷰)."""
+    def text(start, ok, refused):
+        return f"process_start_time_seconds {start}\n" + _counter_metrics(
+            {("m", "k", "200"): ok, ("m", "k", "429"): refused}, _zeros("m"))
+    _, before = _counter_rows(text(1000, 5, 1), at=0.0)
+    [row], restarted = _counter_rows(text(2000, 40, 3), previous=before, at=20.0)
+    assert row["requests"] is None and restarted.started == 2000
+    [row], _ = _counter_rows(text(2000, 50, 4), previous=restarted, at=40.0)
+    assert (row["requests"], row["rejected"]) == (11, 1)
+
+
+def test_후보를_다시_고르다_목록을_못_읽어도_남은_후보를_쓴다(monkeypatch):
+    collect, now, state, seen = _counter_cluster(monkeypatch, pods_ok=False)
+    state["answers"]["kukie-gpu"] = _result(stderr="Command 'kubectl' timed out after 5 seconds", success=False)
+    collect()
+    now[0] += clusters_api.COUNTER_SEARCH_TTL
+    state["answers"]["kukie-gpu"] = _result(_counter_metrics({("qwen", "k1", "200"): 100}, _zeros("qwen")))
+    run = lambda args, timeout: _result(stderr="Command 'kubectl' timed out after 5 seconds", success=False)
+    assert clusters_api._counter_plan(run, lambda limit: limit, found=[], whole=False, cache_key="c:fp:ns",
+                                      clock=lambda: now[0]) == ("gpu-operator", "search")
 
 
 def test_꺼진_GPU_클러스터는_카운터를_읽지_않는다():

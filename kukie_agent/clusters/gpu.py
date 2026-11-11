@@ -151,7 +151,7 @@ ServedModel — served_models
   파드가 아니라 namespace 로 기억한다 — Service 로 읽어 파드를 모른다. 카운터가 다시 뜨면 값이 줄어드는 것으로 안다.
   기억은 clusters_api 가 LATENCY_WINDOW_MAX 초까지 둔다.
     기억이 없다(첫 수집·namespace 가 바뀜·직전이 너무 오래됨)  그 라운드는 모든 줄의 requests·rejected·rejected_ratio·window_seconds 가 null
-    값이 줄었다(카운터가 다시 떠 처음부터 센다)                기억을 버리고 이번은 모두 null — 다음 수집부터 다시 잇는다
+    값이 줄었다·process_start_time_seconds 가 바뀌었다(카운터가 다시 떴다)  기억을 버리고 이번은 모두 null — 다음 수집부터 다시 잇는다
     직전 수집에 없던 모델                                     그 줄만 모두 null — 다음 수집부터
     줄(model·key·code)마다 견준다. 직전에 있던 줄이 사라져도 다시 뜬 것으로 본다 — 카운터는 요청 줄을 지우지 않는다
     구간에 요청이 없었다                                     requests 0, rejected 0, rejected_ratio null, window_seconds 는 있다
@@ -176,7 +176,8 @@ ServedModel — served_models
        clusters_api.COUNTER_SEARCH_TTL 동안 기억한다(목록이 거부됐으면 빈 후보로, 시간 초과처럼 모르는 실패면 기억하지 않는다).
        후보가 모르는 실패(시간 초과·503 등)로 끝나면 맨 뒤로 보낸다 — 죽은 후보 하나가 다른 후보를 막지 않게.
        후보를 고를 때 "여기 없다" 인 곳은 빼고 고르고, 고른 후보가 다 "여기 없다" 로 끝나면 간격을 기다리지 않고 남은 곳에서 다시 고른다
-    답한 곳은 1·2 어느 길이든 기억한다 — 다음에 파드 목록을 못 읽어도 바로 그곳을 읽는다
+    답한 곳은 1·2 어느 길이든 기억한다 — 다음에 파드 목록을 못 읽어도 바로 그곳을 읽는다. 기억한 곳·1로 찾은 곳이 clusters_api.COUNTER_MISSES 번
+       잇달아 모르는 실패면 "여기 없다" 로 친다(엔드포인트 없는 옛 Service 등)
     API 서버의 RBAC 거부·Service 나 namespace 없음(NotFound)은 "여기 없다" 다(counter_absent). 뒤쪽이 낸 403·404 는 아니다. 1·2 어느 길이든 그 namespace 를 COUNTER_SEARCH_TTL 동안 읽지
     않는다 — 차트를 RBAC 없이 깔아 Service 가 없는 곳도 개요마다 조회하지 않게. 기억한 곳이 "여기 없다" 로 바뀌면 다음 후보를 찾는다.
     시간 초과처럼 모르는 실패는 기억을 바꾸지 않는다
@@ -990,13 +991,18 @@ class CounterSample:
     at: float
     series: dict[tuple[str, str, str], float]
     models: frozenset[str] = frozenset()
+    started: float | None = None        # process_start_time_seconds — 카운터 프로세스가 뜬 시각 (없으면 None)
 
 
 def counter_sample(text: str, *, at: float = 0.0) -> CounterSample:
     """카운터 /metrics 를 누적값으로 (모듈 설명 "카운터"). 카운터 지표가 없으면 빈 series·models."""
     series: dict[tuple[str, str, str], float] = {}
     models: set[str] = set()
+    started = None
     for name, labels, value in parse_metrics(text):
+        if name == "process_start_time_seconds":
+            started = value
+            continue
         model = labels.get("model") or ""
         if not model or model == _COUNTER_UNKNOWN_MODEL:
             continue
@@ -1006,7 +1012,7 @@ def counter_sample(text: str, *, at: float = 0.0) -> CounterSample:
             models.add(model)
         elif name == "kukie_counter_rejected_total":
             models.add(model)
-    return CounterSample(at=at, series=series, models=frozenset(models))
+    return CounterSample(at=at, series=series, models=frozenset(models), started=started)
 
 
 def counter_window(sample: CounterSample, previous: CounterSample | None) -> list[dict[str, Any]]:
@@ -1014,11 +1020,13 @@ def counter_window(sample: CounterSample, previous: CounterSample | None) -> lis
 
     줄(series)마다 뺀다 — 직전에 있던 줄이 하나라도 줄었거나 사라졌으면 카운터가 다시 뜬 것이라 모든 줄이 null 이다. 카운터는 요청 줄을
     지우지 않으므로(counter/metrics.go) 사라진 줄은 다시 떠 아직 그 요청이 없다는 뜻이다 — 다시 뜬 뒤 끝난 요청이 하나도 없어도
-    0 으로 내지 않게 (agent#147 리뷰). previous 가 없으면 모든 줄이 null 이다.
+    0 으로 내지 않게 (agent#147 리뷰). process_start_time_seconds(카운터의 프로세스 지표)가 바뀌었어도 다시 뜬 것이다 — 다음 수집 전에
+    모든 줄이 직전 값보다 커져 줄어든 것으로는 못 잡는 재시작. previous 가 없으면 모든 줄이 null 이다.
     """
     before = previous.series if previous is not None else {}
-    connected = previous is not None and all(key in sample.series and sample.series[key] >= value
-                                             for key, value in before.items())
+    restarted = previous is not None and None not in (sample.started, previous.started) and sample.started != previous.started
+    connected = previous is not None and not restarted and all(key in sample.series and sample.series[key] >= value
+                                                               for key, value in before.items())
     done: dict[str, float] = {}
     refused: dict[str, float] = {}
     for key, value in sample.series.items():
