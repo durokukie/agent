@@ -50,6 +50,7 @@
         "phase": "Failed",
         "reason": "Unschedulable",
         "message": "0/2 nodes are available: 2 Insufficient nvidia.com/gpu.",
+        "hint": "GPU 노드가 모자라요. 노드를 늘리거나 다른 모델을 멈춰 주세요.",
         "download": {"percent": 100}
       }
     },
