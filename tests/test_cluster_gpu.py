@@ -914,23 +914,27 @@ def test_카운터는_파드_프록시가_아니라_지표_Service의_서비스_
 
 
 def test_카운터를_찾아볼_namespace는_kukie_gpu가_든_이름을_kukie_먼저_세_개까지다():
-    names = _list(*({"metadata": {"name": n}} for n in [
-        "gpu-metrics", "kube-gpu", "shop", "kukie-gpu", "my-kukie", "llm", "gpu-operator", "a-gpu"]))
+    names = ["gpu-metrics", "kube-gpu", "shop", "kukie-gpu", "my-kukie", "llm", "gpu-operator", "a-gpu"]
     assert gpu.counter_search_namespaces(names) == ["kukie-gpu", "my-kukie", "a-gpu"]
     assert gpu.counter_search_namespaces(names, skip={"kukie-gpu", "a-gpu"}) == ["my-kukie", "gpu-metrics", "gpu-operator"]
-    with pytest.raises(ValueError):
-        gpu.counter_search_namespaces('{"items": {}}')
 
 
 @pytest.mark.parametrize(("stderr", "expected"), [
     ('Error from server (Forbidden): services "kukie-counter-metrics" is forbidden: User "x" cannot get resource "services/proxy"', True),
     ('Error from server (NotFound): services "kukie-counter-metrics" not found', True),
-    ("Error from server (NotFound): the server could not find the requested resource", True),
+    ('Error from server (NotFound): namespaces "kukie-gpu" not found', True),
+    # Service 는 있는데 뒤쪽(카운터)이 404 — 여기 없는 게 아니다 (agent#147 리뷰)
+    ("Error from server (NotFound): the server could not find the requested resource", False),
     ("Command 'kubectl' timed out after 5 seconds", False),
     ('Error from server (ServiceUnavailable): no endpoints available for service "kukie-counter-metrics"', False),
 ])
 def test_카운터_읽기_실패는_여기_없다와_모르는_것을_가른다(stderr, expected):
     assert gpu.counter_absent(stderr) is expected
+
+
+def _counter_rows(text: str, *, previous: gpu.CounterSample | None = None, at: float = 0.0):
+    sample = gpu.counter_sample(text, at=at)
+    return gpu.counter_window(sample, previous), sample
 
 
 def _counter_metrics(requests: dict[tuple[str, str, str], float], rejected: dict[tuple[str, str], float]) -> str:
@@ -954,62 +958,63 @@ def test_카운터_지표로_모델마다_최근_구간_429_비율을_낸다():
     first_text = _counter_metrics({("qwen", "k1", "200"): 100, ("qwen", "k2", "200"): 50, ("qwen", "k1", "429"): 10,
                                    ("unknown", "unknown", "401"): 7},
                                   _zeros("qwen", "gpt") | {("qwen", "limit"): 8, ("qwen", "brake"): 2})
-    rows, first = gpu.counter_rows(first_text, at=100.0)
+    rows, first = _counter_rows(first_text, at=100.0)
     assert rows == [
         {"model": "gpt", "requests": None, "rejected": None, "rejected_ratio": None, "window_seconds": None},
         {"model": "qwen", "requests": None, "rejected": None, "rejected_ratio": None, "window_seconds": None},
     ]                                                                      # 모델을 정하기 전에 끝난 요청(unknown)은 빠진다
-    assert first.at == 100.0 and first.series[("requests", "qwen", "k1", "429")] == 10
-    assert not any(key[1] == "unknown" or key[-1] == "unavailable" for key in first.series)
+    assert first.at == 100.0 and first.series[("qwen", "k1", "429")] == 10 and first.models == {"qwen", "gpt"}
+    assert not any(key[0] == "unknown" for key in first.series)
 
     later = _counter_metrics({("qwen", "k1", "200"): 130, ("qwen", "k2", "200"): 60, ("qwen", "k1", "429"): 30,
                               ("qwen", "k2", "503"): 5, ("unknown", "unknown", "401"): 9},
                              _zeros("qwen", "gpt") | {("qwen", "limit"): 25, ("qwen", "brake"): 5, ("qwen", "unavailable"): 5})
-    rows, second = gpu.counter_rows(later, previous=first, at=120.0)
+    rows, second = _counter_rows(later, previous=first, at=120.0)
     assert rows == [
         {"model": "gpt", "requests": 0, "rejected": 0, "rejected_ratio": None, "window_seconds": 20.0},   # 구간에 요청이 없다
         {"model": "qwen", "requests": 65, "rejected": 20, "rejected_ratio": 0.3077, "window_seconds": 20.0},
     ]
-    assert second.series[("requests", "qwen", "k1", "200")] == 130         # 기억은 늘 누적값 그대로
+    assert second.series[("qwen", "k1", "200")] == 130                     # 기억은 늘 누적값 그대로
 
 
 def test_카운터_값이_줄었으면_다시_뜬_것이라_이번은_null이고_다음부터_잇는다():
-    big = _counter_metrics({("qwen", "k", "200"): 100}, _zeros("qwen") | {("qwen", "limit"): 10})
+    big = _counter_metrics({("qwen", "k", "200"): 100, ("qwen", "k", "429"): 10}, _zeros("qwen") | {("qwen", "limit"): 10})
     small = _counter_metrics({("qwen", "k", "200"): 5}, _zeros("qwen"))
-    _, before = gpu.counter_rows(big, at=0.0)
-    [row], restarted = gpu.counter_rows(small, previous=before, at=20.0)
+    _, before = _counter_rows(big, at=0.0)
+    [row], restarted = _counter_rows(small, previous=before, at=20.0)
     assert row == {"model": "qwen", "requests": None, "rejected": None, "rejected_ratio": None, "window_seconds": None}
-    [row], _ = gpu.counter_rows(big, previous=restarted, at=40.0)
-    assert (row["requests"], row["rejected"], row["rejected_ratio"]) == (95, 10, 0.1053)
+    [row], _ = _counter_rows(big, previous=restarted, at=40.0)
+    assert (row["requests"], row["rejected"], row["rejected_ratio"]) == (105, 10, 0.0952)
 
 
 def test_카운터_줄_하나가_사라져도_다른_모델을_비우지_않는다():
     """줄마다 견준다 — 사라진 줄은 빼고 본다(agent#147 리뷰). 카운터는 요청 줄을 지우지 않지만 지워도 재시작으로 읽지 않는다."""
-    _, before = gpu.counter_rows(_counter_metrics({("a", "k1", "200"): 100, ("a", "k2", "200"): 50, ("b", "k", "200"): 10},
+    _, before = _counter_rows(_counter_metrics({("a", "k1", "200"): 100, ("a", "k2", "200"): 50, ("b", "k", "200"): 10},
                                                   _zeros("a", "b")), at=0.0)
-    rows, _ = gpu.counter_rows(_counter_metrics({("a", "k1", "200"): 104, ("b", "k", "200"): 12}, _zeros("a", "b")),
+    rows, _ = _counter_rows(_counter_metrics({("a", "k1", "200"): 104, ("b", "k", "200"): 12}, _zeros("a", "b")),
                                previous=before, at=20.0)
     assert [(r["model"], r["requests"]) for r in rows] == [("a", 4), ("b", 2)]
 
 
 def test_카운터_직전에_없던_모델은_다음_수집부터_구간이_있다():
-    _, before = gpu.counter_rows(_counter_metrics({("a", "k", "200"): 10}, _zeros("a")), at=0.0)
-    rows, _ = gpu.counter_rows(_counter_metrics({("a", "k", "200"): 12, ("b", "k", "200"): 3}, _zeros("a", "b")),
+    _, before = _counter_rows(_counter_metrics({("a", "k", "200"): 10}, _zeros("a")), at=0.0)
+    rows, _ = _counter_rows(_counter_metrics({("a", "k", "200"): 12, ("b", "k", "200"): 3}, _zeros("a", "b")),
                                previous=before, at=20.0)
     assert [(r["model"], r["requests"], r["window_seconds"]) for r in rows] == [("a", 2, 20.0), ("b", None, None)]
 
 
-def test_거절이_요청보다_앞서_읽히면_요청_수까지만_센다():
-    """rejected_total 은 거절하는 자리에서, requests_total 은 응답이 끝난 뒤 오른다 — 그 사이에 읽은 구간."""
-    _, before = gpu.counter_rows(_counter_metrics({("q", "k", "200"): 10}, _zeros("q")), at=0.0)
-    [row], _ = gpu.counter_rows(_counter_metrics({("q", "k", "200"): 11}, _zeros("q") | {("q", "limit"): 2}),
-                                previous=before, at=20.0)
-    assert (row["requests"], row["rejected"], row["rejected_ratio"]) == (1, 1, 1.0)
+def test_429는_requests_total의_code_429로_세어_거절_카운터와_시점이_어긋나지_않는다():
+    """rejected_total 은 거절하는 자리에서, requests_total 은 응답이 끝난 뒤 오른다 — 그 사이에 읽어도 분자가 분모를 넘지 않는다
+    (agent#147 리뷰). rejected_total 은 모델 목록에만 쓴다."""
+    _, before = _counter_rows(_counter_metrics({("q", "k", "200"): 10}, _zeros("q")), at=0.0)
+    [row], _ = _counter_rows(_counter_metrics({("q", "k", "200"): 11, ("q", "k", "429"): 1}, _zeros("q") | {("q", "limit"): 3}),
+                             previous=before, at=20.0)
+    assert (row["requests"], row["rejected"], row["rejected_ratio"]) == (2, 1, 0.5)
 
 
 def test_카운터_지표가_없으면_줄이_없다():
-    rows, sample = gpu.counter_rows("garbage {{{\n" + fixture("vllm.txt"), at=0.0)
-    assert rows == [] and sample.series == {}
+    rows, sample = _counter_rows("garbage {{{\n" + fixture("vllm.txt"), at=0.0)
+    assert rows == [] and sample.series == {} and sample.models == frozenset()
 
 
 
@@ -2863,7 +2868,8 @@ def test_개요는_카운터의_직전_수집을_기억해_최근_구간_429_비
                                                              _zeros("qwen") | {("qwen", "limit"): 10}))
     assert collect() == [{"model": "qwen", "requests": 40, "rejected": 10, "rejected_ratio": 0.25, "window_seconds": 20.0}]
     assert set(clusters_api._counter_samples) == {"c:fp:ns"}
-    assert clusters_api._counter_memos == {}                               # 파드 목록으로 찾은 곳은 기억하지 않는다
+    # 파드 목록으로 찾은 곳도 기억한다 — 다음에 모든 파드를 못 읽어도 바로 읽는다 (agent#147 리뷰)
+    assert clusters_api._counter_memos["c:fp:ns"].namespace == "kukie-gpu"
 
 
 def test_카운터를_한_번_못_읽으면_그_칸만_null이고_기억은_두어_다음_구간이_그만큼_길다(monkeypatch):
@@ -2945,7 +2951,50 @@ def test_찾아볼_후보가_여럿이어도_라운드마다_하나씩만_읽는
     assert collect() is None and _counter_reads(seen) == ["a-kukie"]
     assert collect() is None and _counter_reads(seen) == ["a-kukie", "b-kukie"]
     assert collect()[0]["model"] == "qwen" and _counter_reads(seen) == ["a-kukie", "b-kukie", "kukie-gpu"]
-    assert sum(args == gpu.NAMESPACES_COMMAND for args, _ in seen) == 2   # 파드를 namespace 마다 읽는 길의 한 번 + 후보를 고른 한 번
+    assert sum(args == gpu.NAMESPACES_COMMAND for args, _ in seen) == 1   # 파드를 namespace 마다 읽는 길이 읽은 목록을 같이 쓴다
+
+
+def test_파드를_읽은_뒤_모든_파드를_못_읽게_되어도_답한_namespace를_바로_읽는다(monkeypatch):
+    collect, now, state, seen = _counter_cluster(monkeypatch)
+    collect()
+    state["pods_ok"] = False
+    seen.clear()
+    now[0] += 20
+    assert collect()[0]["window_seconds"] == 20.0
+    assert _counter_reads(seen) == ["kukie-gpu"]
+
+
+def test_모르는_실패로_끝난_후보는_맨_뒤로_보내_다른_후보를_막지_않는다(monkeypatch):
+    """옛 설치가 남긴 Service 처럼 늘 503 인 후보가 첫째여도 다음 라운드에 다른 후보를 읽는다 (agent#147 리뷰)."""
+    collect, now, state, seen = _counter_cluster(monkeypatch, pods_ok=False)
+    state["namespaces"] = _list(*({"metadata": {"name": n}} for n in ["a-kukie-old", "kukie-gpu", "llm", "shop"]))
+    state["answers"]["a-kukie-old"] = _result(
+        stderr='Error from server (ServiceUnavailable): no endpoints available for service "kukie-counter-metrics"', success=False)
+    assert collect() is None and _counter_reads(seen) == ["a-kukie-old"]
+    assert collect()[0]["model"] == "qwen" and _counter_reads(seen) == ["a-kukie-old", "kukie-gpu"]
+
+
+def test_namespace_목록을_못_읽어도_간격_동안_다시_읽지_않는다(monkeypatch):
+    """이 라운드에 파드 길이 목록을 갖고 있지 않은 곳(연결 지문이 같아도 목록 기억이 없다) — 거부된 목록 조회를 개요마다 보내지 않는다."""
+    collect, now, state, seen = _counter_cluster(monkeypatch, pods_ok=False)
+    state["namespaces"] = None
+    plan = clusters_api._counter_plan(
+        lambda args, timeout: (seen.append((args, timeout)), _result(stderr=FORBIDDEN, success=False))[1],
+        lambda limit: limit, [], found=None, whole=False, cache_key="k", clock=lambda: now[0])
+    assert plan is None and clusters_api._counter_memos["k"].names == ()
+    seen.clear()
+    now[0] += clusters_api.COUNTER_SEARCH_TTL - 1
+    assert clusters_api._counter_plan(lambda args, timeout: seen.append(args), lambda limit: limit, [], found=None,
+                                      whole=False, cache_key="k", clock=lambda: now[0]) is None
+    assert seen == []
+
+
+def test_모양이_이상한_파드가_있어도_지표_대상을_잃지_않는다():
+    odd = {"metadata": {"name": "odd", "namespace": "x", "labels": "not-a-dict"}, "spec": {"containers": []},
+           "status": {"phase": "Running"}}
+    items = json.loads(fixture("gpu_pods.json"))["items"] + [odd]
+    assert gpu.counter_namespace(gpu.running_pods(_list(*items))) is None
+    assert gpu.dcgm_targets(gpu.running_pods(_list(*items)), {L40S_1, L40S_4})
 
 
 def test_꺼진_GPU_클러스터는_카운터를_읽지_않는다():
@@ -2998,7 +3047,7 @@ def test_기억한_namespace가_여기_없다로_바뀌면_기억을_지우고_�
     assert collect() is None
     assert clusters_api._counter_memos["c:fp:ns"].namespace is None
     seen.clear()
-    now[0] += 20
+    now[0] += clusters_api.READABLE_NAMESPACES_TTL                         # 새 namespace 는 목록 기억이 지나야 보인다
     assert collect()[0]["window_seconds"] is None                          # 다른 namespace 라 잇지 않는다
     assert _counter_reads(seen) == ["my-kukie"]
 
