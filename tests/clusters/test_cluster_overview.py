@@ -263,7 +263,7 @@ def test_볼_수_없는_클러스터는_404이고_kubectl은_돌지_않는다(cl
 
 def test_팀_구성원은_개요를_읽고_namespace_범위로만_조회한다(client, fake_server, monkeypatch):
     fake_server.add_member("t-1", "u-2", "MEMBER")
-    # GPU 가 없다고 이미 알고 방금 찾아본 클러스터 — 아니면 꺼진 GPU 클러스터인지 파드를 한 번 더 본다 (test_cluster_gpu.py)
+    # GPU 가 없다고 이미 알고 방금 찾아본 클러스터 — 아니면 꺼진 GPU 클러스터인지 파드를 한 번 더 본다 (tests/clusters/gpu)
     cluster = fake_server.add_cluster(owner="u-1", team_id="t-1", context="eks-shop", namespace="shop",
                                       credential={"token": "secret-token"}, has_gpu=False)
     monkeypatch.setitem(clusters_api._gpu_absent_checked, f"{cluster}:fp-{cluster}:shop", time.monotonic())
@@ -282,7 +282,7 @@ def test_팀_구성원은_개요를_읽고_namespace_범위로만_조회한다(c
     assert (body["context"], body["namespace"]) == ("eks-shop", "shop")
     assert len(body["workloads"]) == 7 and len(body["pods"]) == 5 and len(body["events"]) == 20
     assert body["network"] == {"name": "Cilium", "version": "1.20.3", "source": "daemonset"}
-    assert body["gpu"] is None                                               # GPU 노드가 없다 (test_cluster_gpu.py)
+    assert body["gpu"] is None                                               # GPU 노드가 없다 (tests/clusters/gpu)
     assert datetime.fromisoformat(body["at"]).tzinfo is not None
     assert "secret-token" not in r.text
     assert [call["args"] for call in seen] == [
