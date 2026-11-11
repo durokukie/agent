@@ -23,7 +23,7 @@ jobs:
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - run: uv sync --locked
-      # 렌더 비교 테스트(tests/test_manifests.py)가 진짜 kustomize build 를 돌린다. 버전·sha256 은 Dockerfile 과 같다 (ArgoCD v3.5.3 에 맞춘 값).
+      # 렌더 비교 테스트(tests/manifests/test_manifests.py)가 진짜 kustomize build 를 돌린다. 버전·sha256 은 Dockerfile 과 같다 (ArgoCD v3.5.3 에 맞춘 값).
       # 러너에 깔려 있는 kustomize 는 버전이 따로 놀아 덮어쓴다. CI 에서는 kustomize 가 없으면 그 테스트가 건너뛰지 않고 실패한다
       - name: Install kustomize
         env:

@@ -18,7 +18,7 @@ from kukie_agent import clusters_api, server
 from kukie_agent.clusters import overview
 from kukie_agent.kubectl import KubectlResult
 
-FIXTURES = Path(__file__).parent / "fixtures" / "overview"
+FIXTURES = Path(__file__).parents[1] / "fixtures" / "overview"
 NOW = datetime(2026, 10, 19, 12, 0, 0, tzinfo=timezone.utc)
 
 

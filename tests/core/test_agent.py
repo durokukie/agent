@@ -2,7 +2,7 @@
 
 TestModel로 결정론적으로 돌린다 (실제 LLM 호출·API 키 없음).
 
-응답 조립(steps를 코드가 채우는 것)은 tests/test_response.py 에서 검증한다 (DURO-44).
+응답 조립(steps를 코드가 채우는 것)은 tests/core/test_response.py 에서 검증한다 (DURO-44).
 """
 from types import SimpleNamespace
 
