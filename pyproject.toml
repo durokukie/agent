@@ -25,6 +25,7 @@ required-version = ">=0.12"
 kukie = "kukie_agent.cli:main"
 
 [tool.pytest.ini_options]
+pythonpath = ["tests"]   # helpers · fake_server 를 하위 폴더 테스트에서도 바로 import 한다
 testpaths = ["tests"]   # helm_render/ 는 자기 프로젝트와 CI 로 시험한다
 markers = ["e2e: requires an explicit disposable kind context"]
 

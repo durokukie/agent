@@ -19,7 +19,7 @@ from kukie_agent.manifests import (
 from kukie_agent.manifests.render import kustomize_bin
 from kukie_agent.manifests.workload import split_image
 
-FIXTURE = Path(__file__).parent / "fixtures" / "manifests"
+FIXTURE = Path(__file__).parents[1] / "fixtures" / "manifests"
 PLAIN = AppSource(source_type="Directory", path="apps/plain")
 PROD = AppSource(source_type="Kustomize", path="apps/kustomize/overlays/prod")
 WEB = Target(api_version="apps/v1", kind="Deployment", name="web", namespace="shop")

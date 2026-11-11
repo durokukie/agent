@@ -20,7 +20,7 @@ from kukie_agent.manifests.compare import index
 from kukie_agent.manifests.new_resource import _compare
 from kukie_agent.manifests.render import kustomize_bin
 
-FIXTURE = Path(__file__).parent / "fixtures" / "manifests"
+FIXTURE = Path(__file__).parents[1] / "fixtures" / "manifests"
 PLAIN = AppSource(source_type="Directory", path="apps/plain")
 RECURSE = AppSource(source_type="Directory", path="apps/plain", directory_recurse=True)
 PROD = AppSource(source_type="Kustomize", path="apps/kustomize/overlays/prod")
