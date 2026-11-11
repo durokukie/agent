@@ -3091,6 +3091,15 @@ def test_후보를_다시_고르다_목록을_못_읽어도_남은_후보를_쓴
                                       clock=lambda: now[0]) == ("gpu-operator", "search")
 
 
+def test_파드_목록에_카운터가_여럿이면_답한_적_있는_곳을_먼저_읽는다(monkeypatch):
+    collect, _, state, seen = _counter_cluster(monkeypatch)
+    collect()
+    items = json.loads(state["pods"])["items"] + [_counter_pod("stray", namespace="a-dev")]
+    state["pods"] = _list(*items)
+    seen.clear()
+    assert collect()[0]["model"] == "qwen" and _counter_reads(seen) == ["kukie-gpu"]
+
+
 def test_꺼진_GPU_클러스터는_카운터를_읽지_않는다():
     run, seen = _served_models_cluster(_result('{"items": []}'), nodes="nodes.json", pods=_list(_counter_pod()))
     body, _ = clusters_api._collect_gpu(run, namespace_pods="{}", known=True, clock=lambda: 0.0)

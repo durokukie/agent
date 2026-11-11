@@ -851,6 +851,8 @@ def _counter_plan(run, budget, *, found: list[str], whole: bool,
     now = clock()
     memo = _counter_memo(cache_key, now)
     found = [name for name in found if name not in memo.absent]
+    if memo.namespace in found:
+        return memo.namespace, "found"                      # 답한 적 있는 곳을 먼저 — 떠돌이 카운터 파드에 막히지 않게
     if found:
         return found[0], "found"
     if memo.namespace and memo.namespace not in memo.absent:
@@ -911,6 +913,7 @@ def _counter_result(cache_key: str | None, namespace: str, source: str, result: 
     if gpu.counter_absent(result.stderr or result.stdout or ""):
         def gone(memo: _CounterMemo) -> None:
             memo.absent[namespace] = now
+            memo.misses.pop(namespace, None)
             if memo.namespace == namespace:
                 memo.namespace, memo.names = None, None     # 옮겼거나 껐다 — namespace 목록부터 다시 찾는다
         _update_counter_memo(cache_key, now, gone)
