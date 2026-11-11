@@ -21,7 +21,8 @@ UNTESTED_FILES = {
 # e2e(가드레일의 kubectl 실행)가 지나지 않는 경로. gitops · manifests 는 guardrail/hook.py 가 import 하므로 넣지 않는다
 NO_E2E_PREFIXES = ("tests/clusters/", "tests/core/", "tests/fixtures/", "tests/gitops/", "tests/guardrail/",
                    "tests/manifests/")
-NO_E2E_FILES = {"kukie_agent/clusters/gpu.py", "kukie_agent/clusters/overview.py", "kukie_agent/clusters_api.py"}
+# clusters_api.py 는 e2e 가 쓰는 server.app 에 라우터를 붙이므로 넣지 않는다
+NO_E2E_FILES = {"kukie_agent/clusters/gpu.py", "kukie_agent/clusters/overview.py"}
 
 
 def _untested(path: str) -> bool:
@@ -56,7 +57,7 @@ def main() -> None:
     if os.environ.get("GITHUB_EVENT_NAME") == "pull_request":
         try:
             paths = changed_files()
-        except (OSError, subprocess.CalledProcessError) as error:
+        except (OSError, subprocess.CalledProcessError, UnicodeDecodeError) as error:
             print(f"바뀐 파일을 못 읽어 전부 돌린다: {error}")
     result = scope(paths)
     print(f"바뀐 파일 {len(paths)}개 → {result}")
