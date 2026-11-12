@@ -879,6 +879,8 @@ def _wait_model_volumes(future) -> tuple[list[dict[str, Any]] | None, bool]:
     try:
         return future.result(timeout=GPU_MODEL_VOLUMES_TIMEOUT + 2)
     except Exception:                                       # TimeoutError·kubectl 을 못 띄운 OSError 등
+        # 줄만 서 있던 읽기는 취소한다. 이미 돌고 있는 kubectl 은 자기 시간 제한(예산 안)에서 끝나므로 풀을 오래 잡지 않는다
+        future.cancel()
         logger.debug("모델 볼륨을 읽지 못했다 (기다리다 끝냈다)", exc_info=True)
         return None, False
 
@@ -898,7 +900,10 @@ def _model_volume_rows(cache_key: str | None, raw: list[dict[str, Any]] | None, 
         if remembered is None:
             return None
         raw, last_served = remembered
-        served = served if served is not None else last_served
+        if served is None:
+            served = last_served
+        elif served != last_served:                         # 이름은 새로 읽었다 — 다음 라운드가 낡은 이름으로 되돌아가지 않게
+            _model_volumes_memory.refresh(cache_key, (raw, served))
     return gpu.volume_rows(raw, served or frozenset())
 
 
@@ -1061,6 +1066,14 @@ class _LastRead:
             found = self._values.get(key)
         return found[0] if found else None
 
+    def refresh(self, key: str | None, value: Any) -> None:
+        """기억해 둔 값을 바꾸되 시각은 그대로 둔다 — 값의 일부만 새로 안 라운드(만료를 늦추지 않는다)."""
+        if key:
+            with self._lock:
+                found = self._values.get(key)
+                if found:
+                    self._values[key] = (value, found[1])
+
     def forget(self, key: str | None) -> None:
         if key:
             with self._lock:
@@ -1069,10 +1082,6 @@ class _LastRead:
     def clear(self) -> None:
         with self._lock:
             self._values.clear()
-
-    def __contains__(self, key: str) -> bool:
-        with self._lock:
-            return key in self._values
 
     def _expire(self, now: float) -> None:
         for key in [key for key, (_, at) in self._values.items() if now - at >= self._forget_after]:

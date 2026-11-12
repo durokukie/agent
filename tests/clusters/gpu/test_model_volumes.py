@@ -88,6 +88,7 @@ def test_모델_볼륨은_ServedModel_이름순이고_줄_수를_자르지_않�
     ("7Ei", None, 7 * 1024**6),
     ("8Ei", None, None),                                    # int64 를 넘는다 — apiserver 가 만들지 않는 값
     ("1" * 31, None, None),                                 # 숫자 자릿수 상한
+    ("100Gi\n", None, None),                                # 끝 줄바꿈도 받지 않는다
     ("abc", "40Gi", None),                                  # capacity 를 못 읽으면 요청한 크기로 넘어가지 않는다
     (None, None, None),
 ])
@@ -209,13 +210,6 @@ def test_아주_긴_숫자도_그_줄의_크기만_null이고_목록은_살아_�
 KEY = "cluster:fingerprint:volumes"
 
 
-@pytest.fixture(autouse=True)
-def _forget():
-    clusters_api._model_volumes_memory.clear()
-    yield
-    clusters_api._model_volumes_memory.clear()
-
-
 @pytest.mark.parametrize("failure", [
     _result(stderr="context deadline exceeded", success=False),
     _result("not json"),
@@ -248,7 +242,7 @@ def test_볼_수_없다는_답은_기억을_지우고_null이다(volumes, served
     clusters_api._collect_gpu(ok, namespace_pods="{}", cache_key=KEY, known=True, clock=lambda: 0.0)
     denied, _ = _volumes_cluster(volumes, served=served, nodes="nodes.json")
     body, _ = clusters_api._collect_gpu(denied, namespace_pods="{}", cache_key=KEY, known=True, clock=lambda: 1.0)
-    assert (body or {}).get("model_volumes") is None and KEY not in clusters_api._model_volumes_memory
+    assert (body or {}).get("model_volumes") is None and clusters_api._model_volumes_memory.get(KEY, 1.0) is None
 
 
 def test_오래된_기억은_싣지_않는다():
@@ -328,3 +322,18 @@ def test_곁_읽기를_기다리다_넘기거나_예외면_못_읽은_것으로_
     broken: Future = Future()
     broken.set_exception(OSError("kubectl 을 띄우지 못했다"))
     assert clusters_api._wait_model_volumes(broken) == (None, False)
+
+
+def test_PVC를_못_읽은_라운드에_새로_읽은_ServedModel_이름을_기억해_다음_라운드가_되돌아가지_않는다():
+    """1) 모델이 돌 때 읽음 2) 모델을 지우고 PVC 읽기 시간 초과 3) ServedModel 읽기 실패 — 3에서 retained 가 false 로 돌아가지 않는다 (agent#149 리뷰)."""
+    running = _result(_list({"metadata": {"name": "gpt-oss-120b", "namespace": "llm"}, "spec": {"source": {"huggingface": "openai/gpt-oss-120b"}}}))
+    timeout = _result(stderr="context deadline exceeded", success=False)
+    pods = fixture("gpu_pods.json")                                     # GPU 노드가 있어야 ServedModel 을 못 읽어도 gpu 칸이 온다
+    rounds = [
+        _volumes_cluster(_result(_list(_pvc())), served=running, pods=pods)[0],
+        _volumes_cluster(timeout, served=_result('{"items": []}'), pods=pods)[0],
+        _volumes_cluster(timeout, served=timeout, pods=pods)[0],
+    ]
+    retained = [clusters_api._collect_gpu(run, namespace_pods="{}", cache_key=KEY, clock=lambda i=i: float(i))[0]
+                ["model_volumes"][0]["retained"] for i, run in enumerate(rounds)]
+    assert retained == [False, True, True]

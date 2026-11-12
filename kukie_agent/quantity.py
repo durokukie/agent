@@ -7,7 +7,7 @@ from fractions import Fraction
 from typing import Any
 
 #: 숫자에 지수(1e3)나 이진 단위(Ki~Ei)·십진 단위(m, k~E) 하나. 첫 묶음은 숫자, 둘째는 단위·지수다
-QUANTITY = re.compile(r"^([0-9]+(?:\.[0-9]+)?)([eE][-+]?[0-9]+|m|k|Ki|Mi|Gi|Ti|Pi|Ei|M|G|T|P|E)?$")
+QUANTITY = re.compile(r"^([0-9]+(?:\.[0-9]+)?)([eE][-+]?[0-9]+|m|k|Ki|Mi|Gi|Ti|Pi|Ei|M|G|T|P|E)?\Z")   # \Z — 끝 줄바꿈도 받지 않는다
 
 _UNITS: dict[str, int | Fraction] = {
     "": 1, "m": Fraction(1, 1000), "Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4, "Pi": 1024**5, "Ei": 1024**6,
