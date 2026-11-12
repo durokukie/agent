@@ -22,8 +22,8 @@ def names(stdout: str) -> list[str]:
         raise ValueError("items 가 목록이 아니다")
     picked: set[str] = set()
     for item in items:
-        if not isinstance(item, dict):
-            raise ValueError("item 이 객체가 아니다")
+        if not isinstance(item, dict):   # 다른 목록 파서(gpu·overview._items)처럼 건너뛴다 — 한 줄 때문에 목록 전체를 막지 않게
+            continue
         metadata = item.get("metadata") or {}
         status = item.get("status") or {}
         name = metadata.get("name") if isinstance(metadata, dict) else None

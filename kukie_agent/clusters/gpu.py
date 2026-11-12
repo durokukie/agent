@@ -212,7 +212,7 @@ NODE_POOLS_COMMAND: list[str] = ["get", "nodepools.karpenter.sh", "-o", "json"]
 
 #: 모든 namespace 파드를 못 읽을 때 namespace 마다 파드를 읽으려고 보는 namespace 목록 (클러스터 범위)
 #: 새 대화의 namespace 목록(clusters/namespaces.py)과 같은 명령이다 — 한 곳에 둔다
-NAMESPACES_COMMAND: list[str] = namespaces.LIST_COMMAND
+NAMESPACES_COMMAND: list[str] = list(namespaces.LIST_COMMAND)   # 사본 — 한쪽을 고쳐도 다른 쪽이 따라 바뀌지 않게
 #: namespace 마다 파드를 읽는 수 상한. 넘으면 GPU 쪽 이름(NAMESPACE_HINTS)이 들어간 것부터 고른다
 MAX_POD_NAMESPACES = 24
 #: DCGM exporter·vLLM 이 흔히 도는 namespace 이름 조각 — 상한을 넘을 때 먼저 고른다. kube-prometheus-stack 으로 깐 DCGM 은 보통 monitoring 에 있다

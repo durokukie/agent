@@ -49,7 +49,11 @@ def test_시스템과_지우는_중인_namespace_를_빼고_이름순으로_준�
     assert namespaces.names(json.dumps(body)) == ["default", "llm", "web"]
 
 
-@pytest.mark.parametrize("stdout", ["not json", json.dumps({"kind": "Status"}), json.dumps({"items": ["x"]})])
+def test_객체가_아닌_item_은_건너뛴다():
+    assert namespaces.names(json.dumps({"items": ["x", _ns("web")]})) == ["web"]
+
+
+@pytest.mark.parametrize("stdout", ["not json", json.dumps({"kind": "Status"}), json.dumps({"items": "x"})])
 def test_모양이_다른_출력은_ValueError(stdout):
     with pytest.raises(ValueError):
         namespaces.names(stdout)
@@ -88,7 +92,15 @@ def test_목록을_읽을_권한이_없으면_200_forbidden_과_등록한_namesp
     _api(monkeypatch, _fail(FORBIDDEN))
     r = client.get(f"/clusters/{cluster}/namespaces", headers=USER)
     assert r.status_code == 200
-    assert r.json() == {"status": "forbidden", "default_namespace": "kukie-demo", "namespaces": []}
+    assert r.json() == {"status": "forbidden", "default_namespace": "kukie-demo", "namespaces": ["kukie-demo"]}
+
+
+def test_익명으로_거부되면_권한이_좁은_게_아니라_인증_실패다(client, fake_server, monkeypatch):
+    cluster = fake_server.add_cluster(owner="u-1")
+    _api(monkeypatch, _fail('Error from server (Forbidden): namespaces is forbidden: User "system:anonymous" cannot list '
+                            'resource "namespaces" in API group "" at the cluster scope'))
+    r = client.get(f"/clusters/{cluster}/namespaces", headers=USER)
+    assert r.status_code == 502 and r.json()["detail"]["code"] == "CLUSTER_AUTH_EXPIRED"
 
 
 @pytest.mark.parametrize(("answer", "code"), [

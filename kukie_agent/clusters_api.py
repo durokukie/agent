@@ -228,7 +228,7 @@ async def cluster_namespaces(
     팀 구성원 누구나 부른다(대화는 구성원도 만든다).
 
       ok         읽었다. namespaces 는 이름순이고 kube-* 와 지우는 중인 것은 뺐다
-      forbidden  namespace 목록을 읽을 권한이 없다(limited) — namespaces 는 빈 배열이고, 화면은 default_namespace 만 고르게 한다
+      forbidden  namespace 목록을 읽을 권한이 없다(limited) — namespaces 는 default_namespace 하나다(ok 와 같은 모양)
     default_namespace 는 클러스터에 등록한 namespace 다(대화를 만들 때 고르지 않으면 서버가 쓰는 값). ok 의 namespaces 에도 늘 들어 있다 —
     kube-* 로 등록했거나 지금 지우는 중이어도, 고르지 않은 대화가 쓰는 값이라 화면에서 고를 수 있어야 한다. 그 밖의 kubectl 실패는 개요와 같이
     502 CLUSTER_AUTH_EXPIRED·CLUSTER_UNREACHABLE, 출력을 못 읽으면 502 CLUSTER_BAD_RESPONSE. 같은 연결은 OVERVIEW_SHARE_TTL 초 나눠 쓰고,
@@ -241,12 +241,14 @@ async def cluster_namespaces(
             result = run_kubectl(namespaces.LIST_COMMAND, context=conn.context_name, kubeconfig=path,
                                  timeout=OVERVIEW_TIMEOUT)
         if not result.success:
-            if argocd.failure_kind(result.stderr or result.stdout) == "forbidden":
-                return {"status": "forbidden", "default_namespace": conn.namespace, "namespaces": []}
-            _raise_kubectl_failure(result.stderr or result.stdout)
+            stderr = result.stderr or result.stdout
+            # 익명(system:anonymous)으로 거부된 것은 권한이 좁은 게 아니라 자격증명이 깨진 것이다 — 개요처럼 502 로 알린다
+            if argocd.failure_kind(stderr) == "forbidden" and "system:anonymous" not in stderr:
+                return {"status": "forbidden", "default_namespace": conn.namespace, "namespaces": [conn.namespace]}
+            _raise_kubectl_failure(stderr)
         try:
             names = namespaces.names(result.stdout)
-        except (ValueError, AttributeError, TypeError) as exc:
+        except ValueError as exc:   # 모양은 names 가 본다 — 우리 코드의 버그(그 밖의 예외)는 500 으로 둔다
             # 원문은 클러스터 내용이라 남기지 않는다 (개요와 같다)
             logger.warning("namespace 목록을 읽지 못했다: %s", type(exc).__name__)
             raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
