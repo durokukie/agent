@@ -200,6 +200,7 @@ async def cluster_overview(
 
     def collect() -> tuple[dict[str, Any], bool | None]:
         scope = "namespace"
+        fell_back = False
         with access.kubeconfig(conn) as path:
             failed: KubectlResult | None = None
             if wants_all and not _all_forbidden_recently(key):
@@ -210,13 +211,17 @@ async def cluster_overview(
                     stderr = failed.stderr or failed.stdout
                     if not _all_fallback(stderr):
                         _raise_kubectl_failure(stderr)
-                    # 모든 namespace 를 읽을 권한이 없거나(limited) 너무 커서 시간 안에 못 읽었다 — 등록된 namespace 로 돌아간다
-                    _remember_all_forbidden(key)
+                    # 모든 namespace 를 읽을 권한이 없거나(limited) 너무 커서 시간 안에 못 읽었다 — 등록된 namespace 로 돌아간다.
+                    # 기억은 돌아간 조회가 성공했을 때만 — 닿지 않는 클러스터도 시간 초과로 끝나 그때는 502 로 알리고 기억하지
+                    # 않는다 (PR #151 리뷰. 그 502 는 조회 두 번만큼 늦다)
+                    fell_back = True
                     failed = None
             if scope != "all":
                 outputs, failed = read(path, ["-n", target])
                 if failed is not None:
                     _raise_kubectl_failure(failed.stderr or failed.stdout)
+                if fell_back:
+                    _remember_all_forbidden(key)
             # 앞의 세 조회가 다 된 뒤에만 돈다 — 닿지 않는 클러스터에서 시간을 더 쓰지 않는다
             network = run_kubectl(overview.NETWORK_COMMAND, context=conn.context_name,
                                   kubeconfig=path, timeout=OVERVIEW_TIMEOUT)

@@ -480,3 +480,12 @@ def test_전체면_GPU_칸에_등록된_namespace_파드만_넘긴다(client, fa
     assert client.get(f"/clusters/{cluster}/overview?all=true", headers=USER).json()["scope"] == "all"
     assert passed["namespace"] == "shop"
     assert [p["metadata"]["name"] for p in passed["pods"]["items"]] == ["a"]
+
+
+def test_닿지_않아_시간_초과면_502이고_기억하지_않는다(client, fake_server, monkeypatch):
+    cluster = fake_server.add_cluster(namespace="shop")
+    timeout = _result(stderr="Command '['kubectl', 'get']' timed out after 15 seconds", success=False)
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", lambda args, **k: timeout)
+    r = client.get(f"/clusters/{cluster}/overview?all=true", headers=USER)
+    assert r.status_code == 502 and r.json()["detail"]["code"] == "CLUSTER_UNREACHABLE"
+    assert clusters_api._all_forbidden == {}
