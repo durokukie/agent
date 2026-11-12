@@ -144,11 +144,13 @@ ServedModel — served_models
   없으므로 ServedModel 이름과 대조한다), created_at(metadata.creationTimestamp). ServedModel 이름순. 줄 수를 자르지 않는다 — 오븐이 ServedModel
   마다 하나만 만들고, 자르면 뒤쪽 모델의 배지가 소리 없이 빠진다.
   안의 파일이 다 받아졌는지는 모른다 — 받다가 멈춘 PVC 도 줄이 있다. 앱은 "같은 이름의 디스크를 다시 붙인다" 고만 말한다.
-  이름·라벨이 없는 항목은 그 줄만 건너뛴다. 목록 자체가 깨졌으면(items 없음·객체 아닌 항목) null 이다 — [] 로 "없다" 고 하지 않는다.
+  이름·라벨이 없는 항목과 지우는 중인(deletionTimestamp) PVC 는 그 줄만 건너뛴다 — 지우는 중인 PVC 는 다시 붙지 않는다. 목록 자체가 깨졌으면(items 없음·객체 아닌 항목) null 이다 — [] 로 "없다" 고 하지 않는다.
     null  못 읽었고 기억해 둔 값도 없다, 또는 볼 수 없다(거부·CRD 없음 — 기억을 지운다)
     []    읽었는데 하나도 없다
   시간 초과·예산 부족·깨진 출력(그리고 ServedModel 을 잠깐 못 읽어 조회하지 않은 라운드)은 연결마다 기억해 둔 마지막 성공 값을
-  싣는다 — 측정 기록처럼, 한 번 실패로 "받아 둠" 배지가 깜빡이지 않게. 기억은 GPU_BENCHMARKS_FORGET 초까지 둔다
+  싣는다 — 측정 기록처럼, 한 번 실패로 "받아 둠" 배지가 깜빡이지 않게. 기억은 GPU_BENCHMARKS_FORGET 초까지 둔다.
+  기억하는 것은 읽은 그대로의 줄(주인 여부)이고 retained 는 싣는 라운드의 ServedModel 이름으로 다시 정한다. 그 라운드에 ServedModel 을
+  못 읽었으면 마지막으로 읽은 이름을 쓴다
   읽는 조건은 측정 기록과 같다 — served_models 가 null 이면 조회하지 않는다. GPU 없는 일반 클러스터에 kubectl 이 늘지 않는다.
   측정 기록과 같은 몫에서 **함께**(스레드 둘) 읽는다 — 몫을 따로 떼지 않아 namespace 탐색·지표 몫이 줄지 않는다.
   읽기 권한은 ServedModel·측정 기록과 같은 연결 권한이다(llm namespace 의 읽기). PVC 를 볼 수 없는 곳은 null 이다.
@@ -1047,10 +1049,12 @@ def counter_window(sample: CounterSample, previous: CounterSample | None) -> lis
 
 # ── 모델 볼륨 ─────────────────────────────────────────────
 
-def model_volumes(stdout: str, served: set[str] | frozenset[str] = frozenset()) -> list[dict[str, Any]]:
-    """모델 PVC 목록을 응답 줄로 (모듈 설명 "모델 볼륨"). served 는 llm 에 지금 있는 ServedModel 이름이다 — 그 이름의 PVC 는
-    retained 가 아니다. 이름·라벨이 없는 항목은 그 줄만 건너뛴다. 빈 목록은 "없다" 라는 뜻이라 served_models 처럼 엄격하게 읽는다 —
-    목록이 깨졌으면(items 없음·객체 아닌 항목 포함) ValueError, 부르는 쪽이 null 로 둔다."""
+def model_volumes(stdout: str) -> list[dict[str, Any]]:
+    """모델 PVC 목록을 읽은 그대로의 줄로 (모듈 설명 "모델 볼륨"). retained 대신 owned(주인이 있다)를 둔다 — retained 는 싣는
+    라운드의 ServedModel 이름과 대조해야 하므로 volume_rows 가 정한다(기억해 둔 줄이 낡은 이름으로 굳지 않게).
+    이름·라벨이 없는 항목과 지우는 중인(deletionTimestamp) PVC 는 건너뛴다 — 지우는 중인 것은 다시 붙지 않는다.
+    빈 목록은 "없다" 라는 뜻이라 served_models 처럼 엄격하게 읽는다 — 목록이 깨졌으면(items 없음·객체 아닌 항목 포함) ValueError,
+    부르는 쪽이 못 읽은 것으로 둔다."""
     rows: list[dict[str, Any]] = []
     for item in _strict_items(stdout):
         meta = item.get("metadata")
@@ -1059,7 +1063,7 @@ def model_volumes(stdout: str, served: set[str] | frozenset[str] = frozenset()) 
         labels = meta.get("labels")
         name = labels.get(_SERVED_MODEL_LABEL) if isinstance(labels, dict) else None
         pvc = _text_or_none(meta.get("name"))
-        if not _text_or_none(name) or pvc is None:
+        if not _text_or_none(name) or pvc is None or meta.get("deletionTimestamp"):
             continue
         status = _dict(item.get("status"))
         capacity = _dict(status.get("capacity"))
@@ -1072,11 +1076,19 @@ def model_volumes(stdout: str, served: set[str] | frozenset[str] = frozenset()) 
             "pvc": pvc,
             "size_bytes": quantity.to_int(storage),
             "phase": _text_or_none(status.get("phase")) or "",
-            "retained": not (isinstance(owners, list) and owners) and name not in served,
+            "owned": bool(isinstance(owners, list) and owners),
             "created_at": _text_or_none(meta.get("creationTimestamp")),
         })
     rows.sort(key=lambda row: (row["name"], row["pvc"]))
     return rows
+
+
+def volume_rows(raw: list[dict[str, Any]], served: frozenset[str]) -> list[dict[str, Any]]:
+    """model_volumes 의 줄을 응답 줄로. served 는 llm 에 있는 ServedModel 이름이다 — 주인이 없어도 그 이름의 ServedModel 이
+    있으면 retained 가 아니다(retainOnDelete PVC 는 모델이 돌 때도 주인이 없다)."""
+    return [{"name": row["name"], "pvc": row["pvc"], "size_bytes": row["size_bytes"], "phase": row["phase"],
+             "retained": not row["owned"] and row["name"] not in served, "created_at": row["created_at"]}
+            for row in raw]
 
 
 def _dict(value: Any) -> dict[str, Any]:

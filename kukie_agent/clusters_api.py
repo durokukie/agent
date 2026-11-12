@@ -682,7 +682,8 @@ def _collect_gpu(
         logger.debug("개요의 GPU 조회를 건너뛴다 (노드 목록을 읽지 못했다)")
         return None, None
     if budget(OVERVIEW_TIMEOUT) < 1:
-        return gpu.build(nodes, [], benchmarks=_remembered_benchmarks(cache_key, clock)), (True if nodes else None)
+        return gpu.build(nodes, [], benchmarks=_remembered_benchmarks(cache_key, clock),
+                         model_volumes=_model_volume_rows(cache_key, None, False, None, clock)), (True if nodes else None)
     # 예산을 본 뒤에 창을 잡는다 — 바로 아래에서 파드 조회를 늘 보내므로, 잡은 창은 조회를 보낸 라운드다
     if not nodes and known is not True and not _absent_search_due(cache_key, unknown=known is None, clock=clock):
         return None, (False if known is False else None)
@@ -742,19 +743,22 @@ def _collect_gpu(
     if read_served:
         served_models, served_absent = _read_served_models(run, served_budget)
     # 같은 몫 안에서 ServedModel 뒤에 읽는다 — 매달려도 지표 몫은 그대로다. 못 읽은 라운드는 기억해 둔 값을 쓴다.
-    # 모델 볼륨은 측정 기록과 함께 읽는다 — 몫을 따로 떼지 않고 지연도 늘리지 않는다 (agent#149 리뷰). 못 읽으면 그 라운드만 null
+    # 모델 볼륨은 측정 기록과 함께 읽는다 — 몫을 따로 떼지 않고 지연도 늘리지 않는다 (agent#149 리뷰). 잠깐 못 읽으면 기억해 둔 값,
+    # 볼 수 없다는 답이면 null
     if served_models is not None:
         served_names = frozenset(row["name"] for row in served_models if row["namespace"] == gpu.OVEN_NAMESPACE)
-        volumes_read = _SIDE_READS.submit(_read_model_volumes, run, served_budget, served_names,
-                                          cache_key=cache_key, clock=clock)
-        benchmarks = _read_benchmarks(run, served_budget, cache_key=cache_key, clock=clock)
-        model_volumes = volumes_read.result()
+        volumes_read = _SIDE_READS.submit(_read_model_volumes, run, served_budget)
+        try:
+            benchmarks = _read_benchmarks(run, served_budget, cache_key=cache_key, clock=clock)
+        finally:                                            # 측정 기록이 예외를 내도 임시 kubeconfig 를 지우기 전에 곁 읽기를 끝낸다
+            raw_volumes, volumes_denied = _wait_model_volumes(volumes_read)
+        model_volumes = _model_volume_rows(cache_key, raw_volumes, volumes_denied, served_names, clock)
     else:
         if read_served and served_absent:                   # CRD 없음·거부 — 잠깐의 실패가 아니다
             _forget_benchmarks(cache_key)
-            _forget_volumes(cache_key)
+            _model_volumes_memory.forget(cache_key)
         benchmarks = _remembered_benchmarks(cache_key, clock)
-        model_volumes = _remembered_volumes(cache_key, clock)
+        model_volumes = _model_volume_rows(cache_key, None, False, None, clock)
     if not nodes:
         # 카운터는 읽지 않는다 — 돌고 있는 모델이 없고, 이 길은 지표 몫을 따로 남기지 않는다 (agent#147 리뷰)
         if waiting or node_pools or served_models is not None:
@@ -851,54 +855,51 @@ def _read_served_models(run, budget) -> tuple[list[dict[str, Any]] | None, bool]
         return None, False
 
 
-def _read_model_volumes(run, budget, served: frozenset[str] = frozenset(), *, cache_key: str | None = None,
-                        clock=time.monotonic) -> list[dict[str, Any]] | None:
-    """모델 볼륨 줄 — clusters/gpu.py "모델 볼륨". 어떤 실패도 개요를 실패시키지 않는다. 시간 초과·예산 부족·깨진 출력은
-    마지막으로 성공한 값을 준다(측정 기록과 같다 — 배지가 깜빡이지 않게). 거부·CRD 없음은 "볼 수 없다" 라 기억을 지우고 None."""
+def _read_model_volumes(run, budget) -> tuple[list[dict[str, Any]] | None, bool]:
+    """(읽은 그대로의 모델 볼륨 줄, 볼 수 없다고 확인했나) — clusters/gpu.py "모델 볼륨". 못 읽으면 줄은 None 이고 개요를
+    실패시키지 않는다. 둘째 값은 거부·CRD 없음일 때만 True 다 — 시간 초과·예산 부족·깨진 출력은 잠깐의 실패다."""
     timeout = budget(GPU_MODEL_VOLUMES_TIMEOUT)
     if timeout < 1:
-        return _remembered_volumes(cache_key, clock)
+        return None, False
     result = run(gpu.MODEL_VOLUMES_COMMAND, timeout)
     if not result.success:
         text = result.stderr or result.stdout or ""
         logger.debug("모델 볼륨을 읽지 못했다: %s", _failure_status(text))
-        if gpu.served_models_absent(text):
-            _forget_volumes(cache_key)
-            return None
-        return _remembered_volumes(cache_key, clock)
+        return None, gpu.served_models_absent(text)
     try:
-        rows = gpu.model_volumes(result.stdout, served)
+        return gpu.model_volumes(result.stdout), False
     except (ValueError, AttributeError, TypeError, RecursionError):
         logger.debug("모델 볼륨을 읽지 못했다 (목록 모양이 아니다)")
-        return _remembered_volumes(cache_key, clock)
-    if cache_key:
-        now = clock()
-        with _volumes_lock:
-            _forget_old_volumes(now)
-            _volumes_memory[cache_key] = (rows, now)
-    return rows
+        return None, False
 
 
-def _remembered_volumes(cache_key: str | None, clock=time.monotonic) -> list[dict[str, Any]] | None:
-    """연결의 마지막 성공 모델 볼륨, 없으면 None. 연결 지문이 없으면(cache_key None) 늘 None."""
-    if not cache_key:
+def _wait_model_volumes(future) -> tuple[list[dict[str, Any]] | None, bool]:
+    """곁 스레드의 볼륨 읽기를 기다린다. 읽기는 예산(kubectl 시간 제한) 안에서 끝나므로 그 몫에 여유를 더한 실제 시간까지만
+    기다리고, 넘기거나 예상 밖 예외면 못 읽은 것으로 둔다 — 배지 하나로 개요를 실패시키거나 붙잡지 않는다."""
+    try:
+        return future.result(timeout=GPU_MODEL_VOLUMES_TIMEOUT + 2)
+    except Exception:                                       # TimeoutError·kubectl 을 못 띄운 OSError 등
+        logger.debug("모델 볼륨을 읽지 못했다 (기다리다 끝냈다)", exc_info=True)
+        return None, False
+
+
+def _model_volume_rows(cache_key: str | None, raw: list[dict[str, Any]] | None, denied: bool,
+                       served: frozenset[str] | None, clock=time.monotonic) -> list[dict[str, Any]] | None:
+    """개요에 싣는 model_volumes. 읽었으면 기억하고, 잠깐 못 읽었으면 기억해 둔 줄을, 볼 수 없다(denied)면 기억을 지우고 None.
+    served 는 이 라운드의 ServedModel 이름 — 못 읽었으면 None 이고 기억해 둔 이름을 쓴다."""
+    now = clock()
+    if denied:
+        _model_volumes_memory.forget(cache_key)
         return None
-    with _volumes_lock:
-        _forget_old_volumes(clock())
-        memo = _volumes_memory.get(cache_key)
-    return memo[0] if memo else None
-
-
-def _forget_volumes(cache_key: str | None) -> None:
-    if cache_key:
-        with _volumes_lock:
-            _volumes_memory.pop(cache_key, None)
-
-
-def _forget_old_volumes(now: float) -> None:
-    """GPU_BENCHMARKS_FORGET 초보다 오래된 기억을 지운다. _volumes_lock 안에서 부른다."""
-    for key in [key for key, (_, at) in _volumes_memory.items() if now - at >= GPU_BENCHMARKS_FORGET]:
-        del _volumes_memory[key]
+    if raw is not None:
+        _model_volumes_memory.put(cache_key, (raw, served or frozenset()), now)
+    else:
+        remembered = _model_volumes_memory.get(cache_key, now)
+        if remembered is None:
+            return None
+        raw, last_served = remembered
+        served = served if served is not None else last_served
+    return gpu.volume_rows(raw, served or frozenset())
 
 
 def _read_benchmarks(run, budget, *, cache_key: str | None = None, clock=time.monotonic) -> list[dict[str, Any]]:
@@ -1037,11 +1038,51 @@ _counter_samples: dict[str, tuple[str, gpu.CounterSample]] = {}
 #: 연결마다 마지막으로 성공한 측정 기록 — _read_benchmarks. 한 연결에 많아야 MAX_BENCHMARKS 줄이고 GPU_BENCHMARKS_FORGET 뒤에 지운다
 _benchmarks_memory: dict[str, _BenchmarksMemo] = {}
 _benchmarks_lock = threading.Lock()
-#: 연결마다 마지막으로 읽은 모델 볼륨과 그 시각 (_read_model_volumes)
-_volumes_memory: dict[str, tuple[list[dict[str, Any]], float]] = {}
-_volumes_lock = threading.Lock()
-#: 측정 기록과 함께 읽는 곁 조회(모델 볼륨)용 공용 풀 — 개요마다 풀을 만들고 닫지 않는다
-_SIDE_READS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="gpu-side-read")
+class _LastRead:
+    """연결마다 마지막으로 읽은 값 — 잠깐의 실패에 그 값을 싣는다. forget_after 초가 지난 값은 어느 연결의 것이든 잊는다.
+    연결 지문이 없으면(key None) 기억하지 않는다."""
+
+    def __init__(self, forget_after: float) -> None:
+        self._values: dict[str, tuple[Any, float]] = {}
+        self._lock = threading.Lock()
+        self._forget_after = forget_after
+
+    def put(self, key: str | None, value: Any, now: float) -> None:
+        if key:
+            with self._lock:
+                self._expire(now)
+                self._values[key] = (value, now)
+
+    def get(self, key: str | None, now: float) -> Any | None:
+        if not key:
+            return None
+        with self._lock:
+            self._expire(now)
+            found = self._values.get(key)
+        return found[0] if found else None
+
+    def forget(self, key: str | None) -> None:
+        if key:
+            with self._lock:
+                self._values.pop(key, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._values.clear()
+
+    def __contains__(self, key: str) -> bool:
+        with self._lock:
+            return key in self._values
+
+    def _expire(self, now: float) -> None:
+        for key in [key for key, (_, at) in self._values.items() if now - at >= self._forget_after]:
+            del self._values[key]
+
+
+#: 연결마다 마지막으로 읽은 모델 볼륨 줄(주인 여부 그대로)과 그때의 ServedModel 이름 (_model_volume_rows)
+_model_volumes_memory = _LastRead(GPU_BENCHMARKS_FORGET)
+#: 측정 기록과 함께 읽는 곁 조회(모델 볼륨)용 공용 풀 — 개요마다 풀을 만들고 닫지 않는다. 동시에 도는 개요 수(OVERVIEW_WORKERS)만큼
+_SIDE_READS = ThreadPoolExecutor(max_workers=OVERVIEW_WORKERS, thread_name_prefix="gpu-side-read")
 
 
 def _absent_search_due(cache_key: str | None, *, unknown: bool, clock=time.monotonic) -> bool:

@@ -19,6 +19,11 @@ from kukie_agent.clusters import gpu
 from kukie_agent.kubectl import KubectlResult
 
 
+def _rows(stdout: str, served: frozenset[str] = frozenset()) -> list[dict]:
+    """읽은 그대로의 줄을 응답 줄로 — 개요가 하는 순서와 같다."""
+    return gpu.volume_rows(gpu.model_volumes(stdout), served)
+
+
 def _pvc(name: str = "gpt-oss-120b", *, capacity: str | None = "100Gi", request: str | None = "100Gi",
          phase: str | None = "Bound", owned: bool = False, labels: object = None) -> dict:
     """오븐이 만드는 모델 PVC. retainOnDelete 면 주인이 없다."""
@@ -37,7 +42,7 @@ def _pvc(name: str = "gpt-oss-120b", *, capacity: str | None = "100Gi", request:
 
 
 def test_모델_PVC를_정해진_칸만_응답_줄로_바꾼다():
-    assert gpu.model_volumes(_list(_pvc())) == [{
+    assert _rows(_list(_pvc())) == [{
         "name": "gpt-oss-120b", "pvc": "gpt-oss-120b-models", "size_bytes": 100 * 1024**3, "phase": "Bound",
         "retained": True, "created_at": "2026-11-04T10:00:00Z",
     }]
@@ -49,20 +54,20 @@ def test_모델_볼륨의_명령은_llm의_라벨_달린_PVC만_읽는다():
 
 
 def test_돌고_있는_ServedModel의_PVC는_retained가_아니다():
-    [row] = gpu.model_volumes(_list(_pvc(owned=True)))
+    [row] = _rows(_list(_pvc(owned=True)))
     assert row["retained"] is False
 
 
 def test_retainOnDelete_PVC도_그_이름의_ServedModel이_있으면_retained가_아니다():
     """retainOnDelete 로 만든 PVC 는 모델이 돌 때도 주인이 없다 — 이름으로 대조한다 (agent#149 리뷰)."""
-    rows = gpu.model_volumes(_list(_pvc("gpt-oss-120b"), _pvc("gpt-oss-20b")), frozenset({"gpt-oss-120b"}))
+    rows = _rows(_list(_pvc("gpt-oss-120b"), _pvc("gpt-oss-20b")), frozenset({"gpt-oss-120b"}))
     assert [(row["name"], row["retained"]) for row in rows] == [("gpt-oss-120b", False), ("gpt-oss-20b", True)]
 
 
 def test_모델_볼륨은_ServedModel_이름순이고_줄_수를_자르지_않는다():
-    rows = gpu.model_volumes(_list(_pvc("b"), _pvc("a")))
+    rows = _rows(_list(_pvc("b"), _pvc("a")))
     assert [row["name"] for row in rows] == ["a", "b"]
-    many = gpu.model_volumes(_list(*(_pvc(f"m-{i:03}") for i in range(80))))
+    many = _rows(_list(*(_pvc(f"m-{i:03}") for i in range(80))))
     assert len(many) == 80 and many[-1]["name"] == "m-079"
 
 
@@ -87,12 +92,12 @@ def test_모델_볼륨은_ServedModel_이름순이고_줄_수를_자르지_않�
     (None, None, None),
 ])
 def test_크기는_capacity를_먼저_보고_모르는_모양은_null이다(capacity, requested, expected):
-    [row] = gpu.model_volumes(_list(_pvc(capacity=capacity, request=requested)))
+    [row] = _rows(_list(_pvc(capacity=capacity, request=requested)))
     assert row["size_bytes"] == expected
 
 
 def test_phase가_없으면_빈_문자열이다():
-    [row] = gpu.model_volumes(_list(_pvc(phase=None)))
+    [row] = _rows(_list(_pvc(phase=None)))
     assert row["phase"] == ""
 
 
@@ -112,7 +117,7 @@ def test_목록_모양이_아니면_ValueError라_null이_된다(stdout):
     {**_pvc(), "status": "x", "spec": None},
 ])
 def test_모양이_다른_항목은_그_줄만_건너뛴다(broken):
-    rows = gpu.model_volumes(_list(broken, _pvc("ok")))
+    rows = _rows(_list(broken, _pvc("ok")))
     if broken.get("status") == "x":                          # 이름·라벨은 있다 — 크기·상태만 모른다
         assert [(row["name"], row["size_bytes"], row["phase"]) for row in rows] == [("gpt-oss-120b", None, ""), ("ok", 100 * 1024**3, "Bound")]
     else:
@@ -184,20 +189,20 @@ def test_GPU_없는_일반_클러스터는_모델_볼륨을_조회하지_않는�
 
 def test_예산이_떨어지면_모델_볼륨은_null이다():
     run, seen = _volumes_cluster(_result(_list(_pvc())))
-    assert clusters_api._read_model_volumes(run, lambda limit: 0) is None
+    assert clusters_api._read_model_volumes(run, lambda limit: 0) == (None, False)
     assert seen == []
 
 
 def test_크기_문법은_manifests와_한_곳을_같이_쓴다():
     from kukie_agent import quantity
     from kukie_agent.manifests import models
-    assert models._QUANTITY is quantity.QUANTITY
+    assert models.QUANTITY is quantity.QUANTITY
 
 
 @pytest.mark.parametrize("digits", ["9" * 4400, "9" * 4400 + "Ei"])
 def test_아주_긴_숫자도_그_줄의_크기만_null이고_목록은_살아_있다(digits):
     """int 문자열 한도(4300자리)를 넘어도 목록 전체가 null 이 되거나 응답 JSON 이 깨지지 않는다 (agent#149 리뷰)."""
-    [row] = gpu.model_volumes(_list(_pvc(capacity=digits)))
+    [row] = _rows(_list(_pvc(capacity=digits)))
     assert row["size_bytes"] is None
 
 
@@ -206,9 +211,9 @@ KEY = "cluster:fingerprint:volumes"
 
 @pytest.fixture(autouse=True)
 def _forget():
-    clusters_api._volumes_memory.clear()
+    clusters_api._model_volumes_memory.clear()
     yield
-    clusters_api._volumes_memory.clear()
+    clusters_api._model_volumes_memory.clear()
 
 
 @pytest.mark.parametrize("failure", [
@@ -243,7 +248,7 @@ def test_볼_수_없다는_답은_기억을_지우고_null이다(volumes, served
     clusters_api._collect_gpu(ok, namespace_pods="{}", cache_key=KEY, known=True, clock=lambda: 0.0)
     denied, _ = _volumes_cluster(volumes, served=served, nodes="nodes.json")
     body, _ = clusters_api._collect_gpu(denied, namespace_pods="{}", cache_key=KEY, known=True, clock=lambda: 1.0)
-    assert (body or {}).get("model_volumes") is None and KEY not in clusters_api._volumes_memory
+    assert (body or {}).get("model_volumes") is None and KEY not in clusters_api._model_volumes_memory
 
 
 def test_오래된_기억은_싣지_않는다():
@@ -281,3 +286,45 @@ def test_모델_볼륨은_따로_몫을_떼지_않아_꺼진_클러스터의_nam
     assert sum(searched) == clusters_api.GPU_BUDGET - (clusters_api.GPU_NODE_POOLS_TIMEOUT + clusters_api.GPU_SERVED_MODELS_TIMEOUT
                                                       + clusters_api.GPU_BENCHMARKS_TIMEOUT)
     assert body["model_volumes"] == []
+
+
+def test_지우는_중인_PVC는_싣지_않는다():
+    """Terminating PVC 는 같은 이름으로 다시 만들어도 붙지 않는다 (agent#149 리뷰)."""
+    going = _pvc("going")
+    going["metadata"]["deletionTimestamp"] = "2026-11-12T12:00:00Z"
+    assert [row["name"] for row in _rows(_list(going, _pvc("stay")))] == ["stay"]
+
+
+def test_예산이_일찍_떨어진_라운드도_기억해_둔_볼륨을_싣는다():
+    ok, _ = _volumes_cluster(_result(_list(_pvc())), served=_result(fixture("served_models.json")), pods=fixture("gpu_pods.json"))
+    clusters_api._collect_gpu(ok, namespace_pods="{}", cache_key=KEY, clock=lambda: 0.0)
+    now = [100.0]
+
+    def slow(args, timeout):
+        now[0] += clusters_api.GPU_BUDGET                               # 노드 조회가 예산을 다 쓴다
+        return ok(args, timeout)
+
+    body, _ = clusters_api._collect_gpu(slow, namespace_pods="{}", cache_key=KEY, clock=lambda: now[0])
+    assert body["serving"] == [] and [row["name"] for row in body["model_volumes"]] == ["gpt-oss-120b"]
+
+
+def test_기억해_둔_줄의_retained는_싣는_라운드의_ServedModel_이름으로_다시_정한다():
+    """모델이 돌 때 기억한 줄이 그 뒤 모델을 지운 라운드에 retained=false 로 굳지 않는다 (agent#149 리뷰)."""
+    running = _result(_list({"metadata": {"name": "gpt-oss-120b", "namespace": "llm"}, "spec": {"source": {"huggingface": "openai/gpt-oss-120b"}}}))
+    ok, _ = _volumes_cluster(_result(_list(_pvc())), served=running, nodes="nodes.json")
+    first, _ = clusters_api._collect_gpu(ok, namespace_pods="{}", cache_key=KEY, known=True, clock=lambda: 0.0)
+    assert first["model_volumes"][0]["retained"] is False
+    gone, _ = _volumes_cluster(_result(stderr="context deadline exceeded", success=False), served=_result('{"items": []}'),
+                               nodes="nodes.json")
+    second, _ = clusters_api._collect_gpu(gone, namespace_pods="{}", cache_key=KEY, known=True, clock=lambda: 1.0)
+    assert second["model_volumes"][0]["retained"] is True
+
+
+def test_곁_읽기를_기다리다_넘기거나_예외면_못_읽은_것으로_둔다(monkeypatch):
+    from concurrent.futures import Future
+    monkeypatch.setattr(clusters_api, "GPU_MODEL_VOLUMES_TIMEOUT", -1.95)    # 0.05초만 기다린다
+    late: Future = Future()                                                 # 끝나지 않는 읽기
+    assert clusters_api._wait_model_volumes(late) == (None, False)
+    broken: Future = Future()
+    broken.set_exception(OSError("kubectl 을 띄우지 못했다"))
+    assert clusters_api._wait_model_volumes(broken) == (None, False)
