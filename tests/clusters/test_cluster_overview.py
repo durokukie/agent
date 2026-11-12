@@ -36,7 +36,7 @@ def built() -> dict:
 def test_응답_머리는_context_namespace_수집시각이다():
     body = built()
     assert (body["context"], body["namespace"], body["at"]) == ("eks-shop", "shop", "2026-10-19T12:00:00Z")
-    assert set(body) == {"context", "namespace", "at", "workloads", "pods", "events", "network", "gpu"}
+    assert set(body) == {"context", "namespace", "scope", "at", "workloads", "pods", "events", "network", "gpu"}
     assert body["network"] is None                                           # CNI 조회 출력을 안 넘기면 null
     assert body["gpu"] is None                                               # GPU 칸을 안 넘기면 null (clusters/gpu.py)
 
@@ -138,7 +138,8 @@ def test_이벤트는_최근_것부터_20개():
     events = built()["events"]
     assert len(events) == overview.MAX_EVENTS
     assert events[0] == {"type": "Warning", "reason": "BackOff", "object": "pod/api-1",
-                         "message": "Back-off restarting failed container", "at": "2026-10-19T11:59:00Z"}
+                         "message": "Back-off restarting failed container", "at": "2026-10-19T11:59:00Z",
+                         "namespace": ""}
     # lastTimestamp 가 없는 새 API 모양은 eventTime 으로, 초 단위로 자른다
     assert events[1]["object"] == "deployment/api" and events[1]["at"] == "2026-10-19T11:58:30Z"
     assert events[2]["message"] == "pulled 24"                               # 끝 줄바꿈은 뗀다
@@ -376,3 +377,115 @@ def test_개요도_스레드_상한을_쓴다(client, fake_server, monkeypatch):
     assert client.get(f"/clusters/{cluster}/overview", headers=USER).status_code == 200
     ours = [limiter for name, limiter in seen if name == "collect"]
     assert ours and all(limiter is not None for limiter in ours)
+
+
+# ── 읽는 범위 (?all=true · ?namespace=) ────────────────────────
+
+def test_줄마다_namespace_를_싣는다():
+    body = built()
+    assert {row["namespace"] for row in body["workloads"]} <= {"shop", ""}
+    assert all("namespace" in row for row in body["pods"]) and all("namespace" in row for row in body["events"])
+    assert body["scope"] == "namespace"
+
+
+def _scope_calls(client, fake_server, monkeypatch, query: str, *, deny_all: bool = False,
+                 stderr: str = 'Error from server (Forbidden): deployments.apps is forbidden: User "x" cannot list '
+                               'resource "deployments" in API group "apps" at the cluster scope'):
+    cluster = fake_server.add_cluster(context="eks-shop", namespace="shop", has_gpu=False)
+    monkeypatch.setitem(clusters_api._gpu_absent_checked, f"{cluster}:fp-{cluster}:shop", time.monotonic())
+    seen: list[list[str]] = []
+
+    def fake(args, **kwargs):
+        seen.append(args)
+        if deny_all and "-A" in args:
+            return _result(stderr=stderr, success=False)
+        return _by_resource(args)
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    return cluster, client.get(f"/clusters/{cluster}/overview{query}", headers=USER), seen
+
+
+def test_all_이면_모든_namespace_를_읽는다(client, fake_server, monkeypatch):
+    _, r, seen = _scope_calls(client, fake_server, monkeypatch, "?all=true")
+    assert r.status_code == 200
+    assert (r.json()["scope"], r.json()["namespace"]) == ("all", "shop")
+    assert seen[:3] == [[*args, "-A"] for args in overview.READ_COMMANDS.values()]
+
+
+def test_all_을_거부당하면_등록된_namespace_로_돌아가고_한동안_다시_묻지_않는다(client, fake_server, monkeypatch):
+    cluster, r, seen = _scope_calls(client, fake_server, monkeypatch, "?all=true", deny_all=True)
+    assert r.status_code == 200
+    assert (r.json()["scope"], r.json()["namespace"]) == ("namespace", "shop")
+    assert seen[0][-1] == "-A"                                               # 첫 조회에서 거부되면 바로 돌아간다
+    assert seen[1:4] == [[*args, "-n", "shop"] for args in overview.READ_COMMANDS.values()]
+
+    clusters_api._shared_overviews.clear()
+    seen.clear()
+    assert client.get(f"/clusters/{cluster}/overview?all=true", headers=USER).json()["scope"] == "namespace"
+    assert not any("-A" in args for args in seen[:3])                       # 거부를 기억해 감사 로그에 쌓지 않는다
+
+
+def test_익명_거부는_권한이_아니라_자격증명_문제라_502(client, fake_server, monkeypatch):
+    _, r, _ = _scope_calls(client, fake_server, monkeypatch, "?all=true", deny_all=True,
+                           stderr='Error from server (Forbidden): deployments.apps is forbidden: '
+                                  'User "system:anonymous" cannot list resource "deployments"')
+    assert r.status_code == 502 and r.json()["detail"]["code"] == "CLUSTER_AUTH_EXPIRED"
+
+
+def test_namespace_를_고르면_그_namespace_만_읽는다(client, fake_server, monkeypatch):
+    _, r, seen = _scope_calls(client, fake_server, monkeypatch, "?namespace=llm&all=true")
+    assert r.status_code == 200
+    assert (r.json()["scope"], r.json()["namespace"]) == ("namespace", "llm")
+    assert seen[:3] == [[*args, "-n", "llm"] for args in overview.READ_COMMANDS.values()]
+
+
+@pytest.mark.parametrize("name", ["Bad_NS", "-x", "a" * 64, "a b"])
+def test_이름_꼴이_아닌_namespace_는_400이고_kubectl은_돌지_않는다(client, fake_server, monkeypatch, name):
+    cluster = fake_server.add_cluster()
+    ran: list[object] = []
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", lambda *a, **k: ran.append(a) or _result("{}"))
+    r = client.get(f"/clusters/{cluster}/overview", params={"namespace": name}, headers=USER)
+    assert r.status_code == 400 and r.json()["detail"]["code"] == "INVALID_NAMESPACE"
+    assert ran == []
+
+
+def test_all_이_시간_초과면_등록된_namespace_로_돌아간다(client, fake_server, monkeypatch):
+    _, r, seen = _scope_calls(client, fake_server, monkeypatch, "?all=true", deny_all=True,
+                              stderr="Command '['kubectl', 'get']' timed out after 15 seconds")
+    assert r.status_code == 200 and r.json()["scope"] == "namespace"
+    assert seen[1:4] == [[*args, "-n", "shop"] for args in overview.READ_COMMANDS.values()]
+
+
+def test_다른_namespace_를_고르면_GPU_칸은_읽지_않는다(client, fake_server, monkeypatch):
+    _, r, seen = _scope_calls(client, fake_server, monkeypatch, "?namespace=llm")
+    assert r.status_code == 200 and r.json()["gpu"] is None
+    assert ["get", "nodes", "-o", "json"] not in seen                       # GPU 의 노드 조회를 하지 않는다
+
+
+def test_전체면_GPU_칸에_등록된_namespace_파드만_넘긴다(client, fake_server, monkeypatch):
+    passed: dict = {}
+
+    def spy(run, *, namespace_pods, namespace=None, **kwargs):
+        passed.update(pods=json.loads(namespace_pods), namespace=namespace)
+        return None, None
+
+    monkeypatch.setattr(clusters_api, "_collect_gpu", spy)
+    pods = {"items": [{"metadata": {"name": "a", "namespace": "shop"}}, {"metadata": {"name": "b", "namespace": "llm"}}]}
+    cluster = fake_server.add_cluster(namespace="shop")
+
+    def fake(args, **kwargs):
+        return _result(json.dumps(pods)) if args[1] == "pods" else _by_resource(args)
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    assert client.get(f"/clusters/{cluster}/overview?all=true", headers=USER).json()["scope"] == "all"
+    assert passed["namespace"] == "shop"
+    assert [p["metadata"]["name"] for p in passed["pods"]["items"]] == ["a"]
+
+
+def test_닿지_않아_시간_초과면_502이고_기억하지_않는다(client, fake_server, monkeypatch):
+    cluster = fake_server.add_cluster(namespace="shop")
+    timeout = _result(stderr="Command '['kubectl', 'get']' timed out after 15 seconds", success=False)
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", lambda args, **k: timeout)
+    r = client.get(f"/clusters/{cluster}/overview?all=true", headers=USER)
+    assert r.status_code == 502 and r.json()["detail"]["code"] == "CLUSTER_UNREACHABLE"
+    assert clusters_api._all_forbidden == {}

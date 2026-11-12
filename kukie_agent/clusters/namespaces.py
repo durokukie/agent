@@ -7,11 +7,19 @@ limited(namespace 범위 Edit)면 Forbidden 이고, 그때 화면은 등록한 n
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 #: 부르는 쪽이 `-n` 을 붙이지 않는다 (클러스터 범위)
 LIST_COMMAND: list[str] = ["get", "namespaces", "-o", "json"]
 SYSTEM_PREFIX = "kube-"
+#: namespace 이름(DNS label). URL 에서 받은 값을 kubectl 인자로 넘기기 전에 본다
+_NAME = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")
+
+
+def valid(name: str) -> bool:
+    """kubectl `-n` 에 넘겨도 되는 이름인가. 읽기만 하므로 kube-* 도 된다(개요에서 kube-system 을 볼 수 있다)."""
+    return bool(_NAME.fullmatch(name))
 
 
 def names(stdout: str) -> list[str]:

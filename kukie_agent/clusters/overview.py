@@ -3,8 +3,10 @@
 kubectl 은 clusters_api.py 가 돌리고, 여기는 그 출력(JSON 문자열)을 받아 응답을 만드는 순수 함수만 둔다.
 지금 시각(now)도 인자로 받아 같은 입력이면 늘 같은 결과다 — 테스트가 JSON 픽스처로 그대로 확인한다.
 
-조회 범위는 클러스터에 등록된 namespace 하나다. EKS 고객 클러스터는 namespace 범위 Edit 만 주므로
-`-A`·`get nodes` 같은 클러스터 범위 조회는 하지 않는다 (READ_COMMANDS 가 그 목록이다).
+조회 범위(scope)는 부르는 쪽이 정한다 (clusters_api.cluster_overview).
+  namespace  namespace 하나(`-n`). 기본은 클러스터에 등록된 것, `?namespace=` 로 다른 것
+  all        모든 namespace(`-A`, `?all=true`). 권한이 없으면(limited EKS 는 namespace 범위 Edit 만 준다) 등록된 namespace 로 돌아간다
+워크로드·파드·이벤트 줄마다 namespace 를 싣는다 — all 일 때 같은 이름이 여러 namespace 에 있을 수 있다.
 예외는 CNI 를 알아보는 NETWORK_COMMAND(kube-system 의 DaemonSet)와 GPU 를 알아보는 gpu.py 의 조회(노드·모든 파드 — 못 읽으면
 namespace 목록과 namespace 마다 파드 — ·지표)다.
 둘 다 못 읽으면 그 칸(network·gpu)만 null 이고 개요는 그대로다.
@@ -82,16 +84,18 @@ WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet")
 
 def build(
     *, context: str, namespace: str, workloads: str, pods: str, events: str, now: datetime,
-    network: str | None = None, gpu: dict[str, Any] | None = None,
+    network: str | None = None, gpu: dict[str, Any] | None = None, scope: str = "namespace",
 ) -> dict[str, Any]:
     """READ_COMMANDS 세 번의 stdout(JSON) 으로 ClusterOverview 응답을 만든다.
 
     network 는 NETWORK_COMMAND 의 stdout 이다. 그 조회가 실패했으면 None 을 넘긴다 — 응답의 network 는 null.
     gpu 는 gpu.build 가 만든 칸 그대로다 (조회가 여러 번이라 부르는 쪽이 모은다). GPU 노드가 없거나 못 읽으면 None.
+    scope 가 all 이면 namespace 는 클러스터에 등록된 것이다(읽은 범위가 아니다 — 옛 앱이 머리에 그대로 쓴다).
     """
     return {
         "context": context,
         "namespace": namespace,
+        "scope": scope,
         "at": iso(now),
         "workloads": parse_workloads(_items(workloads), now),
         "pods": parse_pods(_items(pods), now),
@@ -114,12 +118,13 @@ def parse_workloads(items: list[dict[str, Any]], now: datetime) -> list[dict[str
         rows.append({
             "kind": kind,
             "name": meta.get("name", ""),
+            "namespace": meta.get("namespace") or "",
             "ready": ready,
             "desired": desired,
             "status": status,
             "age": age(meta.get("creationTimestamp"), now),
         })
-    rows.sort(key=lambda r: (WORKLOAD_KINDS.index(r["kind"]), r["name"]))
+    rows.sort(key=lambda r: (WORKLOAD_KINDS.index(r["kind"]), r["name"], r["namespace"]))
     return rows
 
 
@@ -180,12 +185,13 @@ def parse_pods(items: list[dict[str, Any]], now: datetime) -> list[dict[str, Any
         containers = [*(status.get("initContainerStatuses") or []), *(status.get("containerStatuses") or [])]
         rows.append({
             "name": meta.get("name", ""),
+            "namespace": meta.get("namespace") or "",
             "phase": pod_phase(status),
             "restarts": sum(_int(c.get("restartCount")) for c in containers),
             "node": (item.get("spec") or {}).get("nodeName") or "",
             "age": age(meta.get("creationTimestamp"), now),
         })
-    rows.sort(key=lambda r: r["name"])
+    rows.sort(key=lambda r: (r["name"], r["namespace"]))
     return rows
 
 
@@ -211,6 +217,7 @@ def parse_events(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "type": "Warning" if item.get("type") == "Warning" else "Normal",
             "reason": item.get("reason") or "",
             "object": f"{str(involved.get('kind') or '').lower()}/{involved.get('name') or ''}",
+            "namespace": involved.get("namespace") or (item.get("metadata") or {}).get("namespace") or "",
             "message": (item.get("message") or item.get("note") or "").strip(),
             "at": iso(when) if when else "",
         }))
