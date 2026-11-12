@@ -64,6 +64,25 @@ def test_목록과_등록한_namespace_를_준다(client, fake_server, monkeypat
     assert ran == [namespaces.LIST_COMMAND]
 
 
+def test_등록한_namespace_는_목록에_없어도_넣는다(client, fake_server, monkeypatch):
+    cluster = fake_server.add_cluster(owner="u-1", namespace="gone")
+    _api(monkeypatch, _ok({"items": [_ns("web"), _ns("gone", "Terminating")]}))
+    r = client.get(f"/clusters/{cluster}/namespaces", headers=USER)
+    assert r.json()["namespaces"] == ["gone", "web"]
+
+
+def test_fresh_면_막_끝난_결과를_건너뛰고_새로_읽는다(client, fake_server, monkeypatch):
+    monkeypatch.setattr("kukie_agent.clusters_api.OVERVIEW_SHARE_TTL", 10)   # 테스트 기본은 나눠 쓰지 않는다
+    monkeypatch.setattr("kukie_agent.clusters_api.FRESH_MIN_AGE", 0)
+    cluster = fake_server.add_cluster(owner="u-1", namespace="study")
+    ran = _api(monkeypatch, _ok({"items": [_ns("study")]}))
+    client.get(f"/clusters/{cluster}/namespaces", headers=USER)
+    client.get(f"/clusters/{cluster}/namespaces", headers=USER)
+    assert len(ran) == 1                                   # 같은 연결은 나눠 쓴다
+    client.get(f"/clusters/{cluster}/namespaces?fresh=true", headers=USER)
+    assert len(ran) == 2
+
+
 def test_목록을_읽을_권한이_없으면_200_forbidden_과_등록한_namespace(client, fake_server, monkeypatch):
     cluster = fake_server.add_cluster(owner="u-1", namespace="kukie-demo")
     _api(monkeypatch, _fail(FORBIDDEN))

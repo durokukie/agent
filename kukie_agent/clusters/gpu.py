@@ -186,6 +186,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from kukie_agent.clusters import namespaces
+
 #: 노드 목록 (클러스터 범위). 부르는 쪽이 `-n` 을 붙이지 않는다
 NODES_COMMAND: list[str] = ["get", "nodes", "-o", "json"]
 #: DCGM exporter·vLLM 파드를 찾는 파드 목록 (모든 namespace). 부르는 쪽이 `-n` 을 붙이지 않는다
@@ -209,7 +211,8 @@ _RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:
 NODE_POOLS_COMMAND: list[str] = ["get", "nodepools.karpenter.sh", "-o", "json"]
 
 #: 모든 namespace 파드를 못 읽을 때 namespace 마다 파드를 읽으려고 보는 namespace 목록 (클러스터 범위)
-NAMESPACES_COMMAND: list[str] = ["get", "namespaces", "-o", "json"]
+#: 새 대화의 namespace 목록(clusters/namespaces.py)과 같은 명령이다 — 한 곳에 둔다
+NAMESPACES_COMMAND: list[str] = namespaces.LIST_COMMAND
 #: namespace 마다 파드를 읽는 수 상한. 넘으면 GPU 쪽 이름(NAMESPACE_HINTS)이 들어간 것부터 고른다
 MAX_POD_NAMESPACES = 24
 #: DCGM exporter·vLLM 이 흔히 도는 namespace 이름 조각 — 상한을 넘을 때 먼저 고른다. kube-prometheus-stack 으로 깐 DCGM 은 보통 monitoring 에 있다
@@ -630,7 +633,7 @@ def namespace_names(stdout: str, *, skip: str | None = None,
     (끝까지 읽었다고 말할 수 없다). 모양이 다르면 ValueError."""
     names = sorted({name for item in _items(stdout)
                     if isinstance(name := (item.get("metadata") or {}).get("name"), str) and name
-                    and not name.startswith("kube-") and name != skip})
+                    and not name.startswith(namespaces.SYSTEM_PREFIX) and name != skip})
     names.sort(key=lambda name: not (name in prefer or hinted_namespace(name)))
     return names[:MAX_POD_NAMESPACES], len(names) <= MAX_POD_NAMESPACES
 
