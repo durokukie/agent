@@ -153,7 +153,7 @@ def test_GPU_노드가_0대여도_GPU를_기다리는_파드가_있으면_꺼진
     monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
     r = client.get(f"/clusters/{cluster}/overview", headers=USER)
     assert r.status_code == 200
-    assert r.json()["gpu"] == {"nodes": [], "serving": [], "benchmarks": [], "served_models": None, "node_pools": [], "counter": None,
+    assert r.json()["gpu"] == {"nodes": [], "serving": [], "benchmarks": [], "served_models": None, "node_pools": [], "counter": None, "model_volumes": None,
         "waiting": [{"namespace": "llm", "pod": "vllm-gpt-oss-20b-b897b5d97-kkjsq", "gpus": 1, "phase": "Pending"}]}
     assert not any(args[1] == "--raw" for args in seen)
     assert [body["hasGpu"] for body in _gpu_calls(fake_server)] == ([True] if stored is None else [])

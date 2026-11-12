@@ -1,5 +1,5 @@
 """클러스터 개요의 gpu 칸 — GPU 노드, 그 위의 DCGM 지표, 서빙 중인 vLLM 모델 (DURO-118), ServedModel 상태 (DURO-182),
-Karpenter GPU NodePool (DURO-184), 측정 기록 (DURO-188), 카운터의 429 비율 (DURO-173).
+Karpenter GPU NodePool (DURO-184), 측정 기록 (DURO-188), 카운터의 429 비율 (DURO-173), 남아 있는 모델 볼륨.
 
 overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순수 함수만 둔다. kubectl 은 clusters_api.py 가 돌린다.
 
@@ -15,6 +15,7 @@ overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순�
   4. SERVED_MODELS_COMMAND  모든 namespace 의 ServedModel. 지표보다 먼저 읽는다 — 지표 파드가 매달려도 예산이 남게.
                      GPU 노드가 없으면 기다리는 파드나 GPU 풀이 있거나 server 값이 GPU 클러스터(true)일 때만 읽는다 — 아래 "ServedModel"
   5. BENCHMARKS_COMMAND  측정 기록 ConfigMap. ServedModel 이 읽힌 라운드에만 읽는다 — 아래 "측정 기록"
+     MODEL_VOLUMES_COMMAND  오븐이 만든 모델 PVC. 측정 기록과 같은 조건·같은 몫에서 그 뒤에 읽는다 — 아래 "모델 볼륨"
   6. proxy_command   찾은 파드의 /metrics 를 API 서버 **파드 프록시**로 읽는다 (Prometheus 없이 kubectl 권한만으로).
                      서비스 프록시가 아니라 파드 프록시인 이유: DCGM exporter 는 노드마다 하나인 DaemonSet 이라 서비스로
                      부르면 아무 파드 하나에 붙어 다른 노드의 값을 받는다. vLLM 도 레플리카마다 값이 다르다.
@@ -132,6 +133,22 @@ ServedModel — served_models
   그것도 없으면 [] 다. 거부와 CRD 없음은 잠깐의 실패가 아니라 "볼 수 없다" 는 답이라 기억을 지우고 [] 다. 웹이 배열로 읽으므로 null 은 쓰지 않는다.
   이 칸은 GPU 클러스터 판단(hasGpu)에 쓰지 않는다.
 
+모델 볼륨 — model_volumes
+  오븐이 ServedModel 마다 만드는 모델 파일 PVC(`<ServedModel 이름>-models`, 라벨 serving.kukie.io/servedmodel=<ServedModel 이름>)가
+  한 줄이다. spec.storage.retainOnDelete 로 만든 PVC 는 주인(ownerReferences)이 없어 ServedModel 을 지워도 남는다 — 같은 이름으로
+  다시 만들면 오븐이 그 PVC 를 다시 붙여, 이미 받은 파일은 다시 받지 않는다. 앱은 이 칸으로 후보 표에 "받아 둠" 을 보인다.
+  PVC 에는 허깅페이스 모델 이름이 없다 — 앱이 후보 id 에서 서버와 같은 규칙(ServedModelName.of)으로 ServedModel 이름을 만들어 잇는다.
+  한 줄: name(라벨의 ServedModel 이름), pvc(metadata.name), size_bytes(status.capacity.storage, 없으면 spec.resources.requests.storage
+  — 바이트 정수, 단위를 못 읽으면 null), phase(status.phase — Bound·Pending·Lost, 없으면 ""), retained(주인이 없다 — 지금 도는
+  ServedModel 의 것이 아니다), created_at(metadata.creationTimestamp). ServedModel 이름순, MAX_MODEL_VOLUMES 줄까지.
+  안의 파일이 다 받아졌는지는 모른다 — 받다가 멈춘 PVC 도 줄이 있다. 앱은 "다시 받지 않는다" 가 아니라 "받던 파일을 이어 쓴다" 로 말한다.
+  이름·라벨이 없는 항목은 그 줄만 건너뛴다.
+    null  읽지 않았다(ServedModel 을 못 읽은 라운드) 또는 못 읽었다(거부·시간 초과·예산 부족·깨진 출력 — 그 라운드만)
+    []    읽었는데 하나도 없다
+  읽는 조건은 측정 기록과 같다 — served_models 가 null 이면 조회하지 않는다. GPU 없는 일반 클러스터에 kubectl 이 늘지 않는다.
+  읽기 권한은 ServedModel·측정 기록과 같은 연결 권한이다(llm namespace 의 읽기). PVC 를 볼 수 없는 곳은 null 이다.
+  이 칸은 GPU 클러스터 판단(hasGpu)에 쓰지 않는다.
+
 카운터 — counter
   애드온 차트가 설치 namespace 에 띄우는 키 발급제 입구 kukie-counter(Deployment, 파드 1개, CPU 노드)의 /metrics 로 낸 모델마다의
   **최근 구간** 429(동시 수 한도에 걸려 거절) 비율이다 (DURO-173). 한 줄: model, requests, rejected, rejected_ratio, window_seconds. model 이름순.
@@ -204,6 +221,16 @@ MAX_BENCHMARK_MODEL = 256
 #: 측정 시각. 대문자 T·Z 와 오프셋까지 있어야 한다 — 시각끼리 견주어 최근 순으로 놓으려면 시간대가 있어야 한다.
 #: 소수 초는 정렬 때 따로 읽는다 — datetime 은 마이크로초까지만 담는다 (_measured_time)
 _RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.([0-9]{1,9}))?(?:Z|[+-][0-9]{2}:[0-9]{2})")
+
+#: 오븐이 만든 모델 PVC (모듈 설명 "모델 볼륨"). 오븐 ServedModel 은 llm 에 만든다. 라벨이 있는 것만 — 값은 ServedModel 이름이다
+MODEL_VOLUMES_COMMAND: list[str] = ["get", "persistentvolumeclaims", "-n", "llm", "-l", "serving.kukie.io/servedmodel", "-o", "json"]
+#: 응답에 싣는 모델 볼륨 수 상한
+MAX_MODEL_VOLUMES = 50
+_SERVED_MODEL_LABEL = "serving.kukie.io/servedmodel"
+#: PVC 크기 — 정수나 소수에 쿠버네티스 단위 하나. 지수 표기(1e3)는 PVC 에 쓰지 않아 모르는 값으로 둔다
+_STORAGE = re.compile(r"([0-9]+(?:\.[0-9]+)?)(Ki|Mi|Gi|Ti|Pi|k|M|G|T|P)?")
+_STORAGE_UNITS: dict[str, int] = {"": 1, "Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4, "Pi": 1024**5,
+                                  "k": 1000, "M": 1000**2, "G": 1000**3, "T": 1000**4, "P": 1000**5}
 
 #: Karpenter NodePool (모듈 설명 "Karpenter GPU 풀"). 클러스터 범위 자원이라 `-A`·`-n` 이 없다
 NODE_POOLS_COMMAND: list[str] = ["get", "nodepools.karpenter.sh", "-o", "json"]
@@ -1012,6 +1039,48 @@ def counter_window(sample: CounterSample, previous: CounterSample | None) -> lis
     return rows
 
 
+# ── 모델 볼륨 ─────────────────────────────────────────────
+
+def model_volumes(stdout: str) -> list[dict[str, Any]]:
+    """모델 PVC 목록을 응답 줄로 (모듈 설명 "모델 볼륨"). 이름·라벨이 없는 항목은 그 줄만 건너뛴다. 목록 자체가 깨졌으면
+    ValueError — 부르는 쪽이 null 로 둔다."""
+    rows: list[dict[str, Any]] = []
+    for item in _items(stdout):
+        meta = item.get("metadata")
+        if not isinstance(meta, dict):
+            continue
+        labels = meta.get("labels")
+        name = labels.get(_SERVED_MODEL_LABEL) if isinstance(labels, dict) else None
+        pvc = _text_or_none(meta.get("name"))
+        if not _text_or_none(name) or pvc is None:
+            continue
+        status = item.get("status") if isinstance(item.get("status"), dict) else {}
+        spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
+        capacity = status.get("capacity") if isinstance(status.get("capacity"), dict) else {}
+        resources = spec.get("resources") if isinstance(spec.get("resources"), dict) else {}
+        requests = resources.get("requests") if isinstance(resources.get("requests"), dict) else {}
+        size = _storage_bytes(capacity.get("storage"))
+        owners = meta.get("ownerReferences")
+        rows.append({
+            "name": name,
+            "pvc": pvc,
+            "size_bytes": size if size is not None else _storage_bytes(requests.get("storage")),
+            "phase": _text_or_none(status.get("phase")) or "",
+            "retained": not (isinstance(owners, list) and owners),
+            "created_at": _text_or_none(meta.get("creationTimestamp")),
+        })
+    rows.sort(key=lambda row: (row["name"], row["pvc"]))
+    return rows[:MAX_MODEL_VOLUMES]
+
+
+def _storage_bytes(value: Any) -> int | None:
+    """"100Gi"·"40G"·"1073741824" 를 바이트로. 모르는 모양이면 None."""
+    match = _STORAGE.fullmatch(value) if isinstance(value, str) else None
+    if not match:
+        return None
+    return int(float(match[1]) * _STORAGE_UNITS[match[2] or ""])
+
+
 # ── 합치기 ───────────────────────────────────────────────
 
 def build(nodes: list[dict[str, Any]], serving: list[dict[str, Any]],
@@ -1019,16 +1088,17 @@ def build(nodes: list[dict[str, Any]], serving: list[dict[str, Any]],
           served_models: list[dict[str, Any]] | None = None,
           node_pools: list[dict[str, Any]] | None = None,
           benchmarks: list[dict[str, Any]] | None = None,
-          counter: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+          counter: list[dict[str, Any]] | None = None,
+          model_volumes: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     """ClusterGpu. GPU 노드도 GPU 를 기다리는 파드도 GPU 풀도 없고 ServedModel 도 못 읽었으면 None — 앱은 "GPU 노드가 없어요" 를 띄운다.
     노드는 없고 기다리는 파드나 GPU 풀, 읽어 낸 ServedModel(빈 배열 포함)이 있으면 꺼진 GPU 클러스터다(nodes 빈 배열).
     served_models·node_pools 의 null 은 "못 읽었다", 빈 배열은 "없다" 다. 빈 node_pools 는 served_models 와 달리 gpu 칸을 만들지
     않는다 — CPU 풀만 있는 Karpenter 클러스터는 GPU 클러스터가 아니다. benchmarks·counter 는 칸을 만드는 근거가 아니다.
-    counter 의 null 은 "못 찾았거나 못 읽었다", 빈 배열은 "읽었는데 모델이 없다" 다."""
+    counter 의 null 은 "못 찾았거나 못 읽었다", 빈 배열은 "읽었는데 모델이 없다" 다. model_volumes 도 칸을 만드는 근거가 아니다."""
     if not nodes and not waiting and served_models is None and not node_pools:
         return None
     return {"nodes": nodes, "serving": serving, "benchmarks": benchmarks or [], "waiting": waiting or [],
-            "served_models": served_models, "node_pools": node_pools, "counter": counter}
+            "served_models": served_models, "node_pools": node_pools, "counter": counter, "model_volumes": model_volumes}
 
 
 # ── Prometheus 글 형식 ────────────────────────────────────

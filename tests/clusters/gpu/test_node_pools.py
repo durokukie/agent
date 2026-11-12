@@ -254,7 +254,7 @@ def test_노드도_대기_파드도_모델도_없어도_GPU_풀이_있으면_GPU
                                               clock=lambda: 0.0)
     assert has_gpu is True
     assert body == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [], "served_models": None,
-                    "node_pools": [GPU_POOL_ROW], "counter": None}
+                    "node_pools": [GPU_POOL_ROW], "counter": None, "model_volumes": None}
     assert [args for args, _ in seen] == [gpu.NODES_COMMAND, gpu.PODS_COMMAND, gpu.NODE_POOLS_COMMAND,
                                           gpu.SERVED_MODELS_COMMAND]   # GPU 풀을 찾은 라운드에 ServedModel 도 읽는다
 

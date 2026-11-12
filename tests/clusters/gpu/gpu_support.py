@@ -54,7 +54,7 @@ def _gpu_cluster(args: list[str], **kwargs) -> KubectlResult:
         return _result(stderr=NO_CRD, success=False)
     if args == gpu.NODE_POOLS_COMMAND:
         return _result(stderr=NO_POOL_CRD, success=False)
-    if args == gpu.BENCHMARKS_COMMAND:
+    if args == gpu.BENCHMARKS_COMMAND or args == gpu.MODEL_VOLUMES_COMMAND:
         return _result('{"items": []}')
     return _result(fixture({"deployments,statefulsets,daemonsets": "workloads.json", "pods": "pods.json",
                             "events": "events.json", "daemonsets": "daemonsets.json"}[args[1]]))

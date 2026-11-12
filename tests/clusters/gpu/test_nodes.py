@@ -69,17 +69,17 @@ def test_GPU_노드도_기다리는_파드도_없으면_build는_None이다():
     assert gpu.gpu_nodes(fixture("nodes.json")) == []
     assert gpu.build([], []) is None and gpu.build([], [], []) is None
     assert gpu.build([{"node": "n"}], []) == {"nodes": [{"node": "n"}], "serving": [], "benchmarks": [], "waiting": [],
-                                              "served_models": None, "node_pools": None, "counter": None}
+                                              "served_models": None, "node_pools": None, "counter": None, "model_volumes": None}
     waiting = [{"namespace": "llm", "pod": "vllm-0", "gpus": 1, "phase": "Pending"}]
     assert gpu.build([], [], waiting) == {"nodes": [], "serving": [], "benchmarks": [], "waiting": waiting,
-                                          "served_models": None, "node_pools": None, "counter": None}
+                                          "served_models": None, "node_pools": None, "counter": None, "model_volumes": None}
     # ServedModel 을 읽었으면 하나도 없어도 칸이 있다 — null(못 읽음)과 빈 배열(없음)은 다르다
     assert gpu.build([], [], [], []) == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [], "served_models": [],
-                                         "node_pools": None, "counter": None}
+                                         "node_pools": None, "counter": None, "model_volumes": None}
     # GPU 풀이 있으면 그것만으로 칸이 있다. 빈 배열은 "GPU 풀 없음" 이라 칸을 만들지 않는다
     pool = [{"name": "gpu", "gpu_limit": 2}]
     assert gpu.build([], [], [], None, pool) == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [],
-                                                 "served_models": None, "node_pools": pool, "counter": None}
+                                                 "served_models": None, "node_pools": pool, "counter": None, "model_volumes": None}
     assert gpu.build([], [], [], None, []) is None
 
 
