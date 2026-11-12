@@ -10,9 +10,10 @@ import re
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from kukie_agent.quantity import QUANTITY
 
 # Kubernetes quantity (1, 0.5, 100m, 256Mi, 1e3 …) — 이 모양이 아니면 YAML 에 넣지 않는다
-_QUANTITY = re.compile(r"^[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+|m|k|Ki|Mi|Gi|Ti|Pi|Ei|M|G|T|P|E)?$")
+_QUANTITY = QUANTITY                                    # 문법은 kukie_agent/quantity.py 한 곳에 둔다
 _RESOURCE_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?(/[a-z0-9]([-a-z0-9.]*[a-z0-9])?)?$")
 _ENV_NAME = re.compile(r"^[-._a-zA-Z][-._a-zA-Z0-9]*$")
 # 컨테이너 이미지 태그 규칙 (OCI distribution spec)

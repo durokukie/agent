@@ -80,7 +80,9 @@ def test_모델_볼륨은_ServedModel_이름순이고_줄_수를_자르지_않�
     (".5Gi", None, None),                                   # _QUANTITY 와 같은 문법 — 앞의 점·끝의 점은 받지 않는다
     ("1.", None, None),
     ("1e999999", None, None),                               # 10**큰수 를 만들지 않는다
-    ("123456789012345678901234567890123Ei", None, 123456789012345678901234567890123 * 1024**6),  # 자릿수가 많아도 정확하다
+    ("7Ei", None, 7 * 1024**6),
+    ("8Ei", None, None),                                    # int64 를 넘는다 — apiserver 가 만들지 않는 값
+    ("1" * 31, None, None),                                 # 숫자 자릿수 상한
     ("abc", "40Gi", None),                                  # capacity 를 못 읽으면 요청한 크기로 넘어가지 않는다
     (None, None, None),
 ])
@@ -186,22 +188,71 @@ def test_예산이_떨어지면_모델_볼륨은_null이다():
     assert seen == []
 
 
-@pytest.mark.parametrize("value", ["1", "1.5", "100Gi", "40G", "1500m", "1e3", "1E-2", "2Ei", ".5Gi", "1.", "Gi", "1gi", "1 Gi",
-                                   "-1Gi", "1e", "1Kb"])
-def test_크기_문법은_manifests의_수량_문법과_같다(value):
-    from kukie_agent.manifests.models import _QUANTITY
-    assert (gpu._STORAGE.fullmatch(value) is not None) == (_QUANTITY.match(value) is not None)
+def test_크기_문법은_manifests와_한_곳을_같이_쓴다():
+    from kukie_agent import quantity
+    from kukie_agent.manifests import models
+    assert models._QUANTITY is quantity.QUANTITY
 
 
-def test_모델_볼륨_읽기가_예외를_던져도_개요는_그대로이고_그_칸만_null이다():
-    def boom(args, timeout):
-        if args == gpu.MODEL_VOLUMES_COMMAND:
-            raise OSError("kubectl 을 띄우지 못했다")
-        return inner(args, timeout)
+@pytest.mark.parametrize("digits", ["9" * 4400, "9" * 4400 + "Ei"])
+def test_아주_긴_숫자도_그_줄의_크기만_null이고_목록은_살아_있다(digits):
+    """int 문자열 한도(4300자리)를 넘어도 목록 전체가 null 이 되거나 응답 JSON 이 깨지지 않는다 (agent#149 리뷰)."""
+    [row] = gpu.model_volumes(_list(_pvc(capacity=digits)))
+    assert row["size_bytes"] is None
 
-    inner, _ = _served_models_cluster(_result(fixture("served_models.json")), pods=fixture("gpu_pods.json"))
-    body, has_gpu = clusters_api._collect_gpu(boom, namespace_pods="{}", clock=lambda: 0.0)
-    assert has_gpu is True and body["model_volumes"] is None and len(body["served_models"]) == 4
+
+KEY = "cluster:fingerprint:volumes"
+
+
+@pytest.fixture(autouse=True)
+def _forget():
+    clusters_api._volumes_memory.clear()
+    yield
+    clusters_api._volumes_memory.clear()
+
+
+@pytest.mark.parametrize("failure", [
+    _result(stderr="context deadline exceeded", success=False),
+    _result("not json"),
+])
+def test_잠깐_못_읽으면_기억해_둔_값을_싣는다(failure):
+    """한 번 실패로 "받아 둠" 배지가 깜빡이지 않게 — 측정 기록과 같다 (agent#149 리뷰)."""
+    ok, _ = _volumes_cluster(_result(_list(_pvc())), nodes="nodes.json")
+    first, _ = clusters_api._collect_gpu(ok, namespace_pods="{}", cache_key=KEY, known=True, clock=lambda: 0.0)
+    bad, _ = _volumes_cluster(failure, nodes="nodes.json")
+    second, _ = clusters_api._collect_gpu(bad, namespace_pods="{}", cache_key=KEY, known=True, clock=lambda: 1.0)
+    assert first["model_volumes"] == second["model_volumes"] and len(second["model_volumes"]) == 1
+
+
+def test_ServedModel을_잠깐_못_읽은_라운드도_기억해_둔_값을_싣는다():
+    ok, _ = _volumes_cluster(_result(_list(_pvc())), served=_result(fixture("served_models.json")), pods=fixture("gpu_pods.json"))
+    clusters_api._collect_gpu(ok, namespace_pods="{}", cache_key=KEY, clock=lambda: 0.0)
+    flaky, _ = _volumes_cluster(_result(_list(_pvc())), served=_result(stderr="context deadline exceeded", success=False),
+                                pods=fixture("gpu_pods.json"))
+    body, _ = clusters_api._collect_gpu(flaky, namespace_pods="{}", cache_key=KEY, clock=lambda: 1.0)
+    assert [row["name"] for row in body["model_volumes"]] == ["gpt-oss-120b"]
+
+
+@pytest.mark.parametrize("volumes, served", [
+    (_result(stderr=FORBIDDEN, success=False), _result('{"items": []}')),
+    (_result(_list(_pvc())), _result(stderr=FORBIDDEN, success=False)),
+    (_result(_list(_pvc())), _result(stderr=NO_CRD, success=False)),
+])
+def test_볼_수_없다는_답은_기억을_지우고_null이다(volumes, served):
+    ok, _ = _volumes_cluster(_result(_list(_pvc())), nodes="nodes.json")
+    clusters_api._collect_gpu(ok, namespace_pods="{}", cache_key=KEY, known=True, clock=lambda: 0.0)
+    denied, _ = _volumes_cluster(volumes, served=served, nodes="nodes.json")
+    body, _ = clusters_api._collect_gpu(denied, namespace_pods="{}", cache_key=KEY, known=True, clock=lambda: 1.0)
+    assert (body or {}).get("model_volumes") is None and KEY not in clusters_api._volumes_memory
+
+
+def test_오래된_기억은_싣지_않는다():
+    ok, _ = _volumes_cluster(_result(_list(_pvc())), nodes="nodes.json")
+    clusters_api._collect_gpu(ok, namespace_pods="{}", cache_key=KEY, known=True, clock=lambda: 0.0)
+    bad, _ = _volumes_cluster(_result(stderr="context deadline exceeded", success=False), nodes="nodes.json")
+    late = clusters_api.GPU_BENCHMARKS_FORGET + 1.0
+    body, _ = clusters_api._collect_gpu(bad, namespace_pods="{}", cache_key=KEY, known=True, clock=lambda: late)
+    assert body["model_volumes"] is None
 
 
 def test_모델_볼륨은_따로_몫을_떼지_않아_꺼진_클러스터의_namespace_탐색_몫이_그대로다(monkeypatch):
