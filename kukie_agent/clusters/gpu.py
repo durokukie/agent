@@ -15,7 +15,7 @@ overview.py 처럼 kubectl 출력(문자열)을 받아 응답을 만드는 순�
   4. SERVED_MODELS_COMMAND  모든 namespace 의 ServedModel. 지표보다 먼저 읽는다 — 지표 파드가 매달려도 예산이 남게.
                      GPU 노드가 없으면 기다리는 파드나 GPU 풀이 있거나 server 값이 GPU 클러스터(true)일 때만 읽는다 — 아래 "ServedModel"
   5. BENCHMARKS_COMMAND  측정 기록 ConfigMap. ServedModel 이 읽힌 라운드에만 읽는다 — 아래 "측정 기록"
-     MODEL_VOLUMES_COMMAND  오븐이 만든 모델 PVC. 측정 기록과 같은 조건·같은 몫에서 그 뒤에 읽는다 — 아래 "모델 볼륨"
+     MODEL_VOLUMES_COMMAND  오븐이 만든 모델 PVC. 측정 기록과 같은 조건·같은 몫에서 함께 읽는다 — 아래 "모델 볼륨"
   6. proxy_command   찾은 파드의 /metrics 를 API 서버 **파드 프록시**로 읽는다 (Prometheus 없이 kubectl 권한만으로).
                      서비스 프록시가 아니라 파드 프록시인 이유: DCGM exporter 는 노드마다 하나인 DaemonSet 이라 서비스로
                      부르면 아무 파드 하나에 붙어 다른 노드의 값을 받는다. vLLM 도 레플리카마다 값이 다르다.
@@ -139,13 +139,15 @@ ServedModel — served_models
   다시 만들면 오븐이 그 PVC 를 다시 붙여, 이미 받은 파일은 다시 받지 않는다. 앱은 이 칸으로 후보 표에 "받아 둠" 을 보인다.
   PVC 에는 허깅페이스 모델 이름이 없다 — 앱이 후보 id 에서 서버와 같은 규칙(ServedModelName.of)으로 ServedModel 이름을 만들어 잇는다.
   한 줄: name(라벨의 ServedModel 이름), pvc(metadata.name), size_bytes(status.capacity.storage, 없으면 spec.resources.requests.storage
-  — 바이트 정수, 단위를 못 읽으면 null), phase(status.phase — Bound·Pending·Lost, 없으면 ""), retained(주인이 없다 — 지금 도는
-  ServedModel 의 것이 아니다), created_at(metadata.creationTimestamp). ServedModel 이름순, MAX_MODEL_VOLUMES 줄까지.
+  — 바이트 정수. capacity 가 있는데 못 읽는 값이면 request 로 넘어가지 않고 null), phase(status.phase — Bound·Pending·Lost, 없으면 ""),
+  retained(주인이 없고 llm 에 그 이름의 ServedModel 도 없다 — 지워진 모델이 남긴 것. retainOnDelete PVC 는 모델이 돌 때도 주인이
+  없으므로 ServedModel 이름과 대조한다), created_at(metadata.creationTimestamp). ServedModel 이름순, MAX_MODEL_VOLUMES 줄까지.
   안의 파일이 다 받아졌는지는 모른다 — 받다가 멈춘 PVC 도 줄이 있다. 앱은 "다시 받지 않는다" 가 아니라 "받던 파일을 이어 쓴다" 로 말한다.
-  이름·라벨이 없는 항목은 그 줄만 건너뛴다.
+  이름·라벨이 없는 항목은 그 줄만 건너뛴다. 목록 자체가 깨졌으면(items 없음·객체 아닌 항목) null 이다 — [] 로 "없다" 고 하지 않는다.
     null  읽지 않았다(ServedModel 을 못 읽은 라운드) 또는 못 읽었다(거부·시간 초과·예산 부족·깨진 출력 — 그 라운드만)
     []    읽었는데 하나도 없다
   읽는 조건은 측정 기록과 같다 — served_models 가 null 이면 조회하지 않는다. GPU 없는 일반 클러스터에 kubectl 이 늘지 않는다.
+  측정 기록과 같은 몫에서 **함께**(스레드 둘) 읽는다 — 몫을 따로 떼지 않아 namespace 탐색·지표 몫이 줄지 않는다.
   읽기 권한은 ServedModel·측정 기록과 같은 연결 권한이다(llm namespace 의 읽기). PVC 를 볼 수 없는 곳은 null 이다.
   이 칸은 GPU 클러스터 판단(hasGpu)에 쓰지 않는다.
 
@@ -201,6 +203,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 #: 노드 목록 (클러스터 범위). 부르는 쪽이 `-n` 을 붙이지 않는다
@@ -222,15 +225,20 @@ MAX_BENCHMARK_MODEL = 256
 #: 소수 초는 정렬 때 따로 읽는다 — datetime 은 마이크로초까지만 담는다 (_measured_time)
 _RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.([0-9]{1,9}))?(?:Z|[+-][0-9]{2}:[0-9]{2})")
 
-#: 오븐이 만든 모델 PVC (모듈 설명 "모델 볼륨"). 오븐 ServedModel 은 llm 에 만든다. 라벨이 있는 것만 — 값은 ServedModel 이름이다
-MODEL_VOLUMES_COMMAND: list[str] = ["get", "persistentvolumeclaims", "-n", "llm", "-l", "serving.kukie.io/servedmodel", "-o", "json"]
-#: 응답에 싣는 모델 볼륨 수 상한
-MAX_MODEL_VOLUMES = 50
+#: 모델 PVC 의 ServedModel 이름 라벨 — 셀렉터와 이름 읽기가 같은 값을 쓴다
 _SERVED_MODEL_LABEL = "serving.kukie.io/servedmodel"
-#: PVC 크기 — 정수나 소수에 쿠버네티스 단위 하나. 지수 표기(1e3)는 PVC 에 쓰지 않아 모르는 값으로 둔다
-_STORAGE = re.compile(r"([0-9]+(?:\.[0-9]+)?)(Ki|Mi|Gi|Ti|Pi|k|M|G|T|P)?")
-_STORAGE_UNITS: dict[str, int] = {"": 1, "Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4, "Pi": 1024**5,
-                                  "k": 1000, "M": 1000**2, "G": 1000**3, "T": 1000**4, "P": 1000**5}
+#: 모델 PVC 와 ServedModel 을 읽는 namespace — 오븐 ServedModel 은 llm 에 만든다
+MODEL_VOLUMES_NAMESPACE = "llm"
+#: 오븐이 만든 모델 PVC (모듈 설명 "모델 볼륨"). 라벨이 있는 것만 — 값은 ServedModel 이름이다
+MODEL_VOLUMES_COMMAND: list[str] = ["get", "persistentvolumeclaims", "-n", MODEL_VOLUMES_NAMESPACE, "-l", _SERVED_MODEL_LABEL,
+                                    "-o", "json"]
+#: PVC 크기 — 쿠버네티스 수량: 숫자에 이진 단위(Ki~Ei)·십진 단위(m, k~E) 하나, 또는 지수(1e3)
+_STORAGE = re.compile(r"([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:(Ki|Mi|Gi|Ti|Pi|Ei|m|k|M|G|T|P|E)|[eE]([+-]?[0-9]{1,3}))?")
+_STORAGE_UNITS: dict[str, Decimal] = {
+    "": Decimal(1), "m": Decimal("0.001"),
+    "Ki": Decimal(1024), "Mi": Decimal(1024**2), "Gi": Decimal(1024**3), "Ti": Decimal(1024**4), "Pi": Decimal(1024**5),
+    "Ei": Decimal(1024**6), "k": Decimal(1000), "M": Decimal(1000**2), "G": Decimal(1000**3), "T": Decimal(1000**4),
+    "P": Decimal(1000**5), "E": Decimal(1000**6)}
 
 #: Karpenter NodePool (모듈 설명 "Karpenter GPU 풀"). 클러스터 범위 자원이라 `-A`·`-n` 이 없다
 NODE_POOLS_COMMAND: list[str] = ["get", "nodepools.karpenter.sh", "-o", "json"]
@@ -723,7 +731,7 @@ def merge_pod_lists(outputs: list[str]) -> str:
         except ValueError:      # JSON 이 아니거나 items 가 목록이 아니다 (json.JSONDecodeError 도 ValueError)
             continue
         for item in rows:
-            meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            meta = _dict(item.get("metadata"))
             key = (str(meta.get("namespace") or ""), str(meta.get("name") or ""))
             if key in seen:
                 continue
@@ -1041,11 +1049,12 @@ def counter_window(sample: CounterSample, previous: CounterSample | None) -> lis
 
 # ── 모델 볼륨 ─────────────────────────────────────────────
 
-def model_volumes(stdout: str) -> list[dict[str, Any]]:
-    """모델 PVC 목록을 응답 줄로 (모듈 설명 "모델 볼륨"). 이름·라벨이 없는 항목은 그 줄만 건너뛴다. 목록 자체가 깨졌으면
-    ValueError — 부르는 쪽이 null 로 둔다."""
+def model_volumes(stdout: str, served: set[str] | frozenset[str] = frozenset()) -> list[dict[str, Any]]:
+    """모델 PVC 목록을 응답 줄로 (모듈 설명 "모델 볼륨"). served 는 llm 에 지금 있는 ServedModel 이름이다 — 그 이름의 PVC 는
+    retained 가 아니다. 이름·라벨이 없는 항목은 그 줄만 건너뛴다. 빈 목록은 "없다" 라는 뜻이라 served_models 처럼 엄격하게 읽는다 —
+    목록이 깨졌으면(items 없음·객체 아닌 항목 포함) ValueError, 부르는 쪽이 null 로 둔다."""
     rows: list[dict[str, Any]] = []
-    for item in _items(stdout):
+    for item in _strict_items(stdout):
         meta = item.get("metadata")
         if not isinstance(meta, dict):
             continue
@@ -1054,31 +1063,38 @@ def model_volumes(stdout: str) -> list[dict[str, Any]]:
         pvc = _text_or_none(meta.get("name"))
         if not _text_or_none(name) or pvc is None:
             continue
-        status = item.get("status") if isinstance(item.get("status"), dict) else {}
-        spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
-        capacity = status.get("capacity") if isinstance(status.get("capacity"), dict) else {}
-        resources = spec.get("resources") if isinstance(spec.get("resources"), dict) else {}
-        requests = resources.get("requests") if isinstance(resources.get("requests"), dict) else {}
-        size = _storage_bytes(capacity.get("storage"))
+        status = _dict(item.get("status"))
+        capacity = _dict(status.get("capacity"))
+        # capacity 가 있으면 그것만 본다 — 못 읽는 값이라고 요청한 크기로 넘어가면 실제와 다른 크기가 나간다
+        storage = capacity["storage"] if "storage" in capacity else \
+            _dict(_dict(_dict(item.get("spec")).get("resources")).get("requests")).get("storage")
         owners = meta.get("ownerReferences")
         rows.append({
             "name": name,
             "pvc": pvc,
-            "size_bytes": size if size is not None else _storage_bytes(requests.get("storage")),
+            "size_bytes": _storage_bytes(storage),
             "phase": _text_or_none(status.get("phase")) or "",
-            "retained": not (isinstance(owners, list) and owners),
+            "retained": not (isinstance(owners, list) and owners) and name not in served,
             "created_at": _text_or_none(meta.get("creationTimestamp")),
         })
     rows.sort(key=lambda row: (row["name"], row["pvc"]))
-    return rows[:MAX_MODEL_VOLUMES]
+    return rows
 
 
 def _storage_bytes(value: Any) -> int | None:
-    """"100Gi"·"40G"·"1073741824" 를 바이트로. 모르는 모양이면 None."""
+    """"100Gi"·"40G"·"1073741824"·"1e9" 를 바이트 정수로(소수 바이트는 올린다 — 쿠버네티스와 같다). 모르는 모양이면 None."""
     match = _STORAGE.fullmatch(value) if isinstance(value, str) else None
     if not match:
         return None
-    return int(float(match[1]) * _STORAGE_UNITS[match[2] or ""])
+    try:
+        number = Decimal(match[1]) * (_STORAGE_UNITS[match[2] or ""] if match[3] is None else Decimal(10) ** int(match[3]))
+    except InvalidOperation:
+        return None
+    return int(number.to_integral_value(rounding="ROUND_CEILING"))
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 # ── 합치기 ───────────────────────────────────────────────

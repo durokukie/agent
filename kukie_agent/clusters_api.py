@@ -61,7 +61,7 @@ GPU_SERVED_MODELS_TIMEOUT = 5
 GPU_NODE_POOLS_TIMEOUT = 5
 #: 측정 기록 ConfigMap 목록 시간 제한(초). 없어도 되는 칸이라 더 짧게 끊는다. GPU 노드가 있으면 NodePool·ServedModel 이 쓰고 남은 절반 몫 안에서만 쓴다(_collect_gpu)
 GPU_BENCHMARKS_TIMEOUT = 3
-#: 모델 PVC 조회 (clusters/gpu.py "모델 볼륨") — 측정 기록과 같은 몫에서 그 뒤에 읽는다
+#: 모델 PVC 조회 (clusters/gpu.py "모델 볼륨") — 측정 기록과 같은 몫에서 함께 읽는다
 GPU_MODEL_VOLUMES_TIMEOUT = 3
 #: 마지막으로 성공한 측정 기록을 연결마다 기억하는 시간(초). 넘으면 어느 연결의 것이든 지운다 — 메모리를 지키고, 하루 넘게 못 읽은 표를 계속 보이지 않게
 GPU_BENCHMARKS_FORGET = 24 * 3600
@@ -698,8 +698,7 @@ def _collect_gpu(
         # ServedModel·측정 기록 몫을 따로 남긴다 (agent#138·#139·#144 리뷰). 일반 클러스터는 둘 다 읽지 않으니 그 몫을 떼지 않는다
         search_deadline = (clock() + max(0.0, deadline - clock()) / 2 if nodes
                            else deadline - GPU_NODE_POOLS_TIMEOUT
-                           - (GPU_SERVED_MODELS_TIMEOUT + GPU_BENCHMARKS_TIMEOUT + GPU_MODEL_VOLUMES_TIMEOUT
-                              if known is True else 0))
+                           - (GPU_SERVED_MODELS_TIMEOUT + GPU_BENCHMARKS_TIMEOUT if known is True else 0))
 
         def search_budget(limit: int) -> int:
             return min(limit, int(search_deadline - clock()))
@@ -742,15 +741,19 @@ def _collect_gpu(
     read_served = nodes or waiting or node_pools or known is True
     if read_served:
         served_models, served_absent = _read_served_models(run, served_budget)
-    # 같은 몫 안에서 ServedModel 뒤에 읽는다 — 매달려도 지표 몫은 그대로다. 못 읽은 라운드는 기억해 둔 값을 쓴다
+    # 같은 몫 안에서 ServedModel 뒤에 읽는다 — 매달려도 지표 몫은 그대로다. 못 읽은 라운드는 기억해 둔 값을 쓴다.
+    # 모델 볼륨은 측정 기록과 함께 읽는다 — 몫을 따로 떼지 않고 지연도 늘리지 않는다 (agent#149 리뷰). 못 읽으면 그 라운드만 null
+    model_volumes: list[dict[str, Any]] | None = None
     if served_models is not None:
-        benchmarks = _read_benchmarks(run, served_budget, cache_key=cache_key, clock=clock)
+        served_names = frozenset(row["name"] for row in served_models if row["namespace"] == gpu.MODEL_VOLUMES_NAMESPACE)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            volumes_read = pool.submit(_read_model_volumes, run, served_budget, served_names)
+            benchmarks = _read_benchmarks(run, served_budget, cache_key=cache_key, clock=clock)
+            model_volumes = volumes_read.result()
     else:
         if read_served and served_absent:                   # CRD 없음·거부 — 잠깐의 실패가 아니다
             _forget_benchmarks(cache_key)
         benchmarks = _remembered_benchmarks(cache_key, clock)
-    # 측정 기록 뒤에 같은 몫에서 — 못 읽으면 그 라운드만 null 이다. 기억하지 않는다(배지 하나라 깜빡여도 표가 흔들리지 않는다)
-    model_volumes = _read_model_volumes(run, served_budget) if served_models is not None else None
     if not nodes:
         # 카운터는 읽지 않는다 — 돌고 있는 모델이 없고, 이 길은 지표 몫을 따로 남기지 않는다 (agent#147 리뷰)
         if waiting or node_pools or served_models is not None:
@@ -847,7 +850,7 @@ def _read_served_models(run, budget) -> tuple[list[dict[str, Any]] | None, bool]
         return None, False
 
 
-def _read_model_volumes(run, budget) -> list[dict[str, Any]] | None:
+def _read_model_volumes(run, budget, served: frozenset[str] = frozenset()) -> list[dict[str, Any]] | None:
     """모델 볼륨 줄 — clusters/gpu.py "모델 볼륨". 어떤 실패도 개요를 실패시키지 않고 그 라운드만 None 이다."""
     timeout = budget(GPU_MODEL_VOLUMES_TIMEOUT)
     if timeout < 1:
@@ -857,7 +860,7 @@ def _read_model_volumes(run, budget) -> list[dict[str, Any]] | None:
         logger.debug("모델 볼륨을 읽지 못했다: %s", _failure_status(result.stderr or result.stdout or ""))
         return None
     try:
-        return gpu.model_volumes(result.stdout)
+        return gpu.model_volumes(result.stdout, served)
     except (ValueError, AttributeError, TypeError, RecursionError):
         logger.debug("모델 볼륨을 읽지 못했다 (목록 모양이 아니다)")
         return None

@@ -1,6 +1,8 @@
 """모델 볼륨 — 오븐이 만든 모델 PVC 를 개요의 gpu 칸에 싣는다 (앱의 "받아 둠" 배지)"""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from gpu_support import (
@@ -50,11 +52,17 @@ def test_돌고_있는_ServedModel의_PVC는_retained가_아니다():
     assert row["retained"] is False
 
 
-def test_모델_볼륨은_ServedModel_이름순이고_상한까지만_싣는다():
+def test_retainOnDelete_PVC도_그_이름의_ServedModel이_있으면_retained가_아니다():
+    """retainOnDelete 로 만든 PVC 는 모델이 돌 때도 주인이 없다 — 이름으로 대조한다 (agent#149 리뷰)."""
+    rows = gpu.model_volumes(_list(_pvc("gpt-oss-120b"), _pvc("gpt-oss-20b")), frozenset({"gpt-oss-120b"}))
+    assert [(row["name"], row["retained"]) for row in rows] == [("gpt-oss-120b", False), ("gpt-oss-20b", True)]
+
+
+def test_모델_볼륨은_ServedModel_이름순이고_줄_수를_자르지_않는다():
     rows = gpu.model_volumes(_list(_pvc("b"), _pvc("a")))
     assert [row["name"] for row in rows] == ["a", "b"]
-    many = gpu.model_volumes(_list(*(_pvc(f"m-{i:03}") for i in range(gpu.MAX_MODEL_VOLUMES + 3))))
-    assert len(many) == gpu.MAX_MODEL_VOLUMES and many[0]["name"] == "m-000"
+    many = gpu.model_volumes(_list(*(_pvc(f"m-{i:03}") for i in range(80))))
+    assert len(many) == 80 and many[-1]["name"] == "m-079"
 
 
 @pytest.mark.parametrize(("capacity", "requested", "expected"), [
@@ -63,8 +71,12 @@ def test_모델_볼륨은_ServedModel_이름순이고_상한까지만_싣는다(
     ("40G", None, 40 * 1000**3),
     ("1.5Ti", None, int(1.5 * 1024**4)),
     ("1073741824", None, 1024**3),
-    ("1e3", None, None),
+    ("9007199254740993", None, 9007199254740993),            # float 를 거치면 ...992 가 된다
+    ("1e3", None, 1000),
+    ("1Ei", None, 1024**6),
+    ("1500m", None, 2),                                     # 소수 바이트는 올린다
     ("Gi", None, None),
+    ("abc", "40Gi", None),                                  # capacity 를 못 읽으면 요청한 크기로 넘어가지 않는다
     (None, None, None),
 ])
 def test_크기는_capacity를_먼저_보고_모르는_모양은_null이다(capacity, requested, expected):
@@ -75,6 +87,13 @@ def test_크기는_capacity를_먼저_보고_모르는_모양은_null이다(capa
 def test_phase가_없으면_빈_문자열이다():
     [row] = gpu.model_volumes(_list(_pvc(phase=None)))
     assert row["phase"] == ""
+
+
+@pytest.mark.parametrize("stdout", ["", "{}", '{"kind": "List"}', '{"items": {}}', '{"items": ["x"]}'])
+def test_목록_모양이_아니면_ValueError라_null이_된다(stdout):
+    """[] 는 "남은 볼륨 없음" 이다 — 깨진 출력을 그렇게 읽지 않는다 (agent#149 리뷰)."""
+    with pytest.raises(ValueError):
+        gpu.model_volumes(stdout)
 
 
 @pytest.mark.parametrize("broken", [
@@ -114,11 +133,13 @@ def test_꺼진_GPU_클러스터에도_남은_모델_볼륨이_보인다():
     assert [(row["name"], row["retained"]) for row in body["model_volumes"]] == [("gpt-oss-120b", True), ("gpt-oss-20b", True)]
 
 
-def test_GPU_노드가_있는_라운드에도_모델_볼륨을_싣는다():
-    run, _ = _volumes_cluster(_result(_list(_pvc(owned=True))), served=_result(fixture("served_models.json")),
-                              pods=fixture("gpu_pods.json"))
+def test_GPU_노드가_있는_라운드에도_모델_볼륨을_싣고_돌고_있는_모델의_것은_retained가_아니다():
+    served = json.loads(fixture("served_models.json"))["items"]
+    llm_name = next(item["metadata"]["name"] for item in served if item["metadata"].get("namespace") == "llm")
+    run, _ = _volumes_cluster(_result(_list(_pvc(llm_name), _pvc("left-behind"))),
+                              served=_result(fixture("served_models.json")), pods=fixture("gpu_pods.json"))
     body, _ = clusters_api._collect_gpu(run, namespace_pods="{}", clock=lambda: 0.0)
-    assert [row["retained"] for row in body["model_volumes"]] == [False]
+    assert {row["name"]: row["retained"] for row in body["model_volumes"]} == {llm_name: False, "left-behind": True}
     assert len(body["served_models"]) == 4
 
 
@@ -127,6 +148,7 @@ def test_GPU_노드가_있는_라운드에도_모델_볼륨을_싣는다():
     _result(stderr="context deadline exceeded", success=False),
     _result("not json"),
     _result('{"items": {}}'),
+    _result(""),
     _result("[" * 200000),
 ])
 def test_모델_볼륨을_못_읽으면_그_칸만_null이고_나머지는_그대로다(volumes):
@@ -157,3 +179,10 @@ def test_예산이_떨어지면_모델_볼륨은_null이다():
     run, seen = _volumes_cluster(_result(_list(_pvc())))
     assert clusters_api._read_model_volumes(run, lambda limit: 0) is None
     assert seen == []
+
+
+def test_모델_볼륨은_따로_몫을_떼지_않아_꺼진_클러스터의_namespace_탐색_몫이_그대로다():
+    """측정 기록과 함께 읽으므로 탐색 deadline 에 모델 볼륨 몫을 더하지 않는다 (agent#149 리뷰)."""
+    import inspect
+    source = inspect.getsource(clusters_api._collect_gpu)
+    assert "GPU_MODEL_VOLUMES_TIMEOUT" not in source

@@ -292,7 +292,7 @@ def test_GPU로_알려진_꺼진_클러스터에_ServedModel이_하나도_없어
     body, has_gpu = clusters_api._collect_gpu(run, namespace_pods="{}", known=True, clock=lambda: 0.0)
     assert has_gpu is True
     assert body == {"nodes": [], "serving": [], "benchmarks": [], "waiting": [], "served_models": [], "node_pools": [],
-                    "counter": None, "model_volumes": []}
+                    "counter": None, "model_volumes": None}
 
 
 @pytest.mark.parametrize(("served", "expected"), [

@@ -277,6 +277,8 @@ def test_GPU로_알려진_꺼진_클러스터는_namespace_탐색이_측정_기�
         if args == gpu.BENCHMARKS_COMMAND:
             timeouts.append(timeout)
             return _result(_list(_measure_cm()))
+        if args == gpu.MODEL_VOLUMES_COMMAND:                           # 측정 기록과 함께(다른 스레드) 돈다 — 이 시계에 쌓지 않는다
+            return _result('{"items": []}')
         now[0] += timeout                                               # namespace 파드·NodePool 은 몫을 다 쓰고 실패한다
         return _result(stderr="timed out", success=False)
 
