@@ -26,6 +26,7 @@ def _forget_readable_namespaces(monkeypatch):
     from kukie_agent import clusters_api
     monkeypatch.setattr(clusters_api, "_readable_namespaces", {})
     monkeypatch.setattr(clusters_api, "_gpu_absent_checked", {})
+    monkeypatch.setattr(clusters_api, "_all_forbidden", {})
     monkeypatch.setattr(clusters_api, "_latency_samples", {})
     monkeypatch.setattr(clusters_api, "_counter_samples", {})
     monkeypatch.setattr(clusters_api, "_benchmarks_memory", {})

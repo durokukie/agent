@@ -148,12 +148,22 @@ async def test_cluster(
 @router.get("/{cluster_id}/overview")
 async def cluster_overview(
     cluster_id: str,
+    namespace: str | None = None,
+    all: bool = False,   # noqa: A002 — 쿼리 이름 그대로 (?all=true)
     user: User = Depends(current_user),
 ) -> dict[str, Any]:
-    """개요 (issue #102). 클러스터 namespace 의 워크로드·파드·최근 이벤트를 읽는다 — 응답 모양과 판정은 clusters/overview.py.
+    """개요 (issue #102). 워크로드·파드·최근 이벤트를 읽는다 — 응답 모양과 판정은 clusters/overview.py.
+
+    읽는 범위(응답의 scope):
+      기본            클러스터에 등록된 namespace 하나 (`-n`). 옛 앱이 부르는 모양 그대로다
+      ?namespace=x    namespace x 하나. 이름 꼴(DNS label)이 아니면 400 INVALID_NAMESPACE
+      ?all=true       모든 namespace (`-A`). 권한이 없으면(Forbidden, 익명 거부는 빼고) 등록된 namespace 로 돌아가고 scope 는
+                      namespace 다 — limited EKS 는 namespace 범위 Edit 만 준다. 거부된 연결은 READABLE_NAMESPACES_TTL 초 기억해
+                      대시보드를 열 때마다 고객 감사 로그에 거부가 쌓이지 않게 한다 (_all_forbidden)
+    둘 다 주면 namespace 가 이긴다.
 
     권한·자격증명은 연결 확인과 같은 길이다 — 못 보는 클러스터는 server 의 404, 팀 구성원 누구나 부른다.
-    읽기 전용이고 namespace 범위(`-n`)로만 조회한다. 상태(status)는 남기지 않는다 — 그건 연결 확인의 일이다.
+    읽기 전용이다. 상태(status)는 남기지 않는다 — 그건 연결 확인의 일이다.
     CNI(network)는 세 조회가 다 된 뒤 kube-system DaemonSet 을 한 번 더 읽어 알아본다 (overview.NETWORK_COMMAND).
     그 조회는 실패해도(Forbidden·시간 초과) 개요를 실패로 만들지 않고 network 만 null 로 둔다.
     GPU(gpu)는 그 뒤에 노드 → 모든 파드 → 지표 순으로 읽는다 (clusters/gpu.py). 노드를 못 읽으면 gpu 만 null 이고 그 뒤는
@@ -170,18 +180,43 @@ async def cluster_overview(
       CLUSTER_BAD_RESPONSE  kubectl 은 성공했는데 JSON 으로 읽지 못했다
     401 이 아니라 502 인 이유: 앱은 401 을 사용자 토큰 만료로 읽고 로그아웃한다. 클러스터 자격증명 문제는 그게 아니다.
     """
+    if namespace is not None and not namespaces.valid(namespace):
+        raise HTTPException(400, {"code": "INVALID_NAMESPACE", "message": f"namespace 이름 꼴이 아니다: {namespace[:63]}"})
     conn = await access.connection(cluster_id, user)
     key = _connection_key(cluster_id, conn)
+    target = namespace or conn.namespace
+    wants_all = all and namespace is None
+
+    def read(path, scope_args: list[str]) -> tuple[dict[str, str], KubectlResult | None]:
+        """READ_COMMANDS 세 번. 실패하면 (지금까지, 실패한 결과) — 첫 실패에서 멈춘다."""
+        outputs: dict[str, str] = {}
+        for name, args in overview.READ_COMMANDS.items():
+            result = run_kubectl([*args, *scope_args], context=conn.context_name,
+                                 kubeconfig=path, timeout=OVERVIEW_TIMEOUT)
+            if not result.success:
+                return outputs, result
+            outputs[name] = result.stdout
+        return outputs, None
 
     def collect() -> tuple[dict[str, Any], bool | None]:
-        outputs: dict[str, str] = {}
+        scope = "namespace"
         with access.kubeconfig(conn) as path:
-            for name, args in overview.READ_COMMANDS.items():
-                result = run_kubectl([*args, "-n", conn.namespace], context=conn.context_name,
-                                     kubeconfig=path, timeout=OVERVIEW_TIMEOUT)
-                if not result.success:
-                    _raise_kubectl_failure(result.stderr or result.stdout)   # 첫 실패에서 멈춘다
-                outputs[name] = result.stdout
+            failed: KubectlResult | None = None
+            if wants_all and not _all_forbidden_recently(key):
+                outputs, failed = read(path, ["-A"])
+                if failed is None:
+                    scope = "all"
+                else:
+                    stderr = failed.stderr or failed.stdout
+                    if argocd.failure_kind(stderr) != "forbidden" or "system:anonymous" in stderr:
+                        _raise_kubectl_failure(stderr)
+                    # 모든 namespace 를 읽을 권한이 없다(limited) — 등록된 namespace 로 돌아간다
+                    _remember_all_forbidden(key)
+                    failed = None
+            if scope != "all":
+                outputs, failed = read(path, ["-n", target])
+                if failed is not None:
+                    _raise_kubectl_failure(failed.stderr or failed.stdout)
             # 앞의 세 조회가 다 된 뒤에만 돈다 — 닿지 않는 클러스터에서 시간을 더 쓰지 않는다
             network = run_kubectl(overview.NETWORK_COMMAND, context=conn.context_name,
                                   kubeconfig=path, timeout=OVERVIEW_TIMEOUT)
@@ -189,7 +224,7 @@ async def cluster_overview(
             def run(args: list[str], timeout: int) -> KubectlResult:
                 return run_kubectl(args, context=conn.context_name, kubeconfig=path, timeout=timeout)
 
-            cluster_gpu, has_gpu = _collect_gpu(run, namespace_pods=outputs["pods"], namespace=conn.namespace,
+            cluster_gpu, has_gpu = _collect_gpu(run, namespace_pods=outputs["pods"], namespace=target,
                                                  cache_key=key, known=conn.has_gpu)
         if not network.success:
             # 고객 클러스터는 kube-system 을 못 읽는 게 보통이라 대시보드가 부를 때마다 난다 — debug 로 둔다 (PR #117 리뷰).
@@ -197,7 +232,7 @@ async def cluster_overview(
             logger.debug("개요의 CNI 조회를 건너뛴다 (kube-system DaemonSet): %s",
                          _failure_status(network.stderr or network.stdout))
         try:
-            return overview.build(context=conn.context_name, namespace=conn.namespace,
+            return overview.build(context=conn.context_name, namespace=target, scope=scope,
                                   now=datetime.now(timezone.utc),
                                   network=network.stdout if network.success else None, gpu=cluster_gpu,
                                   **outputs), has_gpu
@@ -214,8 +249,34 @@ async def cluster_overview(
         await _record_gpu(conn, has_gpu)
         return body
 
-    # 권한은 위에서 요청마다 본다(access.connection). 나눠 쓰는 것은 그 뒤의 kubectl 결과뿐이다
-    return await _shared_overview(key, compute)
+    # 권한은 위에서 요청마다 본다(access.connection). 나눠 쓰는 것은 그 뒤의 kubectl 결과뿐이다.
+    # 범위마다 따로 나눠 쓴다 — 기본(등록된 namespace)은 옛 키 그대로
+    share = (_share_key(key, "overview-ns", namespace) if namespace is not None
+             else _share_key(key, "overview-all") if wants_all else key)
+    return await _shared_overview(share, compute)
+
+
+#: 모든 namespace 개요를 거부당한 연결 → 그때 (time.monotonic). READABLE_NAMESPACES_TTL 초 동안 다시 묻지 않는다
+_all_forbidden: dict[str, float] = {}
+_all_forbidden_lock = threading.Lock()
+
+
+def _all_forbidden_recently(key: str | None, clock=time.monotonic) -> bool:
+    if key is None:
+        return False
+    with _all_forbidden_lock:
+        at = _all_forbidden.get(key)
+        return at is not None and clock() - at < READABLE_NAMESPACES_TTL
+
+
+def _remember_all_forbidden(key: str | None, clock=time.monotonic) -> None:
+    if key is None:
+        return
+    now = clock()
+    with _all_forbidden_lock:
+        for stale in [k for k, at in _all_forbidden.items() if now - at >= READABLE_NAMESPACES_TTL]:
+            del _all_forbidden[stale]
+        _all_forbidden[key] = now
 
 
 @router.get("/{cluster_id}/namespaces")
