@@ -447,3 +447,36 @@ def test_이름_꼴이_아닌_namespace_는_400이고_kubectl은_돌지_않는�
     r = client.get(f"/clusters/{cluster}/overview", params={"namespace": name}, headers=USER)
     assert r.status_code == 400 and r.json()["detail"]["code"] == "INVALID_NAMESPACE"
     assert ran == []
+
+
+def test_all_이_시간_초과면_등록된_namespace_로_돌아간다(client, fake_server, monkeypatch):
+    _, r, seen = _scope_calls(client, fake_server, monkeypatch, "?all=true", deny_all=True,
+                              stderr="Command '['kubectl', 'get']' timed out after 15 seconds")
+    assert r.status_code == 200 and r.json()["scope"] == "namespace"
+    assert seen[1:4] == [[*args, "-n", "shop"] for args in overview.READ_COMMANDS.values()]
+
+
+def test_다른_namespace_를_고르면_GPU_칸은_읽지_않는다(client, fake_server, monkeypatch):
+    _, r, seen = _scope_calls(client, fake_server, monkeypatch, "?namespace=llm")
+    assert r.status_code == 200 and r.json()["gpu"] is None
+    assert ["get", "nodes", "-o", "json"] not in seen                       # GPU 의 노드 조회를 하지 않는다
+
+
+def test_전체면_GPU_칸에_등록된_namespace_파드만_넘긴다(client, fake_server, monkeypatch):
+    passed: dict = {}
+
+    def spy(run, *, namespace_pods, namespace=None, **kwargs):
+        passed.update(pods=json.loads(namespace_pods), namespace=namespace)
+        return None, None
+
+    monkeypatch.setattr(clusters_api, "_collect_gpu", spy)
+    pods = {"items": [{"metadata": {"name": "a", "namespace": "shop"}}, {"metadata": {"name": "b", "namespace": "llm"}}]}
+    cluster = fake_server.add_cluster(namespace="shop")
+
+    def fake(args, **kwargs):
+        return _result(json.dumps(pods)) if args[1] == "pods" else _by_resource(args)
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    assert client.get(f"/clusters/{cluster}/overview?all=true", headers=USER).json()["scope"] == "all"
+    assert passed["namespace"] == "shop"
+    assert [p["metadata"]["name"] for p in passed["pods"]["items"]] == ["a"]

@@ -157,10 +157,10 @@ async def cluster_overview(
     읽는 범위(응답의 scope):
       기본            클러스터에 등록된 namespace 하나 (`-n`). 옛 앱이 부르는 모양 그대로다
       ?namespace=x    namespace x 하나. 이름 꼴(DNS label)이 아니면 400 INVALID_NAMESPACE
-      ?all=true       모든 namespace (`-A`). 권한이 없으면(Forbidden, 익명 거부는 빼고) 등록된 namespace 로 돌아가고 scope 는
+      ?all=true       모든 namespace (`-A`). 권한이 없거나(Forbidden, 익명 거부는 빼고) 시간 안에 못 읽으면 등록된 namespace 로 돌아가고 scope 는
                       namespace 다 — limited EKS 는 namespace 범위 Edit 만 준다. 거부된 연결은 READABLE_NAMESPACES_TTL 초 기억해
                       대시보드를 열 때마다 고객 감사 로그에 거부가 쌓이지 않게 한다 (_all_forbidden)
-    둘 다 주면 namespace 가 이긴다.
+    둘 다 주면 namespace 가 이긴다. 등록된 곳이 아닌 namespace 를 고른 개요는 gpu 칸이 null 이다(GPU 는 전체·기본 개요가 읽는다).
 
     권한·자격증명은 연결 확인과 같은 길이다 — 못 보는 클러스터는 server 의 404, 팀 구성원 누구나 부른다.
     읽기 전용이다. 상태(status)는 남기지 않는다 — 그건 연결 확인의 일이다.
@@ -208,9 +208,9 @@ async def cluster_overview(
                     scope = "all"
                 else:
                     stderr = failed.stderr or failed.stdout
-                    if argocd.failure_kind(stderr) != "forbidden" or "system:anonymous" in stderr:
+                    if not _all_fallback(stderr):
                         _raise_kubectl_failure(stderr)
-                    # 모든 namespace 를 읽을 권한이 없다(limited) — 등록된 namespace 로 돌아간다
+                    # 모든 namespace 를 읽을 권한이 없거나(limited) 너무 커서 시간 안에 못 읽었다 — 등록된 namespace 로 돌아간다
                     _remember_all_forbidden(key)
                     failed = None
             if scope != "all":
@@ -224,8 +224,16 @@ async def cluster_overview(
             def run(args: list[str], timeout: int) -> KubectlResult:
                 return run_kubectl(args, context=conn.context_name, kubeconfig=path, timeout=timeout)
 
-            cluster_gpu, has_gpu = _collect_gpu(run, namespace_pods=outputs["pods"], namespace=target,
-                                                 cache_key=key, known=conn.has_gpu)
+            # GPU 칸은 늘 등록된 namespace 를 기준으로 읽는다 — namespace 기억(_readable_namespaces)이 연결마다 하나라
+            # 범위마다 다른 기준을 넘기면 서로 섞인다 (PR #151 리뷰). 다른 namespace 를 고른 개요는 GPU 칸을 읽지 않는다
+            # (GPU 화면·카드는 전체 개요를 읽는다). 전체면 그중 등록된 namespace 파드만 넘긴다
+            if namespace is not None and namespace != conn.namespace:
+                cluster_gpu, has_gpu = None, None
+            else:
+                registered_pods = (_pods_in(outputs["pods"], conn.namespace) if scope == "all"
+                                   else outputs["pods"])
+                cluster_gpu, has_gpu = _collect_gpu(run, namespace_pods=registered_pods, namespace=conn.namespace,
+                                                     cache_key=key, known=conn.has_gpu)
         if not network.success:
             # 고객 클러스터는 kube-system 을 못 읽는 게 보통이라 대시보드가 부를 때마다 난다 — debug 로 둔다 (PR #117 리뷰).
             # 원문(사용자·ARN 이 실린다)은 남기지 않고 갈래만 남긴다
@@ -256,7 +264,29 @@ async def cluster_overview(
     return await _shared_overview(share, compute)
 
 
-#: 모든 namespace 개요를 거부당한 연결 → 그때 (time.monotonic). READABLE_NAMESPACES_TTL 초 동안 다시 묻지 않는다
+def _all_fallback(stderr: str) -> bool:
+    """모든 namespace 개요가 이렇게 실패하면 등록된 namespace 로 돌아간다 — 권한 없음(익명 거부는 자격증명 문제라 빼고)과
+    kubectl 시간 초과(클러스터가 커서 -A 를 OVERVIEW_TIMEOUT 안에 못 읽었다. 닿지 않는 것은 i/o timeout 이라 여기 안 든다)."""
+    if "timed out after" in stderr:
+        return True
+    return argocd.failure_kind(stderr) == "forbidden" and "system:anonymous" not in stderr
+
+
+def _pods_in(stdout: str, namespace: str) -> str:
+    """모든 namespace 파드 목록(JSON)에서 한 namespace 것만. 모양이 다르면 그대로 둔다 — 개요 파싱이 502 로 알린다."""
+    try:
+        body = json.loads(stdout)
+    except ValueError:
+        return stdout
+    items = body.get("items") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        return stdout
+    kept = [item for item in items
+            if isinstance(item, dict) and ((item.get("metadata") or {}).get("namespace") == namespace)]
+    return json.dumps({**body, "items": kept})
+
+
+#: 모든 namespace 개요를 거부당한(또는 시간 안에 못 읽은) 연결 → 그때 (time.monotonic). READABLE_NAMESPACES_TTL 초 동안 다시 묻지 않는다
 _all_forbidden: dict[str, float] = {}
 _all_forbidden_lock = threading.Lock()
 
