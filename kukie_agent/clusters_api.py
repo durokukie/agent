@@ -2,6 +2,7 @@
 
   POST /clusters/{id}/test       연결 확인 (kubectl version + auth can-i)
   GET  /clusters/{id}/overview   개요 — 웹 대시보드의 클러스터 지도·통계 (issue #102, kubectl get × 3 + CNI 조회 1 + GPU 조회)
+  GET  /clusters/{id}/namespaces   새 대화에서 고를 namespace 목록 (DURO-228, kubectl get × 1)
   GET  /clusters/{id}/argocd/applications   ArgoCD 화면의 Application 목록 (DURO-140, kubectl get × 1)
   GET  /clusters/{id}/argocd/applications/{namespace}/{name}   ArgoCD 화면의 앱 상세 패널 (DURO-145, kubectl get × 1)
   GET  /clusters/{id}/argocd/applications/{namespace}/{name}/rendered   앱 path 를 렌더한 결과 (DURO-148)
@@ -36,7 +37,7 @@ from fastapi import APIRouter, Depends, HTTPException
 import kukie_agent.server as _server   # 순환 import: 이름은 호출 시점에만 쓴다
 from kukie_agent import argocd, server_api
 from kukie_agent.auth import User, current_user
-from kukie_agent.clusters import access, gpu, overview
+from kukie_agent.clusters import access, gpu, namespaces, overview
 from kukie_agent.gitops import browse, github
 from kukie_agent.kubectl import KubectlResult, run_kubectl, thread_limiter
 
@@ -47,6 +48,7 @@ router = APIRouter(prefix="/clusters", tags=["clusters"])
 #: 공용 워커 풀을 통째로 물지 않도록 이 모듈이 쓰는 스레드 수를 따로 묶는다 (자동 리뷰 지적, 이유는 thread_limiter).
 #: kubectl 은 30초씩 잡는다.
 PROBE_WORKERS = 4            # 연결 확인 (kubectl × 3 — version·can-i 30초씩 + 노드 OVERVIEW_TIMEOUT, 최대 75초)
+NAMESPACES_WORKERS = 2       # 새 대화의 namespace 목록 (kubectl × 1, OVERVIEW_TIMEOUT). ArgoCD 화면이 슬롯을 잡아도 새 대화가 기다리지 않게 따로 묶는다
 ARGOCD_WORKERS = 4           # ArgoCD 앱 목록·상세·레포 보기의 앱 목록 (kubectl × 1, OVERVIEW_TIMEOUT). ArgoCD 화면이 띄울 때 부른다 — 개요와 따로 묶는다
 OVERVIEW_WORKERS = 4         # 개요 (kubectl × 5, 노드를 읽고 GPU 가 없다고 이미 안 클러스터가 아니면 GPU_BUDGET 안에서 몇 번 더). 대시보드가 띄울 때마다 부른다 — 연결 확인과 따로 묶는다
 #: 개요의 kubectl 한 번 시간 제한(초). 기본 30초 × 4 면 한 요청이 슬롯을 2분 잡는다 — 닿지 않으면 첫 번째에서 15초로 끝난다 (자동 리뷰 지적)
@@ -214,6 +216,51 @@ async def cluster_overview(
 
     # 권한은 위에서 요청마다 본다(access.connection). 나눠 쓰는 것은 그 뒤의 kubectl 결과뿐이다
     return await _shared_overview(key, compute)
+
+
+@router.get("/{cluster_id}/namespaces")
+async def cluster_namespaces(
+    cluster_id: str,
+    fresh: bool = False,
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    """새 대화에서 고를 namespace 목록 (DURO-228). 권한·자격증명은 개요와 같은 길이다 — 못 보는 클러스터는 server 의 404,
+    팀 구성원 누구나 부른다(대화는 구성원도 만든다).
+
+      ok         읽었다. namespaces 는 이름순이고 kube-* 와 지우는 중인 것은 뺐다
+      forbidden  namespace 목록을 읽을 권한이 없다(limited) — namespaces 는 default_namespace 하나다(ok 와 같은 모양)
+    default_namespace 는 클러스터에 등록한 namespace 다(대화를 만들 때 고르지 않으면 서버가 쓰는 값). ok 의 namespaces 에도 늘 들어 있다 —
+    kube-* 로 등록했거나 지금 지우는 중이어도, 고르지 않은 대화가 쓰는 값이라 화면에서 고를 수 있어야 한다. 그 밖의 kubectl 실패는 개요와 같이
+    502 CLUSTER_AUTH_EXPIRED·CLUSTER_UNREACHABLE, 출력을 못 읽으면 502 CLUSTER_BAD_RESPONSE. 같은 연결은 OVERVIEW_SHARE_TTL 초 나눠 쓰고,
+    `?fresh=true`(namespace 를 막 만들었거나 권한을 막 받은 뒤 다시 읽기)면 ArgoCD 목록처럼 막 끝난 결과를 건너뛴다.
+    """
+    conn = await access.connection(cluster_id, user)
+
+    def collect() -> dict[str, Any]:
+        with access.kubeconfig(conn) as path:
+            result = run_kubectl(namespaces.LIST_COMMAND, context=conn.context_name, kubeconfig=path,
+                                 timeout=OVERVIEW_TIMEOUT)
+        if not result.success:
+            stderr = result.stderr or result.stdout
+            # 익명(system:anonymous)으로 거부된 것은 권한이 좁은 게 아니라 자격증명이 깨진 것이다 — 개요처럼 502 로 알린다
+            if argocd.failure_kind(stderr) == "forbidden" and "system:anonymous" not in stderr:
+                return {"status": "forbidden", "default_namespace": conn.namespace, "namespaces": [conn.namespace]}
+            _raise_kubectl_failure(stderr)
+        try:
+            names = namespaces.names(result.stdout)
+        except ValueError as exc:   # 모양은 names 가 본다 — 우리 코드의 버그(그 밖의 예외)는 500 으로 둔다
+            # 원문은 클러스터 내용이라 남기지 않는다 (개요와 같다)
+            logger.warning("namespace 목록을 읽지 못했다: %s", type(exc).__name__)
+            raise HTTPException(502, {"code": "CLUSTER_BAD_RESPONSE",
+                                      "message": f"kubectl 출력을 읽지 못했다: {type(exc).__name__}"}) from None
+        return {"status": "ok", "default_namespace": conn.namespace, "namespaces": sorted({*names, conn.namespace})}
+
+    async def compute() -> dict[str, Any]:
+        # 개요와 같은 이유로 스레드로 넘긴다 — kubectl 이 도는 동안 서버 전체가 멈추지 않게
+        return await to_thread.run_sync(collect, limiter=thread_limiter("namespaces", NAMESPACES_WORKERS))
+
+    # 응답에 사람마다 다른 값이 없어 나눠 써도 된다 (개요와 같다)
+    return await _shared_overview(_share_key(_connection_key(cluster_id, conn), "namespaces"), compute, fresh=fresh)
 
 
 @router.get("/{cluster_id}/argocd/applications")
