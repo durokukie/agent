@@ -9,6 +9,7 @@ from gpu_support import (
     FORBIDDEN,
     NO_CRD,
     _list,
+    _namespaces,
     _result,
     _served_models_cluster,
     fixture,
@@ -76,6 +77,10 @@ def test_모델_볼륨은_ServedModel_이름순이고_줄_수를_자르지_않�
     ("1Ei", None, 1024**6),
     ("1500m", None, 2),                                     # 소수 바이트는 올린다
     ("Gi", None, None),
+    (".5Gi", None, None),                                   # _QUANTITY 와 같은 문법 — 앞의 점·끝의 점은 받지 않는다
+    ("1.", None, None),
+    ("1e999999", None, None),                               # 10**큰수 를 만들지 않는다
+    ("123456789012345678901234567890123Ei", None, 123456789012345678901234567890123 * 1024**6),  # 자릿수가 많아도 정확하다
     ("abc", "40Gi", None),                                  # capacity 를 못 읽으면 요청한 크기로 넘어가지 않는다
     (None, None, None),
 ])
@@ -181,8 +186,47 @@ def test_예산이_떨어지면_모델_볼륨은_null이다():
     assert seen == []
 
 
-def test_모델_볼륨은_따로_몫을_떼지_않아_꺼진_클러스터의_namespace_탐색_몫이_그대로다():
-    """측정 기록과 함께 읽으므로 탐색 deadline 에 모델 볼륨 몫을 더하지 않는다 (agent#149 리뷰)."""
-    import inspect
-    source = inspect.getsource(clusters_api._collect_gpu)
-    assert "GPU_MODEL_VOLUMES_TIMEOUT" not in source
+@pytest.mark.parametrize("value", ["1", "1.5", "100Gi", "40G", "1500m", "1e3", "1E-2", "2Ei", ".5Gi", "1.", "Gi", "1gi", "1 Gi",
+                                   "-1Gi", "1e", "1Kb"])
+def test_크기_문법은_manifests의_수량_문법과_같다(value):
+    from kukie_agent.manifests.models import _QUANTITY
+    assert (gpu._STORAGE.fullmatch(value) is not None) == (_QUANTITY.match(value) is not None)
+
+
+def test_모델_볼륨_읽기가_예외를_던져도_개요는_그대로이고_그_칸만_null이다():
+    def boom(args, timeout):
+        if args == gpu.MODEL_VOLUMES_COMMAND:
+            raise OSError("kubectl 을 띄우지 못했다")
+        return inner(args, timeout)
+
+    inner, _ = _served_models_cluster(_result(fixture("served_models.json")), pods=fixture("gpu_pods.json"))
+    body, has_gpu = clusters_api._collect_gpu(boom, namespace_pods="{}", clock=lambda: 0.0)
+    assert has_gpu is True and body["model_volumes"] is None and len(body["served_models"]) == 4
+
+
+def test_모델_볼륨은_따로_몫을_떼지_않아_꺼진_클러스터의_namespace_탐색_몫이_그대로다(monkeypatch):
+    """GPU 로 알려진 꺼진 클러스터에서 namespace 마다 파드를 찾는 몫은 NodePool·ServedModel·측정 기록 몫만 뺀 값이다 —
+    모델 볼륨은 측정 기록과 함께 읽어 몫을 따로 떼지 않는다 (agent#149 리뷰). 가짜 시계는 호출마다 시간이 쌓인다."""
+    monkeypatch.setattr(clusters_api, "GPU_METRICS_WORKERS", 1)
+    now = [0.0]
+    searched: list[int] = []
+
+    def run(args, timeout):
+        if args == gpu.NODES_COMMAND:
+            return _result(fixture("nodes.json"))
+        if args == gpu.PODS_COMMAND:
+            return _result(stderr=FORBIDDEN, success=False)
+        if args == gpu.NAMESPACES_COMMAND:
+            return _result(_namespaces(*(f"ns-{i}" for i in range(20))))
+        if args in (gpu.SERVED_MODELS_COMMAND, gpu.BENCHMARKS_COMMAND, gpu.MODEL_VOLUMES_COMMAND):
+            return _result('{"items": []}')
+        if args == gpu.NODE_POOLS_COMMAND:
+            return _result(stderr="timed out", success=False)
+        searched.append(timeout)                                        # namespace 파드 — 몫을 다 쓰고 실패한다
+        now[0] += timeout
+        return _result(stderr="timed out", success=False)
+
+    body, _ = clusters_api._collect_gpu(run, namespace_pods="{}", known=True, clock=lambda: now[0])
+    assert sum(searched) == clusters_api.GPU_BUDGET - (clusters_api.GPU_NODE_POOLS_TIMEOUT + clusters_api.GPU_SERVED_MODELS_TIMEOUT
+                                                      + clusters_api.GPU_BENCHMARKS_TIMEOUT)
+    assert body["model_volumes"] == []

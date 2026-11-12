@@ -746,10 +746,14 @@ def _collect_gpu(
     model_volumes: list[dict[str, Any]] | None = None
     if served_models is not None:
         served_names = frozenset(row["name"] for row in served_models if row["namespace"] == gpu.MODEL_VOLUMES_NAMESPACE)
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=1) as pool:
             volumes_read = pool.submit(_read_model_volumes, run, served_budget, served_names)
             benchmarks = _read_benchmarks(run, served_budget, cache_key=cache_key, clock=clock)
-            model_volumes = volumes_read.result()
+            try:
+                model_volumes = volumes_read.result()
+            except Exception:                               # kubectl 을 못 띄운 것 등 — 배지 하나로 개요를 실패시키지 않는다
+                logger.debug("모델 볼륨을 읽지 못했다 (예외)", exc_info=True)
+                model_volumes = None
     else:
         if read_served and served_absent:                   # CRD 없음·거부 — 잠깐의 실패가 아니다
             _forget_benchmarks(cache_key)

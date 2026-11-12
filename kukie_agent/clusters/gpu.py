@@ -141,8 +141,9 @@ ServedModel — served_models
   한 줄: name(라벨의 ServedModel 이름), pvc(metadata.name), size_bytes(status.capacity.storage, 없으면 spec.resources.requests.storage
   — 바이트 정수. capacity 가 있는데 못 읽는 값이면 request 로 넘어가지 않고 null), phase(status.phase — Bound·Pending·Lost, 없으면 ""),
   retained(주인이 없고 llm 에 그 이름의 ServedModel 도 없다 — 지워진 모델이 남긴 것. retainOnDelete PVC 는 모델이 돌 때도 주인이
-  없으므로 ServedModel 이름과 대조한다), created_at(metadata.creationTimestamp). ServedModel 이름순, MAX_MODEL_VOLUMES 줄까지.
-  안의 파일이 다 받아졌는지는 모른다 — 받다가 멈춘 PVC 도 줄이 있다. 앱은 "다시 받지 않는다" 가 아니라 "받던 파일을 이어 쓴다" 로 말한다.
+  없으므로 ServedModel 이름과 대조한다), created_at(metadata.creationTimestamp). ServedModel 이름순. 줄 수를 자르지 않는다 — 오븐이 ServedModel
+  마다 하나만 만들고, 자르면 뒤쪽 모델의 배지가 소리 없이 빠진다.
+  안의 파일이 다 받아졌는지는 모른다 — 받다가 멈춘 PVC 도 줄이 있다. 앱은 "같은 이름의 디스크를 다시 붙인다" 고만 말한다.
   이름·라벨이 없는 항목은 그 줄만 건너뛴다. 목록 자체가 깨졌으면(items 없음·객체 아닌 항목) null 이다 — [] 로 "없다" 고 하지 않는다.
     null  읽지 않았다(ServedModel 을 못 읽은 라운드) 또는 못 읽었다(거부·시간 초과·예산 부족·깨진 출력 — 그 라운드만)
     []    읽었는데 하나도 없다
@@ -203,7 +204,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from typing import Any
 
 #: 노드 목록 (클러스터 범위). 부르는 쪽이 `-n` 을 붙이지 않는다
@@ -214,8 +215,11 @@ PODS_COMMAND: list[str] = ["get", "pods", "-A", "-o", "json"]
 #: 모든 namespace 의 ServedModel (모듈 설명 "ServedModel"). 부르는 쪽이 `-n` 을 붙이지 않는다
 SERVED_MODELS_COMMAND: list[str] = ["get", "servedmodels.serving.kukie.io", "-A", "-o", "json"]
 
+#: 오븐이 측정 기록·모델 PVC 를 두는 namespace — 오븐 ServedModel 은 llm 에 만든다
+MODEL_VOLUMES_NAMESPACE = "llm"
 #: 측정 기록 ConfigMap (모듈 설명 "측정 기록"). 오븐이 llm 에만 남긴다. 부르는 쪽이 `-n` 을 붙이지 않는다
-BENCHMARKS_COMMAND: list[str] = ["get", "configmaps", "-n", "llm", "-l", "serving.kukie.io/measure-result=true", "-o", "json"]
+BENCHMARKS_COMMAND: list[str] = ["get", "configmaps", "-n", MODEL_VOLUMES_NAMESPACE, "-l", "serving.kukie.io/measure-result=true",
+                                 "-o", "json"]
 #: 응답에 싣는 측정 기록 수 상한. 개요는 20초마다 다시 읽으므로 응답이 커지지 않게 한다
 MAX_BENCHMARKS = 50
 #: 측정 기록 한 줄의 단계 수·model 길이 상한. 오븐은 단계가 7개이고 결과를 4096바이트에 담는다 — 넘으면 오븐이 쓴 값이 아니다
@@ -227,18 +231,17 @@ _RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:
 
 #: 모델 PVC 의 ServedModel 이름 라벨 — 셀렉터와 이름 읽기가 같은 값을 쓴다
 _SERVED_MODEL_LABEL = "serving.kukie.io/servedmodel"
-#: 모델 PVC 와 ServedModel 을 읽는 namespace — 오븐 ServedModel 은 llm 에 만든다
-MODEL_VOLUMES_NAMESPACE = "llm"
 #: 오븐이 만든 모델 PVC (모듈 설명 "모델 볼륨"). 라벨이 있는 것만 — 값은 ServedModel 이름이다
 MODEL_VOLUMES_COMMAND: list[str] = ["get", "persistentvolumeclaims", "-n", MODEL_VOLUMES_NAMESPACE, "-l", _SERVED_MODEL_LABEL,
                                     "-o", "json"]
-#: PVC 크기 — 쿠버네티스 수량: 숫자에 이진 단위(Ki~Ei)·십진 단위(m, k~E) 하나, 또는 지수(1e3)
-_STORAGE = re.compile(r"([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:(Ki|Mi|Gi|Ti|Pi|Ei|m|k|M|G|T|P|E)|[eE]([+-]?[0-9]{1,3}))?")
-_STORAGE_UNITS: dict[str, Decimal] = {
-    "": Decimal(1), "m": Decimal("0.001"),
-    "Ki": Decimal(1024), "Mi": Decimal(1024**2), "Gi": Decimal(1024**3), "Ti": Decimal(1024**4), "Pi": Decimal(1024**5),
-    "Ei": Decimal(1024**6), "k": Decimal(1000), "M": Decimal(1000**2), "G": Decimal(1000**3), "T": Decimal(1000**4),
-    "P": Decimal(1000**5), "E": Decimal(1000**6)}
+#: PVC 크기 — 쿠버네티스 수량. 문법은 manifests/models.py 의 _QUANTITY 와 같다(테스트가 둘을 견준다): 숫자에 지수(1e3)나
+#: 이진 단위(Ki~Ei)·십진 단위(m, k~E) 하나
+_STORAGE = re.compile(r"([0-9]+(?:\.[0-9]+)?)([eE][-+]?[0-9]+|m|k|Ki|Mi|Gi|Ti|Pi|Ei|M|G|T|P|E)?")
+_STORAGE_UNITS: dict[str, int | Fraction] = {
+    "": 1, "m": Fraction(1, 1000), "Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4, "Pi": 1024**5, "Ei": 1024**6,
+    "k": 1000, "M": 1000**2, "G": 1000**3, "T": 1000**4, "P": 1000**5, "E": 1000**6}
+#: 지수 표기의 지수 상한 — 그보다 크면 PVC 크기가 아니고, 10**큰수 를 만들지 않는다
+_STORAGE_MAX_EXPONENT = 30
 
 #: Karpenter NodePool (모듈 설명 "Karpenter GPU 풀"). 클러스터 범위 자원이라 `-A`·`-n` 이 없다
 NODE_POOLS_COMMAND: list[str] = ["get", "nodepools.karpenter.sh", "-o", "json"]
@@ -1082,15 +1085,19 @@ def model_volumes(stdout: str, served: set[str] | frozenset[str] = frozenset()) 
 
 
 def _storage_bytes(value: Any) -> int | None:
-    """"100Gi"·"40G"·"1073741824"·"1e9" 를 바이트 정수로(소수 바이트는 올린다 — 쿠버네티스와 같다). 모르는 모양이면 None."""
+    """"100Gi"·"40G"·"1073741824"·"1e9" 를 정확한 바이트 정수로(소수 바이트는 올린다 — 쿠버네티스와 같다). 모르는 모양이면 None."""
     match = _STORAGE.fullmatch(value) if isinstance(value, str) else None
     if not match:
         return None
-    try:
-        number = Decimal(match[1]) * (_STORAGE_UNITS[match[2] or ""] if match[3] is None else Decimal(10) ** int(match[3]))
-    except InvalidOperation:
-        return None
-    return int(number.to_integral_value(rounding="ROUND_CEILING"))
+    suffix = match[2] or ""
+    if suffix not in _STORAGE_UNITS:                        # 단위가 아니면 지수다 — "Ei"·"E" 는 단위다
+        exponent = int(suffix[1:])
+        if abs(exponent) > _STORAGE_MAX_EXPONENT:
+            return None
+        scale: int | Fraction = Fraction(10) ** exponent
+    else:
+        scale = _STORAGE_UNITS[suffix]
+    return math.ceil(Fraction(match[1]) * scale)             # Fraction 이라 자릿수에 상관없이 정확하다
 
 
 def _dict(value: Any) -> dict[str, Any]:
