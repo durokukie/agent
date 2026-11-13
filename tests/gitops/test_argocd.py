@@ -789,7 +789,8 @@ IN_CLUSTER = "https://kubernetes.default.svc"
     ([], "default", None),
     # 앱은 server 만 적었다 — name 칸 거부 패턴은 걸리는지 모른다 (agent#154 리뷰)
     ([{"server": IN_CLUSTER, "namespace": "*"}, {"name": "!dev-*", "namespace": "*"}], "default", None),
-    ([{"server": IN_CLUSTER, "namespace": "sandbox-*"}, {"name": "!dev-*", "namespace": "*"}], "default", False),
+    ([{"server": IN_CLUSTER, "namespace": "sandbox-*"}, {"name": "!dev-*", "namespace": "*"}], "default", None),
+    ([{"server": IN_CLUSTER, "namespace": "sandbox-*"}, {"name": "!dev-*", "namespace": "shop"}], "default", False),
 ])
 def test_프로젝트_destinations는_ArgoCD와_같은_규칙으로_본다(destinations, namespace, expected):
     assert argocd.destination_permitted(destinations, server=IN_CLUSTER, name="", namespace=namespace) is expected

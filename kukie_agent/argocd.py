@@ -170,7 +170,8 @@ def destination_permitted(destinations: list[dict[str, Any]], *, server: str, na
     어느 항목도 이 클러스터를 가리키지 않으면 None(판단 못 함) — 앱이 name 으로, 프로젝트가 server 로 적는 식이면 여기서
     둘을 이어 볼 수 없다. 이미 돌고 있는 앱이라 실제로는 허락된 클러스터일 것이므로 막지 않고 모른다고 둔다.
     ArgoCD 는 판정 전에 server·name 을 둘 다 채우지만 여기선 앱이 적은 것만 안다. 앱이 적지 않은 칸의 거부 패턴은
-    걸리는지 알 수 없다 — 그것 때문에 막지 않고, 허락으로 보이더라도 None 으로 둔다 (agent#154 리뷰).
+    걸리는지 알 수 없다 — `!` 패턴은 다른 이름을 **허락**하는 항목이기도 해서, 허락으로 보이든 거부로 보이든 None 으로 둔다
+    (agent#154 리뷰).
     """
     cluster_seen = False
     matched = False
@@ -196,7 +197,7 @@ def destination_permitted(destinations: list[dict[str, Any]], *, server: str, na
             return False
     if matched:
         return None if unsure else True
-    return False if cluster_seen else None
+    return False if cluster_seen and not unsure else None
 
 
 def allowed_namespaces(destinations: list[dict[str, Any]], *, server: str, name: str) -> tuple[list[str], list[str]]:
