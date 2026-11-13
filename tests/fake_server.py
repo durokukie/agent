@@ -349,11 +349,13 @@ class FakeServer:
                 "hasGpu")},
         })
 
-    async def update_cluster_status(self, cluster_id: str, *, status: str, checked_at: datetime):
-        self.calls.append(("update_cluster_status", {"id": cluster_id, "status": status}))
+    async def update_cluster_status(self, cluster_id: str, *, status: str, checked_at: datetime, fingerprint: str):
+        self.calls.append(("update_cluster_status", {"id": cluster_id, "status": status, "fingerprint": fingerprint}))
         cluster = self.clusters.get(cluster_id)
         if cluster is None:
             raise _not_found(cluster_id)
+        if cluster["fingerprint"] != fingerprint:
+            raise ServerError(409, "CLUSTER_CHANGED", "이 대화가 쓰던 클러스터의 접속 대상이 바뀌었다")
         cluster["status"] = status
         cluster["lastCheckedAt"] = checked_at.isoformat()
         return {k: v for k, v in cluster.items() if k != "credential"}

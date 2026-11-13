@@ -92,6 +92,23 @@ def test_연결_실패는_이유에_따라_상태가_갈린다(client, fake_serv
     assert fake_server.clusters[cluster]["status"] == "auth_expired"
 
 
+def test_연결을_확인하는_사이_kubeconfig가_바뀌면_결과를_남기지_않고_409(client, fake_server, monkeypatch):
+    """옛 연결로 읽은 결과가 새 연결의 상태로 남으면 안 된다 (DURO-125) — server 가 지문으로 가린다."""
+    cluster = fake_server.add_cluster(fingerprint="fp-old")
+
+    def fake(*a, **k):
+        fake_server.clusters[cluster]["fingerprint"] = "fp-new"   # 확인하는 사이 사용자가 kubeconfig 를 바꿨다
+        return _ok()
+
+    monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
+    r = client.post(f"/clusters/{cluster}/test", headers=USER)
+
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "CLUSTER_CHANGED"
+    assert fake_server.clusters[cluster]["status"] == "disconnected"
+    assert fake_server.clusters[cluster]["lastCheckedAt"] is None
+    assert [b["fingerprint"] for n, b in fake_server.calls if n == "update_cluster_status"] == ["fp-old"]
+
+
 def test_연결_확인도_공용_스레드풀을_다_물지_않는다(client, fake_server, monkeypatch):
     """probe 는 kubectl 두 번 × 30초라 오래 잡는다 — 리미터가 붙어 있어야 한다."""
     from kukie_agent import clusters_api

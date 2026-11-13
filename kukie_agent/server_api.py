@@ -423,10 +423,17 @@ async def cluster_connection(
     return ClusterConnection.from_json(data)
 
 
-async def update_cluster_status(cluster_id: str, *, status: str, checked_at: datetime) -> dict[str, Any]:
-    """연결 확인 결과. 시각은 server 응답과 같은 오프셋 없는 UTC ISO 로 보낸다."""
+async def update_cluster_status(
+    cluster_id: str, *, status: str, checked_at: datetime, fingerprint: str,
+) -> dict[str, Any]:
+    """연결 확인 결과. 시각은 server 응답과 같은 오프셋 없는 UTC ISO 로 보낸다.
+
+    fingerprint 는 확인할 때 쓴 연결 정보의 지문이다 — 그 사이 kubeconfig 가 바뀌었으면 server 가 409 CLUSTER_CHANGED
+    (DURO-125, update_cluster_gpu 와 같은 규칙).
+    """
     at = checked_at.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
-    return await _call("PATCH", _path("clusters", cluster_id, "status"), body={"status": status, "checkedAt": at})
+    return await _call("PATCH", _path("clusters", cluster_id, "status"),
+                       body={"status": status, "checkedAt": at, "fingerprint": fingerprint})
 
 
 async def update_cluster_gpu(cluster_id: str, *, has_gpu: bool, fingerprint: str) -> dict[str, Any]:
