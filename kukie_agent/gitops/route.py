@@ -295,8 +295,22 @@ def _missing_entry(entry: Any, kind: str, name: str, namespace: str | None) -> b
         return False
     if namespace and (entry.get("namespace") or "") not in ("", namespace):
         return False
+    if entry.get("requiresPruning"):
+        return False                               # 반대로 클러스터에만 있고 git 에는 없는 항목이다 (agent#155 리뷰)
     health = entry.get("health") if isinstance(entry.get("health"), dict) else {}
     return health.get("status") == "Missing" or entry.get("status") == "OutOfSync"
+
+
+#: 이 클러스터를 가리키는 Application destination — ArgoCD 가 자기 클러스터에 배포할 때 쓰는 값
+IN_CLUSTER_SERVER = "https://kubernetes.default.svc"
+IN_CLUSTER_NAME = "in-cluster"
+
+
+def _in_cluster(item: dict[str, Any]) -> bool:
+    """앱이 지금 보는 클러스터에 배포하나. 다른 클러스터로 배포하는 앱의 같은 이름 리소스를 고르면 엉뚱한 환경의 레포를
+    고친다 (agent#155 리뷰). 클러스터 객체의 추적 표시가 없는 길이라 destination 으로만 잇는다 — 모르면 후보가 아니다."""
+    destination = (item.get("spec") or {}).get("destination") or {}
+    return destination.get("server") == IN_CLUSTER_SERVER or destination.get("name") == IN_CLUSTER_NAME
 
 
 def _api_version(entry: dict[str, Any]) -> str:
@@ -328,7 +342,7 @@ async def _decide_missing(kind: str, name: str, namespace: str | None, label: st
         # 정하지 못했다 — 승인 순간 다시 판단할 때 STALE 이 아니라 다시 시도하게 (Route.known)
         return Route("kubectl", f"{label} 가 클러스터에 없어요. ArgoCD 앱 목록을 읽지 못해 git 에만 있는 리소스인지 "
                                 "확인하지 못했어요.", known=False)
-    found = [(item, entry) for item in items
+    found = [(item, entry) for item in items if _in_cluster(item)
              for entry in (item.get("status") or {}).get("resources") or []
              if _missing_entry(entry, kind, name, namespace)]
     if not found:
@@ -342,11 +356,58 @@ async def _decide_missing(kind: str, name: str, namespace: str | None, label: st
     item, entry = found[0]
     target = Target(api_version=_api_version(entry), kind=str(entry.get("kind") or kind), name=name,
                     namespace=str(entry.get("namespace") or "") or namespace)
+    app = (item.get("metadata") or {}).get("name")
+    if not namespace and target.namespace:
+        # 처음 조회는 namespace 없이(context 기본 ns) 했다 — 앱이 적은 ns 에 실제로 있으면 git 에만 있는 게 아니다
+        # (drift 로 OutOfSync 인 리소스). 그 ns 로 다시 본다 (agent#155 리뷰)
+        try:
+            live = await to_thread.run_sync(
+                partial(_read, ["get", target.kind, name, "-o", "json", "-n", target.namespace],
+                        context=context, kubeconfig=kubeconfig, deadline=deadline),
+                limiter=thread_limiter("gitops_route", LOOKUP_WORKERS),
+            )
+        except Exception:
+            logger.exception("다른 namespace 의 리소스를 다시 보지 못했다")
+            live = None
+        if live is None:
+            return Route("kubectl", f"{target.label()} 를 클러스터에서 읽지 못했어요.", known=False)
+        if live:
+            return Route("kubectl", f"{label} 는 {target.namespace} 네임스페이스에 있어요 — namespace 를 알려 주세요.",
+                         managed=True)
+    denied = await _project_denies(item, target, context=context, kubeconfig=kubeconfig, deadline=deadline)
+    if denied:
+        # sync 가 거부된 까닭이 바로 이것이면, 값을 고치는 PR 을 머지해도 다시 거부돼 반영되지 않는다 (agent#155 리뷰)
+        return Route("kubectl", f"{target.label()} 는 클러스터에 없고 git 에만 있어요. ArgoCD 앱 {app} 의 프로젝트 "
+                                f"'{denied}' 가 {target.namespace} 네임스페이스를 허락하지 않아 sync 가 거부돼요 — 값을 고치는 PR 을 "
+                                "머지해도 반영되지 않아요. git 의 네임스페이스를 프로젝트가 허락하는 곳으로 고치거나 프로젝트 설정을 "
+                                "바꿔야 해요(Kukie PR 로는 아직 네임스페이스를 못 바꿔요).",
+                     managed=True, application=item, target=target)
     route = await _route_of_app(item, target, cluster_id=cluster_id, change=change, connected=connected)
     # 사람과 AI 가 "왜 클러스터에 없는데 PR 인가" 를 알게 — sync 실패의 까닭은 앱 상태(conditions)에 있다
-    app = (item.get("metadata") or {}).get("name")
     return replace(route, reason=f"{target.label()} 는 클러스터에 없고 git 에만 있어요 — ArgoCD 앱 {app} 의 "
-                                             f"sync 가 실패했거나 아직이에요. {route.reason}")
+                                 f"sync 가 실패했거나 아직이에요. {route.reason}")
+
+
+async def _project_denies(item: dict[str, Any], target: Target, *, context: str, kubeconfig: Path | None,
+                          deadline: float | None) -> str | None:
+    """앱의 ArgoCD 프로젝트가 target 의 네임스페이스를 막으면 그 프로젝트 이름. 허락하거나 모르면 None —
+    새 리소스 길(DURO-240)처럼 프로젝트를 못 읽으면 막지 않는다."""
+    if not target.namespace:
+        return None
+    try:
+        destinations = await to_thread.run_sync(
+            partial(_project_destinations, item, context=context, kubeconfig=kubeconfig, deadline=deadline),
+            limiter=thread_limiter("gitops_route", LOOKUP_WORKERS),
+        )
+    except Exception:
+        logger.exception("ArgoCD 프로젝트를 읽지 못해 네임스페이스 허락을 건너뛴다")
+        return None
+    if destinations is None:
+        return None
+    destination = (item.get("spec") or {}).get("destination") or {}
+    permitted = argocd.destination_permitted(destinations, server=str(destination.get("server") or ""),
+                                             name=str(destination.get("name") or ""), namespace=target.namespace)
+    return str((item.get("spec") or {}).get("project") or "default") if permitted is False else None
 
 
 async def _decide_new(change: NewResource, *, kind: str, name: str, context: str, kubeconfig: Path | None,
