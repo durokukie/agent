@@ -777,3 +777,37 @@ def test_클러스터_조회에는_옵션처럼_보이는_이름을_넘기지_�
     ]
     assert route.live_resources(resources, context="ctx", kubeconfig=None) == []
     assert cluster.seen == []
+
+
+IN_CLUSTER = "https://kubernetes.default.svc"
+
+
+def test_프로젝트가_허락하지_않는_네임스페이스면_PR을_만들지_않고_이유를_알려준다(client, fake_server, room, gh, cluster):
+    """DURO-240 — sandbox 프로젝트(sandbox-*)의 앱에 default 파드를 더하자 머지 뒤 sync 가 통째로 실패했다."""
+    cluster.project_destinations = [{"server": IN_CLUSTER, "namespace": "shop*"}]
+    manifest = "apiVersion: v1\nkind: Pod\nmetadata: {name: caddy, namespace: default}\nspec:\n  containers:\n    - {name: caddy, image: caddy:2.8.4}\n"
+    seen: list = []
+    _chat(client, room, _new_args(manifest_yaml=manifest) | {"kind": "Pod"}, seen=seen)
+
+    text = str(seen[0].content)
+    assert isinstance(seen[0], RetryPromptPart)
+    assert "'default'" in text and "shop*" in text and "Pod default/caddy" in text and "metadata.namespace 를 지우면" in text
+    assert fake_server.plans_of(room) == [] and gh.pulls == {}
+    assert ["get", "appprojects.argoproj.io", "default", "-n", "argocd", "-o", "json"] in cluster.seen
+
+
+def test_프로젝트가_허락하는_다른_네임스페이스는_경고에_허락을_적는다(client, fake_server, room, gh, cluster):
+    cluster.project_destinations = [{"server": IN_CLUSTER, "namespace": "shop*"}]
+    manifest = CADDY_YAML.replace("name: caddy\n", "name: caddy\n  namespace: shop-extra\n", 1)
+    card = _card(client, room, _new_args(manifest_yaml=manifest))
+
+    texts = [risk["risk"] for risk in card["gitops"]["risk_warnings"] if risk["code"] == "other_namespace"]
+    assert texts and "'default' 는 이 네임스페이스를 허락해요" in texts[0]
+
+
+def test_프로젝트를_못_읽으면_막지_않고_확인하지_못했다고_적는다(client, fake_server, room, gh, cluster):
+    manifest = CADDY_YAML.replace("name: caddy\n", "name: caddy\n  namespace: other\n", 1)
+    card = _card(client, room, _new_args(manifest_yaml=manifest))
+
+    texts = [risk["risk"] for risk in card["gitops"]["risk_warnings"] if risk["code"] == "other_namespace"]
+    assert texts and "프로젝트 규칙은 확인하지 못했어요" in texts[0]

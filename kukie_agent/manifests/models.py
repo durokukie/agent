@@ -46,6 +46,11 @@ class AppSource(BaseModel):
     directory_filtered: bool = False     # spec.source.directory.include·exclude 가 있나 — 새 파일을 ArgoCD 가 안 읽을 수 있다
     ignore_differences: list[dict] = []  # spec.ignoreDifferences 그대로
     respect_ignore_differences: bool = False  # spec.syncPolicy.syncOptions 에 RespectIgnoreDifferences=true 가 있나
+    project: str = ""                    # spec.project
+    destination_server: str = ""         # spec.destination.server
+    destination_name: str = ""           # spec.destination.name
+    #: 그 AppProject 의 spec.destinations (DURO-240). None 이면 읽지 않았거나 못 읽었다 — 새 리소스 길에서만 읽는다
+    project_destinations: list[dict] | None = None
 
 
 class Replicas(BaseModel):
@@ -142,6 +147,7 @@ RefuseCode = Literal[
     "overwrite",            # 새 파일 자리에 이미 파일이 있다
     "resource_exists",      # 새로 만들려는 리소스가 이미 앱에 있다
     "kustomize_config",     # 레포 밖을 끌어올 수 있는 Kustomize 설정을 새로 더하려 했다
+    "project_denied",       # 앱의 ArgoCD 프로젝트가 허락하지 않는 네임스페이스 — 머지해도 sync 가 실패한다 (DURO-240)
 ]
 
 

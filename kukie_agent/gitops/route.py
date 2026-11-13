@@ -134,6 +134,7 @@ def app_source(item: dict[str, Any], source: dict[str, Any]) -> AppSource:
     spec = item.get("spec") or {}
     options = ((spec.get("syncPolicy") or {}).get("syncOptions") or [])
     source_type = str(status.get("sourceType") or ("Helm" if source.get("chart") else ""))
+    destination = spec.get("destination") or {}
     return AppSource(
         source_type=source_type,
         path=str(source.get("path") or ""),
@@ -144,6 +145,9 @@ def app_source(item: dict[str, Any], source: dict[str, Any]) -> AppSource:
         respect_ignore_differences=any(
             isinstance(option, str) and option.replace(" ", "") == "RespectIgnoreDifferences=true" for option in options
         ),
+        project=str(spec.get("project") or "default"),
+        destination_server=str(destination.get("server") or ""),
+        destination_name=str(destination.get("name") or ""),
     )
 
 
@@ -214,8 +218,8 @@ async def decide(
 
 
 async def _route_of_app(item: dict[str, Any], target: Target, *, cluster_id: str | None, change: Change | None,
-                        connected: set[str] | None) -> Route:
-    """이 앱의 레포·형식으로 PR 길인지."""
+                        connected: set[str] | None, project_destinations: list[dict] | None = None) -> Route:
+    """이 앱의 레포·형식으로 PR 길인지. project_destinations 는 새 리소스 길에서만 읽어 넘긴다 (DURO-240)."""
     meta = item.get("metadata") or {}
     app_label = f"ArgoCD 앱 {meta.get('name')}"
     source, refused = _source_of(item)
@@ -223,7 +227,8 @@ async def _route_of_app(item: dict[str, Any], target: Target, *, cluster_id: str
         return Route("kubectl", refused or "", managed=True, application=item, target=target)
     repository = repo_name(source.get("repoURL"))
     common = dict(managed=True, repository=repository, application=item, target=target,
-                  source=app_source(item, source), revision=str(source.get("targetRevision") or ""))
+                  source=app_source(item, source).model_copy(update={"project_destinations": project_destinations}),
+                  revision=str(source.get("targetRevision") or ""))
     if repository is None:
         return Route("kubectl", f"{app_label} 의 소스가 GitHub 레포가 아니라 PR 로 못 바꿔요.", **common)
 
@@ -294,7 +299,35 @@ async def _decide_new(change: NewResource, *, kind: str, name: str, context: str
     item = found[0]
     destination = ((item.get("spec") or {}).get("destination") or {}).get("namespace") or None
     target = Target(api_version="", kind=kind, name=name, namespace=destination)
-    return await _route_of_app(item, target, cluster_id=cluster_id, change=change, connected=connected)
+    try:
+        destinations = await to_thread.run_sync(
+            partial(_project_destinations, item, context=context, kubeconfig=kubeconfig, deadline=deadline),
+            limiter=thread_limiter("gitops_route", LOOKUP_WORKERS),
+        )
+    except Exception:
+        logger.exception("ArgoCD 프로젝트 조회를 건너뛴다")
+        destinations = None
+    return await _route_of_app(item, target, cluster_id=cluster_id, change=change, connected=connected,
+                               project_destinations=destinations)
+
+
+def _project_destinations(item: dict[str, Any], *, context: str, kubeconfig: Path | None,
+                          deadline: float | None) -> list[dict] | None:
+    """앱이 속한 AppProject 의 spec.destinations. 못 읽으면(없음·권한·시간) None — 새 리소스를 막지 않고 경고만 한다 (DURO-240).
+
+    AppProject 는 ArgoCD 제어 namespace 에 있다. 보통 Application 과 같은 namespace(argocd)다 — "apps in any namespace" 로
+    다른 namespace 에 둔 앱이면 거기엔 없어 None 이 된다(모름).
+    """
+    meta = item.get("metadata") or {}
+    project = str((item.get("spec") or {}).get("project") or "default")
+    namespace = str(meta.get("namespace") or "argocd")
+    if not argocd.valid_ref(namespace, project):
+        return None
+    data = _read(argocd.project_command(namespace, project), context=context, kubeconfig=kubeconfig, deadline=deadline)
+    destinations = ((data or {}).get("spec") or {}).get("destinations")
+    if not isinstance(destinations, list):
+        return None
+    return [entry for entry in destinations if isinstance(entry, dict)]
 
 
 def live_resources(resources: list[dict[str, str]], *, context: str, kubeconfig: Path | None) -> list[dict[str, str]]:

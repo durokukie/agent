@@ -44,6 +44,8 @@ def propose_git_change(ctx: RunContext[Deps], kind: str, name: str, change: Chan
     Deployment 와 Service 처럼 여러 문서(---)여도 된다. file_name 은 비워도 된다. kind·name 에는 그중 대표 리소스 하나를 적는다.
     기존 파일·기존 리소스는 건드리지 않고, 값이 든 Secret 과 Kustomization 은 못 넣는다. 막히면 이유와 다음 방법을 알려 준다.
     위험해 보이는 설정(클러스터 범위·privileged·latest 이미지 등)은 막지 않고 승인 카드에 경고로 올린다.
+    앱의 ArgoCD 프로젝트가 허락하지 않는 네임스페이스면 막는다 — 머지해도 sync 가 실패한다. 사용자가 그 네임스페이스를 말했어도
+    metadata.namespace 를 지워 앱의 네임스페이스로 다시 제안할지 먼저 묻는다.
 
     시스템이 고칠 파일을 찾아 렌더링으로 확인하고 PR 을 연 뒤 승인 카드를 띄운다. 승인하면 PR 을 머지한 결과를 돌려주고,
     ArgoCD sync 는 시스템이 뒤에서 지켜봐 승인 카드에 보여 준다 — 클러스터는 머지 뒤 ArgoCD 가 sync 해야 바뀐다.

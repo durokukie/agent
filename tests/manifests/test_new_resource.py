@@ -579,3 +579,58 @@ def test_경고가_여럿이면_모두_싣고_막지_않는다(repo):
     result = ready(plan(repo, manifest))
     assert {risk.code for risk in result.risk_warnings} == {"latest_image", "privileged", "host_network"}
     assert len(result.warnings) == 3
+
+
+# ── ArgoCD 프로젝트 허락 범위 (DURO-240) ─────────────────────
+IN_CLUSTER = "https://kubernetes.default.svc"
+SANDBOX = PLAIN.model_copy(update={"project": "sandbox", "destination_server": IN_CLUSTER,
+                                   "project_destinations": [{"server": IN_CLUSTER, "namespace": "shop*"}]})
+
+
+def test_프로젝트가_허락하지_않는_네임스페이스면_막고_허락된_곳과_고칠_방법을_알려준다(repo):
+    manifest = SERVICE.replace("name: caddy\n", "name: caddy\n  namespace: default\n")
+    result = refused(plan(repo, manifest, app=SANDBOX, target=CADDY.model_copy(update={"kind": "Service"})),
+                     "project_denied")
+    assert result.retry
+    assert "'sandbox'" in result.message and "shop*" in result.message and "Service default/caddy" in result.message
+    assert "앱의 네임스페이스(shop)" in result.message
+
+
+def test_네임스페이스를_적지_않으면_앱_destination으로_보아_허락한다(repo):
+    assert ready(plan(repo, BOTH, app=SANDBOX)).risk_warnings == []
+
+
+def test_glob에_맞는_다른_네임스페이스는_막지_않고_프로젝트가_허락한다고_경고한다(repo):
+    manifest = SERVICE.replace("name: caddy\n", "name: caddy\n  namespace: shop-extra\n")
+    risk = risk_of(plan(repo, manifest, app=SANDBOX, target=CADDY.model_copy(update={"kind": "Service"})),
+                   "other_namespace")
+    assert "'sandbox' 는 이 네임스페이스를 허락해요" in risk["risk"]
+
+
+def test_프로젝트를_못_읽었으면_막지_않고_확인하지_못했다고_경고한다(repo):
+    manifest = SERVICE.replace("name: caddy\n", "name: caddy\n  namespace: default\n")
+    risk = risk_of(plan(repo, manifest, target=CADDY.model_copy(update={"kind": "Service"})), "other_namespace")
+    assert "프로젝트 규칙은 확인하지 못했어요" in risk["risk"]
+
+
+def test_클러스터_범위_리소스는_프로젝트_네임스페이스로_막지_않는다(repo):
+    manifest = "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata: {name: caddy}\nrules: []\n"
+    result = plan(repo, manifest, app=SANDBOX, target=CADDY.model_copy(update={"kind": "ClusterRole"}))
+    assert risk_of(result, "cluster_scoped")
+
+
+def test_프로젝트가_이_클러스터를_가리키지_않으면_판단하지_않고_경고만_한다(repo):
+    app = SANDBOX.model_copy(update={"destination_server": "", "destination_name": "in-cluster"})
+    manifest = SERVICE.replace("name: caddy\n", "name: caddy\n  namespace: default\n")
+    risk = risk_of(plan(repo, manifest, app=app, target=CADDY.model_copy(update={"kind": "Service"})),
+                   "other_namespace")
+    assert "확인하지 못했어요" in risk["risk"]
+
+
+@needs_kustomize
+def test_kustomize는_렌더된_네임스페이스로_프로젝트를_본다(repo):
+    app = PROD.model_copy(update={"project": "shop", "destination_server": IN_CLUSTER,
+                                  "project_destinations": [{"server": IN_CLUSTER, "namespace": "shop"}]})
+    result = refused(plan(repo, SERVICE, app=app, target=CADDY.model_copy(update={"kind": "Service"})),
+                     "project_denied")          # overlay 가 shop-prod 로 바꾼다
+    assert "shop-prod" in result.message
