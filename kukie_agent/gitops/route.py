@@ -12,7 +12,8 @@
 클러스터 설정은 없다 — 레포 연결이 끊기거나 새로 생기면 다음 판단부터 달라질 뿐이다. 그래서 승인 순간에도 다시 부른다
 (gitops_hook — 길이 바뀌었으면 STALE). kubectl 조회와 kukie-server 의 연결 목록으로만 판단한다. ArgoCD API 토큰은 쓰지 않는다.
 
-지원 형식은 plain YAML(Directory)·Kustomize, 요청은 manifests 의 넷(레플리카·이미지 태그·resources·환경변수)이다.
+지원 형식은 plain YAML(Directory)·Kustomize, 요청은 manifests 의 넷(레플리카·이미지 태그·resources·환경변수)과
+경로 지정 변경(patch — plain YAML 앱만, Kustomize 앱이면 manifests 가 거절해 kubectl 길로 간다, DURO-249)이다.
 targetRevision 이 브랜치인지(태그·커밋이면 PR 길이 없다)는 GitHub 에 물어야 알아서 여기서 보지 않는다 — PR 을 만들 때 본다.
 """
 from __future__ import annotations
@@ -249,7 +250,8 @@ async def _route_of_app(item: dict[str, Any], target: Target, *, cluster_id: str
                                 "plain YAML 과 Kustomize 만 돼요.", **common)
     if isinstance(change, Other):
         return Route("kubectl", f"'{change.description}' 은 PR 로 못 바꿔요. PR 로는 레플리카 수 · 이미지 태그 · "
-                                "CPU·메모리 · 환경변수만 바꿔요.", **common)
+                                "CPU·메모리 · 환경변수를 바꾸고, plain YAML 앱이면 그 밖의 칸도 경로 지정 변경"
+                                "(what=patch)으로 바꿔요.", **common)
     return Route("pr", f"{app_label} 이 관리하고 레포 {repository} 가 연결돼 있어요 — 변경은 PR 로 올려요.", **common)
 
 
