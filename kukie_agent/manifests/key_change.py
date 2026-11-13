@@ -70,10 +70,18 @@ def prepare(ctx: Context) -> Context | Refused:
     if denied:
         return denied
     moved = new_key(ctx)
-    if moved in ctx.before:
+    # 문서에 namespace 가 없으면 앱 기본으로 간다 — `""` 와 `shop` 은 클러스터에서 같은 곳이다 (agent#160 리뷰)
+    if any(_same_place(ctx, key, moved) for key in ctx.before if key != ctx.key):
         return Refused(code="key_change_blocked",
                        message=f"{_label_in(ctx, moved)} 가 이미 이 앱에 있어요 — 옮기면 같은 리소스가 둘이 돼요.")
     return ctx
+
+
+def _same_place(ctx: Context, a: Key, b: Key) -> bool:
+    """두 키가 클러스터에서 같은 리소스인지 — 빈 namespace 를 앱 기본으로 채워 비교한다."""
+    def placed(key: Key) -> Key:
+        return (key[0], key[1], key[2] or ctx.app.destination_namespace, key[3])
+    return placed(a) == placed(b)
 
 
 def current_namespace(ctx: Context) -> str:
@@ -432,6 +440,11 @@ def _removal(ctx: Context, file: str) -> RiskWarning:
     elif not app.prune:
         code, text, tail = "prune_off", f"{head}Git 에서만 빠지고 클러스터엔 남아요 — 앱의 자동 sync 에 prune 이 꺼져 있어요.", \
             leftover
+    elif isinstance(ctx.change, Delete) and len(ctx.before) == 1 and not app.allow_empty:
+        # ArgoCD 는 자동 sync 가 앱을 비우는 prune 을 막는다 — automated.allowEmpty 가 켜져야 한다 (agent#160 리뷰)
+        code, text, tail = "prune_empty", "앱의 마지막 리소스라 자동 sync 가 지우지 않아요 — 앱을 비우는 prune 은 " \
+                                          "allowEmpty 가 켜져야 해요.", \
+            " ArgoCD 에서 Prune 을 켜고 직접 sync 해야 지워져요 — 그 전엔 남아 OutOfSync 로 보여요."
     else:
         return risks.risk("prune_on", file, label, None, None,
                           f"{head}머지하면 ArgoCD 가 클러스터에서도 지워요(자동 sync · prune 켜짐).{note}", "")

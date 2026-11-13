@@ -144,6 +144,18 @@ def test_prune_설정과_리소스_sync_옵션으로_지워지는지를_가른�
     assert first.text in result.warnings
 
 
+def test_앱의_마지막_리소스는_allowEmpty가_꺼져_있으면_자동으로_안_지워진다고_적는다(sandbox):
+    """agent#160 리뷰: ArgoCD 는 자동 sync 가 앱을 비우는 prune 을 막는다(automated.allowEmpty)."""
+    for name in ("deployment.yaml", "service.yaml"):
+        (sandbox / "apps/plain" / name).unlink()
+    first = ready(plan_change(sandbox, SANDBOX.model_copy(update={"project_destinations": None}),
+                              NGINX.model_copy(update={"in_cluster": True}), Delete())).risk_warnings[0]
+    assert first.code == "prune_empty" and "allowEmpty" in first.text
+    allowed = SANDBOX.model_copy(update={"allow_empty": True})
+    first = ready(plan_change(sandbox, allowed, NGINX.model_copy(update={"in_cluster": True}), Delete())).risk_warnings[0]
+    assert first.code == "prune_on"
+
+
 def test_Delete_false는_git에서_빼는_것과_상관없다고_적는다(repo):
     text = (repo / "apps/plain/service.yaml").read_text()
     (repo / "apps/plain/service.yaml").write_text(text.replace(
@@ -230,6 +242,12 @@ def test_이미_그_네임스페이스이거나_옮길_수_없는_것은_거절�
     service = Target(api_version="v1", kind="Service", name="web", namespace="sandbox-plain")
     result = refused(plan_change(sandbox, SANDBOX, service, MoveNamespace(to="sandbox-two")), "key_change_blocked")
     assert "이미 이 앱에 있어요" in result.message
+    # agent#160 리뷰: 앱 기본으로 옮길 때 그곳을 문서에 적어 둔 같은 리소스도 같은 곳이다 (키는 "" 와 sandbox-plain)
+    write(sandbox, {"apps/plain/nginx-two.yaml": (
+        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: nginx\n  namespace: sandbox-plain\nspec:\n"
+        "  containers: [{name: nginx, image: nginx:1.27}]\n")})
+    result = refused(plan_change(sandbox, SANDBOX, NGINX, MoveNamespace(to="sandbox-plain")), "key_change_blocked")
+    assert "Pod sandbox-plain/nginx 가 이미 이 앱에 있어요" in result.message
 
 
 def test_PVC를_옮기면_데이터가_안_옮겨진다고_높게_적는다(repo):

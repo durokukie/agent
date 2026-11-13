@@ -57,6 +57,7 @@ class AppSource(BaseModel):
     project_destinations: list[dict] | None = None
     auto_sync: bool = False              # spec.syncPolicy.automated 가 있나 — 지운 리소스가 클러스터에서도 지워지는지 (DURO-252)
     prune: bool = False                  # spec.syncPolicy.automated.prune
+    allow_empty: bool = False            # spec.syncPolicy.automated.allowEmpty — 꺼져 있으면 앱을 비우는 자동 prune 을 안 한다
 
 
 class Replicas(BaseModel):

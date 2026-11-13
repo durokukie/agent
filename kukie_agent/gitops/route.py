@@ -158,6 +158,7 @@ def app_source(item: dict[str, Any], source: dict[str, Any]) -> AppSource:
         destination_namespace=str(destination.get("namespace") or ""),
         auto_sync=auto_sync,
         prune=prune,
+        allow_empty=auto_sync and ((spec.get("syncPolicy") or {}).get("automated") or {}).get("allowEmpty") is True,
     )
 
 

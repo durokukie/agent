@@ -479,6 +479,7 @@ def test_클러스터에_있는_리소스를_옮기면_프로젝트_규칙을_�
     found = _decide(monkeypatch, FakeCluster(project_destinations=allowed), change=MoveNamespace(to="other"))
     assert found.path == "pr" and found.source.project_destinations == allowed and found.target.in_cluster is True
     assert found.source.auto_sync is True and found.source.prune is False             # FakeCluster: automated, prune 꺼짐
+    assert found.source.allow_empty is False
     plain = _decide(monkeypatch, FakeCluster(project_destinations=allowed), change=Delete())
     assert plain.path == "pr" and plain.source.project_destinations is None           # 지우기는 읽지 않는다
     kustomize = _decide(monkeypatch, FakeCluster(source_type="Kustomize"), change=Delete())
