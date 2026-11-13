@@ -838,3 +838,82 @@ def test_프로젝트를_못_읽으면_막지_않고_확인하지_못했다고_�
 
     texts = [risk["risk"] for risk in card["gitops"]["risk_warnings"] if risk["code"] == "other_namespace"]
     assert texts and "프로젝트 규칙은 확인하지 못했어요" in texts[0]
+
+
+# ── 경로 지정 변경 (DURO-249) ─────────────────────────────
+
+PATCH_ARGS = {
+    **CHANGE_ARGS,
+    "change": {"what": "patch", "operations": [
+        {"op": "set", "path": "spec.template.spec.containers[web].readinessProbe",
+         "value": {"httpGet": {"path": "/", "port": 80}}},
+        {"op": "set", "path": "spec.template.spec.hostNetwork", "value": True},
+    ]},
+    "intent": "web 에 readinessProbe 를 더하고 hostNetwork 를 켠다.",
+}
+
+
+def test_경로_지정_변경은_PR을_열고_새로_들인_위험을_카드와_Plan과_PR_본문에_싣는다(client, fake_server, room, gh, cluster):
+    card = _card(client, room, PATCH_ARGS)
+
+    pull = gh.pull_of(1)
+    after = gh.commits[pull["head_sha"]]["apps/plain/deployment.yaml"]
+    assert "readinessProbe:" in after and "hostNetwork: true" in after
+    view = card["gitops"]
+    assert view["files"] == ["apps/plain/deployment.yaml"]
+    [risk] = view["risk_warnings"]
+    assert risk["code"] == "host_network" and risk["location"]["field"] == "spec.template.spec.hostNetwork"
+    assert risk["text"] in view["warnings"] and risk["text"] in pull["body"]
+    plan = _plan(fake_server, room)
+    assert plan["payload"]["gitops"]["risk_warnings"] == [risk]
+    assert plan["payload"]["args"]["change"]["operations"][0]["path"].endswith("readinessProbe")
+
+
+def test_위험_없는_경로_지정_변경의_카드에는_경고_칸이_없다(client, fake_server, room, gh, cluster):
+    args = {**PATCH_ARGS, "change": {"what": "patch", "operations": [PATCH_ARGS["change"]["operations"][0]]}}
+    view = _card(client, room, args)["gitops"]
+    assert "risk_warnings" not in view and view["warnings"] == []
+
+
+def test_경로가_틀리면_ModelRetry로_돌려보내고_PR을_만들지_않는다(client, fake_server, room, gh, cluster):
+    args = {**PATCH_ARGS, "change": {"what": "patch", "operations": [
+        {"op": "set", "path": "spec.template.spec.containers[0].ports", "value": []}]}}
+    seen: list = []
+    _chat(client, room, args, seen=seen)
+    assert isinstance(seen[0], RetryPromptPart) and "번호" in str(seen[0].content)
+    assert not gh.pulls
+
+
+def test_바꾸면_안_되는_칸은_다시_고르게도_kubectl로도_보내지_않는다(client, fake_server, room, gh, cluster):
+    """만든 뒤 못 바꾸는 칸은 경로를 바꿔도, kubectl 로 해도 안 된다 — 툴 실패로 끝내 재시도 한도를 쓰지 않는다."""
+    args = {**PATCH_ARGS, "change": {"what": "patch", "operations": [
+        {"op": "set", "path": "spec.selector.matchLabels", "value": {"app": "web2"}}]}}
+    seen: list = []
+    _chat(client, room, args, seen=seen)
+    assert isinstance(seen[0], ToolReturnPart) and "만든 뒤 바꿀 수 없는 칸" in str(seen[0].content)
+    assert "kubectl" not in str(seen[0].content) and not gh.pulls
+
+
+def test_경로_지정으로_레플리카를_바꿔도_클러스터의_HPA를_본다(client, fake_server, room, gh, cluster):
+    cluster.hpa = "web-hpa"
+    args = {**PATCH_ARGS, "change": {"what": "patch", "operations": [
+        {"op": "set", "path": "spec.replicas", "value": 3}]}}
+    seen: list = []
+    _chat(client, room, args, seen=seen)
+    assert "HPA(web-hpa)" in str(seen[0].content) and not gh.pulls
+
+
+def test_경로_지정_변경의_큰_값은_Plan에_해시로_남긴다(client, fake_server, room, gh, cluster):
+    big = {"note": "x" * 300}
+    args = {**PATCH_ARGS, "change": {"what": "patch", "operations": [
+        {"op": "set", "path": "metadata.annotations", "value": big},
+        {"op": "set", "path": "spec.template.spec.containers[web].readinessProbe",
+         "value": {"httpGet": {"path": "/", "port": 80}}}]}}
+    _card(client, room, args)
+    big_op, small_op = _plan(fake_server, room)["payload"]["args"]["change"]["operations"]
+    assert "value" not in big_op and len(big_op["value_sha256"]) == 64 and big_op["path"] == "metadata.annotations"
+    assert small_op["value"] == {"httpGet": {"path": "/", "port": 80}}
+    # 해시로 남겨도 승인 때 같은 요청으로 알아본다 — 머지까지 간다
+    _decide(client, room)
+    _settle(client)
+    assert gh.merges

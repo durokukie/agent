@@ -18,6 +18,7 @@ kubectl 변경 4종의 훅(guardrail/hook.py)과 같은 틀이다: Plan 은 serv
 
 새 리소스(change.what == new_resource, DURO-154)도 같은 흐름이다. 다른 곳은 셋이다: 길은 요청이 고른 앱으로 정하고,
 고칠 곳 찾기 대신 새 파일을 만들고, 경고(risk_warnings)를 gitops 칸에 싣는다 — 승인이 곧 "이 경고를 보고 승인함" 의 기록이다.
+경로 지정 변경(change.what == patch, DURO-249)은 넷과 같은 흐름이고, 새로 들인 위험이 있으면 같은 risk_warnings 칸에 싣는다.
 """
 from __future__ import annotations
 
@@ -40,7 +41,7 @@ from kukie_agent.guardrail.decision_guidance import generate_decision_guidance
 from kukie_agent.guardrail.hook import hooks
 from kukie_agent.guardrail.mutation_request import canonicalize_mutation_args
 from kukie_agent.kubectl import thread_limiter
-from kukie_agent.manifests import Change, NewResource, Replicas, already_in_cluster, representative
+from kukie_agent.manifests import Change, NewResource, Patch, Replicas, already_in_cluster, patch, representative
 from kukie_agent.tools.gitops import RISK, TOOL_NAME, GitOpsResult
 
 logger = logging.getLogger(__name__)
@@ -163,7 +164,8 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
     try:
         token = await pull_requests.token_for(ctx.deps.cluster_id, found.repository)
         hpa = None
-        if isinstance(change, Replicas):
+        # 경로 지정 변경도 레플리카를 건드리면 본다 (spec.replicas · spec 통째) — git 에 없는 HPA 가 되돌린다
+        if isinstance(change, Replicas) or (isinstance(change, Patch) and patch.touches(change, ("spec", "replicas"))):
             hpa = await to_thread.run_sync(partial(
                 routing.find_hpa, found.target.kind, found.target.name, found.target.namespace,
                 context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig,
@@ -211,6 +213,8 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
     }
     if isinstance(change, NewResource):
         gitops["new_resources"] = draft.new_resources
+    if isinstance(change, NewResource) or draft.risk_warnings:
+        # 새 리소스(DURO-154)와 경로 지정 변경(DURO-249)의 경고 — 승인이 곧 "이 경고를 보고 승인함" 의 기록이다
         gitops["risk_warnings"] = draft.risk_warnings
     plan = await ActionPlan.create_draft(
         run_id=ctx.deps.run_id, call_id=call.tool_call_id, tool=TOOL_NAME, args=plan_args, command=command,
