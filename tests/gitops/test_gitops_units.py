@@ -14,7 +14,7 @@ from kukie_agent.gitops import github, route, watch
 from kukie_agent.gitops.github import GitHubError, blob_sha
 from kukie_agent.gitops.pull_requests import base_branch, secret_in
 from kukie_agent.gitops.repo import repo_name
-from kukie_agent.manifests import Other, Replicas
+from kukie_agent.manifests import Other, Patch, PatchOperation, Replicas
 
 
 # ── 레포 주소 ─────────────────────────────────────────────
@@ -282,6 +282,13 @@ def test_레포가_연결_안_됐으면_연결하라고_안내한다(monkeypatch
 def test_지원하지_않는_요청이면_kubectl_길(monkeypatch):
     found = _decide(monkeypatch, FakeCluster(), change=Other(description="노드 셀렉터 바꾸기"))
     assert found.path == "kubectl" and "노드 셀렉터" in found.reason
+
+
+def test_Kustomize_앱의_경로_지정_변경은_렌더_전에_kubectl_길(monkeypatch):
+    change = Patch(operations=[PatchOperation(op="set", path="spec.minReadySeconds", value=5)])
+    found = _decide(monkeypatch, FakeCluster(source_type="Kustomize"), change=change)
+    assert found.path == "kubectl" and "경로 지정 변경" in found.reason
+    assert _decide(monkeypatch, FakeCluster(), change=change).path == "pr"
 
 
 def test_연결_목록을_못_읽으면_kubectl_길로_둔다(monkeypatch):

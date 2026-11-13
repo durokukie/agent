@@ -195,8 +195,8 @@ def test_이름_있는_항목을_지운다(repo):
 
 
 def test_ArgoCD_추적_표시는_못_바꾼다(repo):
-    refused(plan_change(repo, PLAIN, WEB, ops(("set", 'metadata.labels["app.kubernetes.io/instance"]', "x"))),
-            "guarded_field")
+    # instance 레이블은 막지 않는다 — label 추적이면 ArgoCD 가 덮어쓰고, annotation 추적이면 평범한 레이블이다
+    ready(plan_change(repo, PLAIN, WEB, ops(("set", 'metadata.labels["app.kubernetes.io/instance"]', "x"))))
     # 어노테이션이 아직 없으면 위 칸(annotations)부터 통째로 set 한다 — 그래도 결과로 막는다
     refused(plan_change(repo, PLAIN, WEB, ops(("set", "metadata.annotations", {"argocd.argoproj.io/tracking-id": "x"}))),
             "guarded_field")
@@ -222,9 +222,12 @@ def test_Secret_에서_가져오던_환경변수를_평문으로_바꾸지_않�
     """이름(DB_URL)이 비밀처럼 보이지 않아도 secretKeyRef 였던 항목이 바뀌거나 사라지면 막는다 — 넷의 env 요청과 같다."""
     refused(plan_change(repo, PLAIN, WEB, ops(("set", f"{CONTAINER}.env[DB_URL]",
                                               {"name": "DB_URL", "value": "postgres://u:p@db/shop"}))), "secret")
-    refused(plan_change(repo, PLAIN, WEB, ops(("remove", f"{CONTAINER}.env[DB_URL]"))), "secret")
-    refused(plan_change(repo, PLAIN, WEB, ops(("set", f"{CONTAINER}.env", [{"name": "GREETING", "value": "hi"}]))),
+    refused(plan_change(repo, PLAIN, WEB, ops(("set", f"{CONTAINER}.env", [{"name": "DB_URL", "value": "x"}]))),
             "secret")
+    # 지우거나 다른 Secret 을 가리키는 것은 평문이 남지 않아 된다
+    ready(plan_change(repo, PLAIN, WEB, ops(("remove", f"{CONTAINER}.env[DB_URL]"))))
+    ready(plan_change(repo, PLAIN, WEB, ops(("set", f"{CONTAINER}.env[DB_URL]",
+                                            {"name": "DB_URL", "valueFrom": {"secretKeyRef": {"name": "db2", "key": "url"}}}))))
 
 
 def test_HPA_가_맡은_레플리카는_경로_지정으로도_못_바꾼다(repo):
@@ -276,6 +279,29 @@ def test_YAML_1_1_에서_참거짓으로_읽히는_문자열은_따옴표로_쓴
         ("set", "metadata.annotations", {"sidecar": "yes", "mode": "off", "plain": "hello"}))))
     assert doc_after(result)["metadata"]["annotations"] == {"sidecar": "yes", "mode": "off", "plain": "hello"}
     assert 'sidecar: "yes"' in result.files[FILE] and "plain: hello" in result.files[FILE]
+    # PyYAML 은 y·n 을 문자열로 읽지만 ArgoCD(go-yaml v2)는 참거짓으로 읽는다. 키도 같다
+    result = ready(plan_change(repo, PLAIN, WEB, ops(("set", "metadata.annotations", {"on": "y", "n": "x"}))))
+    assert '"on": "y"' in result.files[FILE] and '"n": x' in result.files[FILE]
+
+
+def test_칸을_지워도_다음_칸_위_주석은_남는다(repo):
+    text = (repo / FILE).read_text(encoding="utf-8")
+    (repo / FILE).write_text(text.replace("spec:\n  replicas: 1\n",
+                                          "spec:\n  replicas: 1\n  minReadySeconds: 5\n  # 셀렉터는 바꾸지 않는다\n"),
+                             encoding="utf-8")
+    result = ready(plan_change(repo, PLAIN, WEB, ops(("remove", "spec.minReadySeconds"))))
+    removed, added = changed_lines(result.file_diff)
+    assert removed == ["  minReadySeconds: 5"] and added == []
+
+
+def test_Pod_는_이미지_말고_못_바꾼다(repo):
+    (repo / "apps/plain/pod.yaml").write_text(
+        "apiVersion: v1\nkind: Pod\nmetadata:\n  name: debug\nspec:\n  containers:\n"
+        "    - name: box\n      image: busybox:1.36\n", encoding="utf-8")
+    pod = Target(api_version="v1", kind="Pod", name="debug", namespace="shop")
+    refused(plan_change(repo, PLAIN, pod, ops(("set", "spec.containers[box].args", ["sleep", "1"]))), "guarded_field")
+    ready(plan_change(repo, PLAIN, pod, ops(("set", "spec.containers[box].image", "busybox:1.37"))))
+    ready(plan_change(repo, PLAIN, pod, ops(("set", "metadata.labels", {"team": "shop"}))))
 
 
 def test_Secret_은_경로_지정으로도_못_고친다(repo):

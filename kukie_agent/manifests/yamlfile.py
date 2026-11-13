@@ -10,6 +10,7 @@ import re
 from typing import Any
 
 from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.error import YAMLError
 
 # 키 바로 아래 목록의 `-` 가 키와 같은 칸이면 들여쓰지 않는 목록이다
@@ -77,3 +78,38 @@ def remove_item(parent: Any, key: str, index: int) -> None:
         if lines:
             column = len(below.value.lstrip("\n")) - len(below.value.lstrip("\n").lstrip(" "))
             seq.yaml_set_start_comment("\n".join(line[1:].lstrip() for line in lines), indent=column)
+
+
+def remove_key(parent: Any, key: str) -> None:
+    """맵의 칸 하나를 지운다 — 주석은 remove_item 처럼 그 칸 위의 것만 같이 지운다.
+
+    ruamel 은 칸 사이 주석을 앞 칸의 가장 깊은 마지막 값에 매단다. 그대로 지우면 다음 칸 위 주석이 같이 사라진다.
+    첫 칸을 지울 때 그 위 주석은 윗 맵에 매달려 있어 남는다 — 지워지는 것보다 남는 편이 낫다.
+    """
+    holder, slot_key, at = _tail(parent, key)
+    slot = holder.ca.items.get(slot_key)
+    below = slot[at] if slot else None
+    keys = list(parent)
+    position = keys.index(key)
+    del parent[key]
+    if position > 0:
+        holder, slot_key, at = _tail(parent, keys[position - 1])
+        holder.ca.items.setdefault(slot_key, [None] * 4)[at] = below
+    elif below is not None and len(parent):
+        lines = [line.strip()[1:].lstrip() for line in below.value.splitlines() if line.strip().startswith("#")]
+        if lines:
+            column = len(below.value.lstrip("\n")) - len(below.value.lstrip("\n").lstrip(" "))
+            parent.yaml_set_comment_before_after_key(list(parent)[0], before="\n".join(lines), indent=column)
+
+
+def _tail(node: Any, key: Any) -> tuple[Any, Any, int]:
+    """node[key] 뒤에 오는 주석이 매달리는 자리 — (주석을 가진 객체, ca.items 키, 칸 번호)."""
+    value = node[key]
+    if isinstance(value, CommentedMap) and len(value):
+        return _tail(value, list(value)[-1])
+    if isinstance(value, CommentedSeq) and len(value):
+        last = value[-1]
+        if isinstance(last, CommentedMap) and len(last):
+            return _tail(last, list(last)[-1])
+        return value, len(value) - 1, 0
+    return node, key, 2

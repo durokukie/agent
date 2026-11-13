@@ -31,7 +31,7 @@ from anyio import to_thread
 from kukie_agent import argocd, server_api
 from kukie_agent.gitops.repo import repo_name
 from kukie_agent.kubectl import KubectlResult, run_kubectl, thread_limiter
-from kukie_agent.manifests import AppSource, Change, NewResource, Other, Target
+from kukie_agent.manifests import AppSource, Change, NewResource, Other, Patch, Target
 from kukie_agent.manifests.models import KIND_SHAPE, NAME_SHAPE
 
 logger = logging.getLogger(__name__)
@@ -248,6 +248,10 @@ async def _route_of_app(item: dict[str, Any], target: Target, *, cluster_id: str
         what = "Helm" if source_type == "Helm" else source_type or "알 수 없는 형식"
         return Route("kubectl", f"{app_label} 은 {what} 앱이라 아직 PR 로 못 바꿔요. "
                                 "plain YAML 과 Kustomize 만 돼요.", **common)
+    if isinstance(change, Patch) and source_type != "Directory":
+        # 렌더까지 가서 거절하기 전에 — 경로 지정 변경은 아직 plain YAML 앱만 된다 (Kustomize 는 DURO-251)
+        return Route("kubectl", f"{app_label} 은 {source_type} 앱이라 경로 지정 변경을 아직 PR 로 못 해요. "
+                                "PR 로는 레플리카 수 · 이미지 태그 · CPU·메모리 · 환경변수만 바꿔요.", **common)
     if isinstance(change, Other):
         return Route("kubectl", f"'{change.description}' 은 PR 로 못 바꿔요. PR 로는 레플리카 수 · 이미지 태그 · "
                                 "CPU·메모리 · 환경변수를 바꾸고, plain YAML 앱이면 그 밖의 칸도 경로 지정 변경"

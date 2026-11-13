@@ -89,10 +89,10 @@ def resource_risks(obj: dict, key: Key, file: str, destination: str | None, *, p
                                "컨테이너가 root(UID 0)로 돌아요. 컨테이너가 뚫리면 노드 쪽 피해가 커져요.",
                                "root 가 아닌 UID 로 돌리고 runAsNonRoot: true 를 함께 두세요."))
         elif leaf in ("hostNetwork", "hostPID", "hostIPC") and value is True:
-            what = {"hostNetwork": "네트워크", "hostPID": "프로세스 목록", "hostIPC": "프로세스 간 통신(IPC)"}[leaf]
+            what = {"hostNetwork": "네트워크를", "hostPID": "프로세스 목록을", "hostIPC": "프로세스 간 통신(IPC)을"}[leaf]
             found.append(risk({"hostNetwork": "host_network", "hostPID": "host_pid", "hostIPC": "host_ipc"}[leaf],
                                file, resource, field, "true",
-                               f"파드가 노드의 {what}을 그대로 써요. 노드와 다른 파드와의 격리를 받지 못해요.",
+                               f"파드가 노드의 {what} 그대로 써요. 노드와 다른 파드와의 격리를 받지 못해요.",
                                "hostNetwork 를 빼고 Service 로 열어 주세요." if leaf == "hostNetwork"
                                else f"{leaf} 를 빼 주세요."))
         elif leaf == "serviceAccountName" and isinstance(value, str) and value and value != "default":

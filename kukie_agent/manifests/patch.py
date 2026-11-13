@@ -38,11 +38,12 @@ from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 from kukie_agent.manifests import compare
 from kukie_agent.manifests.compare import FieldPath, brief, show
 from kukie_agent.manifests.models import Patch, PatchOperation
-from kukie_agent.manifests.yamlfile import remove_item
+from kukie_agent.manifests.yamlfile import remove_item, remove_key
 
-#: 바꾸면 ArgoCD 가 리소스를 알아보지 못한다 (argocd.py 의 추적 표시)
+#: ArgoCD 가 리소스를 알아보는 표시 (argocd.py). ArgoCD 가 apply 때 채우는 칸이라 git 에 적을 까닭이 없다.
+#: app.kubernetes.io/instance 레이블은 막지 않는다 — label 추적이면 ArgoCD 가 apply 때 앱 이름으로 덮어쓰고,
+#: annotation 추적(v3 기본)이면 평범한 레이블이다. 어느 쪽인지는 레포만 봐서는 모른다
 TRACKING_ANNOTATION = "argocd.argoproj.io/tracking-id"
-TRACKING_LABEL = "app.kubernetes.io/instance"
 #: 만든 뒤 바꿀 수 없는 칸 — 종류별. 바꾸면 apply 가 거절돼 sync 가 실패한다 (지우고 다시 만들어야 한다)
 IMMUTABLE: dict[str, tuple[FieldPath, ...]] = {
     "Deployment": (("spec", "selector"),),
@@ -143,11 +144,16 @@ def check_paths(change: Patch) -> Parsed:
 
 def guarded(kind: str, before: dict, after: dict) -> str | None:
     """지금 → 기대값에서 바뀌면 안 되는 칸이 바뀌었으면 그 이유."""
-    for side in ("annotations", "labels"):
-        name = TRACKING_ANNOTATION if side == "annotations" else TRACKING_LABEL
-        if compare.value_at(before, ("metadata", side, name)) != compare.value_at(after, ("metadata", side, name)):
-            return (f"metadata.{side}[\"{name}\"] 는 ArgoCD 가 이 리소스를 알아보는 표시예요 — 바꾸면 ArgoCD 가 "
-                    "이 리소스를 놓쳐요")
+    path = ("metadata", "annotations", TRACKING_ANNOTATION)
+    if compare.value_at(before, path) != compare.value_at(after, path):
+        return (f"metadata.annotations[\"{TRACKING_ANNOTATION}\"] 는 ArgoCD 가 이 리소스를 알아보는 표시예요 — "
+                "ArgoCD 가 채우는 칸이라 git 에 적지 않아요")
+    if kind == "Pod":
+        changed = [p for p in compare.diff_paths(before.get("spec"), after.get("spec"))
+                   if not _pod_mutable(p)]
+        if changed:
+            return (f"Pod 의 spec.{show(changed[0])} 는 만든 뒤 바꿀 수 없는 칸이에요 — 머지해도 쿠버네티스가 거절해 sync 가 "
+                    "실패해요. Pod 는 이미지 · activeDeadlineSeconds 만 바꿀 수 있어요. Deployment 로 옮기는 것을 권해요")
     for path in IMMUTABLE.get(kind, ()):
         if compare.value_at(before, path) != compare.value_at(after, path):
             return (f"{kind} 의 {show(path)} 는 만든 뒤 바꿀 수 없는 칸이에요 — 머지해도 쿠버네티스가 거절해 sync 가 "
@@ -165,6 +171,13 @@ def guarded(kind: str, before: dict, after: dict) -> str | None:
             if before.get(section) != after.get(section):
                 return f"이 {kind} 는 immutable 이라 {section} 를 바꿀 수 없어요 — 새 이름으로 만들어야 해요"
     return None
+
+
+def _pod_mutable(path: FieldPath) -> bool:
+    """Pod spec 중 만든 뒤에도 바꿀 수 있는 칸 — 컨테이너 이미지와 activeDeadlineSeconds (tolerations 는 더하기만 돼 막는다)."""
+    if path == ("activeDeadlineSeconds",):
+        return True
+    return len(path) == 3 and path[0] in ("containers", "initContainers") and path[2] == "image"
 
 
 def selects(selector: dict, labels: dict) -> bool:
@@ -232,21 +245,24 @@ def apply(obj: Any, parsed: Parsed, *, ruamel: bool = False) -> None:
             else:
                 if not isinstance(parent, dict) or str(last) not in parent:
                     raise PathError(f"'{operation.path}' 칸이 지금 없어요 — 지울 게 없어요")
-                del parent[str(last)]
+                if ruamel:
+                    remove_key(parent, str(last))
+                else:
+                    del parent[str(last)]
 
 
 def _walk(obj: Any, parts: tuple[Key | Named, ...], path: str) -> Any:
     here = obj
     for depth, part in enumerate(parts):
-        where = show(field_path(parts[:depth + 1]))
         if isinstance(part, Named):
             if not isinstance(here, list):
-                raise PathError(f"'{path}' 의 {where} 는 목록이 아니에요")
+                raise PathError(f"'{path}' 의 {show(field_path(parts[:depth + 1]))} 는 목록이 아니에요")
             here = here[_index(here, part, path)]
         else:
             if not isinstance(here, dict) or str(part) not in here:
+                where = show(field_path(parts[:depth + 1]))
                 raise PathError(f"'{path}' 의 위 칸 {where} 가 지금 없어요 — 오타가 아니라면 있는 위 칸부터 통째로 set 하세요"
-                                f" (예: {show(field_path(parts[:depth + 1]))} 를 새 값으로)")
+                                f" (예: {where} 를 새 값으로)")
             here = here[str(part)]
     return here
 
@@ -276,11 +292,23 @@ def _remove_seq_item(doc: Any, list_parts: tuple[Key | Named, ...], index: int) 
 def _block(value: Any) -> Any:
     """새 값을 레포 모양(block)으로 쓰게 ruamel 자료형으로 바꾼다."""
     if isinstance(value, dict):
-        return CommentedMap((str(k), _block(v)) for k, v in value.items())
+        return CommentedMap((_scalar(str(k)), _block(v)) for k, v in value.items())
     if isinstance(value, list):
         return CommentedSeq(_block(v) for v in value)
-    if isinstance(value, str) and "\n" not in value and _read_back(value) != value:
-        # ruamel 은 YAML 1.2 라 yes·on·off·y 를 따옴표 없이 쓴다. 렌더(PyYAML)와 ArgoCD(go-yaml)는 1.1 이라 참거짓으로 읽는다
+    if isinstance(value, str):
+        return _scalar(value)
+    return value
+
+
+#: go-yaml v2(ArgoCD · sigs.k8s.io/yaml)가 참거짓으로 읽는 낱말 — PyYAML 은 y·n 을 문자열로 읽어 렌더 비교로는 안 보인다
+_GO_YAML_BOOLS = frozenset({"y", "Y", "yes", "Yes", "YES", "n", "N", "no", "No", "NO", "on", "On", "ON",
+                            "off", "Off", "OFF", "true", "True", "TRUE", "false", "False", "FALSE"})
+
+
+def _scalar(value: str) -> str:
+    """ruamel 은 YAML 1.2 라 yes·on·off·y 를 따옴표 없이 쓴다. 렌더(PyYAML)와 ArgoCD(go-yaml)는 1.1 이라 참거짓으로
+    읽는다 — 다시 읽어 같은 문자열이 아니게 될 낱말은 따옴표로 쓴다 (키도 같다)."""
+    if "\n" not in value and (value in _GO_YAML_BOOLS or _read_back(value) != value):
         return DoubleQuotedScalarString(value)
     return value
 

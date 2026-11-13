@@ -214,12 +214,17 @@ def _prepare_patch(ctx: Context, hpa: str | None) -> Context | Refused:
 
 
 def _plaintext_secret(before: dict, after: dict) -> bool:
-    """평문 비밀이 새로 들어가는지 — 넷의 env 요청(_check_env)과 같은 규칙을 모든 컨테이너 목록(init · ephemeral)과
-    종류(Pod · 커스텀 리소스)에. 비밀처럼 보이는 이름에 평문 값이 새로 생기거나, Secret 에서 가져오던 항목이 바뀌거나 사라지면 막는다."""
+    """평문 비밀이 새로 들어가는지 — 모든 컨테이너 목록(init · ephemeral)과 종류(Pod · 커스텀 리소스)를 본다.
+    비밀처럼 보이는 이름에 평문 값이 새로 생기거나, Secret 에서 가져오던 항목이 평문 값(value)으로 바뀌면 막는다.
+    그 항목을 지우거나 다른 Secret 을 가리키게 하는 것은 평문이 git 에 남지 않아 막지 않는다 (컨테이너 지우기 등)."""
     old = risks.plaintext_env(before)
     if any(old.get(path) != value for path, value in risks.plaintext_env(after).items()):
         return True
-    return any(compare.value_at(before, path) != compare.value_at(after, path) for path in risks.secret_refs(before))
+    for path in risks.secret_refs(before):
+        item = compare.value_at(after, path)
+        if isinstance(item, dict) and item.get("value") not in (None, ""):
+            return True
+    return False
 
 
 def _secret() -> Refused:
@@ -376,7 +381,7 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
                                "그 폴더 안에서만 고쳐 주세요.")
 
     label = compare.label(ctx.key)
-    risks = _patch_risks(ctx, after[ctx.key], sorted(files)[0]) if isinstance(ctx.change, Patch) else []
+    introduced = _patch_risks(ctx, after[ctx.key], sorted(files)[0]) if isinstance(ctx.change, Patch) else []
     return Ready(
         files=files,
         file_diff="".join(
@@ -384,8 +389,8 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
             for p in sorted(files)),
         render_diff=compare.unified(compare.dump(ctx.obj), compare.dump(after[ctx.key]),
                                     f"{label} (지금)", f"{label} (머지 후)"),
-        warnings=[*ctx.warnings, *(risk.text for risk in risks)],
-        risk_warnings=risks,
+        warnings=[*ctx.warnings, *(risk.text for risk in introduced)],
+        risk_warnings=introduced,
     )
 
 
