@@ -235,6 +235,8 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await gitops_after_merge.stop()
+        from kukie_agent import conversations_api   # 순환 import — 이 파일 끝에서 라우터로 붙는다
+        await conversations_api.stop_failure_retries()
         await server_api.close()
 
 

@@ -58,6 +58,10 @@ STALE_MESSAGE = "결과를 저장하지 못해 중단된 요청이다 — 새 �
 #: PR 머지 승인이 답을 기다리는 시간(초). 앞단(CloudFront origin_read_timeout 60초)이 끊기 전에 답한다 (DURO-158).
 #: 대개는 머지와 모델의 답까지 이 안에 끝난다 — 넘으면 일은 뒤에서 마저 하고 202 로 먼저 답한다
 APPROVE_WAIT = float(os.environ.get("KUKIE_GITOPS_APPROVE_WAIT") or 45)
+#: 실패 표시(failed)를 Kukie API 서버에 못 남겼을 때 뒤에서 다시 남기는 간격(초). server 는 배포 때(Recreate, 1개)
+#: 1~2분 비어 약 5분을 기다린다. 그래도 못 남기면 running 이 남고 다음 chat·재전송·재시작 복원이 닫는다
+FAIL_RETRY_SECONDS: tuple[float, ...] = (2, 5, 10, 20, 30, 60, 60, 60, 60)
+_fail_retries: set[asyncio.Task[None]] = set()
 
 
 # ── 요청 본문 ──────────────────────────────────────────────
@@ -276,10 +280,55 @@ async def chat(
 async def _fail_run(run: server_api.Run, exc: HTTPException) -> None:
     """실행이 실패한 run 을 failed 로 남긴다. 이것마저 못 남기면 로그만 — 원래 오류를 덮지 않는다.
     running 으로 남은 run 은 다음 chat(잠금 안의 정리)이나 같은 request_id 재전송이 닫는다."""
+    fields = dict(status="failed", response_payload=_error_record(exc))
     try:
-        await server_api.update_run(run.id, status="failed", response_payload=_error_record(exc))
-    except Exception:
+        await server_api.update_run(run.id, **fields)
+    except Exception as failure:
         logger.exception("실패 기록도 저장하지 못했다 (run=%s)", run.id)
+        _retry_failure_later(run.id, fields, failure)
+
+
+def _retry_failure_later(run_id: str, fields: dict[str, Any], exc: Exception) -> None:
+    """실패 표시를 Kukie API 서버가 돌아올 때까지 뒤에서 다시 남긴다.
+
+    앱은 기록에 running 턴이 있으면 입력을 막는다. 그래서 server 배포로 잠깐 닿지 못해 running 이 남으면, 다음 chat 이
+    남은 run 을 닫는 길에 사용자가 닿지 못하고 방이 "처리 중" 에 갇힌다 (2026-11-13 dev member 재배포).
+
+    종료 상태만 다시 쓴다. server 는 상태 전이를 막지 않아, 그 사이 다른 길(다음 chat·재전송·재시작 복원)이 닫은
+    run 을 활성(awaiting_approval·recovery_required)으로 되살리면 안 된다. 종료 → 종료(interrupted → failed)는 방을 잠그지 않는다.
+    """
+    if fields.get("status") in server_api.RUN_ACTIVE or not _unreachable(exc):
+        return
+    task = asyncio.create_task(_save_failure_later(run_id, fields))
+    _fail_retries.add(task)
+    task.add_done_callback(_fail_retries.discard)
+
+
+def _unreachable(exc: Exception) -> bool:
+    """server 에 닿지 못했거나 server 가 5xx 로 답했다 — 기다리면 될 수 있다. 4xx 는 다시 해도 같다."""
+    return isinstance(exc, server_api.ServerError) and (exc.code == "SERVER_UNAVAILABLE" or exc.status_code >= 500)
+
+
+async def _save_failure_later(run_id: str, fields: dict[str, Any]) -> None:
+    for delay in FAIL_RETRY_SECONDS:
+        await asyncio.sleep(delay)
+        try:
+            await server_api.update_run(run_id, **fields)
+        except Exception as exc:
+            if _unreachable(exc):
+                continue
+            logger.exception("실패 표시를 뒤늦게 남기다 그만뒀다 (run=%s)", run_id)
+            return
+        logger.warning("server 가 돌아와 실패 표시를 뒤늦게 남겼다 (run=%s)", run_id)
+        return
+    logger.error("실패 표시를 끝내 남기지 못했다 (run=%s) — 다음 chat·재전송·재시작 복원이 닫는다", run_id)
+
+
+async def stop_failure_retries() -> None:
+    """끌 때 기다리던 다시 남기기를 멈춘다. 남은 running 은 다음 기동의 interrupt-orphaned 가 닫는다."""
+    for task in list(_fail_retries):
+        task.cancel()
+    await asyncio.gather(*_fail_retries, return_exceptions=True)
 
 
 async def _save_or_fail(
@@ -311,13 +360,13 @@ async def _save_or_fail(
         logger.exception("실행 결과 저장 실패 (conversation=%s, run=%s)", conversation_id, run.id)
         if session is not None:
             await repo_link_memo.settle(session.deps, saved=False)   # 메모가 든 기록이 저장되지 않았다 — 칸도 그대로
+        failure = (dict(status=failure_status) if keep_payload
+                   else dict(status=failure_status, response_payload=_error_record(on_failure)))
         try:
-            if keep_payload:
-                await server_api.update_run(run.id, status=failure_status)
-            else:
-                await server_api.update_run(run.id, status=failure_status, response_payload=_error_record(on_failure))
-        except Exception:
+            await server_api.update_run(run.id, **failure)
+        except Exception as unsaved:
             logger.exception("실패 표시도 저장하지 못했다 (run=%s)", run.id)
+            _retry_failure_later(run.id, failure, unsaved)
         # failed 는 종료 상태다 — 메모리의 승인 티켓과 그 턴의 기록도 함께 버린다 (팀원 리뷰 + 자동 리뷰).
         # "server 가 닫았으면 나머지도 닫는다" 하나다. recovery_required·awaiting_approval 은 활성이라 나중에 interrupt 가 지나간다.
         if failure_status not in server_api.RUN_ACTIVE and session is not None:
