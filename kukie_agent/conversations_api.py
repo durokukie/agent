@@ -31,7 +31,7 @@ import dataclasses
 import logging
 import os
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Awaitable, Callable, Iterator
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -285,10 +285,10 @@ async def _fail_run(run: server_api.Run, exc: HTTPException) -> None:
         await server_api.update_run(run.id, **fields)
     except Exception as failure:
         logger.exception("실패 기록도 저장하지 못했다 (run=%s)", run.id)
-        _retry_failure_later(run.id, fields, failure)
+        _retry_failure_later(run, fields, failure)
 
 
-def _retry_failure_later(run_id: str, fields: dict[str, Any], exc: Exception) -> None:
+def _retry_failure_later(run: server_api.Run, fields: dict[str, Any], exc: Exception) -> None:
     """실패 표시를 Kukie API 서버가 돌아올 때까지 뒤에서 다시 남긴다.
 
     앱은 기록에 running 턴이 있으면 입력을 막는다. 그래서 server 배포로 잠깐 닿지 못해 running 이 남으면, 다음 chat 이
@@ -297,32 +297,40 @@ def _retry_failure_later(run_id: str, fields: dict[str, Any], exc: Exception) ->
     종료 상태만 다시 쓴다. server 는 상태 전이를 막지 않아, 그 사이 다른 길(다음 chat·재전송·재시작 복원)이 닫은
     run 을 활성(awaiting_approval·recovery_required)으로 되살리면 안 된다. 종료 → 종료(interrupted → failed)는 방을 잠그지 않는다.
     """
-    if fields.get("status") in server_api.RUN_ACTIVE or not _unreachable(exc):
+    if not FAIL_RETRY_SECONDS or fields.get("status") in server_api.RUN_ACTIVE or not _unreachable(exc):
         return
-    task = asyncio.create_task(_save_failure_later(run_id, fields))
+    task = asyncio.create_task(_save_failure_later(run, fields))
     _fail_retries.add(task)
     task.add_done_callback(_fail_retries.discard)
 
 
 def _unreachable(exc: Exception) -> bool:
-    """server 에 닿지 못했거나 server 가 5xx 로 답했다 — 기다리면 될 수 있다. 4xx 는 다시 해도 같다."""
-    return isinstance(exc, server_api.ServerError) and (exc.code == "SERVER_UNAVAILABLE" or exc.status_code >= 500)
+    """server 에 닿지 못했거나 server 가 5xx 로 답했다 — 기다리면 될 수 있다. 4xx 는 다시 해도 같다.
+    내부 토큰 거절도 503 SERVER_UNAVAILABLE 로 오지만 설정 오류라 기다려도 바뀌지 않는다 (PR #153 리뷰)."""
+    return (isinstance(exc, server_api.ServerError)
+            and (exc.code == "SERVER_UNAVAILABLE" or exc.status_code >= 500)
+            and exc.message != server_api.INTERNAL_AUTH_MISMATCH)
 
 
-async def _save_failure_later(run_id: str, fields: dict[str, Any]) -> None:
+async def _save_failure_later(run: server_api.Run, fields: dict[str, Any]) -> None:
     """쓰기 전에 지금 상태를 다시 읽어 아직 running 일 때만 남긴다 (PR #153 리뷰). 닫힌 run 을 덮어쓰면 두 가지가 깨진다.
       - 결과 저장(completed)이 server 에 들어간 뒤 응답만 끊긴 경우(ReadTimeout 도 SERVER_UNAVAILABLE) — 정상 결과가 failed 가 된다
       - 같은 request_id 재전송이 interrupted 로 닫은 run — 같은 재전송에 다른 응답이 나간다
-    읽기는 빈 PATCH 다 — server 는 준 칸만 바꾸고 run 을 돌려준다. 읽기와 쓰기 사이의 틈은 남는다(server 에 조건부 갱신이 없다).
+    읽기는 빈 PATCH 다 — server 는 준 칸만 바꾸고 run 을 돌려준다. 읽기와 쓰기는 이 방의 잠금 안에서 한다. 이 run 을 닫는
+    다른 길(다음 chat·재전송)도 같은 잠금을 쥐고, replica 가 하나라 그 사이에 끼어들 수 없다. 방이 메모리에 없으면 잠글 것도
+    없다 — 닫는 길이 먼저 방을 복원해야 하고, 재시작이면 이 작업도 함께 사라진다.
     """
+    run_id = run.id
     for delay in FAIL_RETRY_SECONDS:
         await asyncio.sleep(delay)
+        live = registry.get(run.conversation_id)
         try:
-            current = (await server_api.update_run(run_id)).run
-            if current.status != "running":
-                logger.warning("뒤늦은 실패 표시를 그만둔다 — run 이 이미 %s 다 (run=%s)", current.status, run_id)
-                return
-            await server_api.update_run(run_id, **fields)
+            async with live.lock if live is not None else nullcontext():
+                current = (await server_api.update_run(run_id)).run
+                if current.status != "running":
+                    logger.warning("뒤늦은 실패 표시를 그만둔다 — run 이 이미 %s 다 (run=%s)", current.status, run_id)
+                    return
+                await server_api.update_run(run_id, **fields)
         except Exception as exc:
             if _unreachable(exc):
                 continue
@@ -375,7 +383,7 @@ async def _save_or_fail(
             await server_api.update_run(run.id, **failure)
         except Exception as unsaved:
             logger.exception("실패 표시도 저장하지 못했다 (run=%s)", run.id)
-            _retry_failure_later(run.id, failure, unsaved)
+            _retry_failure_later(run, failure, unsaved)
         # failed 는 종료 상태다 — 메모리의 승인 티켓과 그 턴의 기록도 함께 버린다 (팀원 리뷰 + 자동 리뷰).
         # "server 가 닫았으면 나머지도 닫는다" 하나다. recovery_required·awaiting_approval 은 활성이라 나중에 interrupt 가 지나간다.
         if failure_status not in server_api.RUN_ACTIVE and session is not None:

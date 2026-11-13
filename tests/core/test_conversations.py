@@ -456,7 +456,8 @@ def test_기동_정리가_실패해도_서버는_뜬다(fake_server, monkeypatch
 # ── 저장 실패 ──────────────────────────────────────────────
 
 def _failure_retry_run(fake_server, monkeypatch, *, down: int, status: str = "failed",
-                       error: ServerError | None = None, closed_meanwhile: str | None = None) -> tuple[str, list[str]]:
+                       error: ServerError | None = None, closed_meanwhile: str | None = None,
+                       wrap=None) -> tuple[str, list[str]]:
     """실패 표시가 처음 down 번 server 에 닿지 못할 때, 뒤에서 다시 남기기를 끝까지 돌린다. (방, 부를 때마다 결과)
     closed_meanwhile 이면 server 가 돌아오기 전에 그 run 이 그 상태로 닫혀 있다 (다른 길이 닫았거나, 첫 저장이 들어갔다)."""
     from kukie_agent import conversations_api
@@ -465,7 +466,7 @@ def _failure_retry_run(fake_server, monkeypatch, *, down: int, status: str = "fa
     room = new_room(fake_server)
     fake_server.put_run(room, request_id="r-down", input_text="머지 뒤 질문")
     run = server_api.Run.from_json(fake_server.active_run_of(room))
-    original = server_api.update_run
+    original = wrap or server_api.update_run
     tries: list[str] = []
     fail = error or ServerError(503, "SERVER_UNAVAILABLE", "Kukie API 서버에 연결할 수 없다: ConnectError")
 
@@ -517,6 +518,45 @@ def test_뒤에서_다시_남기는_것은_종료_상태뿐이다(fake_server, m
     room, tries = _failure_retry_run(fake_server, monkeypatch, down=2, status="recovery_required")
     assert tries == ["down", "down"]                          # 결과 저장 + 대체 쓰기. 뒤에서는 다시 하지 않는다
     assert _statuses(fake_server, room) == ["running"]
+
+
+def test_뒤늦은_실패_표시의_읽기와_쓰기는_방의_잠금_안에서_한다(fake_server, monkeypatch):
+    """PR #153 리뷰: 같은 request_id 재전송도 이 잠금을 쥐고 run 을 닫는다 — 읽고 쓰는 사이에 끼어들지 못하게."""
+    from kukie_agent import conversations_api
+
+    lock = asyncio.Lock()
+    held: list[bool] = []
+    monkeypatch.setattr(conversations_api.registry, "get", lambda conversation_id: SimpleNamespace(lock=lock))
+    original = server_api.update_run
+
+    async def watching(run_id, **fields):
+        held.append(lock.locked())
+        return await original(run_id, **fields)
+
+    room, tries = _failure_retry_run(fake_server, monkeypatch, down=1, wrap=watching)
+    assert tries == ["down", "read", "saved"]
+    assert held == [True, True]                               # 뒤에서 한 읽기·쓰기 둘 다 잠금 안
+    assert _statuses(fake_server, room) == ["failed"]
+
+
+def test_내부_토큰_거절은_다시_하지_않는다(fake_server, monkeypatch):
+    """PR #153 리뷰: 내부 토큰 거절도 503 SERVER_UNAVAILABLE 로 오지만 기다려도 바뀌지 않는다."""
+    room, tries = _failure_retry_run(fake_server, monkeypatch, down=1, error=ServerError(
+        503, "SERVER_UNAVAILABLE", server_api.INTERNAL_AUTH_MISMATCH))
+    assert tries == ["down"]
+    assert _statuses(fake_server, room) == ["running"]
+
+
+def test_간격이_비어_있으면_뒤에서_돌_작업을_만들지_않는다(fake_server, monkeypatch):
+    """PR #153 리뷰: conftest 가 간격을 비운 테스트에서도 작업이 생겨 '끝내 남기지 못했다' 로그가 거짓으로 남았다."""
+    from kukie_agent import conversations_api
+
+    room = new_room(fake_server)
+    fake_server.put_run(room, request_id="r-down", input_text="질문")
+    run = server_api.Run.from_json(fake_server.active_run_of(room))
+    conversations_api._retry_failure_later(run, {"status": "failed"},
+                                           ServerError(503, "SERVER_UNAVAILABLE", "down"))
+    assert not conversations_api._fail_retries
 
 
 def test_server_가_거절한_실패_표시는_다시_하지_않는다(fake_server, monkeypatch):
