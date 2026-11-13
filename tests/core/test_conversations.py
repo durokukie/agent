@@ -16,10 +16,11 @@ from fastapi.testclient import TestClient
 from pydantic_ai import ModelResponse
 from pydantic_ai.messages import ModelRequest, ToolCallPart, UserPromptPart
 from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import DeferredToolRequests
 
 from helpers import OTHER, USER, answer_model, chat_model, new_room, scale_call, sync, waiting_plan
-from kukie_agent import conversations, server, server_api
+from kukie_agent import conversations, server, server_api, title
 from kukie_agent.agent import agent
 from kukie_agent.auth import User
 from kukie_agent.server_api import ServerError
@@ -372,6 +373,31 @@ def test_chat은_첫_마디를_제목_후보로_보내고_mode_입력은_보내�
     sent = [c.get("title_from") for name, c in fake_server.calls if name == "update_run"]
     assert sent == [None, "nginx 를 4개로 늘려줘", "두 번째 질문"]
     assert fake_server.conversation(room)["title"] == "nginx 를 4개로 늘려줘"   # 한 번만 정해진다
+
+
+def test_첫_마디면_모델이_지은_제목을_함께_보낸다(client, fake_server):
+    """제목 모델은 답과 동시에 돈다. 지은 제목은 run 기록과 함께 title 로 가고, 이미 이름이 있으면 부르지 않는다."""
+    room = new_room(fake_server)
+    namer = TestModel(custom_output_text="  ArgoCD sync\n실패 원인 ")
+    with agent.override(model=answer_model("답변입니다.")), title.title_agent.override(model=namer):
+        _say(client, room, "마지막 sync 실패한 거 왜 그래")
+        _say(client, room, "두 번째 질문")
+    sent = [c.get("title") for name, c in fake_server.calls if name == "update_run"]
+    assert sent == ["ArgoCD sync 실패 원인", None]                      # 두 번째는 이미 이름이 있어 안 부른다
+    assert fake_server.conversation(room)["title"] == "ArgoCD sync 실패 원인"
+
+
+def test_제목_모델이_실패해도_답은_나가고_첫_마디로_짓는다(client, fake_server):
+    room = new_room(fake_server)
+
+    async def boom(messages, info):
+        raise RuntimeError("제목 모델 죽음")
+
+    with agent.override(model=answer_model("답변입니다.")), title.title_agent.override(model=FunctionModel(boom)):
+        response = _say(client, room, "파드 몇개있음")
+    assert response.status_code == 200
+    assert [c.get("title") for name, c in fake_server.calls if name == "update_run"] == [None]
+    assert fake_server.conversation(room)["title"] == "파드 몇개있음"
 
 
 # ── 채팅방 독립성 · 복원 ───────────────────────────────────

@@ -123,7 +123,7 @@ kind 클러스터 E2E: `KUKIE_E2E_CONTEXT=kind-<name> python -m pytest -m e2e` �
 | `KUKIE_INTERNAL_TOKEN` | 내부 API 토큰 — kukie-server 의 `KUKIE_INTERNAL_TOKEN` 과 같은 값. 위 둘 중 하나라도 없으면 대화 경로는 503 |
 | `KUKIE_DEV_AUTH`, `KUKIE_DEV_USER` | server 없이 로컬 개발 — flat 엔드포인트(`/session` `/chat` `/approve` `/resume`)만 열린다. 계획은 `~/.kukie/plans` 의 `.md` 로만 남는다 |
 | `KUKIE_ACCESS_COOKIE` | 웹 access 쿠키 이름 (기본 `kukie_access`, kukie-server 와 같아야 한다) |
-| `KUKIE_MODEL`, `KUKIE_GUIDANCE_MODEL`, 각 제공사 API 키 | 메인 에이전트·판단 가이드 모델 |
+| `KUKIE_MODEL`, `KUKIE_GUIDANCE_MODEL`, `KUKIE_TITLE_MODEL`, 각 제공사 API 키 | 메인 에이전트·판단 가이드·대화 제목 모델 (제목은 비우면 판단 가이드 모델) |
 
 없어진 변수: `KUKIE_DATABASE_URL`(agent 에 DB 가 없다), `KUKIE_SECRET_KEY`·`KUKIE_ALLOW_LOCAL_CLUSTER`(자격증명 암호화와 kubeconfig 검사가 kukie-server 로 옮겨 가 그쪽 `KUKIE_CREDENTIAL_KEY`·`KUKIE_ALLOW_LOCAL_CLUSTER` 가 됐다), `KUKIE_MEMBER_URL`(`KUKIE_SERVER_URL` 이 대신한다).
 

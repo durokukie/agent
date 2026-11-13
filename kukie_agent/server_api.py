@@ -382,18 +382,19 @@ async def start_run(
 async def update_run(
     run_id: str, *, status: str | None = None, response_payload: dict[str, Any] | None = None,
     append_agent_messages: list[Any] | None = None, usage_summary: dict[str, Any] | None = None,
-    title_from: str | None = None,
+    title_from: str | None = None, title: str | None = None,
 ) -> RunUpdate:
     """run 갱신 한 번. 준 칸만 바꾼다 (None = 그대로).
 
     server 가 한 트랜잭션에서 한다: 종료 상태면 finishedAt + 열린 plan 마감(결정 있고 결과 없음 → UNKNOWN,
-    나머지 → EXPIRED), title_from 이면 첫 마디로 제목 짓기 (기본 제목일 때만).
+    나머지 → EXPIRED), title_from 이면 첫 마디로 제목 짓기 (기본 제목일 때만). title 은 모델이 지은 후보로,
+    server 가 쓸 만하면 title_from 대신 쓴다 (title_from 과 함께일 때만 본다).
     agent_messages 는 기존 배열 뒤에 **이어 붙인다** — 승인·재개가 같은 run 을 이어 쓰기 때문이다.
     """
     body: dict[str, Any] = {}
     for key, value in (
         ("status", status), ("responsePayload", response_payload), ("appendAgentMessages", append_agent_messages),
-        ("usageSummary", usage_summary), ("titleFrom", title_from),
+        ("usageSummary", usage_summary), ("titleFrom", title_from), ("title", title),
     ):
         if value is not None:
             body[key] = value
