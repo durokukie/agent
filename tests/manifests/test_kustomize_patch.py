@@ -121,6 +121,18 @@ def test_같은_리소스를_다시_바꾸면_그_patch_파일을_다시_쓴다(
 
 
 @needs_kustomize
+def test_뒤에_다른_patch_가_걸렸으면_다시_쓸_때_맨_뒤로_옮긴다(repo):
+    from kukie_agent.manifests import Env
+    first = ready(plan_change(repo, PROD, API, ops(("set", f"{CONTAINER}.env[STAGE].value", "a"))))
+    write(repo, first.files)
+    second = ready(plan_change(repo, PROD, API, Env(container="api", values={"STAGE": "b"})))
+    write(repo, second.files)
+    third = ready(plan_change(repo, PROD, API, ops(("set", f"{CONTAINER}.env[STAGE].value", "c"))))
+    paths = [p["path"] for p in yaml.safe_load(third.files[KUSTOMIZATION])["patches"]]
+    assert paths == ["env.yaml", "kukie-deployment-api-env.yaml", "kukie-deployment-api-patch.yaml"]
+
+
+@needs_kustomize
 def test_Service_같은_다른_종류도_된다(repo):
     result = ready(plan_change(repo, PROD, SVC, ops(("set", "spec.type", "NodePort"))))
     assert f"{OVERLAY}/kukie-service-api-patch.yaml" in result.files

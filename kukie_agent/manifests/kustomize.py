@@ -239,6 +239,14 @@ def _general_patch(ctx: Context, kustomization: Any, file: Path) -> dict[str, st
     doc = CommentedMap([("apiVersion", ctx.target.api_version), ("kind", ctx.target.kind), ("metadata", metadata)])
     for key, value in diff.items():
         doc[key] = value
+    patches = kustomization.get("patches") or []
+    mine = [p for p in patches if isinstance(p, dict) and p.get("path") == name]
+    if mine and patches[-1] is not mine[-1]:
+        # 그 뒤에 다른 patch(넷의 env · resources 등)가 걸렸으면 맨 뒤로 옮긴다 — 파일은 "이 patch 를 뺀 렌더" 기준이라
+        # 뒤에 남은 patch 가 같은 칸을 다시 덮으면 기대값과 달라진다 (agent#159 리뷰)
+        for entry in mine:
+            patches.remove(entry)
+        patches.append(mine[-1])
     _add_patch(kustomization, name, ctx, target_name)
     return {ctx.relative(path): _dump(doc, _HEADER.format(kind=ctx.target.kind, name=ctx.target.name))}
 
