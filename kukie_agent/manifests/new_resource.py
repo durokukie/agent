@@ -8,7 +8,8 @@
   - 값이 든 Secret · 레포 밖을 끌어올 수 있는 Kustomize 설정(Kustomization 종류, 레포에 이미 있는 원격 resources 는 렌더가 거절한다)
   - 앱의 ArgoCD 프로젝트(AppProject spec.destinations)가 허락하지 않는 네임스페이스 — 머지하면 sync 가 통째로 실패해 그 앱의
     다른 변경까지 막힌다 (DURO-240). 프로젝트를 못 읽었거나 판단이 안 서면 막지 않고 경고에 그렇게 적는다
-그 밖에 봐 둘 것(클러스터 범위 · 다른 네임스페이스 · privileged · hostPath · hostNetwork · latest·태그 없는 이미지)은 경고로 올린다.
+그 밖에 봐 둘 것(클러스터 범위 · 다른 네임스페이스 · privileged · 권한 상승 · capabilities · root · hostPath ·
+hostNetwork·PID·IPC · 서비스 계정 · latest·태그 없는 이미지)은 경고로 올린다. 이 목록(_risks)은 경로 지정 변경(DURO-249)도 같이 쓴다.
 경고는 렌더 결과를 본다 — Kustomize 가 네임스페이스·이미지 태그를 바꾸면 바뀐 값이 클러스터에 올라갈 값이다.
 
 레포 폴더는 읽기만 한다 — 고친 내용은 결과(Ready.files)로만 나간다. git · GitHub · PR 은 이 모듈 밖이다.
@@ -440,10 +441,33 @@ def _risks(obj: dict, key: Key, file: str, destination: str | None, *, project: 
             found.append(_risk("privileged", file, resource, field, "true",
                                "이 컨테이너가 노드의 거의 모든 권한을 가져요. 뚫리면 노드 전체와 그 위의 다른 파드까지 위험해요.",
                                "privileged 를 빼고, 꼭 필요한 권한만 securityContext.capabilities.add 로 주세요."))
-        elif leaf == "hostNetwork" and value is True:
-            found.append(_risk("host_network", file, resource, field, "true",
-                               "파드가 노드의 네트워크를 그대로 써요. 포트가 겹칠 수 있고 네트워크 격리를 받지 못해요.",
-                               "hostNetwork 를 빼고 Service 로 열어 주세요."))
+        elif leaf == "allowPrivilegeEscalation" and value is True and parent == "securityContext":
+            found.append(_risk("privilege_escalation", file, resource, field, "true",
+                               "컨테이너 안의 프로세스가 처음보다 큰 권한(setuid 등)을 얻을 수 있어요.",
+                               "allowPrivilegeEscalation 을 false 로 두세요."))
+        elif leaf == "add" and parent == "capabilities" and isinstance(value, list) and value:
+            found.append(_risk("capabilities", file, resource, field, ", ".join(map(str, value)),
+                               "컨테이너에 리눅스 권한(capability)을 더 줘요. SYS_ADMIN · NET_ADMIN 같은 것은 노드까지 닿을 수 있어요.",
+                               "정말 필요한 것만 남기고, 가능하면 drop: [ALL] 과 함께 쓰세요."))
+        elif leaf == "runAsUser" and value == 0 and parent == "securityContext":
+            found.append(_risk("run_as_root", file, resource, field, "0",
+                               "컨테이너가 root(UID 0)로 돌아요. 컨테이너가 뚫리면 노드 쪽 피해가 커져요.",
+                               "root 가 아닌 UID 로 돌리고 runAsNonRoot: true 를 함께 두세요."))
+        elif leaf in ("hostNetwork", "hostPID", "hostIPC") and value is True:
+            what = {"hostNetwork": "네트워크", "hostPID": "프로세스 목록", "hostIPC": "프로세스 간 통신(IPC)"}[leaf]
+            found.append(_risk({"hostNetwork": "host_network", "hostPID": "host_pid", "hostIPC": "host_ipc"}[leaf],
+                               file, resource, field, "true",
+                               f"파드가 노드의 {what}을 그대로 써요. 노드와 다른 파드와의 격리를 받지 못해요.",
+                               "hostNetwork 를 빼고 Service 로 열어 주세요." if leaf == "hostNetwork"
+                               else f"{leaf} 를 빼 주세요."))
+        elif leaf == "serviceAccountName" and isinstance(value, str) and value and value != "default":
+            found.append(_risk("service_account", file, resource, field, value,
+                               "파드가 이 서비스 계정의 권한으로 쿠버네티스 API 를 불러요.",
+                               "그 서비스 계정에 붙은 Role·ClusterRole 이 꼭 필요한 만큼인지 확인하세요."))
+        elif leaf == "automountServiceAccountToken" and value is True:
+            found.append(_risk("service_account_token", file, resource, field, "true",
+                               "파드 안에 쿠버네티스 API 토큰이 들어가요. 컨테이너가 뚫리면 그 토큰의 권한을 쓸 수 있어요.",
+                               "API 를 부르지 않는 앱이면 false 로 두세요."))
         elif leaf == "hostPath" and isinstance(value, dict) and holder == "volumes":
             found.append(_risk("host_path", file, resource, field, str(value.get("path") or ""),
                                "파드가 노드의 파일을 직접 읽고 써요. 노드의 설정이나 다른 파드의 데이터가 노출될 수 있어요.",

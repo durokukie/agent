@@ -811,3 +811,47 @@ def test_프로젝트를_못_읽으면_막지_않고_확인하지_못했다고_�
 
     texts = [risk["risk"] for risk in card["gitops"]["risk_warnings"] if risk["code"] == "other_namespace"]
     assert texts and "프로젝트 규칙은 확인하지 못했어요" in texts[0]
+
+
+# ── 경로 지정 변경 (DURO-249) ─────────────────────────────
+
+PATCH_ARGS = {
+    **CHANGE_ARGS,
+    "change": {"what": "patch", "operations": [
+        {"op": "set", "path": "spec.template.spec.containers[web].readinessProbe",
+         "value": {"httpGet": {"path": "/", "port": 80}}},
+        {"op": "set", "path": "spec.template.spec.hostNetwork", "value": True},
+    ]},
+    "intent": "web 에 readinessProbe 를 더하고 hostNetwork 를 켠다.",
+}
+
+
+def test_경로_지정_변경은_PR을_열고_새로_들인_위험을_카드와_Plan과_PR_본문에_싣는다(client, fake_server, room, gh, cluster):
+    card = _card(client, room, PATCH_ARGS)
+
+    pull = gh.pull_of(1)
+    after = gh.commits[pull["head_sha"]]["apps/plain/deployment.yaml"]
+    assert "readinessProbe:" in after and "hostNetwork: true" in after
+    view = card["gitops"]
+    assert view["files"] == ["apps/plain/deployment.yaml"]
+    [risk] = view["risk_warnings"]
+    assert risk["code"] == "host_network" and risk["location"]["field"] == "spec.template.spec.hostNetwork"
+    assert risk["text"] in view["warnings"] and risk["text"] in pull["body"]
+    plan = _plan(fake_server, room)
+    assert plan["payload"]["gitops"]["risk_warnings"] == [risk]
+    assert plan["payload"]["args"]["change"]["operations"][0]["path"].endswith("readinessProbe")
+
+
+def test_위험_없는_경로_지정_변경의_카드에는_경고_칸이_없다(client, fake_server, room, gh, cluster):
+    args = {**PATCH_ARGS, "change": {"what": "patch", "operations": [PATCH_ARGS["change"]["operations"][0]]}}
+    view = _card(client, room, args)["gitops"]
+    assert "risk_warnings" not in view and view["warnings"] == []
+
+
+def test_경로가_틀리면_ModelRetry로_돌려보내고_PR을_만들지_않는다(client, fake_server, room, gh, cluster):
+    args = {**PATCH_ARGS, "change": {"what": "patch", "operations": [
+        {"op": "set", "path": "spec.template.spec.containers[0].ports", "value": []}]}}
+    seen: list = []
+    _chat(client, room, args, seen=seen)
+    assert isinstance(seen[0], RetryPromptPart) and "번호" in str(seen[0].content)
+    assert not gh.pulls

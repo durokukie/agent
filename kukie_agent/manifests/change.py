@@ -19,10 +19,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kukie_agent.manifests import compare, kustomize, plain
+from kukie_agent.manifests import compare, kustomize, patch, plain
 from kukie_agent.manifests.compare import FieldPath, Key
 from kukie_agent.manifests.models import (
-    AppSource, Change, Env, ImageTag, NewResource, Other, Ready, Refused, Replicas, Resources, Target,
+    AppSource, Change, Env, ImageTag, NewResource, Other, Patch, Ready, Refused, Replicas, Resources, RiskWarning,
+    Target,
 )
 from kukie_agent.manifests.render import (
     RenderError, RenderTimeout, kustomization_file, kustomize_roots, render, resolve_inside,
@@ -98,9 +99,14 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
     if isinstance(change, Other):
         return Refused(code="unsupported_change",
                        message=f"'{change.description}' 은 아직 PR 로 못 해요. "
-                               "PR 로는 레플리카 수 · 이미지 태그 · CPU·메모리 · 환경변수만 바꿔요.")
+                               "PR 로는 레플리카 수 · 이미지 태그 · CPU·메모리 · 환경변수를 바꾸고, plain YAML 앱이면 "
+                               "그 밖의 칸도 경로 지정 변경(what=patch)으로 바꿔요.")
     if isinstance(change, NewResource):
         return Refused(code="unsupported_change", message="새 리소스는 plan_new_resource 로 만들어요.")
+    if isinstance(change, Patch) and app.source_type != "Directory":
+        return Refused(code="unsupported_change",
+                       message="경로 지정 변경은 아직 plain YAML(Directory) 앱만 돼요. Kustomize 앱은 PR 로 레플리카 수 · "
+                               "이미지 태그 · CPU·메모리 · 환경변수만 바꿔요.")
     if target.kind == "Secret":
         return _secret()
 
@@ -128,6 +134,9 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
                                f"({', '.join(compare.label(k) for k in keys)}) — namespace 를 알려 주세요.")
     key = keys[0]
     obj = before[key]
+
+    if isinstance(change, Patch):
+        return _prepare_patch(Context(repo, app, app_dir, target, change, before, key, obj, None, ()))
 
     if isinstance(change, Replicas):
         if target.kind not in SCALABLE:
@@ -174,6 +183,45 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
 
     ctx = Context(repo, app, app_dir, target, change, before, key, obj, name, allowed)
     return _check_ignored(ctx)
+
+
+def _prepare_patch(ctx: Context) -> Context | Refused:
+    """경로 지정 변경(DURO-249) — 경로가 이 리소스에 맞는지·바꾸면 안 되는 칸인지를 렌더 결과에 먼저 적용해 본다."""
+    assert isinstance(ctx.change, Patch)
+    try:
+        want = patch.expected(ctx.obj, ctx.change)
+    except patch.PathError as exc:
+        return Refused(code="invalid_patch", retry=True, message=f"{compare.label(ctx.key)}: {exc}.")
+    why = patch.guarded(ctx.target.kind, ctx.obj, want)
+    if why:
+        # kubectl 길로 보내지 않는다 — 같은 변경은 kubectl 로도 실패하거나(만든 뒤 못 바꾸는 칸) ArgoCD 를 깨뜨린다
+        return Refused(code="guarded_field", retry=True, message=f"{compare.label(ctx.key)}: {why}.")
+    if not compare.diff_paths(ctx.obj, want):
+        return _no_change(ctx.target, "그 칸들이 이미 그 값이에요.")
+    if _plaintext_secret(ctx.obj, want, ctx.target.kind):
+        return _secret()
+    for operation in ctx.change.operations:
+        ctx.allowed = patch.field_path(patch.parse(operation.path))
+        checked = _check_ignored(ctx)
+        if isinstance(checked, Refused):
+            return checked
+    ctx.warnings = list(dict.fromkeys(ctx.warnings))
+    return ctx
+
+
+def _plaintext_secret(before: dict, after: dict, kind: str) -> bool:
+    """비밀처럼 보이는 이름의 환경변수에 평문 값이 새로 들어가는지 — 넷의 env 요청과 같은 규칙 (_check_env)."""
+    if kind not in POD_SPEC:
+        return False
+    old = {(c.get("name"), e.get("name")): e for c in containers(before, kind) for e in c.get("env") or []
+           if isinstance(e, dict)}
+    for item in containers(after, kind):
+        for env in item.get("env") or []:
+            if not isinstance(env, dict) or not _SECRETISH.search(str(env.get("name") or "")):
+                continue
+            if env.get("value") and env != old.get((item.get("name"), env.get("name"))):
+                return True
+    return False
 
 
 def _secret() -> Refused:
@@ -324,6 +372,7 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
                                "그 폴더 안에서만 고쳐 주세요.")
 
     label = compare.label(ctx.key)
+    risks = _patch_risks(ctx, after[ctx.key], sorted(files)[0]) if isinstance(ctx.change, Patch) else []
     return Ready(
         files=files,
         file_diff="".join(
@@ -331,8 +380,21 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
             for p in sorted(files)),
         render_diff=compare.unified(compare.dump(ctx.obj), compare.dump(after[ctx.key]),
                                     f"{label} (지금)", f"{label} (머지 후)"),
-        warnings=ctx.warnings,
+        warnings=[*ctx.warnings, *(risk.text for risk in risks)],
+        risk_warnings=risks,
     )
+
+
+def _patch_risks(ctx: Context, after: dict, file: str) -> list[RiskWarning]:
+    """경로 지정 변경이 새로 들인 위험 — 새 리소스와 같은 목록(new_resource._risks)으로 고친 뒤를 보고, 고치기 전에도
+    있던 것은 뺀다. 막지 않고 승인 카드에 올린다 (patch.py 머리말)."""
+    from kukie_agent.manifests.new_resource import _risks   # new_resource 가 이 모듈을 가져다 쓴다 — 순환을 피한다
+
+    def seen(obj: dict) -> list[RiskWarning]:
+        return _risks(obj, ctx.key, file, None)
+
+    old = {(r.code, r.location.field, r.location.value) for r in seen(ctx.obj)}
+    return [r for r in seen(after) if (r.code, r.location.field, r.location.value) not in old]
 
 
 def _compare_app(ctx: Context, after: dict[Key, dict]) -> Refused | None:
@@ -374,8 +436,10 @@ def _describe(key: Key, before: dict[Key, dict], after: dict[Key, dict]) -> str:
 
 def expected_after(ctx: Context) -> dict:
     """지금 렌더 결과에 요청만 그대로 적용한 것 — 고친 뒤 렌더 결과가 이것과 같아야 한다."""
-    obj = copy.deepcopy(ctx.obj)
     change = ctx.change
+    if isinstance(change, Patch):
+        return patch.expected(ctx.obj, change)
+    obj = copy.deepcopy(ctx.obj)
     if isinstance(change, Replicas):
         _child(obj, "spec")["replicas"] = change.count
         return obj
@@ -412,6 +476,8 @@ def _child(parent: dict, key: str) -> dict:
 def _normalized(obj: dict, kind: str) -> dict:
     """빈 env 목록은 없는 것과 같다 — plain 은 `env: []` 로, Kustomize 는 칸을 지워 남길 수 있다."""
     obj = copy.deepcopy(obj)
+    if kind not in POD_SPEC:            # 경로 지정 변경은 컨테이너 없는 종류(Service …)도 고친다
+        return obj
     for item in containers(obj, kind):
         if item.get("env") == []:
             del item["env"]

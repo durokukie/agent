@@ -33,8 +33,17 @@ def propose_git_change(ctx: RunContext[Deps], kind: str, name: str, change: Chan
     """ArgoCD 가 관리하는 리소스를 클러스터에 직접 쓰지 않고, ArgoCD 가 보는 GitHub 레포에 PR 을 올려 바꾼다.
 
     리소스 조회 결과에 "변경은 PR 길" 이라고 나온 리소스(ArgoCD 관리 + 레포 연결됨)를 바꿀 때 kubectl 변경 툴 대신 쓴다.
-    바꿀 수 있는 것은 넷이다 — change 의 what 으로 고른다:
+    change 의 what 으로 고른다. 자주 쓰는 넷은 전용이다:
       replicas(count) · image_tag(tag, container) · resources(container, requests, limits) · env(container, values, remove)
+    그 밖의 칸(포트 · probe · command/args · 라벨·어노테이션 · 볼륨 · nodeSelector · Service 포트 …)은 경로 지정 변경으로 한다:
+      patch(operations=[{op: "set", path, value} | {op: "remove", path}, …])
+      - path 는 리소스 기준이다. 키는 점으로 잇고, 이름(name) 있는 목록 항목은 [이름], 점·슬래시가 든 키는 ["키"]:
+          spec.template.spec.containers[web].readinessProbe · metadata.labels["app.kubernetes.io/part-of"]
+      - 목록을 번호로 가리키지 않는다. 이름 없는 목록(args · ports · tolerations …)은 그 목록 전체를 set 한다
+      - 위 칸이 없으면 위 칸부터 통째로 set 한다. value 는 JSON 값(문자열 · 숫자 · 참거짓 · 맵 · 목록)이다
+      - apiVersion · kind · metadata.name · metadata.namespace 는 못 바꾼다(다른 리소스가 된다). metadata 아래는 labels · annotations 만
+      - plain YAML 앱만 된다. Kustomize 앱은 넷만 된다
+      - privileged · hostPath · 서비스 계정 같은 위험해 보이는 값은 막지 않고 승인 카드에 경고로 올린다
     그 밖의 변경, ArgoCD 가 관리하지 않는 리소스, 레포가 연결되지 않은 리소스는 kubectl 변경 툴로 한다 —
     잘못 부르면 시스템이 이유와 함께 다시 하라고 알려 준다.
 

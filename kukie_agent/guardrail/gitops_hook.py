@@ -18,6 +18,7 @@ kubectl 변경 4종의 훅(guardrail/hook.py)과 같은 틀이다: Plan 은 serv
 
 새 리소스(change.what == new_resource, DURO-154)도 같은 흐름이다. 다른 곳은 셋이다: 길은 요청이 고른 앱으로 정하고,
 고칠 곳 찾기 대신 새 파일을 만들고, 경고(risk_warnings)를 gitops 칸에 싣는다 — 승인이 곧 "이 경고를 보고 승인함" 의 기록이다.
+경로 지정 변경(change.what == patch, DURO-249)은 넷과 같은 흐름이고, 새로 들인 위험이 있으면 같은 risk_warnings 칸에 싣는다.
 """
 from __future__ import annotations
 
@@ -211,6 +212,8 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
     }
     if isinstance(change, NewResource):
         gitops["new_resources"] = draft.new_resources
+    if isinstance(change, NewResource) or draft.risk_warnings:
+        # 새 리소스(DURO-154)와 경로 지정 변경(DURO-249)의 경고 — 승인이 곧 "이 경고를 보고 승인함" 의 기록이다
         gitops["risk_warnings"] = draft.risk_warnings
     plan = await ActionPlan.create_draft(
         run_id=ctx.deps.run_id, call_id=call.tool_call_id, tool=TOOL_NAME, args=plan_args, command=command,

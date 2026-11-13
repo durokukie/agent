@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, Any
 
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
-from kukie_agent.manifests import compare
-from kukie_agent.manifests.models import Env, ImageTag, Refused, Replicas, Resources
+from kukie_agent.manifests import compare, patch
+from kukie_agent.manifests.models import Env, ImageTag, Patch, Refused, Replicas, Resources
 from kukie_agent.manifests.render import plain_files
 from kukie_agent.manifests.workload import POD_SPEC, dig, with_tag
 from kukie_agent.manifests.yamlfile import YamlFile, remove_item
@@ -29,7 +29,11 @@ def propose(ctx: Context) -> dict[str, str] | Refused:
         where = ", ".join(path for path, _, _ in found) or "없음"
         return Refused(code="ambiguous", message=f"{compare.label(ctx.key)} 문서가 {len(found)}개예요({where}).")
     path, parsed, doc = found[0]
-    edit(doc, ctx)
+    try:
+        edit(doc, ctx)
+    except patch.PathError as exc:
+        # 렌더 결과에는 맞았는데 파일 문서에는 안 맞는 경우(같은 리소스가 렌더에서 달라 보일 때) — 다시 고르게 한다
+        return Refused(code="invalid_patch", retry=True, message=f"{path}: {exc}.")
     if not parsed.keeps_shape():
         ctx.warnings.append(f"{path} 는 다시 쓰면 들여쓰기·따옴표 모양이 조금 바뀌어요 — diff 에 같이 보여요.")
     return {path: parsed.dump()}
@@ -38,6 +42,10 @@ def propose(ctx: Context) -> dict[str, str] | Refused:
 def edit(doc: Any, ctx: Context) -> None:
     """ruamel 문서 하나를 요청대로 고친다 (Kustomize patch 파일에도 쓴다)."""
     change = ctx.change
+    if isinstance(change, Patch):
+        # prepare 가 같은 패치를 렌더 결과에 먼저 적용해 봤다 — 경로가 틀렸으면 거기서 걸렸다
+        patch.apply(doc, patch.check_paths(change), ruamel=True)
+        return
     if isinstance(change, Replicas):
         _child(doc, "spec")["replicas"] = change.count
         return

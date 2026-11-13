@@ -6,8 +6,9 @@
 """
 from __future__ import annotations
 
+import json
 import re
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -110,8 +111,36 @@ class Env(BaseModel):
         return self
 
 
+#: 경로 지정 변경 한 번에 바꾸는 칸 수 · 값 하나의 JSON 길이 상한 — 카드와 PR diff 를 사람이 읽을 수 있는 크기로
+PATCH_OPERATIONS = 20
+PATCH_VALUE_LIMIT = 20_000
+
+
+class PatchOperation(BaseModel):
+    """경로 하나 바꾸기. 경로 모양은 manifests/patch.py 머리말."""
+    op: Literal["set", "remove"]
+    path: str = Field(min_length=1, max_length=300)
+    value: Any = None                    # set 일 때 그 칸의 새 값 (JSON 값 그대로 — 문자열·숫자·참거짓·맵·목록)
+
+    @model_validator(mode="after")
+    def _value(self) -> PatchOperation:
+        if self.op == "set" and self.value is None:
+            raise ValueError(f"{self.path}: set 에는 value 가 있어야 해요 — 칸을 없애려면 op 를 remove 로")
+        if self.op == "remove" and self.value is not None:
+            raise ValueError(f"{self.path}: remove 에는 value 를 적지 않아요")
+        if len(json.dumps(self.value, ensure_ascii=False)) > PATCH_VALUE_LIMIT:
+            raise ValueError(f"{self.path}: 값이 너무 커요 (JSON {PATCH_VALUE_LIMIT}자 이하)")
+        return self
+
+
+class Patch(BaseModel):
+    """정해진 넷 밖의 칸을 경로로 바꾸는 요청 (DURO-249). 지금은 plain YAML(Directory) 앱만 — Kustomize 는 DURO-251."""
+    what: Literal["patch"] = "patch"
+    operations: list[PatchOperation] = Field(min_length=1, max_length=PATCH_OPERATIONS)
+
+
 class Other(BaseModel):
-    """처음 지원하는 넷(레플리카·이미지 태그·resources·환경변수) 밖의 요청."""
+    """지원하는 요청(넷 + 경로 지정 변경) 밖의 요청."""
     what: Literal["other"] = "other"
     description: str
 
@@ -125,7 +154,7 @@ class NewResource(BaseModel):
     file_name: str | None = None                # 앱 폴더 기준 새 파일 이름. 비우면 첫 리소스 이름으로 짓는다
 
 
-Change = Annotated[Replicas | ImageTag | Resources | Env | Other | NewResource, Field(discriminator="what")]
+Change = Annotated[Replicas | ImageTag | Resources | Env | Patch | Other | NewResource, Field(discriminator="what")]
 
 # 못 하는 이유. retry 가 True 면 고칠 곳을 다시 골라 볼 만하다(툴이 ModelRetry 로 이어 붙인다),
 # False 면 PR 로는 못 하는 일이라 kubectl + 경고 길로 간다 (설계 문서 3절).
@@ -148,6 +177,8 @@ RefuseCode = Literal[
     "resource_exists",      # 새로 만들려는 리소스가 이미 앱에 있다
     "kustomize_config",     # 레포 밖을 끌어올 수 있는 Kustomize 설정을 새로 더하려 했다
     "project_denied",       # 앱의 ArgoCD 프로젝트가 허락하지 않는 네임스페이스 — 머지해도 sync 가 실패한다 (DURO-240)
+    "invalid_patch",        # 경로 지정 변경의 경로가 틀렸거나 그 리소스에 없다 — 경로를 고쳐 다시 (DURO-249)
+    "guarded_field",        # 바꾸면 안 되는 칸 — 리소스 식별 · ArgoCD 추적 표시 · 만든 뒤 못 바꾸는 칸 (DURO-249)
 ]
 
 
@@ -181,7 +212,7 @@ class Ready(BaseModel):
     file_diff: str          # git diff 모양 — PR·승인 카드에 싣는다
     render_diff: str        # 클러스터에서 실제로 바뀔 것 — 요청한 리소스 하나의 렌더 결과 전·후
     warnings: list[str] = []
-    risk_warnings: list[RiskWarning] = []   # 새 리소스 요청에만 (DURO-154)
+    risk_warnings: list[RiskWarning] = []   # 새 리소스(DURO-154) · 경로 지정 변경(DURO-249) 요청에만
     new_resources: list[dict[str, str]] = []  # 새 리소스 요청에만 — {api_version, kind, name, namespace, file}
 
 
