@@ -339,6 +339,130 @@ def test_조회가_실패하면_길을_모른다고_표시한다(monkeypatch):
     assert found.known is True and found.path == "kubectl"
 
 
+# ── 클러스터에 없는 리소스 (DURO-248) ─────────────────────
+
+#: sandbox-plain 실측(2026-11-13): 프로젝트가 막아 sync 가 거부된 Pod 는 health 없이 status OutOfSync 만 남는다
+_NGINX = {"kind": "Pod", "name": "nginx", "namespace": "default", "status": "OutOfSync", "version": "v1"}
+_WEB = {"group": "apps", "kind": "Deployment", "name": "web", "namespace": "shop", "status": "Synced", "version": "v1"}
+
+
+def _cluster_with(*resources, **kwargs) -> FakeCluster:
+    return FakeCluster(app_status={"sync": {"status": "OutOfSync"}, "health": {"status": "Healthy"},
+                                   "resources": [dict(r) for r in resources]}, **kwargs)
+
+
+def _decide_missing(monkeypatch, cluster: FakeCluster, *, kind="pod", name="nginx", namespace="default",
+                    change=None):
+    monkeypatch.setattr(route, "run_kubectl", cluster.run)
+
+    async def manifest_repos(cluster_id):
+        from kukie_agent import server_api
+        return [server_api.ManifestRepo(id="r", cluster_id=cluster_id, repository=REPO, repository_id=1,
+                                        installation_id=1)]
+
+    from kukie_agent import server_api
+    monkeypatch.setattr(server_api, "manifest_repos", manifest_repos)
+    return sync(route.decide(kind=kind, name=name, namespace=namespace, context="c", kubeconfig=None,
+                             cluster_id="cl-1", change=change or Replicas(count=1)))
+
+
+def test_sync_실패로_클러스터에_없어도_git에_있으면_그_앱의_PR_길(monkeypatch):
+    """kukie-gitops-sandbox#10: 프로젝트가 막아 sync 되지 않은 Pod — 클러스터에 없다고 kubectl 길로 빠졌다."""
+    found = _decide_missing(monkeypatch, _cluster_with(_NGINX, _WEB), change=Other(description="이미지 바꾸기"))
+    assert found.managed and found.known and found.application["metadata"]["name"] == "shop-web"
+    assert found.target.api_version == "v1" and found.target.kind == "Pod"           # 렌더 결과와 맞출 정식 이름
+    assert found.target.namespace == "default" and found.target.name == "nginx"
+    assert "클러스터에 없고 git 에만 있어요" in found.reason and "shop-web" in found.reason
+    # 앱으로 판단했으니 나머지 규칙은 그대로 — 지원하지 않는 요청이면 그 이유가 붙는다
+    assert found.path == "kubectl" and "PR 로 못 바꿔요" in found.reason
+
+    found = _decide_missing(monkeypatch, _cluster_with(dict(_WEB, name="api", status="OutOfSync",
+                                                            health={"status": "Missing"})),
+                            kind="deployments", name="api", namespace="shop")
+    assert found.path == "pr" and found.target.api_version == "apps/v1" and found.target.kind == "Deployment"
+    assert found.fingerprint()["application"] == {"name": "shop-web", "namespace": "argocd"}
+
+
+@pytest.mark.parametrize("kind", ["Pod", "pod", "pods", "po"])
+def test_kind는_짧은_이름과_복수형도_맞춘다(monkeypatch, kind):
+    found = _decide_missing(monkeypatch, _cluster_with(_NGINX), kind=kind)
+    assert found.path == "pr" and found.target.kind == "Pod"
+
+
+def test_어느_앱에도_없거나_이미_Synced면_지금처럼_kubectl_길(monkeypatch):
+    found = _decide_missing(monkeypatch, _cluster_with(_WEB))
+    assert found.path == "kubectl" and found.known and not found.managed
+    assert "이 리소스를 가진 ArgoCD 앱도 없어요" in found.reason
+    synced = _decide_missing(monkeypatch, _cluster_with(dict(_NGINX, status="Synced")))
+    assert synced.path == "kubectl" and "앱도 없어요" in synced.reason          # 클러스터에 없는데 Synced 는 지운 직후 등
+    other_ns = _decide_missing(monkeypatch, _cluster_with(_NGINX), namespace="sandbox-plain")
+    assert other_ns.path == "kubectl" and "앱도 없어요" in other_ns.reason
+
+
+def test_여러_앱에_있으면_정하지_않는다(monkeypatch):
+    found = _decide_missing(monkeypatch, _cluster_with(_NGINX, same_name_in="team-b"))
+    assert found.path == "kubectl" and found.managed and "여러 ArgoCD 앱" in found.reason
+    # namespace 를 모르면 다른 네임스페이스의 같은 이름도 후보다
+    two = _decide_missing(monkeypatch, _cluster_with(_NGINX, dict(_NGINX, namespace="other")), namespace=None)
+    assert two.path == "kubectl" and "default" in two.reason and "other" in two.reason
+
+
+def test_다른_클러스터로_배포하는_앱이나_정리_대상_항목은_후보가_아니다(monkeypatch):
+    """agent#155 리뷰: 다른 클러스터 앱의 같은 이름 리소스를 고르면 엉뚱한 환경의 레포를 고친다.
+    requiresPruning 은 반대로 클러스터에만 있고 git 에는 없는 항목이다."""
+    remote = _decide_missing(monkeypatch, _cluster_with(_NGINX, destination_server="https://prod.example.com"))
+    assert remote.path == "kubectl" and "앱도 없어요" in remote.reason
+    pruning = _decide_missing(monkeypatch, _cluster_with(dict(_NGINX, requiresPruning=True)))
+    assert pruning.path == "kubectl" and "앱도 없어요" in pruning.reason
+
+
+def test_프로젝트가_그_네임스페이스를_막으면_PR을_열지_않고_까닭을_알린다(monkeypatch):
+    """agent#155 리뷰: sync 가 거부된 까닭이 프로젝트면, 값을 고치는 PR 을 머지해도 다시 거부돼 반영되지 않는다."""
+    sandbox = [{"server": "https://kubernetes.default.svc", "namespace": "sandbox-*"}]
+    found = _decide_missing(monkeypatch, _cluster_with(_NGINX, project_destinations=sandbox))
+    assert found.path == "kubectl" and found.managed and found.known
+    assert "default 네임스페이스를 허락하지 않아 sync 가 거부돼요" in found.reason and "'default'" in found.reason
+    allowed = [{"server": "https://kubernetes.default.svc", "namespace": "*"}]
+    assert _decide_missing(monkeypatch, _cluster_with(_NGINX, project_destinations=allowed)).path == "pr"
+
+
+def test_namespace_없이_물었는데_앱이_적은_ns에_실제로_있으면_git에만_있는_게_아니다(monkeypatch):
+    """agent#155 리뷰: 처음 조회는 context 기본 ns 라, 다른 ns 에 있는 drift(OutOfSync) 리소스를 없다고 볼 수 있다."""
+    from kukie_agent.kubectl import KubectlResult
+    cluster = _cluster_with(dict(_NGINX, namespace="team"))
+    original = cluster.run
+
+    def run(args, **kwargs):
+        if args[:3] == ["get", "Pod", "nginx"] and args[-2:] == ["-n", "team"]:
+            return KubectlResult(command="kubectl get", stdout=json.dumps({"kind": "Pod"}), stderr="", success=True)
+        return original(args, **kwargs)
+
+    cluster.run = run
+    found = _decide_missing(monkeypatch, cluster, namespace=None)
+    assert found.path == "kubectl" and "team 네임스페이스에 있어요" in found.reason
+    cluster.run = original                                       # 그 ns 에도 없으면 git 에만 있다
+    assert _decide_missing(monkeypatch, cluster, namespace=None).path == "pr"
+
+
+def test_ArgoCD가_없거나_앱_목록을_못_읽으면(monkeypatch):
+    absent = _decide_missing(monkeypatch, _cluster_with(_NGINX, no_argocd=True))
+    assert absent.path == "kubectl" and absent.known and absent.reason == "pod default/nginx 가 클러스터에 없어요."  # 요청한 kind 그대로 (지금과 같다)
+    cluster = _cluster_with(_NGINX)
+    original = cluster.run
+
+    def forbidden(args, **kwargs):
+        if args[:2] == ["get", "applications.argoproj.io"]:
+            from kukie_agent.kubectl import KubectlResult
+            return KubectlResult(command="kubectl get", stdout="", success=False, exit_code=1,
+                                 stderr='applications.argoproj.io is forbidden: User "x" cannot list resource')
+        return original(args, **kwargs)
+
+    cluster.run = forbidden
+    found = _decide_missing(monkeypatch, cluster)
+    # 정하지 못했다 — 승인 순간 다시 판단할 때 STALE 이 아니라 다시 시도한다
+    assert found.path == "kubectl" and found.known is False and "확인하지 못했어요" in found.reason
+
+
 @pytest.mark.parametrize("name,ok", [
     ("main", True), ("env/prod", True), ("release-1.0", True),
     ("../../pulls", False), ("a//b", False), ("/main", False), ("main/", False), ("a b", False),
