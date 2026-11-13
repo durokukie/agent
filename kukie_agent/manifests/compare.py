@@ -88,6 +88,10 @@ def diff_paths(before: Any, after: Any, path: FieldPath = ()) -> list[FieldPath]
                     found.append((*path, item(name)))
                 else:
                     found += diff_paths(named_before[name], named_after[name], (*path, item(name)))
+            # 이름 목록의 순서는 보통 뜻이 없지만, env 는 $(VAR) 가 앞에 정의된 항목만 본다 — 참조가 있으면 순서도 차이다
+            if path and path[-1] == "env" and "$(" in json.dumps(after, default=str) and \
+                    [n for n in named_before if n in named_after] != [n for n in named_after if n in named_before]:
+                found.append(path)
             return found
         if len(before) != len(after):
             return [path]

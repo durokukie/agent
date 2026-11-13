@@ -262,6 +262,40 @@ def test_merge_patch_이름으로_병합하는_목록은_항목만():
         {"name": "A", "value": "9"}, {"name": "C", "value": "3"}, {"name": "B", "$patch": "delete"}]}
 
 
+def test_merge_patch_이름_목록은_기대값_순서가_나오게_쓴다():
+    """kustomize 는 patch 에 적힌 항목을 앞에 둔다 — 순서가 어긋나면 바뀌지 않은 항목도 이름만 적는다 (agent#159 리뷰)."""
+    current = {"env": [{"name": "A", "value": "1"}, {"name": "B", "value": "2"}]}
+    # B 만 바꾸면 B 가 앞으로 온다 — A 를 이름만 적어 순서를 지킨다
+    assert merge_patch(current, {"env": [{"name": "A", "value": "1"}, {"name": "B", "value": "9"}]}, builtin=True) == {
+        "env": [{"name": "A"}, {"name": "B", "value": "9"}]}
+    # 앞 항목만 바꾸면 순서가 그대로라 그 항목만
+    assert merge_patch(current, {"env": [{"name": "A", "value": "7"}, {"name": "B", "value": "2"}]}, builtin=True) == {
+        "env": [{"name": "A", "value": "7"}]}
+
+
+@needs_kustomize
+def test_환경변수_순서를_바꾸면_렌더에도_그_순서로(repo):
+    first = ready(plan_change(repo, PROD, API, ops(("set", f"{CONTAINER}.env", [
+        {"name": "URL", "value": "x"}, {"name": "HOST", "value": "h"}, {"name": "STAGE", "value": "prod"}]))))
+    write(repo, first.files)
+    second = ready(plan_change(repo, PROD, API, ops(("set", f"{CONTAINER}.env", [
+        {"name": "HOST", "value": "h"}, {"name": "URL", "value": "https://$(HOST)"},
+        {"name": "STAGE", "value": "prod"}]))))
+    env = yaml.safe_load(second.files[PATCH])["spec"]["template"]["spec"]["containers"][0]["env"]
+    assert [item["name"] for item in env] == ["HOST", "URL"]          # STAGE 는 뒤에 그대로 붙는다
+
+
+def test_이름_목록의_순서가_바뀌면_렌더_비교에서도_차이다():
+    from kukie_agent.manifests import compare
+    before = {"env": [{"name": "A", "value": "1"}, {"name": "B", "value": "$(A)"}]}
+    swapped = {"env": [before["env"][1], before["env"][0]]}
+    assert compare.diff_paths(before, swapped) == [("env",)]
+    # $(VAR) 참조가 없으면 순서는 보지 않는다 — 다른 이름 목록도 같다
+    plain = {"env": [{"name": "A"}, {"name": "B"}]}
+    assert compare.diff_paths(plain, {"env": [{"name": "B"}, {"name": "A"}]}) == []
+    assert compare.diff_paths({"volumes": swapped["env"]}, {"volumes": before["env"]}) == []
+
+
 def test_merge_patch_커스텀_리소스와_원자_목록은_통째로():
     current, want = {"ports": [{"port": 1}]}, {"ports": [{"port": 2}]}
     assert merge_patch(current, want, builtin=False) == {"ports": [{"port": 2}]}

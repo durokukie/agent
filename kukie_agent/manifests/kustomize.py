@@ -271,12 +271,14 @@ def merge_patch(current: Any, want: Any, *, builtin: bool, field: str | None = N
         if field in _NAME_MERGED and isinstance(current, list):
             now, wanted = compare.named(current), compare.named(want)
             if now is not None and wanted is not None:
-                items: list[Any] = []
-                for name, item in wanted.items():
-                    if name not in now:
-                        items.append(copy.deepcopy(item))
-                    elif now[name] != item:
-                        items.append({"name": name, **merge_patch(now[name], item, builtin=builtin)})
+                changed = {name: (copy.deepcopy(item) if name not in now
+                                  else {"name": name, **merge_patch(now[name], item, builtin=builtin)})
+                           for name, item in wanted.items() if now.get(name) != item}
+                # kustomize 는 patch 에 적힌 항목을 그 순서로 앞에 두고 나머지를 뒤에 붙인다 — 그대로 두면 순서가 바뀌는
+                # 경우(env 는 $(VAR) 가 앞 항목만 본다) 바뀌지 않은 항목도 이름만 적어 기대값 순서를 맞춘다 (agent#159 리뷰)
+                merged = [*changed, *(name for name in now if name in wanted and name not in changed)]
+                order = list(changed) if merged == list(wanted) else list(wanted)
+                items: list[Any] = [changed.get(name, {"name": name}) for name in order]
                 items += [{"name": name, "$patch": "delete"} for name in now if name not in wanted]
                 return items
         return [*copy.deepcopy(want), {"$patch": "replace"}]
