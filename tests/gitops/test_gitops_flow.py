@@ -194,6 +194,28 @@ def test_sync_실패로_클러스터에_없는_리소스도_PR로_고치고_승�
     assert _plan(fake_server, room)["status"] == "APPLIED"
 
 
+def test_리소스를_지우는_PR은_파일을_지우고_승인_순간_지운_파일까지_맞춰_머지한다(client, fake_server, room, gh, cluster):
+    """DURO-252: 문서가 하나뿐인 파일은 파일째 지운다. 승인 카드의 지문(지운 파일은 빈 blob id)이 GitHub 의 PR 파일 목록과
+    같아야 머지한다. 앱의 prune 이 꺼져 있어 클러스터엔 남는다고 카드·PR 본문에 적는다."""
+    args = {**CHANGE_ARGS, "change": {"what": "delete"}, "intent": "web 을 지운다."}
+    card = _card(client, room, args)
+    head = gh.commits[gh.pull_of(1)["head_sha"]]
+    assert "apps/plain/deployment.yaml" not in head and "apps/plain/service.yaml" in head
+    view = card["gitops"]
+    assert view["files"] == ["apps/plain/deployment.yaml"] and "+++ /dev/null" in view["file_diff"]
+    assert "(머지 후 — 없어짐)" in view["render_diff"]
+    risks = view["risk_warnings"]
+    assert [risk["code"] for risk in risks] == ["prune_off", "delete"] and risks[0]["level"] == "normal"
+    assert "클러스터엔 남아요" in gh.pull_of(1)["body"]
+    assert _plan(fake_server, room)["payload"]["gitops"]["files"] == [{"path": "apps/plain/deployment.yaml",
+                                                                     "blob_sha": ""}]
+
+    _decide(client, room)
+    _settle(client)
+    assert len(gh.merges) == 1 and "apps/plain/deployment.yaml" not in gh.commits[gh.branches["main"]]
+    assert _plan(fake_server, room)["status"] == "APPLIED"
+
+
 def test_ArgoCD가_관리하지_않으면_ModelRetry로_kubectl_길을_알려준다(client, fake_server, room, gh, cluster):
     cluster.managed = False
     seen: list = []
@@ -657,13 +679,24 @@ def test_새_리소스의_sync가_실패하면_이유를_Plan에_남긴다(clien
     assert sync["status"] == "sync_failed" and "not permitted in project" in sync["message"]
 
 
-def test_새_리소스의_재시도에_실패한_sync가_보이면_없는_길을_제안하지_않는다():
-    plan = gitops_after_merge.ActionPlan(
-        id="p", path=None, created_at="", call_id="c", tool="t", args={"change": {"what": "new_resource"}}, skill="s",
+def _merged_plan(what: str):
+    return gitops_after_merge.ActionPlan(
+        id="p", path=None, created_at="", call_id="c", tool="t", args={"change": {"what": what}}, skill="s",
         target={}, command=[], risk_level="caution", status="APPLIED", intent="i", expected_effects=[], side_effects=[],
     )
-    note = gitops_hook._follow_up({"status": "sync_failed"}, plan)
-    assert "GitHub 에서 이 PR 을 revert" in note and "propose_git_change" not in note
+
+
+def test_새_리소스의_sync가_실패하면_지우거나_옮기는_PR을_제안한다():
+    """DURO-252 전에는 파일을 지우는 PR 이 없어 GitHub revert 만 안내했다 — 이제는 지우기·옮기기를 PR 로 한다."""
+    note = gitops_hook._follow_up({"status": "sync_failed"}, _merged_plan("new_resource"))
+    assert "what=delete" in note and "what=namespace" in note and "원하기 전에는 부르지 마라" in note
+
+
+@pytest.mark.parametrize("what", ["delete", "namespace"])
+def test_지우거나_옮긴_PR의_sync가_실패하면_GitHub_revert와_데이터를_안내한다(what):
+    note = gitops_hook._follow_up({"status": "sync_failed"}, _merged_plan(what))
+    assert "GitHub 에서 이 PR 을 revert" in note and "데이터는 revert 해도 돌아오지 않는다" in note
+    assert "원래 값(렌더 diff 의 - 줄)" not in note
 
 
 def test_새_리소스도_거절하면_PR을_닫는다(client, fake_server, room, gh, cluster):

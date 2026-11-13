@@ -14,7 +14,7 @@ from kukie_agent.gitops import github, route, watch
 from kukie_agent.gitops.github import GitHubError, blob_sha
 from kukie_agent.gitops.pull_requests import base_branch, secret_in
 from kukie_agent.gitops.repo import repo_name
-from kukie_agent.manifests import Other, Patch, PatchOperation, Replicas
+from kukie_agent.manifests import Delete, MoveNamespace, Other, Patch, PatchOperation, Replicas
 
 
 # ── 레포 주소 ─────────────────────────────────────────────
@@ -130,6 +130,33 @@ def test_커밋은_새_kukie_브랜치_ref로만_간다(api):
     assert bodies[1] == {"message": "m", "tree": "t1", "parents": ["c0"]}
     assert bodies[2] == {"ref": "refs/heads/kukie/x", "sha": "c1"}
     assert not [r for r in seen if r.method == "PATCH"]         # 있는 ref 를 옮기는 호출은 없다
+
+
+def test_내용이_None인_파일은_트리에서_지운다(api):
+    """DURO-252: Git Data API 는 base_tree 위 트리 항목의 sha 를 null 로 주면 그 파일을 뺀다."""
+    handlers, seen = api
+    handlers[("GET", f"/repos/{REPO}/git/commits/c0")] = (200, {"tree": {"sha": "t0"}})
+    handlers[("POST", f"/repos/{REPO}/git/trees")] = (201, {"sha": "t1"})
+    handlers[("POST", f"/repos/{REPO}/git/commits")] = (201, {"sha": "c1"})
+    handlers[("POST", f"/repos/{REPO}/git/refs")] = (201, {"ref": "refs/heads/kukie/x"})
+
+    async def go():
+        async with github.GitHub(REPO, "t") as gh:
+            return await gh.create_branch_commit(base_sha="c0", branch="kukie/x",
+                                                 files={"a.yaml": None, "k.yaml": "y\n"}, message="m")
+
+    sync(go())
+    tree = json.loads(next(r for r in seen if r.method == "POST").content)["tree"]
+    assert tree == [{"path": "a.yaml", "mode": "100644", "type": "blob", "sha": None},
+                    {"path": "k.yaml", "mode": "100644", "type": "blob", "content": "y\n"}]
+
+
+def test_지운_파일의_승인_지문은_GitHub_PR_파일_목록처럼_빈_문자열이다():
+    from kukie_agent.gitops.pull_requests import Draft
+    draft = Draft(repository=REPO, base="main", base_sha="c0", files={"a.yaml": None, "b.yaml": "x"},
+                  file_diff="", render_diff="")
+    assert draft.file_entries() == [{"path": "a.yaml", "blob_sha": ""}, {"path": "b.yaml", "blob_sha": blob_sha("x")}]
+    assert draft.conflict_keys() == [f"git:{REPO}:a.yaml", f"git:{REPO}:b.yaml"]
 
 
 def test_머지는_승인한_head로_하고_막힌_방식은_건너뛴다(api):
@@ -431,6 +458,31 @@ def test_프로젝트가_그_네임스페이스를_막으면_PR을_열지_않고
     assert "default 네임스페이스를 허락하지 않아 sync 가 거부돼요" in found.reason and "'default'" in found.reason
     allowed = [{"server": "https://kubernetes.default.svc", "namespace": "*"}]
     assert _decide_missing(monkeypatch, _cluster_with(_NGINX, project_destinations=allowed)).path == "pr"
+    # DURO-252 전에는 "Kukie PR 로는 아직 네임스페이스를 못 바꿔요" 였다 — 이제 옮기거나 빼는 PR 을 알려 준다
+    assert "what=namespace" in found.reason and "what=delete" in found.reason and "앱 기본은 shop" in found.reason
+
+
+def test_프로젝트가_막은_리소스도_옮기거나_지우는_변경은_PR_길이다(monkeypatch):
+    """DURO-252 완료 기준 — sandbox nginx: default 를 막는 프로젝트의 Pod 를 허락된 곳으로 옮기는 PR 을 연다.
+    옮길 곳의 허락은 manifests 가 본다(project_destinations 를 넘긴다)."""
+    sandbox = [{"server": "https://kubernetes.default.svc", "namespace": "sandbox-*"}]
+    moved = _decide_missing(monkeypatch, _cluster_with(_NGINX, project_destinations=sandbox),
+                            change=MoveNamespace(to="sandbox-plain"))
+    assert moved.path == "pr" and moved.source.project_destinations == sandbox
+    assert moved.target.in_cluster is False and moved.source.destination_namespace == "shop"
+    deleted = _decide_missing(monkeypatch, _cluster_with(_NGINX, project_destinations=sandbox), change=Delete())
+    assert deleted.path == "pr" and deleted.source.project_destinations is None
+
+
+def test_클러스터에_있는_리소스를_옮기면_프로젝트_규칙을_읽어_넘기고_prune을_읽는다(monkeypatch):
+    allowed = [{"server": "https://kubernetes.default.svc", "namespace": "*"}]
+    found = _decide(monkeypatch, FakeCluster(project_destinations=allowed), change=MoveNamespace(to="other"))
+    assert found.path == "pr" and found.source.project_destinations == allowed and found.target.in_cluster is True
+    assert found.source.auto_sync is True and found.source.prune is False             # FakeCluster: automated, prune 꺼짐
+    plain = _decide(monkeypatch, FakeCluster(project_destinations=allowed), change=Delete())
+    assert plain.path == "pr" and plain.source.project_destinations is None           # 지우기는 읽지 않는다
+    kustomize = _decide(monkeypatch, FakeCluster(source_type="Kustomize"), change=Delete())
+    assert kustomize.path == "pr"                                                     # 둘 다 Kustomize 앱도 된다
 
 
 def test_namespace_없이_물었는데_앱이_적은_ns에_실제로_있으면_git에만_있는_게_아니다(monkeypatch):

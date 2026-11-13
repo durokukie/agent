@@ -190,6 +190,21 @@ def test_PR_길_리소스에_경고_없이_kubectl을_부르면_한_번_돌려�
     assert [p["toolName"] for p in fake_server.plans_of(room)] == ["propose_git_change"]
 
 
+def test_PR_길_리소스를_kubectl로_지우려_하면_PR_삭제로_돌려보낸다(client, fake_server, room, cluster):
+    """DURO-252: kubectl 로 지우면 ArgoCD 가 다시 만든다 — git 에서 빼는 PR(what=delete)로."""
+    delete = {"kind": "deployment", "name": "web", "namespace": "shop",
+              "intent": "web 을 지운다", "expected_effects": ["web 이 없어진다"], "side_effects": ["화면이 멈춘다"]}
+    propose = {**PROPOSE, "change": {"what": "delete"}, "intent": "web 을 지운다"}
+    script = Script(("delete_resource", delete), ("propose_git_change", propose))
+    body = _chat(client, room, script, "web 지워 줘")
+
+    retry = next(p for view in script.views for p in view if isinstance(p, RetryPromptPart))
+    assert retry.tool_name == "delete_resource" and "what=delete" in retry.content
+    card = body["approvals"][0]
+    assert card["tool"] == "propose_git_change" and card["gitops"]["files"] == ["apps/plain/deployment.yaml"]
+    assert [risk["code"] for risk in card["gitops"]["risk_warnings"]] == ["prune_off", "delete"]
+
+
 def test_돌려받은_뒤_같은_kubectl_호출을_다시_하면_경고_카드와_함께_간다(client, fake_server, room, cluster):
     script = Script(("scale_resource", SCALE), ("scale_resource", SCALE))
     body = _chat(client, room, script, "급해요 kubectl 로 바로 3개")

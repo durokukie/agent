@@ -118,10 +118,15 @@ def _follow_up(sync: dict[str, Any] | None, plan: ActionPlan) -> str | None:
                 "나중에 결과를 물으면 ArgoCD 앱 상태를 조회해 답하라.")
     if not sync or sync.get("status") not in ("sync_failed", "degraded"):
         return None
-    if (plan.args.get("change") or {}).get("what") == "new_resource":
-        # 파일을 지우는 PR 은 아직 없다 — 없는 길을 제안하지 않는다
+    what = (plan.args.get("change") or {}).get("what")
+    if what == "new_resource":
         return ("머지는 됐지만 ArgoCD 반영이 실패했다. 이유를 설명하고, 프로젝트 설정이 막았다면 무엇을 바꿔야 하는지 알려라. "
-                "되돌리려면 GitHub 에서 이 PR 을 revert 해야 한다고 안내하라 — Kukie 는 파일을 지우는 PR 을 만들지 못한다.")
+                "되돌리려면 그 리소스를 지우는 PR(what=delete)을 propose_git_change 로 올리거나, 네임스페이스가 막혔다면 허락된 곳으로 "
+                "옮기는 PR(what=namespace)을 올리자고 제안하라. 사용자가 원하기 전에는 부르지 마라.")
+    if what in ("delete", "namespace"):
+        # 지우거나 옮긴 리소스는 원래 값으로 칸을 되돌리는 길이 없다 — 되살리려면 GitHub 의 revert 다 (DURO-252)
+        return ("머지는 됐지만 ArgoCD 반영이 실패했다. 이유를 설명하고, 되돌리려면 GitHub 에서 이 PR 을 revert 해야 한다고 안내하라. "
+                "지워진 PVC 등의 데이터는 revert 해도 돌아오지 않는다는 것도 알려라.")
     return ("머지는 됐지만 ArgoCD 반영이 실패했다. 이유를 설명하고, 되돌리려면 같은 칸을 원래 값(렌더 diff 의 - 줄)으로 "
             "propose_git_change 해 revert PR 을 올리자고 제안하라. 사용자가 원하기 전에는 부르지 마라.")
 

@@ -160,15 +160,18 @@ class FakeGitHub:
     async def pull_files(self, number: int) -> dict[str, str]:
         p = self.pulls[number]
         base, head = self.commits[p["base_sha"]], self.commits[p["head_sha"]]
-        return {path: blob_sha(content) for path, content in head.items() if base.get(path) != content}
+        changed = {path: blob_sha(content) for path, content in head.items() if base.get(path) != content}
+        return {**changed, **{path: "" for path in base if path not in head}}   # GitHub 처럼 지운 파일은 빈 문자열
 
     async def open_kukie_pulls(self) -> list[PullRequest]:
         return [self._pull(n) for n, p in self.pulls.items() if p["state"] == "open"
                 and p["head_ref"].startswith(BRANCH_PREFIX)]
 
-    async def create_branch_commit(self, *, base_sha: str, branch: str, files: dict[str, str], message: str) -> str:
+    async def create_branch_commit(self, *, base_sha: str, branch: str, files: dict[str, str | None],
+                                   message: str) -> str:
         assert branch.startswith(BRANCH_PREFIX) and branch not in self.branches, branch
         merged = {**self.commits[base_sha], **files}
+        merged = {path: content for path, content in merged.items() if content is not None}   # None 은 지운다
         sha = hashlib.sha1(json.dumps(merged, sort_keys=True).encode()).hexdigest()
         self.commits[sha] = merged
         self.branches[branch] = sha
