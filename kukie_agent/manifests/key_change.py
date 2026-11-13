@@ -152,7 +152,25 @@ def _plain(ctx: Context) -> dict[str, str | None] | Refused:
         where = ", ".join(path for path, _, _ in found) or "없음"
         return Refused(code="ambiguous", message=f"{compare.label(ctx.key)} 문서가 {len(found)}개예요({where}).")
     path, parsed, index = found[0]
-    return _edit_file(ctx, path, parsed, index)
+    edits = _edit_file(ctx, path, parsed, index)
+    if edits[path] is None and _last_file(ctx, path):
+        # 폴더의 마지막 파일을 지우면 git 에서 폴더가 사라지고 ArgoCD 는 없는 source.path 를 오류로 본다 — 빈 앱을 렌더하지
+        # 않아 prune 도 안 된다. 주석만 남긴 파일로 폴더를 지킨다 (agent#160 리뷰)
+        edits[path] = EMPTY_APP
+    return edits
+
+
+#: 앱 폴더의 마지막 리소스를 지울 때 남기는 내용 — 문서가 없어 아무것도 렌더하지 않는다
+EMPTY_APP = ("# Kukie 가 이 앱의 마지막 리소스를 지웠어요. 이 파일까지 지우면 앱 폴더가 git 에서 사라져\n"
+             "# ArgoCD 가 경로 오류를 내요 — 새 리소스를 더하거나 앱을 지울 때 같이 정리하세요.\n")
+
+
+def _last_file(ctx: Context, path: str) -> bool:
+    """path 말고는 앱 폴더(레포 루트가 아닐 때)에 git 이 담을 파일이 없나."""
+    if ctx.app_dir == ctx.root.resolve():
+        return False
+    return not any(file.is_file() and ctx.relative(file) != path and ".git" not in file.relative_to(ctx.root.resolve()).parts
+                   for file in ctx.app_dir.rglob("*"))
 
 
 def _edit_file(ctx: Context, path: str, parsed: YamlFile, index: int) -> dict[str, str | None]:

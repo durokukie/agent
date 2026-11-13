@@ -210,10 +210,30 @@ def test_리소스를_지우는_PR은_파일을_지우고_승인_순간_지운_�
     assert _plan(fake_server, room)["payload"]["gitops"]["files"] == [{"path": "apps/plain/deployment.yaml",
                                                                      "blob_sha": ""}]
 
+    assert _plan(fake_server, room)["payload"]["gitops"]["sync_policy"] == {"auto_sync": True, "prune": False,
+                                                                          "allow_empty": False}
+    assert "sync_policy" not in view                                        # 승인 순간 다시 볼 값 — 카드 칸이 아니다
+
     _decide(client, room)
     _settle(client)
     assert len(gh.merges) == 1 and "apps/plain/deployment.yaml" not in gh.commits[gh.branches["main"]]
     assert _plan(fake_server, room)["status"] == "APPLIED"
+
+
+def test_승인하는_사이_prune_설정이_바뀌면_지우는_PR을_머지하지_않는다(client, fake_server, room, gh, cluster, monkeypatch):
+    """agent#160 리뷰: "클러스터엔 남아요" 로 승인한 삭제가 prune 이 켜진 뒤 머지되면 실제로 지워진다."""
+    _card(client, room, {**CHANGE_ARGS, "change": {"what": "delete"}, "intent": "web 을 지운다."})
+    application = cluster.application
+
+    def pruning():
+        item = application()
+        item["spec"]["syncPolicy"]["automated"]["prune"] = True
+        return item
+
+    monkeypatch.setattr(cluster, "application", pruning)
+    _decide(client, room)
+    assert gh.merges == [] and gh.pull_of(1)["state"] == "closed"
+    assert _plan(fake_server, room)["status"] == "STALE"
 
 
 def test_ArgoCD가_관리하지_않으면_ModelRetry로_kubectl_길을_알려준다(client, fake_server, room, gh, cluster):

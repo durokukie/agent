@@ -101,6 +101,16 @@ def test_문서가_여럿인_파일은_그_문서만_빼고_나머지와_주석�
     assert "HorizontalPodAutoscaler" not in text and "---" not in text
 
 
+def test_앱_폴더의_마지막_파일은_지우지_않고_주석만_남긴다(sandbox):
+    """agent#160 리뷰: 폴더가 git 에서 사라지면 ArgoCD 가 없는 source.path 를 오류로 봐 prune 도 못 한다."""
+    for name in ("deployment.yaml", "service.yaml"):
+        (sandbox / "apps/plain" / name).unlink()
+    result = ready(plan_change(sandbox, SANDBOX, NGINX, Delete()))
+    text = result.files["apps/plain/nginx-pod.yaml"]
+    assert text is not None and text.startswith("# Kukie 가 이 앱의 마지막 리소스를 지웠어요.")
+    assert all(line.startswith("#") for line in text.splitlines())
+
+
 def test_가운데_문서를_빼도_다른_문서의_주석은_남는다(repo):
     write(repo, {"apps/plain/config.yaml": (
         "# a 설정\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n---\n"

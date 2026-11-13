@@ -41,7 +41,9 @@ from kukie_agent.guardrail.decision_guidance import generate_decision_guidance
 from kukie_agent.guardrail.hook import hooks
 from kukie_agent.guardrail.mutation_request import canonicalize_mutation_args
 from kukie_agent.kubectl import thread_limiter
-from kukie_agent.manifests import Change, NewResource, Patch, Replicas, already_in_cluster, patch, representative
+from kukie_agent.manifests import (
+    Change, Delete, MoveNamespace, NewResource, Patch, Replicas, already_in_cluster, patch, representative,
+)
 from kukie_agent.tools.gitops import RISK, TOOL_NAME, GitOpsResult
 
 logger = logging.getLogger(__name__)
@@ -131,6 +133,12 @@ def _follow_up(sync: dict[str, Any] | None, plan: ActionPlan) -> str | None:
             "propose_git_change 해 revert PR 을 올리자고 제안하라. 사용자가 원하기 전에는 부르지 마라.")
 
 
+def _sync_policy(found: routing.Route) -> dict[str, bool]:
+    """삭제·옮기기(DURO-252) 카드의 "클러스터에서 지워지나" 를 정한 앱 설정."""
+    assert found.source is not None
+    return {"auto_sync": found.source.auto_sync, "prune": found.source.prune, "allow_empty": found.source.allow_empty}
+
+
 async def _decide(ctx, kind: str, name: str, namespace: str, change: Change) -> routing.Route:
     return await routing.decide(
         kind=kind, name=name, namespace=namespace, context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig,
@@ -218,6 +226,8 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
     }
     if isinstance(change, NewResource):
         gitops["new_resources"] = draft.new_resources
+    if isinstance(change, Delete | MoveNamespace):
+        gitops["sync_policy"] = _sync_policy(found)          # 승인 순간 다시 본다 — 카드 칸이 아니다 (_GITOPS_CARD)
     if isinstance(change, NewResource) or draft.risk_warnings:
         # 새 리소스(DURO-154)와 경로 지정 변경(DURO-249)의 경고 — 승인이 곧 "이 경고를 보고 승인함" 의 기록이다
         gitops["risk_warnings"] = draft.risk_warnings
@@ -290,6 +300,9 @@ async def _execute(ctx, call, plan_args, target, risk, kind, name, namespace, ch
         stale = f"지금은 PR 길이 아니에요: {found.reason}"
     elif found.fingerprint() != gitops.get("route"):
         stale = "대상 ArgoCD 앱이나 레포 설정이 승인 카드를 만든 뒤 바뀌었어요."
+    elif "sync_policy" in gitops and _sync_policy(found) != gitops["sync_policy"]:
+        # 삭제·옮기기의 카드는 이 설정으로 "지워짐 / 남음" 을 적었다 — 바뀌면 다른 결과를 승인한 셈이다 (agent#160 리뷰)
+        stale = "ArgoCD 앱의 자동 sync·prune 설정이 승인 카드를 만든 뒤 바뀌었어요 — 클러스터에서 지워지는지가 달라져요."
     token = None
     checked = None
     if stale is None:
