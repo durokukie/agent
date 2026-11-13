@@ -167,6 +167,33 @@ def test_PR을_승인_전에_열고_PR_머지_승인_카드를_띄운다(client,
     assert "ghs_fake-token" not in str(plan) and "ghs_fake-token" not in str(card)   # 토큰은 어디에도 안 남는다
 
 
+def test_sync_실패로_클러스터에_없는_리소스도_PR로_고치고_승인_순간에도_같은_길이다(client, fake_server, room, gh, cluster,
+                                                                     monkeypatch):
+    """DURO-248: git 에는 있는데 sync 가 거부돼 클러스터에 없는 리소스 — 앱의 status.resources 로 PR 길을 찾는다.
+    승인 순간 다시 판단해도 같은 앱·같은 지문이라 STALE 이 아니다."""
+    cluster.app_status = {"sync": {"status": "OutOfSync"}, "health": {"status": "Healthy"},
+                          "resources": [{"group": "apps", "version": "v1", "kind": "Deployment", "name": "web",
+                                         "namespace": "shop", "status": "OutOfSync"}]}
+    live = route.run_kubectl
+
+    def missing(args, **kwargs):
+        if args[:3] == ["get", "deployment", "web"]:
+            from kukie_agent.kubectl import KubectlResult
+            return KubectlResult(command="kubectl get", stdout="", success=False, exit_code=1,
+                                 stderr='Error from server (NotFound): deployments.apps "web" not found')
+        return live(args, **kwargs)
+
+    monkeypatch.setattr(route, "run_kubectl", missing)
+    card = _card(client, room)
+    assert card["gitops"]["application"]["name"] == "shop-web"
+    assert "replicas: 3" in gh.commits[gh.pull_of(1)["head_sha"]]["apps/plain/deployment.yaml"]
+
+    _decide(client, room)
+    _settle(client)
+    assert len(gh.merges) == 1
+    assert _plan(fake_server, room)["status"] == "APPLIED"
+
+
 def test_ArgoCD가_관리하지_않으면_ModelRetry로_kubectl_길을_알려준다(client, fake_server, room, gh, cluster):
     cluster.managed = False
     seen: list = []
