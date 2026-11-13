@@ -25,6 +25,7 @@ from kukie_agent.agent import agent
 from kukie_agent.auth import User
 from kukie_agent.server_api import ServerError
 from kukie_agent.skills.base import KukieResponse
+from kukie_agent.title import wanted as real_title_wanted
 
 
 @pytest.fixture
@@ -375,8 +376,9 @@ def test_chat은_첫_마디를_제목_후보로_보내고_mode_입력은_보내�
     assert fake_server.conversation(room)["title"] == "nginx 를 4개로 늘려줘"   # 한 번만 정해진다
 
 
-def test_첫_마디면_모델이_지은_제목을_함께_보낸다(client, fake_server):
+def test_첫_마디면_모델이_지은_제목을_함께_보낸다(client, fake_server, monkeypatch):
     """제목 모델은 답과 동시에 돈다. 지은 제목은 run 기록과 함께 title 로 가고, 이미 이름이 있으면 부르지 않는다."""
+    monkeypatch.setattr(title, "wanted", real_title_wanted)
     room = new_room(fake_server)
     namer = TestModel(custom_output_text="  ArgoCD sync\n실패 원인 ")
     with agent.override(model=answer_model("답변입니다.")), title.title_agent.override(model=namer):
@@ -387,7 +389,8 @@ def test_첫_마디면_모델이_지은_제목을_함께_보낸다(client, fake_
     assert fake_server.conversation(room)["title"] == "ArgoCD sync 실패 원인"
 
 
-def test_제목_모델이_실패해도_답은_나가고_첫_마디로_짓는다(client, fake_server):
+def test_제목_모델이_실패해도_답은_나가고_첫_마디로_짓는다(client, fake_server, monkeypatch):
+    monkeypatch.setattr(title, "wanted", real_title_wanted)
     room = new_room(fake_server)
 
     async def boom(messages, info):

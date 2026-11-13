@@ -37,6 +37,14 @@ def _forget_readable_namespaces(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_title_model_by_default(monkeypatch):
+    """제목 모델(kukie_agent/title.py)을 부르지 않는다 (PR #161 리뷰). 부르면 ALLOW_MODEL_REQUESTS=False 로 막혀
+    결과는 같지만 chat 테스트마다 경고 로그가 쌓인다. 제목을 보는 테스트(test_conversations.py)만 되살린다."""
+    from kukie_agent import title
+    monkeypatch.setattr(title, "wanted", lambda *a: False)
+
+
+@pytest.fixture(autouse=True)
 def _no_failure_retry_by_default(monkeypatch):
     """실패 표시를 뒤에서 다시 남기지 않는다 (PR #153 리뷰). 저장 장애를 흉내 내는 테스트가 2초 뒤 도는 작업을 남기면
     루프가 닫힐 때 'Task was destroyed' 가 나고, monkeypatch 가 풀린 뒤 진짜 update_run 을 부를 수 있다.
