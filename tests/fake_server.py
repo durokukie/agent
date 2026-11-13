@@ -42,6 +42,12 @@ def _not_found(what: str) -> ServerError:
     return ServerError(404, "NOT_FOUND", f"없다: {what}")
 
 
+def _same_fingerprint(cluster: dict[str, Any], fingerprint: str) -> None:
+    """server 의 지문 대조 (연결 정보·status·gpu 공통) — 다르면 409 CLUSTER_CHANGED. 문구는 server 와 같다."""
+    if cluster["fingerprint"] != fingerprint:
+        raise ServerError(409, "CLUSTER_CHANGED", "이 대화가 쓰던 클러스터의 접속 대상이 바뀌었습니다. 새 대화를 시작해 주세요.")
+
+
 def _conflict(code: str = "PLAN_STATE_CONFLICT", message: str = "지금 상태에서는 할 수 없다") -> ServerError:
     return ServerError(409, code, message)
 
@@ -341,8 +347,8 @@ class FakeServer:
         cluster = self.clusters.get(cluster_id)
         if cluster is None or not self._readable_cluster(cluster, user.id):
             raise _not_found(cluster_id)
-        if expected_fingerprint and cluster["fingerprint"] != expected_fingerprint:
-            raise ServerError(409, "CLUSTER_CHANGED", "이 대화가 쓰던 클러스터의 접속 대상이 바뀌었다")
+        if expected_fingerprint:
+            _same_fingerprint(cluster, expected_fingerprint)
         return server_api.ClusterConnection.from_json({
             "clusterId": cluster_id, **{k: cluster[k] for k in (
                 "name", "apiServer", "caData", "insecure", "contextName", "namespace", "fingerprint", "credential",
@@ -354,8 +360,7 @@ class FakeServer:
         cluster = self.clusters.get(cluster_id)
         if cluster is None:
             raise _not_found(cluster_id)
-        if cluster["fingerprint"] != fingerprint:
-            raise ServerError(409, "CLUSTER_CHANGED", "이 대화가 쓰던 클러스터의 접속 대상이 바뀌었다")
+        _same_fingerprint(cluster, fingerprint)
         cluster["status"] = status
         cluster["lastCheckedAt"] = checked_at.isoformat()
         return {k: v for k, v in cluster.items() if k != "credential"}
@@ -365,8 +370,7 @@ class FakeServer:
         cluster = self.clusters.get(cluster_id)
         if cluster is None:
             raise _not_found(cluster_id)
-        if cluster["fingerprint"] != fingerprint:
-            raise ServerError(409, "CLUSTER_CHANGED", "이 대화가 쓰던 클러스터의 접속 대상이 바뀌었다")
+        _same_fingerprint(cluster, fingerprint)
         cluster["hasGpu"] = has_gpu
         return {k: v for k, v in cluster.items() if k != "credential"}
 

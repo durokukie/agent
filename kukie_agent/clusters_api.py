@@ -133,11 +133,17 @@ async def test_cluster(
     status = "connected" if version.success else _failure_status(version.stderr)
     if conn.fingerprint:
         # 확인하는 사이 kubeconfig 가 바뀌었으면 server 가 409 CLUSTER_CHANGED 로 거절한다 — 옛 연결의 결과를 새 연결에
-        # 남기지 않는다 (DURO-125). 그대로 올려 앱이 다시 확인하게 한다
-        await server_api.update_cluster_status(cluster_id, status=status, checked_at=datetime.now(timezone.utc),
-                                               fingerprint=conn.fingerprint)
+        # 남기지도, 화면에 지금 결과처럼 보이지도 않는다 (DURO-125). server 문구는 대화용이라 연결 확인 문구로 바꿔 올린다
+        try:
+            await server_api.update_cluster_status(cluster_id, status=status, checked_at=datetime.now(timezone.utc),
+                                                   fingerprint=conn.fingerprint)
+        except server_api.ServerError as exc:
+            if exc.code == "CLUSTER_CHANGED":
+                raise _changed_during_test() from None
+            raise
     else:
-        # server 가 늘 400 으로 거절할 호출이다 — 부르지 않되 상태가 남지 않는 것은 남긴다
+        # server 가 늘 400(지문 필수)으로 거절할 호출이다 — 부르지 않되 상태가 남지 않는 것은 남긴다.
+        # server 는 지문을 늘 채워 주므로(NOT NULL 컬럼) 실제로는 생기지 않는 길이다
         logger.warning("클러스터 %s 의 연결 확인 결과를 남기지 못했다: 연결 정보에 지문이 없다", cluster_id)
     recorded = await _record_gpu(conn, has_gpu)
     return {
@@ -695,6 +701,11 @@ async def _gitops_apps(cluster_id: str, conn: server_api.ClusterConnection) -> d
 def _revision_body(repository: str, revision: browse.Revision, path: str) -> dict[str, Any]:
     return {"repository": repository, "ref": revision.ref, "sha": revision.sha,
             "default_branch": revision.default_branch, "path": path}
+
+
+def _changed_during_test() -> HTTPException:
+    return HTTPException(409, {"code": "CLUSTER_CHANGED",
+                               "message": "확인하는 사이 이 클러스터의 연결 정보가 바뀌었어요. 다시 확인해 주세요."})
 
 
 def _repo_not_connected(repository: str) -> HTTPException:
@@ -1266,7 +1277,7 @@ async def _record_gpu(conn: server_api.ClusterConnection, has_gpu: bool | None) 
     if has_gpu == conn.has_gpu:
         return True
     if not conn.fingerprint:
-        # server 가 늘 409 로 거절할 호출이다 — 부르지 않되 동기화가 멈춘 것은 남긴다
+        # server 가 늘 400(지문 필수)으로 거절할 호출이다 — 부르지 않되 동기화가 멈춘 것은 남긴다
         logger.warning("클러스터 %s 의 GPU 여부를 남기지 못했다: 연결 정보에 지문이 없다", conn.cluster_id)
         return False
     try:

@@ -167,7 +167,7 @@ def test_연결_정보에_지문이_없으면_GPU_여부를_남기지_않는다(
                         lambda args, **k: _result(fixture("gpu_nodes.json")) if args == gpu.NODES_COMMAND
                         else _result("{}" if args[0] == "version" else "yes"))
     assert client.post(f"/clusters/{cluster}/test", headers=USER).json()["has_gpu"] is None
-    assert _gpu_calls(fake_server) == [] and "지문이 없다" in caplog.text
+    assert _gpu_calls(fake_server) == [] and "GPU 여부를 남기지 못했다: 연결 정보에 지문이 없다" in caplog.text
 
     fake_server.clusters[cluster]["hasGpu"] = True                         # server 값과 같으면 지문 없이도 그 값을 준다
     assert client.post(f"/clusters/{cluster}/test", headers=USER).json()["has_gpu"] is True
