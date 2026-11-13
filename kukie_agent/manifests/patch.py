@@ -307,6 +307,9 @@ def _block(value: Any) -> Any:
     return value
 
 
+to_yaml = _block
+
+
 #: go-yaml v2(ArgoCD · sigs.k8s.io/yaml)가 참거짓으로 읽는 낱말 — PyYAML 은 y·n 을 문자열로 읽어 렌더 비교로는 안 보인다
 _GO_YAML_BOOLS = frozenset({"y", "Y", "yes", "Yes", "YES", "n", "N", "no", "No", "NO", "on", "On", "ON",
                             "off", "Off", "OFF", "true", "True", "TRUE", "false", "False", "FALSE"})

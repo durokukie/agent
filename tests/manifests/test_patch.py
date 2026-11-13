@@ -327,12 +327,6 @@ def test_요청하지_않은_칸이_같이_바뀌면_렌더_비교가_거절한�
     assert "spec.replicas" in result.message
 
 
-def test_Kustomize_앱은_아직_경로_지정_변경을_못_한다(repo):
-    result = refused(plan_change(repo, PROD, API, ops(("set", "spec.template.spec.hostNetwork", True))),
-                     "unsupported_change")
-    assert not result.retry and "plain YAML" in result.message     # kubectl 길로 간다
-
-
 # ── 위험 경고 — 막지 않고 카드에 ──────────────────────────
 
 

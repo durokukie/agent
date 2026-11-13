@@ -72,7 +72,10 @@ def plan_change(repo: Path, app: AppSource, target: Target, change: Change, *,
     edits = (key_change.propose if key_change.is_key_change(change) else PROPOSERS[app.source_type])(ctx)
     if isinstance(edits, Refused):
         return edits
-    return verify(ctx, edits)
+    result = verify(ctx, edits)
+    if isinstance(result, Refused) and app.source_type == "Kustomize":
+        return kustomize.explain(ctx, result)
+    return result
 
 
 def verify_change(repo: Path, app: AppSource, target: Target, change: Change,
@@ -99,15 +102,11 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
     if isinstance(change, Other):
         return Refused(code="unsupported_change",
                        message=f"'{change.description}' 은 아직 PR 로 못 해요. "
-                               "PR 로는 레플리카 수 · 이미지 태그 · CPU·메모리 · 환경변수를 바꾸고, plain YAML 앱이면 "
-                               "그 밖의 칸도 경로 지정 변경(what=patch)으로 바꿔요. 리소스 삭제(what=delete)와 "
+                               "PR 로는 레플리카 수 · 이미지 태그 · CPU·메모리 · 환경변수를 바꾸고, "
+                               "그 밖의 칸은 경로 지정 변경(what=patch)으로 바꿔요. 리소스 삭제(what=delete)와 "
                                "네임스페이스 옮기기(what=namespace)도 PR 로 해요.")
     if isinstance(change, NewResource):
         return Refused(code="unsupported_change", message="새 리소스는 plan_new_resource 로 만들어요.")
-    if isinstance(change, Patch) and app.source_type != "Directory":
-        return Refused(code="unsupported_change",
-                       message="경로 지정 변경은 아직 plain YAML(Directory) 앱만 돼요. Kustomize 앱은 PR 로 레플리카 수 · "
-                               "이미지 태그 · CPU·메모리 · 환경변수만 바꿔요.")
     if target.kind == "Secret":
         return _secret()
 

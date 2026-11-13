@@ -311,10 +311,10 @@ def test_지원하지_않는_요청이면_kubectl_길(monkeypatch):
     assert found.path == "kubectl" and "노드 셀렉터" in found.reason
 
 
-def test_Kustomize_앱의_경로_지정_변경은_렌더_전에_kubectl_길(monkeypatch):
+def test_Kustomize_앱의_경로_지정_변경도_PR_길(monkeypatch):
+    """DURO-251 — Kustomize 앱도 overlay 에 patch 파일을 걸어 PR 로 한다."""
     change = Patch(operations=[PatchOperation(op="set", path="spec.minReadySeconds", value=5)])
-    found = _decide(monkeypatch, FakeCluster(source_type="Kustomize"), change=change)
-    assert found.path == "kubectl" and "경로 지정 변경" in found.reason
+    assert _decide(monkeypatch, FakeCluster(source_type="Kustomize"), change=change).path == "pr"
     assert _decide(monkeypatch, FakeCluster(), change=change).path == "pr"
 
 

@@ -42,7 +42,8 @@ def propose_git_change(ctx: RunContext[Deps], kind: str, name: str, change: Chan
       - 목록을 번호로 가리키지 않는다. 이름 없는 목록(args · ports · tolerations …)은 그 목록 전체를 set 한다
       - 위 칸이 없으면 위 칸부터 통째로 set 한다. value 는 JSON 값(문자열 · 숫자 · 참거짓 · 맵 · 목록)이다
       - apiVersion · kind · metadata.name · metadata.namespace 는 못 바꾼다(다른 리소스가 된다). metadata 아래는 labels · annotations 만
-      - plain YAML 앱만 된다. Kustomize 앱은 넷만 된다
+      - plain YAML 앱은 그 문서를, Kustomize 앱은 overlay 에 Kukie patch 파일을 고친다(base 는 안 고친다). overlay 의
+        replicas: · images: 가 정하는 칸은 그 항목을 고치고, commonLabels 등 overlay 전체에 붙는 칸은 거절한다
       - privileged · hostPath · 서비스 계정 같은 위험해 보이는 값은 막지 않고 승인 카드에 경고로 올린다
     리소스를 지우거나 다른 네임스페이스로 옮길 때는 전용 둘을 쓴다 (plain YAML · Kustomize 앱 모두):
       delete() — 그 리소스를 레포에서 뺀다. 클러스터에서도 지워지는지는 앱의 prune 설정이 정하고 승인 카드에 나온다

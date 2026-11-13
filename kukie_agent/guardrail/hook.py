@@ -349,7 +349,7 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
             if getattr(ctx, "retry", 0) < 1:
                 raise ModelRetry(
                     f"{PR_PATH_RETRY} 이유: {pr.reason} 레플리카·이미지 태그·resources·환경변수 변경이면 "
-                    "propose_git_change 로 다시 하라. plain YAML 앱이면 그 밖의 칸(포트·probe·args·라벨 …)도 "
+                    "propose_git_change 로 다시 하라. 그 밖의 칸(포트·probe·args·라벨 …)도 "
                     "propose_git_change 의 경로 지정 변경(what=patch)으로 한다. 리소스 삭제는 what=delete, 네임스페이스 "
                     "옮기기는 what=namespace 로 한다(kubectl 로 지우면 ArgoCD 가 다시 만든다). 그것으로도 안 되는 변경이거나 "
                     "사용자가 kubectl 로 바로 바꾸길 원하면"
