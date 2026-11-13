@@ -378,3 +378,15 @@ def test_패치가_건드리는_칸():
     change = ops(("set", "spec", {}), ("remove", "metadata.labels.tier"))
     assert patching.touches(change, ("spec", "replicas")) and patching.touches(change, ("metadata",))
     assert not patching.touches(ops(("set", "spec.minReadySeconds", 1)), ("spec", "replicas"))
+
+
+def test_StatefulSet_은_바꿀_수_있는_칸만(repo):
+    (repo / "apps/plain/db.yaml").write_text(
+        "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: db\nspec:\n  serviceName: db\n"
+        "  selector:\n    matchLabels: {app: db}\n  template:\n    metadata:\n      labels: {app: db}\n"
+        "    spec:\n      containers:\n        - name: db\n          image: postgres:16\n", encoding="utf-8")
+    db = Target(api_version="apps/v1", kind="StatefulSet", name="db", namespace="shop")
+    refused(plan_change(repo, PLAIN, db, ops(("set", "spec.revisionHistoryLimit", 3))), "guarded_field")
+    refused(plan_change(repo, PLAIN, db, ops(("set", "spec.serviceName", "db2"))), "guarded_field")
+    ready(plan_change(repo, PLAIN, db, ops(("set", "spec.minReadySeconds", 5))))
+    ready(plan_change(repo, PLAIN, db, ops(("set", "spec.template.spec.containers[db].image", "postgres:17"))))

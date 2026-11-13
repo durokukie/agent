@@ -49,14 +49,16 @@ IMMUTABLE: dict[str, tuple[FieldPath, ...]] = {
     "Deployment": (("spec", "selector"),),
     "ReplicaSet": (("spec", "selector"),),
     "DaemonSet": (("spec", "selector"),),
-    "StatefulSet": (("spec", "selector"), ("spec", "serviceName"), ("spec", "volumeClaimTemplates"),
-                    ("spec", "podManagementPolicy")),
     "Job": (("spec", "selector"), ("spec", "template")),
     "Service": (("spec", "clusterIP"), ("spec", "clusterIPs")),
     "PersistentVolumeClaim": (("spec", "accessModes"), ("spec", "storageClassName"), ("spec", "volumeName"),
                               ("spec", "volumeMode"), ("spec", "selector"), ("spec", "dataSource"),
                               ("spec", "dataSourceRef")),
 }
+
+#: StatefulSet spec 중 만든 뒤에도 바꿀 수 있는 칸 — 나머지는 apply 가 거절한다 (허용 목록)
+_STATEFULSET_MUTABLE = frozenset({"replicas", "template", "updateStrategy", "persistentVolumeClaimRetentionPolicy",
+                                  "minReadySeconds", "ordinals"})
 
 #: 셀렉터가 파드 템플릿 레이블을 골라야 하는 종류 — 맞지 않으면 apply 가 거절된다
 _SELECTED = ("Deployment", "ReplicaSet", "DaemonSet", "StatefulSet")
@@ -154,6 +156,11 @@ def guarded(kind: str, before: dict, after: dict) -> str | None:
         if changed:
             return (f"Pod 의 spec.{show(changed[0])} 는 만든 뒤 바꿀 수 없는 칸이에요 — 머지해도 쿠버네티스가 거절해 sync 가 "
                     "실패해요. Pod 는 이미지 · activeDeadlineSeconds 만 바꿀 수 있어요. Deployment 로 옮기는 것을 권해요")
+    if kind == "StatefulSet":
+        fixed = sorted({str(p[0]) for p in compare.diff_paths(before.get("spec"), after.get("spec"))} - _STATEFULSET_MUTABLE)
+        if fixed:
+            return (f"StatefulSet 의 spec.{fixed[0]} 는 만든 뒤 바꿀 수 없는 칸이에요 — 머지해도 쿠버네티스가 거절해 sync 가 "
+                    "실패해요. StatefulSet 은 replicas · template · updateStrategy · minReadySeconds 등만 바꿀 수 있어요")
     for path in IMMUTABLE.get(kind, ()):
         if compare.value_at(before, path) != compare.value_at(after, path):
             return (f"{kind} 의 {show(path)} 는 만든 뒤 바꿀 수 없는 칸이에요 — 머지해도 쿠버네티스가 거절해 sync 가 "
