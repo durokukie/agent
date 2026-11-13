@@ -206,7 +206,7 @@ def original_name(kustomization: Any, rendered: str) -> str:
 
 #: strategic merge 에서 name 으로 항목을 맞추는 목록 (쿠버네티스 기본 종류). 항목 하나만 고치거나 `$patch: delete` 로 뺀다
 _NAME_MERGED = frozenset({"containers", "initContainers", "ephemeralContainers", "env", "volumes",
-                          "imagePullSecrets", "resourceClaims"})
+                          "imagePullSecrets", "resourceClaims", "webhooks"})
 #: name 이 아닌 키(containerPort+protocol · mountPath · port …)로 맞추는 병합 목록 — 키를 맞추기 어려워 `$patch: replace` 로
 #: 통째로 바꾼다 (측정에서 ports 를 지울 때 containerPort 만으로는 안 지워졌다)
 _KEY_MERGED = frozenset({"ports", "volumeMounts", "volumeDevices", "hostAliases", "topologySpreadConstraints",
@@ -337,18 +337,19 @@ def _route_transformers(kustomization: Any, ctx: Context, for_patch: dict, targe
                         "칸을 지우거나 숫자가 아닌 값으로는 바꿀 수 없어요")
             replicas["count"] = new
             want["spec"]["replicas"] = old
-    template = _pod_template(kind)
-    if template is None:
+    # 파드 스펙 — 워크로드는 템플릿 안, Pod 는 spec 바로 아래 (agent#159 리뷰)
+    pod_spec = POD_SPEC.get(kind) or (("spec",) if kind == "Pod" else None)
+    if pod_spec is None:
         return None
     for section in ("containers", "initContainers"):
-        for old_item in dig(current, (*template, "spec", section)) or []:
+        for old_item in dig(current, (*pod_spec, section)) or []:
             if not isinstance(old_item, dict) or not isinstance(old_item.get("image"), str):
                 continue
             entry = _image_entry(kustomization, old_item["image"])
-            new_item = compare.value_at(want, (*template, "spec", section, compare.item(str(old_item.get("name")))))
+            new_item = compare.value_at(want, (*pod_spec, section, compare.item(str(old_item.get("name")))))
             if entry is None or not isinstance(new_item, dict) or new_item.get("image") == old_item["image"]:
                 continue
-            path = compare.show((*template, "spec", section, compare.item(str(old_item.get("name"))), "image"))
+            path = compare.show((*pod_spec, section, compare.item(str(old_item.get("name"))), "image"))
             if not isinstance(new_item.get("image"), str) or not new_item["image"]:
                 return (f"그 칸({path})은 이 overlay kustomization 의 images: 가 정해요 — 거기를 고쳐야 해요. "
                         "이미지를 지울 수는 없어요")

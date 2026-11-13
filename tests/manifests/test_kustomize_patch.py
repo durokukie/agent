@@ -176,6 +176,18 @@ def test_images_항목에_태그와_digest_를_같이_둔다(repo):
 
 
 @needs_kustomize
+def test_Pod_의_이미지도_images_항목으로(repo):
+    pod = ("apiVersion: v1\nkind: Pod\nmetadata: {name: debug}\nspec:\n  containers:\n"
+           "    - {name: debug, image: nginx}\n")
+    app = overlay(repo, "pod", "resources: [pod.yaml]\nimages: [{name: nginx, newTag: '1.27'}]\n", **{"pod.yaml": pod})
+    target = Target(api_version="v1", kind="Pod", name="debug")
+    result = ready(plan_change(repo, app, target, ops(("set", "spec.containers[debug].image", "nginx:1.28"))))
+    assert list(result.files) == ["apps/kustomize/overlays/pod/kustomization.yaml"]
+    assert yaml.safe_load(result.files["apps/kustomize/overlays/pod/kustomization.yaml"])["images"] == [
+        {"name": "nginx", "newTag": "1.28"}]
+
+
+@needs_kustomize
 def test_컨테이너를_통째로_바꿔도_이미지는_images_항목으로(repo):
     import copy as copying
 
@@ -308,6 +320,12 @@ def test_이름_목록의_순서가_바뀌면_렌더_비교에서도_차이다()
     plain = {"env": [{"name": "A"}, {"name": "B"}]}
     assert compare.diff_paths(plain, {"env": [{"name": "B"}, {"name": "A"}]}) == []
     assert compare.diff_paths({"volumes": swapped["env"]}, {"volumes": before["env"]}) == []
+
+
+def test_merge_patch_webhooks_도_이름으로_지운다():
+    current = {"webhooks": [{"name": "a.x.io"}, {"name": "b.x.io"}]}
+    assert merge_patch(current, {"webhooks": [{"name": "b.x.io"}]}, builtin=True) == {
+        "webhooks": [{"name": "a.x.io", "$patch": "delete"}]}
 
 
 def test_merge_patch_커스텀_리소스와_원자_목록은_통째로():
