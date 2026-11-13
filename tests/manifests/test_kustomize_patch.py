@@ -167,6 +167,15 @@ def test_images_가_정하는_이미지는_images_항목을_고치고_나머지�
 
 
 @needs_kustomize
+def test_images_항목에_태그와_digest_를_같이_둔다(repo):
+    digest = "sha256:" + "a" * 64
+    result = ready(plan_change(repo, PROD, API, ops(
+        ("set", f"{CONTAINER}.image", f"public.ecr.aws/docker/library/nginx:1.30-alpine@{digest}"))))
+    assert {"name": "public.ecr.aws/docker/library/nginx", "newTag": "1.30-alpine", "digest": digest} in \
+        yaml.safe_load(result.files[KUSTOMIZATION])["images"]
+
+
+@needs_kustomize
 def test_컨테이너를_통째로_바꿔도_이미지는_images_항목으로(repo):
     import copy as copying
 

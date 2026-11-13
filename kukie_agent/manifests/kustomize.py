@@ -364,19 +364,16 @@ def _image_entry(kustomization: Any, image: str) -> Any:
 
 
 def _set_image(entry: Any, image: str) -> None:
-    """`images:` 항목이 이 이미지를 내게 고친다 — 저장소가 다르면 newName, digest 가 있으면 digest(태그보다 먼저다)."""
+    """`images:` 항목이 이 이미지를 내게 고친다 — 저장소가 다르면 newName, 태그는 newTag, digest 는 digest.
+    둘 다 있으면 둘 다 둔다 — kustomize v5.8.1 은 `repo:tag@digest` 로 낸다 (agent#159 리뷰)."""
     repo, tag, digest = split_image(image)
     if repo != (entry.get("newName") or entry.get("name")):
         entry["newName"] = repo
-    if digest:
-        entry.pop("newTag", None)
-        entry["digest"] = digest
-    else:
-        entry.pop("digest", None)
-        if tag:
-            entry["newTag"] = tag
+    for key, value in (("newTag", tag), ("digest", digest)):
+        if value:
+            entry[key] = value
         else:
-            entry.pop("newTag", None)
+            entry.pop(key, None)
 
 
 def _render_without(ctx: Context, file: Path, name: str) -> dict | Refused:
