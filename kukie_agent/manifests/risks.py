@@ -36,7 +36,7 @@ def risk(code: str, file: str, resource: str, field: str | None, value: str | No
         value = value[:VALUE_LIMIT] + "…"
     where = " · ".join(part for part in (resource, field, value) if part)
     return RiskWarning(code=code, location=WarningLocation(file=file, resource=resource, field=field, value=value),
-                       risk=risk, suggestion=suggestion, text=f"{where}: {risk} {suggestion}")
+                       risk=risk, suggestion=suggestion, text=f"{where}: {risk} {suggestion}".rstrip())
 
 
 def walk(node: Any, path: FieldPath = ()) -> Iterator[tuple[FieldPath, Any]]:

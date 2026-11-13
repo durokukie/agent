@@ -8,6 +8,7 @@
 | 새 리소스 — 앱 없음·레포 미연결·Helm 등           | 이유와 다른 길   |
 | 클러스터에 없음 — 앱 하나의 status.resources 에 있음 | 그 앱으로 위 규칙 |
 | 클러스터에 없음 — 어느 앱에도 없음·여러 앱        | kubectl         |
+| 클러스터에 없음 — 프로젝트가 막은 네임스페이스     | kubectl(안내). 삭제·허락된 곳으로 옮기기는 PR |
 
 새 리소스(DURO-154)는 아직 클러스터에 없어 추적 표시로 길을 못 정한다. 요청이 고른 ArgoCD 앱을 읽어 같은 규칙으로 판단한다.
 git 에는 있는데 sync 가 실패해 클러스터에 없는 리소스(DURO-248)도 추적 표시가 없다. Application 의 status.resources 에서 찾는다.
@@ -16,7 +17,8 @@ git 에는 있는데 sync 가 실패해 클러스터에 없는 리소스(DURO-24
 (gitops_hook — 길이 바뀌었으면 STALE). kubectl 조회와 kukie-server 의 연결 목록으로만 판단한다. ArgoCD API 토큰은 쓰지 않는다.
 
 지원 형식은 plain YAML(Directory)·Kustomize, 요청은 manifests 의 넷(레플리카·이미지 태그·resources·환경변수)과
-경로 지정 변경(patch — plain YAML 앱만, Kustomize 앱이면 manifests 가 거절해 kubectl 길로 간다, DURO-249)이다.
+경로 지정 변경(patch — plain YAML 앱만, Kustomize 앱이면 manifests 가 거절해 kubectl 길로 간다, DURO-249),
+삭제(delete)·네임스페이스 옮기기(namespace, DURO-252)다. 옮기기는 옮겨 갈 곳을 프로젝트가 허락하는지 보려고 AppProject 를 읽는다.
 targetRevision 이 브랜치인지(태그·커밋이면 PR 길이 없다)는 GitHub 에 물어야 알아서 여기서 보지 않는다 — PR 을 만들 때 본다.
 """
 from __future__ import annotations
@@ -34,7 +36,7 @@ from anyio import to_thread
 from kukie_agent import argocd, server_api
 from kukie_agent.gitops.repo import repo_name
 from kukie_agent.kubectl import KubectlResult, run_kubectl, thread_limiter
-from kukie_agent.manifests import AppSource, Change, NewResource, Other, Patch, Target
+from kukie_agent.manifests import AppSource, Change, Delete, MoveNamespace, NewResource, Other, Patch, Target
 from kukie_agent.manifests.models import KIND_SHAPE, NAME_SHAPE
 
 logger = logging.getLogger(__name__)
@@ -139,6 +141,7 @@ def app_source(item: dict[str, Any], source: dict[str, Any]) -> AppSource:
     options = ((spec.get("syncPolicy") or {}).get("syncOptions") or [])
     source_type = str(status.get("sourceType") or ("Helm" if source.get("chart") else ""))
     destination = spec.get("destination") or {}
+    auto_sync, _, prune = argocd.sync_policy(item)
     return AppSource(
         source_type=source_type,
         path=str(source.get("path") or ""),
@@ -152,6 +155,10 @@ def app_source(item: dict[str, Any], source: dict[str, Any]) -> AppSource:
         project=str(spec.get("project") or "default"),
         destination_server=str(destination.get("server") or ""),
         destination_name=str(destination.get("name") or ""),
+        destination_namespace=str(destination.get("namespace") or ""),
+        auto_sync=auto_sync,
+        prune=prune,
+        allow_empty=auto_sync and ((spec.get("syncPolicy") or {}).get("automated") or {}).get("allowEmpty") is True,
     )
 
 
@@ -218,13 +225,19 @@ async def decide(
                      managed=True)
 
     target = Target(api_version=str(resource.get("apiVersion") or ""), kind=str(resource.get("kind") or kind),
-                    name=name, namespace=(resource.get("metadata") or {}).get("namespace") or namespace)
-    return await _route_of_app(item, target, cluster_id=cluster_id, change=change, connected=connected)
+                    name=name, namespace=(resource.get("metadata") or {}).get("namespace") or namespace, in_cluster=True)
+    destinations = None
+    if isinstance(change, MoveNamespace):
+        # 옮겨 갈 곳을 프로젝트가 허락하는지는 manifests 가 본다 (DURO-252) — 못 읽으면 None, 막지 않고 카드에 경고한다
+        destinations = await _read_destinations(item, context=context, kubeconfig=kubeconfig, deadline=deadline)
+    return await _route_of_app(item, target, cluster_id=cluster_id, change=change, connected=connected,
+                               project_destinations=destinations)
 
 
 async def _route_of_app(item: dict[str, Any], target: Target, *, cluster_id: str | None, change: Change | None,
                         connected: set[str] | None, project_destinations: list[dict] | None = None) -> Route:
-    """이 앱의 레포·형식으로 PR 길인지. project_destinations 는 새 리소스 길에서만 읽어 넘긴다 (DURO-240)."""
+    """이 앱의 레포·형식으로 PR 길인지. project_destinations 는 새 리소스(DURO-240)·네임스페이스 옮기기(DURO-252) 길에서만
+    읽어 넘긴다."""
     meta = item.get("metadata") or {}
     app_label = f"ArgoCD 앱 {meta.get('name')}"
     source, refused = _source_of(item)
@@ -259,7 +272,8 @@ async def _route_of_app(item: dict[str, Any], target: Target, *, cluster_id: str
     if isinstance(change, Other):
         return Route("kubectl", f"'{change.description}' 은 PR 로 못 바꿔요. PR 로는 레플리카 수 · 이미지 태그 · "
                                 "CPU·메모리 · 환경변수를 바꾸고, plain YAML 앱이면 그 밖의 칸도 경로 지정 변경"
-                                "(what=patch)으로 바꿔요.", **common)
+                                "(what=patch)으로 바꿔요. 리소스 삭제(what=delete)와 네임스페이스 옮기기(what=namespace)도 "
+                                "PR 로 해요.", **common)
     return Route("pr", f"{app_label} 이 관리하고 레포 {repository} 가 연결돼 있어요 — 변경은 PR 로 올려요.", **common)
 
 
@@ -361,7 +375,7 @@ async def _decide_missing(kind: str, name: str, namespace: str | None, label: st
                                 "어느 것인지 정할 수 없어요. namespace 를 알려 주세요.", managed=True)
     item, entry = found[0]
     target = Target(api_version=_api_version(entry), kind=str(entry.get("kind") or kind), name=name,
-                    namespace=str(entry.get("namespace") or "") or namespace)
+                    namespace=str(entry.get("namespace") or "") or namespace, in_cluster=False)
     app = (item.get("metadata") or {}).get("name")
     if not namespace and target.namespace:
         # 처음 조회는 namespace 없이(context 기본 ns) 했다 — 앱이 적은 ns 에 실제로 있으면 git 에만 있는 게 아니다
@@ -380,35 +394,45 @@ async def _decide_missing(kind: str, name: str, namespace: str | None, label: st
         if live:
             return Route("kubectl", f"{label} 는 {target.namespace} 네임스페이스에 있어요 — namespace 를 알려 주세요.",
                          managed=True)
-    denied = await _project_denies(item, target, context=context, kubeconfig=kubeconfig, deadline=deadline)
-    if denied:
-        # sync 가 거부된 까닭이 바로 이것이면, 값을 고치는 PR 을 머지해도 다시 거부돼 반영되지 않는다 (agent#155 리뷰)
+    destinations = None
+    if target.namespace or isinstance(change, MoveNamespace):
+        destinations = await _read_destinations(item, context=context, kubeconfig=kubeconfig, deadline=deadline)
+    denied = _project_denies(item, target, destinations)
+    if denied and not isinstance(change, Delete | MoveNamespace):
+        # sync 가 거부된 까닭이 바로 이것이면, 값을 고치는 PR 을 머지해도 다시 거부돼 반영되지 않는다 (agent#155 리뷰).
+        # 그 리소스를 git 에서 빼거나(delete) 허락된 곳으로 옮기는(namespace) 것은 바로 그 거부를 푸는 변경이라 PR 길로 둔다 (DURO-252)
+        default = ((item.get("spec") or {}).get("destination") or {}).get("namespace")
         return Route("kubectl", f"{target.label()} 는 클러스터에 없고 git 에만 있어요. ArgoCD 앱 {app} 의 프로젝트 "
                                 f"'{denied}' 가 {target.namespace} 네임스페이스를 허락하지 않아 sync 가 거부돼요 — 값을 고치는 PR 을 "
-                                "머지해도 반영되지 않아요. git 의 네임스페이스를 프로젝트가 허락하는 곳으로 고치거나 프로젝트 설정을 "
-                                "바꿔야 해요(Kukie PR 로는 아직 네임스페이스를 못 바꿔요).",
+                                "머지해도 반영되지 않아요. 프로젝트가 허락하는 네임스페이스"
+                                + (f"(앱 기본은 {default})" if default else "")
+                                + "로 옮기는 PR(what=namespace)이나 git 에서 빼는 PR(what=delete)을 먼저 올리거나, "
+                                "프로젝트 설정을 바꿔야 해요.",
                      managed=True, application=item, target=target)
-    route = await _route_of_app(item, target, cluster_id=cluster_id, change=change, connected=connected)
+    route = await _route_of_app(item, target, cluster_id=cluster_id, change=change, connected=connected,
+                                project_destinations=destinations if isinstance(change, MoveNamespace) else None)
     # 사람과 AI 가 "왜 클러스터에 없는데 PR 인가" 를 알게 — sync 실패의 까닭은 앱 상태(conditions)에 있다
     return replace(route, reason=f"{target.label()} 는 클러스터에 없고 git 에만 있어요 — ArgoCD 앱 {app} 의 "
                                  f"sync 가 실패했거나 아직이에요. {route.reason}")
 
 
-async def _project_denies(item: dict[str, Any], target: Target, *, context: str, kubeconfig: Path | None,
-                          deadline: float | None) -> str | None:
-    """앱의 ArgoCD 프로젝트가 target 의 네임스페이스를 막으면 그 프로젝트 이름. 허락하거나 모르면 None —
-    새 리소스 길(DURO-240)처럼 프로젝트를 못 읽으면 막지 않는다."""
-    if not target.namespace:
-        return None
+async def _read_destinations(item: dict[str, Any], *, context: str, kubeconfig: Path | None,
+                             deadline: float | None) -> list[dict] | None:
+    """앱의 AppProject spec.destinations. 못 읽으면 None — 막지 않는다 (_project_destinations)."""
     try:
-        destinations = await to_thread.run_sync(
+        return await to_thread.run_sync(
             partial(_project_destinations, item, context=context, kubeconfig=kubeconfig, deadline=deadline),
             limiter=thread_limiter("gitops_route", LOOKUP_WORKERS),
         )
     except Exception:
         logger.exception("ArgoCD 프로젝트를 읽지 못해 네임스페이스 허락을 건너뛴다")
         return None
-    if destinations is None:
+
+
+def _project_denies(item: dict[str, Any], target: Target, destinations: list[dict] | None) -> str | None:
+    """앱의 ArgoCD 프로젝트가 target 의 네임스페이스를 막으면 그 프로젝트 이름. 허락하거나 모르면 None —
+    새 리소스 길(DURO-240)처럼 프로젝트를 못 읽으면 막지 않는다."""
+    if not target.namespace or destinations is None:
         return None
     destination = (item.get("spec") or {}).get("destination") or {}
     permitted = argocd.destination_permitted(destinations, server=str(destination.get("server") or ""),
