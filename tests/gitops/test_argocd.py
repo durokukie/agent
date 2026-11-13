@@ -771,3 +771,37 @@ def test_fresh_여도_FRESH_MIN_AGE_보다_덜_된_결과는_나눠_쓴다(share
 
     assert asyncio.run(main()) == ({"n": 1}, {"n": 1}, {"n": 2})
     assert 0 < clusters_api.FRESH_MIN_AGE < clusters_api.OVERVIEW_SHARE_TTL
+
+
+# ── AppProject 허락 범위 (DURO-240) ─────────────────────
+IN_CLUSTER = "https://kubernetes.default.svc"
+
+
+@pytest.mark.parametrize("destinations, namespace, expected", [
+    ([{"server": IN_CLUSTER, "namespace": "sandbox-*"}], "sandbox-plain", True),
+    ([{"server": IN_CLUSTER, "namespace": "sandbox-*"}], "default", False),
+    ([{"server": "*", "namespace": "*"}], "default", True),                                   # default 프로젝트
+    ([{"name": "in-cluster", "namespace": "*"}], "default", None),                            # 앱은 server, 프로젝트는 name
+    ([{"server": "https://other", "namespace": "*"}], "default", None),                       # 다른 클러스터만 허락
+    ([{"server": IN_CLUSTER, "namespace": "*"}, {"server": IN_CLUSTER, "namespace": "!kube-system"}], "kube-system", False),
+    ([{"server": IN_CLUSTER, "namespace": "*"}, {"server": IN_CLUSTER, "namespace": "!kube-system"}], "default", True),
+    ([{"server": "!https://other", "namespace": "*"}], "default", True),
+    ([], "default", None),
+    # 앱은 server 만 적었다 — name 칸 거부 패턴은 걸리는지 모른다 (agent#154 리뷰)
+    ([{"server": IN_CLUSTER, "namespace": "*"}, {"name": "!dev-*", "namespace": "*"}], "default", None),
+    ([{"server": IN_CLUSTER, "namespace": "sandbox-*"}, {"name": "!dev-*", "namespace": "*"}], "default", None),
+    ([{"server": IN_CLUSTER, "namespace": "sandbox-*"}, {"name": "!dev-*", "namespace": "shop"}], "default", False),
+])
+def test_프로젝트_destinations는_ArgoCD와_같은_규칙으로_본다(destinations, namespace, expected):
+    assert argocd.destination_permitted(destinations, server=IN_CLUSTER, name="", namespace=namespace) is expected
+
+
+def test_허락된_네임스페이스는_이_클러스터_것만_모은다():
+    destinations = [{"server": IN_CLUSTER, "namespace": "sandbox-*"}, {"server": "https://other", "namespace": "prod"},
+                    {"server": IN_CLUSTER, "namespace": "sandbox-*"}]
+    assert argocd.allowed_namespaces(destinations, server=IN_CLUSTER, name="") == (["sandbox-*"], [])
+
+
+def test_제외_패턴은_허락_목록에_섞지_않는다():
+    destinations = [{"server": IN_CLUSTER, "namespace": "*"}, {"server": IN_CLUSTER, "namespace": "!kube-system"}]
+    assert argocd.allowed_namespaces(destinations, server=IN_CLUSTER, name="") == (["*"], ["kube-system"])

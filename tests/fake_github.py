@@ -241,6 +241,8 @@ class FakeCluster:
     same_name_in: str | None = None
     #: True 면 ArgoCD 가 깔려 있지 않다
     no_argocd: bool = False
+    #: 앱의 AppProject(default) spec.destinations. None 이면 AppProject 를 못 찾는다 (DURO-240)
+    project_destinations: list[dict[str, Any]] | None = None
 
     def resource(self) -> dict[str, Any]:
         annotations = {"argocd.argoproj.io/tracking-id": "shop-web:apps/Deployment:shop/web"} if self.managed else {}
@@ -280,6 +282,10 @@ class FakeCluster:
                 other["metadata"]["namespace"] = self.same_name_in
                 return _ok({"items": [self.application(), *([other] if self.same_name_in else [])]})
             return _ok(self.application())
+        if args[:2] == ["get", "appprojects.argoproj.io"] and self.project_destinations is not None:
+            return _ok({"apiVersion": "argoproj.io/v1alpha1", "kind": "AppProject",
+                        "metadata": {"name": args[2], "namespace": "argocd"},
+                        "spec": {"destinations": self.project_destinations}})
         if args[:2] == ["get", "horizontalpodautoscalers"]:
             items = [{"metadata": {"name": self.hpa}, "spec": {"scaleTargetRef": {"kind": "Deployment", "name": "web"}}}]
             return _ok({"items": items if self.hpa else []})

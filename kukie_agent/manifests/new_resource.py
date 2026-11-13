@@ -6,6 +6,8 @@
   - 앱 폴더 밖 쓰기 · 기존 파일 덮어쓰기
   - 렌더 비교에서 기존 리소스가 바뀌거나 요청하지 않은 리소스가 생김 · 렌더 실패
   - 값이 든 Secret · 레포 밖을 끌어올 수 있는 Kustomize 설정(Kustomization 종류, 레포에 이미 있는 원격 resources 는 렌더가 거절한다)
+  - 앱의 ArgoCD 프로젝트(AppProject spec.destinations)가 허락하지 않는 네임스페이스 — 머지하면 sync 가 통째로 실패해 그 앱의
+    다른 변경까지 막힌다 (DURO-240). 프로젝트를 못 읽었거나 판단이 안 서면 막지 않고 경고에 그렇게 적는다
 그 밖에 봐 둘 것(클러스터 범위 · 다른 네임스페이스 · privileged · hostPath · hostNetwork · latest·태그 없는 이미지)은 경고로 올린다.
 경고는 렌더 결과를 본다 — Kustomize 가 네임스페이스·이미지 태그를 바꾸면 바뀐 값이 클러스터에 올라갈 값이다.
 
@@ -23,6 +25,7 @@ from typing import Any
 
 import yaml
 
+from kukie_agent import argocd
 from kukie_agent.manifests import compare, kustomize
 from kukie_agent.manifests.change import _SECRETISH, _SHOW_LIMIT, busy, other_environments
 from kukie_agent.manifests.compare import FieldPath, Key
@@ -143,6 +146,10 @@ def plan_new_resource(repo: Path, app: AppSource, target: Target, request: NewRe
                                message="다른 환경도 같이 바뀌어요: " + ", ".join(changed[:_SHOW_LIMIT])
                                        + f". '{app_path}' 를 base 로 쓰는 곳이 있어요 — 그 환경의 overlay 앱을 골라 주세요.")
 
+    denied = _project_denied(app, target, created)
+    if denied is not None:
+        return denied
+
     resources = []
     risks = []
     if app.source_type == "Directory" and app.directory_filtered:
@@ -154,7 +161,8 @@ def plan_new_resource(repo: Path, app: AppSource, target: Target, request: NewRe
         namespace = "" if key[1] in _CLUSTER_SCOPED else key[2] or target.namespace or ""
         resources.append({"api_version": key[0], "kind": key[1], "name": key[3], "namespace": namespace,
                           "file": relative})
-        risks += _risks(obj, (key[0], key[1], namespace, key[3]), relative, target.namespace)
+        risks += _risks(obj, (key[0], key[1], namespace, key[3]), relative, target.namespace,
+                        project=app.project if _permitted(app, namespace) else None)
     return Ready(
         files=files,
         file_diff="".join(
@@ -373,7 +381,42 @@ def _walk(node: Any, path: FieldPath = ()) -> Iterator[tuple[FieldPath, Any]]:
             yield from _walk(value, (*path, compare.item(value["name"]) if named else index))
 
 
-def _risks(obj: dict, key: Key, file: str, destination: str | None) -> list[RiskWarning]:
+def _permitted(app: AppSource, namespace: str) -> bool | None:
+    """그 네임스페이스를 앱의 ArgoCD 프로젝트가 허락하나. 프로젝트를 못 읽었으면 None (DURO-240)."""
+    if app.project_destinations is None or not namespace:
+        return None
+    return argocd.destination_permitted(app.project_destinations, server=app.destination_server,
+                                        name=app.destination_name, namespace=namespace)
+
+
+def _project_denied(app: AppSource, target: Target, created: list[tuple[Key, dict]]) -> Refused | None:
+    """렌더된 새 리소스 중 프로젝트가 허락하지 않는 네임스페이스가 있으면 막는다. 클러스터 범위 리소스는 보지 않는다 —
+    clusterResourceWhitelist 는 아직 읽지 않고 cluster_scoped 경고로 둔다."""
+    outside = []
+    for key, _ in created:
+        if key[1] in _CLUSTER_SCOPED:
+            continue
+        namespace = key[2] or target.namespace or ""
+        if _permitted(app, namespace) is False:
+            outside.append(compare.label((key[0], key[1], namespace, key[3])))
+    if not outside:
+        return None
+    assert app.project_destinations is not None
+    allowed, excluded = argocd.allowed_namespaces(app.project_destinations, server=app.destination_server,
+                                                  name=app.destination_name)
+    where = ", ".join(allowed[:_SHOW_LIMIT]) or "없음"
+    if excluded:
+        where += f"(제외: {', '.join(excluded[:_SHOW_LIMIT])})"
+    fix = (f"metadata.namespace 를 지우면 앱의 네임스페이스({target.namespace})에 만들어져요. "
+           if target.namespace else "")
+    return Refused(code="project_denied", retry=True, message=(
+        f"이 앱의 ArgoCD 프로젝트 '{app.project}' 는 이 클러스터에서 {where} 네임스페이스에만 배포를 허락해요. "
+        f"{', '.join(outside[:_SHOW_LIMIT])} 는 허락 밖이라 머지해도 ArgoCD sync 가 실패하고, 이 앱의 다른 변경까지 반영되지 않아요. "
+        f"{fix}그 네임스페이스가 꼭 필요하면 그곳을 허락하는 앱을 고르거나, ArgoCD 프로젝트 설정을 먼저 바꿔 주세요."))
+
+
+def _risks(obj: dict, key: Key, file: str, destination: str | None, *, project: str | None = None) -> list[RiskWarning]:
+    """project 는 이 네임스페이스를 허락한다고 확인한 ArgoCD 프로젝트 이름이다. None 이면 프로젝트 규칙을 확인하지 못했다."""
     resource = compare.label(key)
     kind, namespace = key[1], key[2]
     found: list[RiskWarning] = []
@@ -383,8 +426,10 @@ def _risks(obj: dict, key: Key, file: str, destination: str | None) -> list[Risk
                            "클러스터 전체에 영향을 줘요. 이 앱 밖의 리소스와 권한까지 바뀔 수 있어요.",
                            "꼭 클러스터 전체에 필요한지 확인하세요. 한 네임스페이스면 충분하면 Role·RoleBinding 같은 네임스페이스 범위로 바꾸세요."))
     if namespace and destination and namespace != destination:
+        project_note = (f"ArgoCD 프로젝트 '{project}' 는 이 네임스페이스를 허락해요." if project is not None
+                        else "ArgoCD 프로젝트 규칙은 확인하지 못했어요 — 프로젝트가 막으면 sync 가 실패해요.")
         found.append(_risk("other_namespace", file, resource, "metadata.namespace", namespace,
-                           f"이 앱의 네임스페이스({destination})가 아닌 곳에 만들어져요. 다른 팀의 공간일 수 있고, ArgoCD 프로젝트가 막으면 sync 가 실패해요.",
+                           f"이 앱의 네임스페이스({destination})가 아닌 곳에 만들어져요. 다른 팀의 공간일 수 있어요. {project_note}",
                            f"metadata.namespace 를 지우거나 {destination} 로 바꾸세요. 그 네임스페이스가 맞다면 그곳을 보는 앱을 고르는 것도 방법이에요."))
     for path, value in _walk(obj):
         field = compare.show(path)
