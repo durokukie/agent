@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kukie_agent.manifests import compare, kustomize, patch, plain, risks
+from kukie_agent.manifests import compare, key_change, kustomize, patch, plain, risks
 from kukie_agent.manifests.compare import FieldPath, Key
 from kukie_agent.manifests.models import (
     AppSource, Change, Env, ImageTag, NewResource, Other, Patch, Ready, Refused, Replicas, Resources, RiskWarning,
@@ -55,7 +55,7 @@ class Context:
 
 
 # 형식별로 고칠 파일을 고르는 곳. Helm(DURO-137)은 여기와 render.render 에 한 줄씩 더한다
-Proposer = Callable[[Context], "dict[str, str] | Refused"]
+Proposer = Callable[[Context], "dict[str, str | None] | Refused"]
 PROPOSERS: dict[str, Proposer] = {"Directory": plain.propose, "Kustomize": kustomize.propose}
 
 
@@ -68,7 +68,8 @@ def plan_change(repo: Path, app: AppSource, target: Target, change: Change, *,
     ctx = prepare(repo, app, target, change, hpa=hpa)
     if isinstance(ctx, Refused):
         return ctx
-    edits = PROPOSERS[app.source_type](ctx)
+    # 삭제·네임스페이스 변경(DURO-252)은 형식마다 고치는 법이 달라 key_change 가 고른다
+    edits = (key_change.propose if key_change.is_key_change(change) else PROPOSERS[app.source_type])(ctx)
     if isinstance(edits, Refused):
         return edits
     result = verify(ctx, edits)
@@ -78,7 +79,7 @@ def plan_change(repo: Path, app: AppSource, target: Target, change: Change, *,
 
 
 def verify_change(repo: Path, app: AppSource, target: Target, change: Change,
-                  edits: dict[str, str], *, hpa: str | None = None) -> Ready | Refused:
+                  edits: dict[str, str | None], *, hpa: str | None = None) -> Ready | Refused:
     """누가 골랐든 고친 파일(레포 루트 기준 경로 → 새 내용)이 요청한 것만 바꾸는지 렌더 비교로 확인한다."""
     ctx = prepare(repo, app, target, change, hpa=hpa)
     if isinstance(ctx, Refused):
@@ -102,7 +103,8 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
         return Refused(code="unsupported_change",
                        message=f"'{change.description}' 은 아직 PR 로 못 해요. "
                                "PR 로는 레플리카 수 · 이미지 태그 · CPU·메모리 · 환경변수를 바꾸고, "
-                               "그 밖의 칸은 경로 지정 변경(what=patch)으로 바꿔요.")
+                               "그 밖의 칸은 경로 지정 변경(what=patch)으로 바꿔요. 리소스 삭제(what=delete)와 "
+                               "네임스페이스 옮기기(what=namespace)도 PR 로 해요.")
     if isinstance(change, NewResource):
         return Refused(code="unsupported_change", message="새 리소스는 plan_new_resource 로 만들어요.")
     if target.kind == "Secret":
@@ -133,6 +135,8 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
     key = keys[0]
     obj = before[key]
 
+    if key_change.is_key_change(change):
+        return key_change.prepare(Context(repo, app, app_dir, target, change, before, key, obj, None, ()))
     if isinstance(change, Patch):
         return _prepare_patch(Context(repo, app, app_dir, target, change, before, key, obj, None, ()), hpa)
 
@@ -330,12 +334,13 @@ def _check_ignored(ctx: Context) -> Context | Refused:
 # ── 고친 뒤 ───────────────────────────────────────────────
 
 
-def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
-    files: dict[str, str] = {}
+def verify(ctx: Context, edits: dict[str, str | None]) -> Ready | Refused:
+    """edits 의 값이 None 이면 그 파일을 지운다 (삭제 요청, DURO-252)."""
+    files: dict[str, str | None] = {}
     originals: dict[str, str | None] = {}
     for path, content in edits.items():
         found = resolve_inside(ctx.root, path)
-        if found is None or found.is_dir():
+        if found is None or found.is_dir() or (content is None and not found.is_file()):
             return Refused(code="invalid_path", retry=True, message=f"'{path}' 는 레포 안 파일이 아니에요.")
         relative = ctx.relative(found)
         original = found.read_text(encoding="utf-8") if found.is_file() else None
@@ -348,6 +353,9 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
         workdir = Path(tmp) / "repo"
         shutil.copytree(ctx.root, workdir, symlinks=True, ignore=shutil.ignore_patterns(".git"))
         for relative, content in files.items():
+            if content is None:
+                (workdir / relative).unlink()
+                continue
             (workdir / relative).parent.mkdir(parents=True, exist_ok=True)
             (workdir / relative).write_text(content, encoding="utf-8")
         app_path = ctx.relative(ctx.app_dir)
@@ -359,7 +367,7 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
         except RenderError as exc:
             return Refused(code="render_failed", retry=True, message=f"고친 뒤 렌더링이 안 돼요. {exc}")
 
-        refused = _compare_app(ctx, after)
+        refused = (key_change.compare_app if key_change.is_key_change(ctx.change) else _compare_app)(ctx, after)
         if refused:
             return refused
         if ctx.app.source_type == "Kustomize":
@@ -380,17 +388,26 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
                                "그 폴더 안에서만 고쳐 주세요.")
 
     label = compare.label(ctx.key)
-    introduced = _patch_risks(ctx, after[ctx.key], sorted(files)[0]) if isinstance(ctx.change, Patch) else []
+    if key_change.is_key_change(ctx.change):
+        introduced = key_change.risk_warnings(ctx, sorted(files)[0])
+        rendered = key_change.render_diff(ctx, after)
+    else:
+        introduced = _patch_risks(ctx, after[ctx.key], sorted(files)[0]) if isinstance(ctx.change, Patch) else []
+        rendered = compare.unified(compare.dump(ctx.obj), compare.dump(after[ctx.key]),
+                                   f"{label} (지금)", f"{label} (머지 후)")
     return Ready(
         files=files,
-        file_diff="".join(
-            compare.unified(originals[p], files[p], f"a/{p}" if originals[p] is not None else "/dev/null", f"b/{p}")
-            for p in sorted(files)),
-        render_diff=compare.unified(compare.dump(ctx.obj), compare.dump(after[ctx.key]),
-                                    f"{label} (지금)", f"{label} (머지 후)"),
+        file_diff="".join(_file_diff(p, originals[p], files[p]) for p in sorted(files)),
+        render_diff=rendered,
         warnings=[*ctx.warnings, *(risk.text for risk in introduced)],
         risk_warnings=introduced,
     )
+
+
+def _file_diff(path: str, original: str | None, content: str | None) -> str:
+    """git diff 모양 — 새 파일은 /dev/null 에서, 지운 파일(None)은 /dev/null 로."""
+    return compare.unified(original, content or "", f"a/{path}" if original is not None else "/dev/null",
+                           f"b/{path}" if content is not None else "/dev/null")
 
 
 def _patch_risks(ctx: Context, after: dict, file: str) -> list[RiskWarning]:

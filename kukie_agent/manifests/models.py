@@ -29,6 +29,8 @@ class Target(BaseModel):
     kind: str
     name: str
     namespace: str | None = None
+    #: 클러스터에 있나 — 경로 판단이 채운다. False 면 git 에만 있다(sync 실패, DURO-248) — 지워도 클러스터에서 지울 것이 없다
+    in_cluster: bool | None = None
 
     @property
     def group(self) -> str:
@@ -50,8 +52,12 @@ class AppSource(BaseModel):
     project: str = ""                    # spec.project
     destination_server: str = ""         # spec.destination.server
     destination_name: str = ""           # spec.destination.name
-    #: 그 AppProject 의 spec.destinations (DURO-240). None 이면 읽지 않았거나 못 읽었다 — 새 리소스 길에서만 읽는다
+    destination_namespace: str = ""      # spec.destination.namespace — namespace 가 없는 문서가 들어가는 곳
+    #: 그 AppProject 의 spec.destinations (DURO-240). None 이면 읽지 않았거나 못 읽었다 — 새 리소스·네임스페이스 변경 길에서만 읽는다
     project_destinations: list[dict] | None = None
+    auto_sync: bool = False              # spec.syncPolicy.automated 가 있나 — 지운 리소스가 클러스터에서도 지워지는지 (DURO-252)
+    prune: bool = False                  # spec.syncPolicy.automated.prune
+    allow_empty: bool = False            # spec.syncPolicy.automated.allowEmpty — 꺼져 있으면 앱을 비우는 자동 prune 을 안 한다
 
 
 class Replicas(BaseModel):
@@ -139,6 +145,21 @@ class Patch(BaseModel):
     operations: list[PatchOperation] = Field(min_length=1, max_length=PATCH_OPERATIONS)
 
 
+#: 쿠버네티스 네임스페이스 이름 (RFC 1123 label)
+_NAMESPACE = r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+
+
+class Delete(BaseModel):
+    """리소스를 레포에서 빼는 요청 (DURO-252). 클러스터에서도 지워지는지는 앱의 prune 설정이 정한다 — manifests/key_change.py."""
+    what: Literal["delete"] = "delete"
+
+
+class MoveNamespace(BaseModel):
+    """리소스를 다른 네임스페이스로 옮기는 요청 (DURO-252). 쿠버네티스 입장에서는 옛 것 삭제 + 새 것 생성이다."""
+    what: Literal["namespace"] = "namespace"
+    to: str = Field(pattern=_NAMESPACE)
+
+
 class Other(BaseModel):
     """지원하는 요청(넷 + 경로 지정 변경) 밖의 요청."""
     what: Literal["other"] = "other"
@@ -154,7 +175,8 @@ class NewResource(BaseModel):
     file_name: str | None = None                # 앱 폴더 기준 새 파일 이름. 비우면 첫 리소스 이름으로 짓는다
 
 
-Change = Annotated[Replicas | ImageTag | Resources | Env | Patch | Other | NewResource, Field(discriminator="what")]
+Change = Annotated[Replicas | ImageTag | Resources | Env | Patch | Delete | MoveNamespace | Other | NewResource,
+                   Field(discriminator="what")]
 
 # 못 하는 이유. retry 가 True 면 고칠 곳을 다시 골라 볼 만하다(툴이 ModelRetry 로 이어 붙인다),
 # False 면 PR 로는 못 하는 일이라 kubectl + 경고 길로 간다 (설계 문서 3절).
@@ -180,6 +202,7 @@ RefuseCode = Literal[
     "invalid_patch",        # 경로 지정 변경의 경로가 틀렸거나 그 리소스에 없다 — 경로를 고쳐 다시 (DURO-249)
     "guarded_field",        # 바꾸면 안 되는 칸 — 리소스 식별 · ArgoCD 추적 표시 · 만든 뒤 못 바꾸는 칸 (DURO-249)
     "patch_mismatch",       # 경로가 렌더 결과에는 맞는데 레포 파일 문서에는 안 맞는다 (DURO-249)
+    "key_change_blocked",   # 삭제·네임스페이스 변경을 이 레포 모양에서는 못 한다 — base 에만 있음·patch 가 가리킴 등 (DURO-252)
 ]
 
 
@@ -201,6 +224,8 @@ class WarningLocation(BaseModel):
 class RiskWarning(BaseModel):
     """막지는 않지만 승인 전에 봐야 할 것 (DURO-154) — 어디가, 무슨 일이 날 수 있고, 어떻게 하면 되는지."""
     code: str
+    #: 삭제·네임스페이스 변경(DURO-252)만 채운다 — high 는 되돌려도(revert) 데이터가 돌아오지 않을 수 있는 것
+    level: Literal["high", "normal"] | None = None
     location: WarningLocation
     risk: str
     suggestion: str
@@ -209,11 +234,12 @@ class RiskWarning(BaseModel):
 
 class Ready(BaseModel):
     ok: Literal[True] = True
-    files: dict[str, str]   # 레포 루트 기준 경로 → 고친 뒤 전체 내용 (새 파일 포함, 안 바뀐 파일은 없다)
+    #: 레포 루트 기준 경로 → 고친 뒤 전체 내용 (새 파일 포함, 안 바뀐 파일은 없다). None 은 그 파일을 지운다 (DURO-252)
+    files: dict[str, str | None]
     file_diff: str          # git diff 모양 — PR·승인 카드에 싣는다
     render_diff: str        # 클러스터에서 실제로 바뀔 것 — 요청한 리소스 하나의 렌더 결과 전·후
     warnings: list[str] = []
-    risk_warnings: list[RiskWarning] = []   # 새 리소스(DURO-154) · 경로 지정 변경(DURO-249) 요청에만
+    risk_warnings: list[RiskWarning] = []   # 새 리소스(DURO-154) · 경로 지정 변경(DURO-249) · 삭제·네임스페이스(DURO-252)
     new_resources: list[dict[str, str]] = []  # 새 리소스 요청에만 — {api_version, kind, name, namespace, file}
 
 

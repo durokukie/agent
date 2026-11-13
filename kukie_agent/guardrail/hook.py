@@ -38,7 +38,7 @@ from kukie_agent.guardrail.approval import _manifest_preview
 from kukie_agent.guardrail.decision_guidance import generate_decision_guidance
 from kukie_agent.guardrail.mutation_request import canonicalize_mutation_args
 from kukie_agent.kubectl import KubectlResult, assemble, run_kubectl, thread_limiter
-from kukie_agent.manifests import Replicas
+from kukie_agent.manifests import Delete, Replicas
 from kukie_agent.tools.mutate import MUTATING_TOOLS, RISK_STICKERS
 
 logger = logging.getLogger(__name__)
@@ -118,8 +118,8 @@ async def _argocd_ownership(ctx, target: PlanTarget) -> dict | None:
 
 #: PR 길 리소스에 kubectl 을 부르면 한 번 돌려보낼 때 쓰는 머리말 (DURO-135)
 PR_PATH_RETRY = "이 리소스는 지금 PR 길이다."
-#: 같은 일을 PR 로도 할 수 있는 kubectl 툴 — restart·delete 는 PR 로 하는 변경이 아니다
-_PR_ALTERNATIVE = frozenset({"scale_resource", "apply_manifest"})
+#: 같은 일을 PR 로도 할 수 있는 kubectl 툴 — restart 는 PR 로 하는 변경이 아니다. delete 는 git 에서 빼는 PR 이 된다 (DURO-252)
+_PR_ALTERNATIVE = frozenset({"scale_resource", "apply_manifest", "delete_resource"})
 
 
 #: PR 길 판단(_pr_path) 전체 시간(초). 넘으면 모르는 것으로 보고 kubectl 길 그대로 간다 — 승인 카드가 그만큼만 늦는다
@@ -139,6 +139,8 @@ async def _pr_path(ctx, tool_name: str, managed: dict, normalized_args: dict) ->
             change = Replicas(count=normalized_args["replicas"])
         except ValidationError:
             return None        # PR 로는 못 하는 값(0..1000 밖) — 판단할 것 없이 kubectl 길이다 (범위는 kubectl 이 본다)
+    elif tool_name == "delete_resource":
+        change = Delete()      # git 에서 빼는 PR 이 된다 (DURO-252) — kubectl 로 지우면 ArgoCD 가 다시 만든다
     else:
         change = None
     # 예산은 두 겹으로 지킨다: 취소할 수 있는 await(server 호출·스레드 슬롯 대기)는 move_on_after 로, 이미 도는 스레드 안의
@@ -348,7 +350,8 @@ async def guardrail(ctx, *, call, tool_def, args, handler):
                 raise ModelRetry(
                     f"{PR_PATH_RETRY} 이유: {pr.reason} 레플리카·이미지 태그·resources·환경변수 변경이면 "
                     "propose_git_change 로 다시 하라. 그 밖의 칸(포트·probe·args·라벨 …)도 "
-                    "propose_git_change 의 경로 지정 변경(what=patch)으로 한다. 그것으로도 안 되는 변경이거나 "
+                    "propose_git_change 의 경로 지정 변경(what=patch)으로 한다. 리소스 삭제는 what=delete, 네임스페이스 "
+                    "옮기기는 what=namespace 로 한다(kubectl 로 지우면 ArgoCD 가 다시 만든다). 그것으로도 안 되는 변경이거나 "
                     "사용자가 kubectl 로 바로 바꾸길 원하면"
                     "(장애 대응 등) 같은 호출을 한 번 더 하라 — ArgoCD 경고 카드와 함께 승인을 받는다."
                 )

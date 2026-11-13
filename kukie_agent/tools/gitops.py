@@ -45,6 +45,12 @@ def propose_git_change(ctx: RunContext[Deps], kind: str, name: str, change: Chan
       - plain YAML 앱은 그 문서를, Kustomize 앱은 overlay 에 Kukie patch 파일을 고친다(base 는 안 고친다). overlay 의
         replicas: · images: 가 정하는 칸은 그 항목을 고치고, commonLabels 등 overlay 전체에 붙는 칸은 거절한다
       - privileged · hostPath · 서비스 계정 같은 위험해 보이는 값은 막지 않고 승인 카드에 경고로 올린다
+    리소스를 지우거나 다른 네임스페이스로 옮길 때는 전용 둘을 쓴다 (plain YAML · Kustomize 앱 모두):
+      delete() — 그 리소스를 레포에서 뺀다. 클러스터에서도 지워지는지는 앱의 prune 설정이 정하고 승인 카드에 나온다
+      namespace(to) — metadata.namespace 를 to 로 바꾼다. 옛 것을 지우고 새로 만드는 것이다(Service 주소·PVC 데이터가 바뀐다).
+        to 를 앱의 ArgoCD 프로젝트가 허락해야 한다. 앱 기본 네임스페이스로 옮기면 namespace 줄을 지운다
+      Kustomize 에서 리소스가 base 에서 오거나 overlay patch 가 그 리소스를 가리키면 못 한다(옮기기는 `namespace:` 가 정하는 앱도) —
+      이유를 사용자에게 알리고 GitHub 에서 직접 고치게 한다. kubectl 로 지우거나 옮기면 ArgoCD 가 되돌린다
     그 밖의 변경, ArgoCD 가 관리하지 않는 리소스, 레포가 연결되지 않은 리소스는 kubectl 변경 툴로 한다 —
     잘못 부르면 시스템이 이유와 함께 다시 하라고 알려 준다.
 

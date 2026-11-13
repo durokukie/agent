@@ -48,7 +48,8 @@ DIFF_LIMIT = 20_000
 
 #: kubectl 길로도, 고칠 곳 다시 고르기로도 보내지 않는 거절. busy 는 잠시 뒤 같은 요청이면 되고, 경로 지정 변경의
 #: guarded_field(만든 뒤 못 바꾸는 칸 등 — kubectl 로도 실패하거나 ArgoCD 를 깨뜨린다)·patch_mismatch 는 요청을 바꿔야 한다
-_STOP = frozenset({"busy", "guarded_field", "patch_mismatch"})
+#: key_change_blocked(DURO-252)는 레포 모양 때문에 PR 로 못 하는 삭제·네임스페이스 변경이다 — kubectl 로 바꾸면 ArgoCD 가 되돌린다
+_STOP = frozenset({"busy", "guarded_field", "patch_mismatch", "key_change_blocked"})
 
 
 class Refuse(Exception):
@@ -66,7 +67,7 @@ class Draft:
     repository: str
     base: str
     base_sha: str
-    files: dict[str, str]                     # 레포 루트 기준 경로 → 고친 뒤 전체 내용
+    files: dict[str, str | None]              # 레포 루트 기준 경로 → 고친 뒤 전체 내용. None 은 지운다 (DURO-252)
     file_diff: str
     render_diff: str
     warnings: list[str] = field(default_factory=list)
@@ -75,7 +76,9 @@ class Draft:
     new_resources: list[dict[str, str]] = field(default_factory=list)   # 새 리소스 요청에만 (DURO-154)
 
     def file_entries(self) -> list[dict[str, str]]:
-        return [{"path": path, "blob_sha": github.blob_sha(content)} for path, content in sorted(self.files.items())]
+        # 지운 파일은 빈 blob id — GitHub 의 PR 파일 목록(github.pull_files)이 지운 파일을 그렇게 준다. 승인 순간 그대로 맞춰 본다
+        return [{"path": path, "blob_sha": "" if content is None else github.blob_sha(content)}
+                for path, content in sorted(self.files.items())]
 
     def conflict_keys(self) -> list[str]:
         """기획 07 Conflict Key 의 레포·파일 단위 키 — 같은 파일을 고치는 변경 둘이 겹치지 않게 (설계 4절)."""
