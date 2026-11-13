@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from kukie_agent.manifests import (
     AppSource, Patch, PatchOperation, Ready, Refused, Target, plan_change, verify_change,
 )
+from kukie_agent.manifests import compare
 from kukie_agent.manifests import patch as patching
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "manifests"
@@ -167,7 +168,8 @@ def test_set_에는_값이_remove_에는_값이_없어야_한다():
 def test_만든_뒤_못_바꾸는_칸은_막는다(repo):
     result = refused(plan_change(repo, PLAIN, WEB, ops(("set", "spec.selector.matchLabels", {"app": "web2"}))),
                      "guarded_field")
-    assert "selector" in result.message and result.retry          # kubectl 길로 보내지 않는다
+    # 경로를 바꿔 다시 해도 풀리지 않는다 — 다시 고르게 하지도, kubectl 길로 보내지도 않는다 (pull_requests._STOP)
+    assert "selector" in result.message and not result.retry
 
 
 def test_위_칸을_통째로_바꿔도_못_바꾸는_칸이_그대로면_된다(repo):
@@ -209,6 +211,71 @@ def test_Service_의_clusterIP_는_못_바꾼다(repo):
 def test_비밀처럼_보이는_환경변수에_평문을_넣지_않는다(repo):
     env = [{"name": "GREETING", "value": "hello"}, {"name": "DB_PASSWORD", "value": "hunter2"}]
     refused(plan_change(repo, PLAIN, WEB, ops(("set", f"{CONTAINER}.env", env))), "secret")
+
+
+def test_init_컨테이너의_평문_비밀도_막는다(repo):
+    init = [{"name": "migrate", "image": "busybox:1.36", "env": [{"name": "DB_PASSWORD", "value": "hunter2"}]}]
+    refused(plan_change(repo, PLAIN, WEB, ops(("set", "spec.template.spec.initContainers", init))), "secret")
+
+
+def test_Secret_에서_가져오던_환경변수를_평문으로_바꾸지_않는다(repo):
+    """이름(DB_URL)이 비밀처럼 보이지 않아도 secretKeyRef 였던 항목이 바뀌거나 사라지면 막는다 — 넷의 env 요청과 같다."""
+    refused(plan_change(repo, PLAIN, WEB, ops(("set", f"{CONTAINER}.env[DB_URL]",
+                                              {"name": "DB_URL", "value": "postgres://u:p@db/shop"}))), "secret")
+    refused(plan_change(repo, PLAIN, WEB, ops(("remove", f"{CONTAINER}.env[DB_URL]"))), "secret")
+    refused(plan_change(repo, PLAIN, WEB, ops(("set", f"{CONTAINER}.env", [{"name": "GREETING", "value": "hi"}]))),
+            "secret")
+
+
+def test_HPA_가_맡은_레플리카는_경로_지정으로도_못_바꾼다(repo):
+    result = refused(plan_change(repo, PLAIN, WEB, ops(("set", "spec.replicas", 3)), hpa="web"), "hpa")
+    assert "HPA(web)" in result.message
+    spec = yaml.safe_load((repo / FILE).read_text(encoding="utf-8"))["spec"]
+    refused(plan_change(repo, PLAIN, WEB, ops(("set", "spec", {**spec, "replicas": 3})), hpa="web"), "hpa")
+    # 레플리카를 건드리지 않으면 된다
+    ready(plan_change(repo, PLAIN, WEB, ops(("set", "spec.minReadySeconds", 5)), hpa="web"))
+
+
+def test_immutable_은_풀_수_없다(repo):
+    (repo / "apps/plain/config.yaml").write_text(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web-config\nimmutable: true\ndata:\n  a: b\n",
+        encoding="utf-8")
+    config = Target(api_version="v1", kind="ConfigMap", name="web-config", namespace="shop")
+    refused(plan_change(repo, PLAIN, config, ops(("remove", "immutable"))), "guarded_field")
+    refused(plan_change(repo, PLAIN, config, ops(("set", "immutable", False))), "guarded_field")
+    refused(plan_change(repo, PLAIN, config, ops(("set", "data.a", "c"))), "guarded_field")
+    ready(plan_change(repo, PLAIN, config, ops(("set", "metadata.labels", {"team": "shop"}))))
+
+
+def test_셀렉터의_matchExpressions_도_본다(repo):
+    text = (repo / FILE).read_text(encoding="utf-8")
+    (repo / FILE).write_text(text.replace(
+        "  selector:\n    matchLabels: {app: web}\n",
+        "  selector:\n    matchExpressions: [{key: app, operator: In, values: [web]}]\n"), encoding="utf-8")
+    refused(plan_change(repo, PLAIN, WEB, ops(("set", "spec.template.metadata.labels", {"app": "api"}))),
+            "guarded_field")
+    refused(plan_change(repo, PLAIN, WEB, ops(("set", "spec.template.metadata.labels", {"tier": "front"}))),
+            "guarded_field")
+    ready(plan_change(repo, PLAIN, WEB, ops(("set", "spec.template.metadata.labels", {"app": "web", "tier": "front"}))))
+
+
+def test_셀렉터_고르기():
+    labels = {"app": "web", "tier": "front"}
+    assert patching.selects({"matchLabels": {"app": "web"}}, labels)
+    assert not patching.selects({"matchLabels": {"app": "api"}}, labels)
+    assert patching.selects({"matchExpressions": [{"key": "tier", "operator": "NotIn", "values": ["back"]},
+                                                  {"key": "app", "operator": "Exists"},
+                                                  {"key": "gone", "operator": "DoesNotExist"}]}, labels)
+    assert not patching.selects({"matchExpressions": [{"key": "app", "operator": "DoesNotExist"}]}, labels)
+    assert not patching.selects({"matchExpressions": [{"key": "app", "operator": "Weird"}]}, labels)
+
+
+def test_YAML_1_1_에서_참거짓으로_읽히는_문자열은_따옴표로_쓴다(repo):
+    """ruamel(1.2)은 yes·on·off 를 그냥 쓰지만 렌더(PyYAML)·ArgoCD(go-yaml)는 1.1 이라 참거짓으로 읽는다."""
+    result = ready(plan_change(repo, PLAIN, WEB, ops(
+        ("set", "metadata.annotations", {"sidecar": "yes", "mode": "off", "plain": "hello"}))))
+    assert doc_after(result)["metadata"]["annotations"] == {"sidecar": "yes", "mode": "off", "plain": "hello"}
+    assert 'sidecar: "yes"' in result.files[FILE] and "plain: hello" in result.files[FILE]
 
 
 def test_Secret_은_경로_지정으로도_못_고친다(repo):
@@ -276,3 +343,12 @@ def test_경로_모양():
     for bad in ("", ".spec", "spec.", "spec[0]", "spec[ 1 ]", "spec x", "spec.[a]b"):
         with pytest.raises(patching.PathError):
             patching.parse(bad)
+    # 메시지에 보이는 경로(compare.show)는 그대로 다시 쓸 수 있다
+    for path in ('metadata.annotations["a.b/c"]', "spec.template.spec.containers[api].env"):
+        assert compare.show(patching.field_path(patching.parse(path))) == path
+
+
+def test_패치가_건드리는_칸():
+    change = ops(("set", "spec", {}), ("remove", "metadata.labels.tier"))
+    assert patching.touches(change, ("spec", "replicas")) and patching.touches(change, ("metadata",))
+    assert not patching.touches(ops(("set", "spec.minReadySeconds", 1)), ("spec", "replicas"))

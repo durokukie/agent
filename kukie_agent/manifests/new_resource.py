@@ -9,7 +9,7 @@
   - 앱의 ArgoCD 프로젝트(AppProject spec.destinations)가 허락하지 않는 네임스페이스 — 머지하면 sync 가 통째로 실패해 그 앱의
     다른 변경까지 막힌다 (DURO-240). 프로젝트를 못 읽었거나 판단이 안 서면 막지 않고 경고에 그렇게 적는다
 그 밖에 봐 둘 것(클러스터 범위 · 다른 네임스페이스 · privileged · 권한 상승 · capabilities · root · hostPath ·
-hostNetwork·PID·IPC · 서비스 계정 · latest·태그 없는 이미지)은 경고로 올린다. 이 목록(_risks)은 경로 지정 변경(DURO-249)도 같이 쓴다.
+hostNetwork·PID·IPC · 서비스 계정 · latest·태그 없는 이미지)은 경고로 올린다. 이 목록은 risks.py 에 있고 경로 지정 변경(DURO-249)도 같이 쓴다.
 경고는 렌더 결과를 본다 — Kustomize 가 네임스페이스·이미지 태그를 바꾸면 바뀐 값이 클러스터에 올라갈 값이다.
 
 레포 폴더는 읽기만 한다 — 고친 내용은 결과(Ready.files)로만 나간다. git · GitHub · PR 은 이 모듈 밖이다.
@@ -20,39 +20,27 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
-from typing import Any
 
 import yaml
 
 from kukie_agent import argocd
 from kukie_agent.manifests import compare, kustomize
-from kukie_agent.manifests.change import _SECRETISH, _SHOW_LIMIT, busy, other_environments
-from kukie_agent.manifests.compare import FieldPath, Key
+from kukie_agent.manifests.change import _SHOW_LIMIT, busy, other_environments
+from kukie_agent.manifests.compare import Key
 from kukie_agent.manifests.models import (
-    KIND_SHAPE, NAME_SHAPE, AppSource, NewResource, Ready, Refused, RiskWarning, Target, WarningLocation,
+    KIND_SHAPE, NAME_SHAPE, AppSource, NewResource, Ready, Refused, RiskWarning, Target,
 )
 from kukie_agent.manifests.render import (
     KUSTOMIZATION_FILES, RenderError, RenderTimeout, kustomization_file, render, resolve_inside,
 )
-from kukie_agent.manifests.workload import split_image
+from kukie_agent.manifests.risks import CLUSTER_SCOPED, resource_risks, risk
 
 _FILE_SUFFIXES = (".yaml", ".yml")
 #: 파일 이름 길이 — 쿠버네티스 이름은 253자까지라 그대로 쓰면 파일 시스템 한도(255바이트)를 넘는다
 _FILE_NAME_LIMIT = 200
 #: 폴더에 있으면 ArgoCD 가 앱 형식을 다르게 읽는 파일 이름
 _RESERVED_FILES = (*KUSTOMIZATION_FILES, "Chart.yaml")
-#: 네임스페이스가 없다고 아는 종류. 이름으로 짐작하지 않는다 — ClusterServiceVersion 처럼 네임스페이스가 있는 종류도 있고,
-#: 틀리면 namespace 칸이 비어 같은 이름을 못 찾는다(agent#132 리뷰). 모르는 커스텀 리소스는 경고하지 않고, 막는 데도 쓰지 않는다
-_CLUSTER_SCOPED = frozenset({
-    "ClusterRole", "ClusterRoleBinding", "ClusterIssuer", "ClusterSecretStore", "ClusterExternalSecret",
-    "CustomResourceDefinition", "Namespace", "Node", "PersistentVolume", "StorageClass", "PriorityClass",
-    "IngressClass", "RuntimeClass", "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration",
-    "APIService", "CSIDriver", "VolumeSnapshotClass",
-})
-_CONTAINER_LISTS = ("containers", "initContainers", "ephemeralContainers")
-_VALUE_LIMIT = 200
 #: 쿠버네티스 이름 규칙. 렌더 비교는 YAML 만 읽어 못 거른다 — 그대로 올리면 머지한 뒤 sync 가 실패한다
 _DNS_SUBDOMAIN = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*")
 _DNS_LABEL = re.compile(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?")
@@ -154,15 +142,15 @@ def plan_new_resource(repo: Path, app: AppSource, target: Target, request: NewRe
     resources = []
     risks = []
     if app.source_type == "Directory" and app.directory_filtered:
-        risks.append(_risk("directory_filter", relative, app.path or ".", "spec.source.directory", None,
+        risks.append(risk("directory_filter", relative, app.path or ".", "spec.source.directory", None,
                            "이 앱은 읽을 파일을 include·exclude 로 골라요. 새 파일이 거기서 빠지면 머지해도 클러스터에 안 생겨요.",
                            "앱의 include·exclude 설정이 이 파일 이름을 받는지 확인하세요."))
     for key, obj in created:
         # 네임스페이스를 안 적은 문서는 앱의 destination 으로 들어간다. 클러스터 범위 리소스는 네임스페이스가 없다
-        namespace = "" if key[1] in _CLUSTER_SCOPED else key[2] or target.namespace or ""
+        namespace = "" if key[1] in CLUSTER_SCOPED else key[2] or target.namespace or ""
         resources.append({"api_version": key[0], "kind": key[1], "name": key[3], "namespace": namespace,
                           "file": relative})
-        risks += _risks(obj, (key[0], key[1], namespace, key[3]), relative, target.namespace,
+        risks += resource_risks(obj, (key[0], key[1], namespace, key[3]), relative, target.namespace,
                         project=app.project if _permitted(app, namespace) else None)
     return Ready(
         files=files,
@@ -304,8 +292,8 @@ def _already_in_app(docs: list[dict], before: dict[Key, dict]) -> Refused | None
             same_ns = not wanted or not key[2] or wanted == key[2]
             if (_group(key[0]), key[1], key[3]) == (_group(doc["apiVersion"]), doc["kind"], doc["metadata"]["name"]) and same_ns:
                 return Refused(code="resource_exists", retry=True, message=(
-                    f"{compare.label(key)} 는 이미 이 앱에 있어요. 새로 만들지 말고 change 의 replicas·image_tag·resources·env 로 "
-                    f"고쳐 주세요. {_OR_GITHUB}"))
+                    f"{compare.label(key)} 는 이미 이 앱에 있어요. 새로 만들지 말고 change 의 replicas·image_tag·resources·env 로, "
+                    f"그 밖의 칸은 plain YAML 앱이면 경로 지정 변경(patch)으로 고쳐 주세요. {_OR_GITHUB}"))
     return None
 
 
@@ -345,15 +333,6 @@ def _pick(doc: dict, new: dict[Key, dict]) -> Key | None:
 # ── 경고 ──────────────────────────────────────────────────
 
 
-def _risk(code: str, file: str, resource: str, field: str | None, value: str | None, risk: str,
-          suggestion: str) -> RiskWarning:
-    if value is not None and len(value) > _VALUE_LIMIT:
-        value = value[:_VALUE_LIMIT] + "…"
-    where = " · ".join(part for part in (resource, field, value) if part)
-    return RiskWarning(code=code, location=WarningLocation(file=file, resource=resource, field=field, value=value),
-                       risk=risk, suggestion=suggestion, text=f"{where}: {risk} {suggestion}")
-
-
 def representative(resources: list[dict[str, str]], kind: str, name: str) -> dict[str, str] | None:
     """요청이 대표로 적은 리소스의 렌더 결과. 종류까지 맞춘다 — Deployment·Service 는 이름이 같은 경우가 흔하다.
     이름은 _pick 처럼 본다 — namePrefix·nameSuffix 가 붙으면 그 이름을 품은 것 중 가장 짧은 것."""
@@ -365,21 +344,10 @@ def representative(resources: list[dict[str, str]], kind: str, name: str) -> dic
 def already_in_cluster(resource: dict[str, str]) -> RiskWarning:
     """git 에는 없지만 클러스터에 이미 있는 리소스 — 렌더 비교로는 안 보인다. 조회는 gitops/route.py 가 한다."""
     namespace = f"{resource['namespace']}/" if resource["namespace"] else ""
-    return _risk("already_in_cluster", resource["file"], f"{resource['kind']} {namespace}{resource['name']}", None, None,
+    return risk("already_in_cluster", resource["file"], f"{resource['kind']} {namespace}{resource['name']}", None, None,
                  "클러스터에 같은 이름의 리소스가 이미 있어요. sync 하면 새로 생기는 게 아니라 지금 것을 이 내용으로 덮어써요.",
                  "지금 설정과 비교해 보고, 다른 리소스라면 이름을 바꿔 주세요.")
 
-
-def _walk(node: Any, path: FieldPath = ()) -> Iterator[tuple[FieldPath, Any]]:
-    """객체의 모든 칸 — 이름 있는 목록 항목은 `[이름]` 조각으로. 파드 스펙 위치를 종류로 고르지 않으니 커스텀 리소스도 같이 본다."""
-    if isinstance(node, dict):
-        for key, value in node.items():
-            yield (*path, str(key)), value
-            yield from _walk(value, (*path, str(key)))
-    elif isinstance(node, list):
-        for index, value in enumerate(node):
-            named = isinstance(value, dict) and isinstance(value.get("name"), str)
-            yield from _walk(value, (*path, compare.item(value["name"]) if named else index))
 
 
 def _permitted(app: AppSource, namespace: str) -> bool | None:
@@ -395,7 +363,7 @@ def _project_denied(app: AppSource, target: Target, created: list[tuple[Key, dic
     clusterResourceWhitelist 는 아직 읽지 않고 cluster_scoped 경고로 둔다."""
     outside = []
     for key, _ in created:
-        if key[1] in _CLUSTER_SCOPED:
+        if key[1] in CLUSTER_SCOPED:
             continue
         namespace = key[2] or target.namespace or ""
         if _permitted(app, namespace) is False:
@@ -416,71 +384,3 @@ def _project_denied(app: AppSource, target: Target, created: list[tuple[Key, dic
         f"{fix}그 네임스페이스가 꼭 필요하면 그곳을 허락하는 앱을 고르거나, ArgoCD 프로젝트 설정을 먼저 바꿔 주세요."))
 
 
-def _risks(obj: dict, key: Key, file: str, destination: str | None, *, project: str | None = None) -> list[RiskWarning]:
-    """project 는 이 네임스페이스를 허락한다고 확인한 ArgoCD 프로젝트 이름이다. None 이면 프로젝트 규칙을 확인하지 못했다."""
-    resource = compare.label(key)
-    kind, namespace = key[1], key[2]
-    found: list[RiskWarning] = []
-    # 경고는 틀려도 막지 않으니 이름 짐작도 쓴다 (ClusterPolicy·ClusterTask …). namespace 칸은 아는 종류만 비운다 (plan_new_resource)
-    if kind in _CLUSTER_SCOPED or kind.startswith("Cluster"):
-        found.append(_risk("cluster_scoped", file, resource, "kind", kind,
-                           "클러스터 전체에 영향을 줘요. 이 앱 밖의 리소스와 권한까지 바뀔 수 있어요.",
-                           "꼭 클러스터 전체에 필요한지 확인하세요. 한 네임스페이스면 충분하면 Role·RoleBinding 같은 네임스페이스 범위로 바꾸세요."))
-    if namespace and destination and namespace != destination:
-        project_note = (f"ArgoCD 프로젝트 '{project}' 는 이 네임스페이스를 허락해요." if project is not None
-                        else "ArgoCD 프로젝트 규칙은 확인하지 못했어요 — 프로젝트가 막으면 sync 가 실패해요.")
-        found.append(_risk("other_namespace", file, resource, "metadata.namespace", namespace,
-                           f"이 앱의 네임스페이스({destination})가 아닌 곳에 만들어져요. 다른 팀의 공간일 수 있어요. {project_note}",
-                           f"metadata.namespace 를 지우거나 {destination} 로 바꾸세요. 그 네임스페이스가 맞다면 그곳을 보는 앱을 고르는 것도 방법이에요."))
-    for path, value in _walk(obj):
-        field = compare.show(path)
-        leaf = path[-1]
-        parent = path[-2] if len(path) > 1 else None
-        holder = path[-3] if len(path) > 2 else None
-        if leaf == "privileged" and value is True and parent == "securityContext":
-            found.append(_risk("privileged", file, resource, field, "true",
-                               "이 컨테이너가 노드의 거의 모든 권한을 가져요. 뚫리면 노드 전체와 그 위의 다른 파드까지 위험해요.",
-                               "privileged 를 빼고, 꼭 필요한 권한만 securityContext.capabilities.add 로 주세요."))
-        elif leaf == "allowPrivilegeEscalation" and value is True and parent == "securityContext":
-            found.append(_risk("privilege_escalation", file, resource, field, "true",
-                               "컨테이너 안의 프로세스가 처음보다 큰 권한(setuid 등)을 얻을 수 있어요.",
-                               "allowPrivilegeEscalation 을 false 로 두세요."))
-        elif leaf == "add" and parent == "capabilities" and isinstance(value, list) and value:
-            found.append(_risk("capabilities", file, resource, field, ", ".join(map(str, value)),
-                               "컨테이너에 리눅스 권한(capability)을 더 줘요. SYS_ADMIN · NET_ADMIN 같은 것은 노드까지 닿을 수 있어요.",
-                               "정말 필요한 것만 남기고, 가능하면 drop: [ALL] 과 함께 쓰세요."))
-        elif leaf == "runAsUser" and value == 0 and parent == "securityContext":
-            found.append(_risk("run_as_root", file, resource, field, "0",
-                               "컨테이너가 root(UID 0)로 돌아요. 컨테이너가 뚫리면 노드 쪽 피해가 커져요.",
-                               "root 가 아닌 UID 로 돌리고 runAsNonRoot: true 를 함께 두세요."))
-        elif leaf in ("hostNetwork", "hostPID", "hostIPC") and value is True:
-            what = {"hostNetwork": "네트워크", "hostPID": "프로세스 목록", "hostIPC": "프로세스 간 통신(IPC)"}[leaf]
-            found.append(_risk({"hostNetwork": "host_network", "hostPID": "host_pid", "hostIPC": "host_ipc"}[leaf],
-                               file, resource, field, "true",
-                               f"파드가 노드의 {what}을 그대로 써요. 노드와 다른 파드와의 격리를 받지 못해요.",
-                               "hostNetwork 를 빼고 Service 로 열어 주세요." if leaf == "hostNetwork"
-                               else f"{leaf} 를 빼 주세요."))
-        elif leaf == "serviceAccountName" and isinstance(value, str) and value and value != "default":
-            found.append(_risk("service_account", file, resource, field, value,
-                               "파드가 이 서비스 계정의 권한으로 쿠버네티스 API 를 불러요.",
-                               "그 서비스 계정에 붙은 Role·ClusterRole 이 꼭 필요한 만큼인지 확인하세요."))
-        elif leaf == "automountServiceAccountToken" and value is True:
-            found.append(_risk("service_account_token", file, resource, field, "true",
-                               "파드 안에 쿠버네티스 API 토큰이 들어가요. 컨테이너가 뚫리면 그 토큰의 권한을 쓸 수 있어요.",
-                               "API 를 부르지 않는 앱이면 false 로 두세요."))
-        elif leaf == "hostPath" and isinstance(value, dict) and holder == "volumes":
-            found.append(_risk("host_path", file, resource, field, str(value.get("path") or ""),
-                               "파드가 노드의 파일을 직접 읽고 써요. 노드의 설정이나 다른 파드의 데이터가 노출될 수 있어요.",
-                               "PersistentVolumeClaim·emptyDir·ConfigMap 으로 바꿀 수 있는지 보세요."))
-        elif leaf == "image" and isinstance(value, str) and holder in _CONTAINER_LISTS:
-            _, tag, digest = split_image(value)
-            if not digest and tag in (None, "latest"):
-                found.append(_risk("latest_image" if tag else "untagged_image", file, resource, field, value,
-                                   "어느 버전이 뜰지 정해지지 않아요. 파드가 다시 뜰 때 다른 버전이 올라올 수 있고, 되돌리기도 어려워요.",
-                                   "1.29.0 처럼 버전을 고정한 태그나 digest 를 쓰세요."))
-        elif leaf == "value" and holder == "env" and isinstance(parent, str) and _SECRETISH.search(parent) and value:
-            # 값은 싣지 않는다 — 비밀 값일 수 있다
-            found.append(_risk("plaintext_env", file, resource, field, None,
-                               "비밀번호나 키처럼 보이는 환경변수 값이 git 에 평문으로 남아요.",
-                               "값이 비밀이면 Secret 을 따로 두고 valueFrom.secretKeyRef 로 가리키세요."))
-    return found

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,4 +50,21 @@ def canonicalize_mutation_args(
         change = dict(values["change"])
         change["manifest_sha256"] = hashlib.sha256(change.pop("manifest_yaml").encode("utf-8")).hexdigest()
         values["change"] = change
+    if tool_name == "propose_git_change" and values["change"].get("what") == "patch":
+        # 경로는 그대로 두고 큰 값만 해시로 — 경로 목록은 승인 카드·판단 가이드가 읽고, 값은 PR 과 render_diff 에 있다 (DURO-249)
+        change = dict(values["change"])
+        change["operations"] = [_patch_operation(operation) for operation in change["operations"]]
+        values["change"] = change
     return CanonicalMutationArgs(normalized=normalized, plan=values)
+
+
+#: 이보다 긴(JSON) 경로 지정 변경 값은 Plan 의 args 에 해시로 남긴다
+PATCH_VALUE_INLINE = 200
+
+
+def _patch_operation(operation: dict[str, Any]) -> dict[str, Any]:
+    text = json.dumps(operation.get("value"), ensure_ascii=False, sort_keys=True)
+    if len(text) <= PATCH_VALUE_INLINE:
+        return operation
+    rest = {key: value for key, value in operation.items() if key != "value"}
+    return {**rest, "value_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}

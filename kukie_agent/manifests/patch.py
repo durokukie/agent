@@ -14,25 +14,29 @@ AI 는 무엇을 바꿀지(경로와 값)만 낸다. 어느 문서를 고칠지�
   - 리소스를 가리키는 칸: apiVersion · kind · metadata.name · metadata.namespace — 바꾸면 다른 리소스가 된다 (DURO-252)
   - metadata 아래는 labels · annotations 만. status 는 git 에 두는 칸이 아니다
   - ArgoCD 가 리소스를 알아보는 표시(tracking-id 어노테이션 · app.kubernetes.io/instance 레이블) — 바꾸면 ArgoCD 가 놓친다
-  - 만든 뒤 바꿀 수 없는 칸(Deployment selector 등), 셀렉터와 맞지 않게 되는 파드 레이블 — 머지해도 쿠버네티스가 거절해
-    sync 가 실패한다. 막는 기준은 경로가 아니라 결과다: spec 을 통째로 set 해도 그 값들이 그대로면 된다
+  - 만든 뒤 바꿀 수 없는 칸(Deployment selector · immutable ConfigMap 등), 셀렉터(matchLabels · matchExpressions)와
+    맞지 않게 되는 파드 레이블 — 머지해도 쿠버네티스가 거절해 sync 가 실패한다. 막는 기준은 경로가 아니라 결과다: spec 을
+    통째로 set 해도 그 값들이 그대로면 된다. 경로를 바꿔도 풀리지 않아 다시 고르게 하지 않고 툴 실패로 끝낸다
+  - HPA 가 맡은 레플리카 · 평문 비밀 값 — 넷(replicas · env)과 같은 규칙 (change.py)
   - 위 칸이 없는 경로 — 오타로 엉뚱한 칸이 생기지 않게. 위 칸부터 통째로 set 하게 돌려보낸다
 
 위험해 보이는 값(privileged · hostPath · hostNetwork · serviceAccountName …)은 막지 않고 승인 카드에 경고로 올린다 —
-새 리소스(new_resource._risks)와 같은 목록이다. 막지 않는 이유는 새 리소스와 같다: 전체 권한 클러스터에서는 같은 변경을
+새 리소스와 같은 목록(risks.py)이다. 막지 않는 이유는 새 리소스와 같다: 전체 권한 클러스터에서는 같은 변경을
 kubectl 로도 할 수 있어, PR 길만 막으면 기록이 남지 않는 길로 빠진다 (블로그 GitOps 02편 7.2).
 """
 from __future__ import annotations
 
 import copy
-import json
 import re
+from dataclasses import dataclass
 from typing import Any
 
+import yaml
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
+from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
 from kukie_agent.manifests import compare
-from kukie_agent.manifests.compare import FieldPath
+from kukie_agent.manifests.compare import FieldPath, brief, show
 from kukie_agent.manifests.models import Patch, PatchOperation
 from kukie_agent.manifests.yamlfile import remove_item
 
@@ -71,6 +75,16 @@ class Named(str):
     """이름 있는 목록 항목 조각 — `[api]`."""
 
 
+Parsed = list[tuple[PatchOperation, tuple["Key | Named", ...]]]
+
+
+@dataclass(frozen=True)
+class Applied:
+    """prepare 가 한 번 읽은 경로와 기대값(지금 렌더 결과에 패치만 적용한 것)."""
+    parsed: Parsed
+    want: dict
+
+
 def parse(path: str) -> tuple[Key | Named, ...]:
     if not path or path.startswith(".") or path.endswith("."):
         raise PathError(f"경로 '{path}' 모양이 아니에요")
@@ -100,23 +114,10 @@ def field_path(parts: tuple[Key | Named, ...]) -> FieldPath:
     return tuple(compare.item(p) if isinstance(p, Named) else str(p) for p in parts)
 
 
-def show(path: FieldPath) -> str:
-    """compare.show 와 같되, 점·슬래시가 든 키는 ["…"] 로 — 사람이 그대로 다시 쓸 수 있게."""
-    text = ""
-    for part in path:
-        if isinstance(part, str) and part.startswith("["):
-            text += part
-        elif isinstance(part, str) and re.fullmatch(r"[A-Za-z0-9_$-]+", part):
-            text += f".{part}" if text else part
-        else:
-            text += f'["{part}"]'
-    return text
-
-
 # ── 고칠 수 있는 경로인지 ────────────────────────────────
 
 
-def check_paths(change: Patch) -> list[tuple[PatchOperation, tuple[Key | Named, ...]]]:
+def check_paths(change: Patch) -> Parsed:
     """경로 모양과 고칠 수 없는 칸을 본다. 틀리면 PathError."""
     parsed = []
     seen: list[FieldPath] = []
@@ -152,23 +153,61 @@ def guarded(kind: str, before: dict, after: dict) -> str | None:
             return (f"{kind} 의 {show(path)} 는 만든 뒤 바꿀 수 없는 칸이에요 — 머지해도 쿠버네티스가 거절해 sync 가 "
                     "실패해요. 지우고 다시 만들어야 해서 아직 PR 로 못 해요")
     if kind in _SELECTED:
-        wanted = compare.value_at(after, ("spec", "selector", "matchLabels"))
+        selector = compare.value_at(after, ("spec", "selector"))
         labels = compare.value_at(after, ("spec", "template", "metadata", "labels"))
-        if isinstance(wanted, dict) and wanted and not (
-                isinstance(labels, dict) and all(labels.get(k) == v for k, v in wanted.items())):
-            return (f"spec.template.metadata.labels 가 spec.selector.matchLabels({brief(wanted)})와 맞지 않게 돼요 — "
+        if isinstance(selector, dict) and not selects(selector, labels if isinstance(labels, dict) else {}):
+            return (f"spec.template.metadata.labels 가 spec.selector({brief(selector)})와 맞지 않게 돼요 — "
                     "쿠버네티스가 거절해 sync 가 실패해요. 셀렉터가 고르는 레이블은 남겨 두세요")
     if before.get("immutable") is True:
+        if after.get("immutable") is not True:
+            return f"이 {kind} 는 immutable 이라 immutable 칸을 풀 수 없어요 — 새 이름으로 만들어야 해요"
         for section in ("data", "binaryData"):
             if before.get(section) != after.get(section):
                 return f"이 {kind} 는 immutable 이라 {section} 를 바꿀 수 없어요 — 새 이름으로 만들어야 해요"
     return None
 
 
+def selects(selector: dict, labels: dict) -> bool:
+    """레이블 셀렉터(matchLabels + matchExpressions)가 이 레이블을 고르는지. 모르는 연산자는 고르지 않는 것으로 본다 —
+    쿠버네티스도 받지 않는다."""
+    match = selector.get("matchLabels") or {}
+    if not isinstance(match, dict) or any(labels.get(k) != v for k, v in match.items()):
+        return False
+    for rule in selector.get("matchExpressions") or []:
+        if not isinstance(rule, dict):
+            return False
+        key, operator, values = rule.get("key"), rule.get("operator"), rule.get("values") or []
+        if operator == "In":
+            ok = key in labels and labels[key] in values
+        elif operator == "NotIn":
+            ok = key not in labels or labels[key] not in values
+        elif operator == "Exists":
+            ok = key in labels
+        elif operator == "DoesNotExist":
+            ok = key not in labels
+        else:
+            ok = False
+        if not ok:
+            return False
+    return True
+
+
+def touches(change: Patch, path: FieldPath) -> bool:
+    """패치가 이 칸(또는 그 위·아래 칸)을 건드리는지 — 경로가 틀리면 False (prepare 가 따로 거절한다)."""
+    for operation in change.operations:
+        try:
+            mine = field_path(parse(operation.path))
+        except PathError:
+            continue
+        if compare.under(mine, path) or compare.under(path, mine):
+            return True
+    return False
+
+
 # ── 적용 — 렌더 결과(dict)와 레포 문서(ruamel) 둘 다 ──────
 
 
-def apply(obj: Any, parsed: list[tuple[PatchOperation, tuple[Key | Named, ...]]], *, ruamel: bool = False) -> None:
+def apply(obj: Any, parsed: Parsed, *, ruamel: bool = False) -> None:
     """패치를 그 자리에서 적용한다. 경로가 맞지 않으면 PathError — 렌더 결과에 먼저 적용해 걸러 낸다."""
     for operation, parts in parsed:
         parent = _walk(obj, parts[:-1], operation.path)
@@ -240,16 +279,22 @@ def _block(value: Any) -> Any:
         return CommentedMap((str(k), _block(v)) for k, v in value.items())
     if isinstance(value, list):
         return CommentedSeq(_block(v) for v in value)
+    if isinstance(value, str) and "\n" not in value and _read_back(value) != value:
+        # ruamel 은 YAML 1.2 라 yes·on·off·y 를 따옴표 없이 쓴다. 렌더(PyYAML)와 ArgoCD(go-yaml)는 1.1 이라 참거짓으로 읽는다
+        return DoubleQuotedScalarString(value)
     return value
 
 
-def expected(obj: dict, change: Patch) -> dict:
-    """지금 렌더 결과에 패치만 적용한 것."""
-    result = copy.deepcopy(obj)
-    apply(result, check_paths(change))
-    return result
+def _read_back(value: str) -> Any:
+    try:
+        return yaml.safe_load(value)
+    except yaml.YAMLError:
+        return None
 
 
-def brief(value: Any) -> str:
-    text = json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return text if len(text) <= 80 else text[:77] + "..."
+def prepare(obj: dict, change: Patch) -> Applied:
+    """경로를 읽고, 지금 렌더 결과에 패치만 적용한 기대값을 만든다. 경로가 틀리면 PathError."""
+    parsed = check_paths(change)
+    want = copy.deepcopy(obj)
+    apply(want, parsed)
+    return Applied(parsed, want)

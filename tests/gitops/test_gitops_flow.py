@@ -855,3 +855,38 @@ def test_경로가_틀리면_ModelRetry로_돌려보내고_PR을_만들지_않�
     _chat(client, room, args, seen=seen)
     assert isinstance(seen[0], RetryPromptPart) and "번호" in str(seen[0].content)
     assert not gh.pulls
+
+
+def test_바꾸면_안_되는_칸은_다시_고르게도_kubectl로도_보내지_않는다(client, fake_server, room, gh, cluster):
+    """만든 뒤 못 바꾸는 칸은 경로를 바꿔도, kubectl 로 해도 안 된다 — 툴 실패로 끝내 재시도 한도를 쓰지 않는다."""
+    args = {**PATCH_ARGS, "change": {"what": "patch", "operations": [
+        {"op": "set", "path": "spec.selector.matchLabels", "value": {"app": "web2"}}]}}
+    seen: list = []
+    _chat(client, room, args, seen=seen)
+    assert isinstance(seen[0], ToolReturnPart) and "만든 뒤 바꿀 수 없는 칸" in str(seen[0].content)
+    assert "kubectl" not in str(seen[0].content) and not gh.pulls
+
+
+def test_경로_지정으로_레플리카를_바꿔도_클러스터의_HPA를_본다(client, fake_server, room, gh, cluster):
+    cluster.hpa = "web-hpa"
+    args = {**PATCH_ARGS, "change": {"what": "patch", "operations": [
+        {"op": "set", "path": "spec.replicas", "value": 3}]}}
+    seen: list = []
+    _chat(client, room, args, seen=seen)
+    assert "HPA(web-hpa)" in str(seen[0].content) and not gh.pulls
+
+
+def test_경로_지정_변경의_큰_값은_Plan에_해시로_남긴다(client, fake_server, room, gh, cluster):
+    big = {"note": "x" * 300}
+    args = {**PATCH_ARGS, "change": {"what": "patch", "operations": [
+        {"op": "set", "path": "metadata.annotations", "value": big},
+        {"op": "set", "path": "spec.template.spec.containers[web].readinessProbe",
+         "value": {"httpGet": {"path": "/", "port": 80}}}]}}
+    _card(client, room, args)
+    big_op, small_op = _plan(fake_server, room)["payload"]["args"]["change"]["operations"]
+    assert "value" not in big_op and len(big_op["value_sha256"]) == 64 and big_op["path"] == "metadata.annotations"
+    assert small_op["value"] == {"httpGet": {"path": "/", "port": 80}}
+    # 해시로 남겨도 승인 때 같은 요청으로 알아본다 — 머지까지 간다
+    _decide(client, room)
+    _settle(client)
+    assert gh.merges

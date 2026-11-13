@@ -12,14 +12,13 @@ Kustomize 는 레포의 다른 kustomization 폴더(base · 다른 overlay)도 �
 from __future__ import annotations
 
 import copy
-import re
 import shutil
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kukie_agent.manifests import compare, kustomize, patch, plain
+from kukie_agent.manifests import compare, kustomize, patch, plain, risks
 from kukie_agent.manifests.compare import FieldPath, Key
 from kukie_agent.manifests.models import (
     AppSource, Change, Env, ImageTag, NewResource, Other, Patch, Ready, Refused, Replicas, Resources, RiskWarning,
@@ -32,8 +31,7 @@ from kukie_agent.manifests.workload import (
     POD_SPEC, SCALABLE, container, containers, dig, split_image, with_tag,
 )
 
-# 값이 비밀번호·키처럼 보이는 환경변수 이름 — git 에 평문으로 남기지 않는다
-_SECRETISH = re.compile(r"PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|CREDENTIAL", re.I)
+_SECRETISH = risks.SECRETISH
 _SHOW_LIMIT = 5
 
 
@@ -50,6 +48,7 @@ class Context:
     container: str | None      # 컨테이너 칸을 고치는 요청이면 그 이름
     allowed: FieldPath         # 요청이 고치는 칸의 뿌리 — ignoreDifferences 와 겹치는지 볼 때 쓴다 (렌더 비교는 expected_after)
     warnings: list[str] = field(default_factory=list)
+    patched: patch.Applied | None = None   # 경로 지정 변경이면 prepare 가 읽은 경로와 기대값 — verify·propose 가 다시 계산하지 않는다
 
     def relative(self, path: Path) -> str:
         return path.relative_to(self.root.resolve()).as_posix()
@@ -136,16 +135,14 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
     obj = before[key]
 
     if isinstance(change, Patch):
-        return _prepare_patch(Context(repo, app, app_dir, target, change, before, key, obj, None, ()))
+        return _prepare_patch(Context(repo, app, app_dir, target, change, before, key, obj, None, ()), hpa)
 
     if isinstance(change, Replicas):
         if target.kind not in SCALABLE:
             return Refused(code="unsupported_change", message=f"{target.kind} 는 레플리카 수가 없어요.")
         scaler = hpa or _scaler_in_git(before, key)
         if scaler:
-            return Refused(code="hpa",
-                           message=f"{target.label()} 의 레플리카 수는 HPA({scaler})가 정해요. "
-                                   "git 의 replicas 를 바꿔도 HPA 가 되돌려요 — HPA 의 최소·최대값을 바꿔야 해요.")
+            return _hpa(target, scaler)
         current = dig(obj, ("spec", "replicas"))
         if (1 if current is None else current) == change.count:   # 비어 있으면 쿠버네티스 기본값 1
             return _no_change(target, f"레플리카가 이미 {change.count} 예요.")
@@ -185,23 +182,30 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
     return _check_ignored(ctx)
 
 
-def _prepare_patch(ctx: Context) -> Context | Refused:
+def _prepare_patch(ctx: Context, hpa: str | None) -> Context | Refused:
     """경로 지정 변경(DURO-249) — 경로가 이 리소스에 맞는지·바꾸면 안 되는 칸인지를 렌더 결과에 먼저 적용해 본다."""
     assert isinstance(ctx.change, Patch)
+    label = compare.label(ctx.key)
     try:
-        want = patch.expected(ctx.obj, ctx.change)
+        applied = patch.prepare(ctx.obj, ctx.change)
     except patch.PathError as exc:
-        return Refused(code="invalid_patch", retry=True, message=f"{compare.label(ctx.key)}: {exc}.")
+        return Refused(code="invalid_patch", retry=True, message=f"{label}: {exc}.")
+    want = applied.want
     why = patch.guarded(ctx.target.kind, ctx.obj, want)
     if why:
-        # kubectl 길로 보내지 않는다 — 같은 변경은 kubectl 로도 실패하거나(만든 뒤 못 바꾸는 칸) ArgoCD 를 깨뜨린다
-        return Refused(code="guarded_field", retry=True, message=f"{compare.label(ctx.key)}: {why}.")
+        # 경로를 바꿔 다시 해도 풀리지 않고, kubectl 로 해도 실패하거나(만든 뒤 못 바꾸는 칸) ArgoCD 를 깨뜨린다 — 툴 실패로 끝낸다
+        return Refused(code="guarded_field", message=f"{label}: {why}.")
     if not compare.diff_paths(ctx.obj, want):
         return _no_change(ctx.target, "그 칸들이 이미 그 값이에요.")
-    if _plaintext_secret(ctx.obj, want, ctx.target.kind):
+    if _plaintext_secret(ctx.obj, want):
         return _secret()
-    for operation in ctx.change.operations:
-        ctx.allowed = patch.field_path(patch.parse(operation.path))
+    if ctx.target.kind in SCALABLE and dig(ctx.obj, ("spec", "replicas")) != dig(want, ("spec", "replicas")):
+        scaler = hpa or _scaler_in_git(ctx.before, ctx.key)
+        if scaler:
+            return _hpa(ctx.target, scaler)
+    ctx.patched = applied
+    for _, parts in applied.parsed:
+        ctx.allowed = patch.field_path(parts)
         checked = _check_ignored(ctx)
         if isinstance(checked, Refused):
             return checked
@@ -209,25 +213,25 @@ def _prepare_patch(ctx: Context) -> Context | Refused:
     return ctx
 
 
-def _plaintext_secret(before: dict, after: dict, kind: str) -> bool:
-    """비밀처럼 보이는 이름의 환경변수에 평문 값이 새로 들어가는지 — 넷의 env 요청과 같은 규칙 (_check_env)."""
-    if kind not in POD_SPEC:
-        return False
-    old = {(c.get("name"), e.get("name")): e for c in containers(before, kind) for e in c.get("env") or []
-           if isinstance(e, dict)}
-    for item in containers(after, kind):
-        for env in item.get("env") or []:
-            if not isinstance(env, dict) or not _SECRETISH.search(str(env.get("name") or "")):
-                continue
-            if env.get("value") and env != old.get((item.get("name"), env.get("name"))):
-                return True
-    return False
+def _plaintext_secret(before: dict, after: dict) -> bool:
+    """평문 비밀이 새로 들어가는지 — 넷의 env 요청(_check_env)과 같은 규칙을 모든 컨테이너 목록(init · ephemeral)과
+    종류(Pod · 커스텀 리소스)에. 비밀처럼 보이는 이름에 평문 값이 새로 생기거나, Secret 에서 가져오던 항목이 바뀌거나 사라지면 막는다."""
+    old = risks.plaintext_env(before)
+    if any(old.get(path) != value for path, value in risks.plaintext_env(after).items()):
+        return True
+    return any(compare.value_at(before, path) != compare.value_at(after, path) for path in risks.secret_refs(before))
 
 
 def _secret() -> Refused:
     return Refused(code="secret",
                    message="Secret 값은 PR 에 넣지 않아요 — git 에 평문으로 남아요. "
                            "Sealed Secrets 나 External Secrets 로 바꿔 주세요.")
+
+
+def _hpa(target: Target, scaler: str) -> Refused:
+    return Refused(code="hpa",
+                   message=f"{target.label()} 의 레플리카 수는 HPA({scaler})가 정해요. "
+                           "git 의 replicas 를 바꿔도 HPA 가 되돌려요 — HPA 의 최소·최대값을 바꿔야 해요.")
 
 
 def _no_change(target: Target, why: str) -> Refused:
@@ -386,12 +390,10 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
 
 
 def _patch_risks(ctx: Context, after: dict, file: str) -> list[RiskWarning]:
-    """경로 지정 변경이 새로 들인 위험 — 새 리소스와 같은 목록(new_resource._risks)으로 고친 뒤를 보고, 고치기 전에도
-    있던 것은 뺀다. 막지 않고 승인 카드에 올린다 (patch.py 머리말)."""
-    from kukie_agent.manifests.new_resource import _risks   # new_resource 가 이 모듈을 가져다 쓴다 — 순환을 피한다
-
+    """경로 지정 변경이 새로 들인 위험 — 새 리소스와 같은 목록(risks.py)으로 고친 뒤를 보고, 고치기 전에도 있던 것은 뺀다.
+    막지 않고 승인 카드에 올린다 (patch.py 머리말)."""
     def seen(obj: dict) -> list[RiskWarning]:
-        return _risks(obj, ctx.key, file, None)
+        return risks.resource_risks(obj, ctx.key, file, None)
 
     old = {(r.code, r.location.field, r.location.value) for r in seen(ctx.obj)}
     return [r for r in seen(after) if (r.code, r.location.field, r.location.value) not in old]
@@ -420,8 +422,8 @@ def _compare_app(ctx: Context, after: dict[Key, dict]) -> Refused | None:
     if stray:
         return Refused(code="render_mismatch", retry=True,
                        message="고친 뒤 결과가 요청과 달라요: "
-                               + ", ".join(f"{compare.show(p)} (요청대로면 {_brief(compare.value_at(expected, p))}, "
-                                           f"고친 뒤 {_brief(compare.value_at(got, p))})" for p in stray[:_SHOW_LIMIT])
+                               + ", ".join(f"{compare.show(p)} (요청대로면 {compare.brief(compare.value_at(expected, p))}, "
+                                           f"고친 뒤 {compare.brief(compare.value_at(got, p))})" for p in stray[:_SHOW_LIMIT])
                                + ". 요청한 칸만 요청한 값으로 바뀌게 고쳐 주세요.")
     return None
 
@@ -438,7 +440,8 @@ def expected_after(ctx: Context) -> dict:
     """지금 렌더 결과에 요청만 그대로 적용한 것 — 고친 뒤 렌더 결과가 이것과 같아야 한다."""
     change = ctx.change
     if isinstance(change, Patch):
-        return patch.expected(ctx.obj, change)
+        assert ctx.patched is not None
+        return copy.deepcopy(ctx.patched.want)
     obj = copy.deepcopy(ctx.obj)
     if isinstance(change, Replicas):
         _child(obj, "spec")["replicas"] = change.count
@@ -482,11 +485,6 @@ def _normalized(obj: dict, kind: str) -> dict:
         if item.get("env") == []:
             del item["env"]
     return obj
-
-
-def _brief(value: object) -> str:
-    text = "없음" if value is compare.MISSING else str(value)
-    return text if len(text) <= 60 else text[:57] + "..."
 
 
 def busy(exc: RenderTimeout, doing: str = "") -> Refused:

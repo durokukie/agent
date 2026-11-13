@@ -41,7 +41,7 @@ from kukie_agent.guardrail.decision_guidance import generate_decision_guidance
 from kukie_agent.guardrail.hook import hooks
 from kukie_agent.guardrail.mutation_request import canonicalize_mutation_args
 from kukie_agent.kubectl import thread_limiter
-from kukie_agent.manifests import Change, NewResource, Replicas, already_in_cluster, representative
+from kukie_agent.manifests import Change, NewResource, Patch, Replicas, already_in_cluster, patch, representative
 from kukie_agent.tools.gitops import RISK, TOOL_NAME, GitOpsResult
 
 logger = logging.getLogger(__name__)
@@ -164,7 +164,8 @@ async def gitops_guardrail(ctx, *, call, tool_def, args, handler):
     try:
         token = await pull_requests.token_for(ctx.deps.cluster_id, found.repository)
         hpa = None
-        if isinstance(change, Replicas):
+        # 경로 지정 변경도 레플리카를 건드리면 본다 (spec.replicas · spec 통째) — git 에 없는 HPA 가 되돌린다
+        if isinstance(change, Replicas) or (isinstance(change, Patch) and patch.touches(change, ("spec", "replicas"))):
             hpa = await to_thread.run_sync(partial(
                 routing.find_hpa, found.target.kind, found.target.name, found.target.namespace,
                 context=ctx.deps.context, kubeconfig=ctx.deps.kubeconfig,

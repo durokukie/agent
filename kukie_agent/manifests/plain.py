@@ -32,8 +32,10 @@ def propose(ctx: Context) -> dict[str, str] | Refused:
     try:
         edit(doc, ctx)
     except patch.PathError as exc:
-        # 렌더 결과에는 맞았는데 파일 문서에는 안 맞는 경우(같은 리소스가 렌더에서 달라 보일 때) — 다시 고르게 한다
-        return Refused(code="invalid_patch", retry=True, message=f"{path}: {exc}.")
+        # 렌더 결과에는 맞았는데 파일 문서에는 안 맞는 경우(파일에 없는 칸을 렌더가 채울 때 등). 문서는 코드가 고르니 같은 경로로
+        # 다시 해도 같다 — 툴 실패로 끝내고, 위 칸부터 통째로 바꾸는 식으로 다시 요청하게 한다
+        return Refused(code="patch_mismatch", message=f"{path}: {exc}. 레포 파일의 모양이 렌더 결과와 달라 이 경로로는 "
+                                                       "못 고쳐요 — 파일에 있는 위 칸부터 통째로 바꿔 보세요.")
     if not parsed.keeps_shape():
         ctx.warnings.append(f"{path} 는 다시 쓰면 들여쓰기·따옴표 모양이 조금 바뀌어요 — diff 에 같이 보여요.")
     return {path: parsed.dump()}
@@ -44,7 +46,8 @@ def edit(doc: Any, ctx: Context) -> None:
     change = ctx.change
     if isinstance(change, Patch):
         # prepare 가 같은 패치를 렌더 결과에 먼저 적용해 봤다 — 경로가 틀렸으면 거기서 걸렸다
-        patch.apply(doc, patch.check_paths(change), ruamel=True)
+        assert ctx.patched is not None
+        patch.apply(doc, ctx.patched.parsed, ruamel=True)
         return
     if isinstance(change, Replicas):
         _child(doc, "spec")["replicas"] = change.count

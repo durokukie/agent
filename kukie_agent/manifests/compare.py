@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import difflib
+import json
+import re
 from typing import Any
 
 import yaml
@@ -15,6 +17,8 @@ from kukie_agent.manifests.render import RenderError
 
 Key = tuple[str, str, str, str]
 FieldPath = tuple[str | int, ...]
+
+_PLAIN_KEY = re.compile(r"[A-Za-z0-9_$-]+")
 
 
 def key_of(obj: dict) -> Key:
@@ -111,15 +115,27 @@ def value_at(obj: Any, path: FieldPath) -> Any:
 
 
 def show(path: FieldPath) -> str:
+    """사람이 읽는 경로. 점·슬래시가 든 키는 ["…"] 로 — 경로 지정 변경(patch.py)에 그대로 다시 쓸 수 있게."""
     text = ""
     for part in path:
         if isinstance(part, int):
             text += f"[{part}]"
         elif part.startswith("["):
             text += part
-        else:
+        elif _PLAIN_KEY.fullmatch(part):
             text += f".{part}" if text else part
+        else:
+            text += '["' + part.replace('"', '\\"') + '"]'
     return text
+
+
+def brief(value: object, limit: int = 60) -> str:
+    """메시지에 싣는 값 — 맵·목록은 JSON 으로, 길면 자른다."""
+    if value is MISSING:
+        return "없음"
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str) if isinstance(value, (dict, list)) \
+        else str(value)
+    return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
 def under(path: FieldPath, prefix: FieldPath) -> bool:

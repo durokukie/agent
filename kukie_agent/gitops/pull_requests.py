@@ -46,6 +46,11 @@ _SECRET_KIND = re.compile(r"^\s*kind:\s*Secret\s*$", re.IGNORECASE)
 DIFF_LIMIT = 20_000
 
 
+#: kubectl 길로도, 고칠 곳 다시 고르기로도 보내지 않는 거절. busy 는 잠시 뒤 같은 요청이면 되고, 경로 지정 변경의
+#: guarded_field(만든 뒤 못 바꾸는 칸 등 — kubectl 로도 실패하거나 ArgoCD 를 깨뜨린다)·patch_mismatch 는 요청을 바꿔야 한다
+_STOP = frozenset({"busy", "guarded_field", "patch_mismatch"})
+
+
 class Refuse(Exception):
     """PR 을 만들 수 없다. kubectl=True 면 PR 로는 못 하는 일이라 kubectl 변경 툴(경고 카드)로 가라는 뜻이다."""
 
@@ -140,8 +145,8 @@ async def draft(route: Route, change: Change, token: server_api.RepoToken, *, hp
                 limiter=thread_limiter("gitops_render", RENDER_WORKERS),
             )
         if isinstance(result, Refused):
-            if result.code == "busy":
-                raise Refuse(result.message)                # 툴 실패로 끝낸다 — 잠시 뒤 같은 요청이면 된다
+            if result.code in _STOP:
+                raise Refuse(result.message)                # 툴 실패로 끝낸다 — kubectl 로도, 같은 요청을 다시 해도 안 된다
             raise Refuse(result.message, kubectl=not result.retry, retry=result.retry)
         if secret_in(result.file_diff, kind_line=not new):
             raise Refuse("바뀔 내용에 비밀 값(키·토큰·Secret)이 보여 PR 을 만들지 않았어요 — git 에 평문으로 남아요. "

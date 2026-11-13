@@ -179,6 +179,7 @@ RefuseCode = Literal[
     "project_denied",       # 앱의 ArgoCD 프로젝트가 허락하지 않는 네임스페이스 — 머지해도 sync 가 실패한다 (DURO-240)
     "invalid_patch",        # 경로 지정 변경의 경로가 틀렸거나 그 리소스에 없다 — 경로를 고쳐 다시 (DURO-249)
     "guarded_field",        # 바꾸면 안 되는 칸 — 리소스 식별 · ArgoCD 추적 표시 · 만든 뒤 못 바꾸는 칸 (DURO-249)
+    "patch_mismatch",       # 경로가 렌더 결과에는 맞는데 레포 파일 문서에는 안 맞는다 (DURO-249)
 ]
 
 
