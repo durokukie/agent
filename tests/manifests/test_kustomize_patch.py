@@ -130,6 +130,11 @@ def test_뒤에_다른_patch_가_걸렸으면_다시_쓸_때_맨_뒤로_옮긴�
     third = ready(plan_change(repo, PROD, API, ops(("set", f"{CONTAINER}.env[STAGE].value", "c"))))
     paths = [p["path"] for p in yaml.safe_load(third.files[KUSTOMIZATION])["patches"]]
     assert paths == ["env.yaml", "kukie-deployment-api-env.yaml", "kukie-deployment-api-patch.yaml"]
+    write(repo, third.files)
+    # 거꾸로도 — 넷의 env patch 를 다시 쓰면 그것이 맨 뒤로 간다
+    fourth = ready(plan_change(repo, PROD, API, Env(container="api", values={"STAGE": "d"})))
+    paths = [p["path"] for p in yaml.safe_load(fourth.files[KUSTOMIZATION])["patches"]]
+    assert paths == ["env.yaml", "kukie-deployment-api-patch.yaml", "kukie-deployment-api-env.yaml"]
 
 
 @needs_kustomize

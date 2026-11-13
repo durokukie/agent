@@ -169,7 +169,14 @@ def _mark_deletes(patch_container: Any, names: list[str]) -> None:
 
 def _add_patch(kustomization: Any, name: str, ctx: Context, target_name: str) -> None:
     patches = _list(kustomization, "patches")
-    if any(isinstance(p, dict) and p.get("path") == name for p in patches):
+    mine = [p for p in patches if isinstance(p, dict) and p.get("path") == name]
+    if mine:
+        # 다시 쓰는 Kukie patch 는 맨 뒤로 — 그 뒤에 다른 Kukie patch(넷의 env · resources · 경로 지정)가 걸렸으면 같은 칸을
+        # 다시 덮어 이번 요청이 반영되지 않는다 (agent#159 리뷰). 이미 맨 뒤면 그대로 둔다
+        if patches[-1] is not mine[-1]:
+            for entry in mine:
+                patches.remove(entry)
+            patches.append(mine[-1])
         return
     # target 으로 고르면 patch 안의 이름·namespace 와 상관없이 그 리소스에 걸린다 (overlay 가 namespace 를 바꿔도)
     target = CommentedMap()
@@ -239,14 +246,6 @@ def _general_patch(ctx: Context, kustomization: Any, file: Path) -> dict[str, st
     doc = CommentedMap([("apiVersion", ctx.target.api_version), ("kind", ctx.target.kind), ("metadata", metadata)])
     for key, value in diff.items():
         doc[key] = value
-    patches = kustomization.get("patches") or []
-    mine = [p for p in patches if isinstance(p, dict) and p.get("path") == name]
-    if mine and patches[-1] is not mine[-1]:
-        # 그 뒤에 다른 patch(넷의 env · resources 등)가 걸렸으면 맨 뒤로 옮긴다 — 파일은 "이 patch 를 뺀 렌더" 기준이라
-        # 뒤에 남은 patch 가 같은 칸을 다시 덮으면 기대값과 달라진다 (agent#159 리뷰)
-        for entry in mine:
-            patches.remove(entry)
-        patches.append(mine[-1])
     _add_patch(kustomization, name, ctx, target_name)
     return {ctx.relative(path): _dump(doc, _HEADER.format(kind=ctx.target.kind, name=ctx.target.name))}
 
