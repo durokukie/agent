@@ -237,13 +237,14 @@ async def test_plan_동작과_연결_정보(server):
     plan = await server_api.plan_action(PLAN["id"], "decision", {"approved": True, "userId": "u-1"})
     conn = await server_api.cluster_connection("cl-1", USER, expected_fingerprint="fp")
     await server_api.update_cluster_status("cl-1", status="connected",
-                                           checked_at=datetime(2026, 10, 14, 18, 0, tzinfo=timezone.utc))
+                                           checked_at=datetime(2026, 10, 14, 18, 0, tzinfo=timezone.utc),
+                                           fingerprint="fp")
 
     assert seen[0].url.path == f"/internal/plans/{PLAN['id']}/decision" and plan.status == "APPROVED"
     assert seen[1].url.params["expectedFingerprint"] == "fp" and seen[1].headers["Authorization"].startswith("Bearer ")
     assert conn.credential == {"token": "secret-token"}
     assert "secret-token" not in repr(conn)                       # 로그에 찍혀도 자격증명은 안 나온다
-    assert _body(seen[2]) == {"status": "connected", "checkedAt": "2026-10-14T18:00:00"}
+    assert _body(seen[2]) == {"status": "connected", "checkedAt": "2026-10-14T18:00:00", "fingerprint": "fp"}
     with pytest.raises(ValueError, match="unknown plan action"):
         await server_api.plan_action("p", "approve")
 

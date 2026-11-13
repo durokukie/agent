@@ -13,7 +13,8 @@
 
 권한은 server 가 본다. 연결 정보를 사용자 토큰으로 받으므로(clusters/access.py) 못 보는 클러스터는 그 호출이
 404 를 준다. 팀 구성원도 부를 수 있고, 결과(status·last_checked_at)를 `PATCH /internal/clusters/{id}/status` 로
-남긴다 — 연결 확인의 부산물이라 "쓰기는 Admin" 경계에서 일부러 빼 뒀다 (자동 리뷰 지적).
+남긴다 — 연결 확인의 부산물이라 "쓰기는 Admin" 경계에서 일부러 빼 뒀다 (자동 리뷰 지적). 확인할 때 쓴 연결 정보의
+지문을 같이 보내, 그 사이 kubeconfig 가 바뀌었으면 server 가 409 CLUSTER_CHANGED 로 거절한다 (DURO-125).
 GPU 노드 유무(hasGpu)도 같은 까닭으로 연결 확인·개요가 노드 목록을 읽었을 때 `PATCH /internal/clusters/{id}/gpu` 로
 남긴다 (DURO-118). 앱은 클러스터 목록의 그 값으로 GPU 아이콘을 띄운다 — 개요를 부르지 않고도.
 
@@ -130,7 +131,20 @@ async def test_cluster(
     # 최대 75초(version + can-i + 노드) 동안 서버 전체가 멈춘다 (자동 리뷰 지적). 스레드로 넘긴다.
     version, can_edit, has_gpu = await to_thread.run_sync(probe, limiter=thread_limiter("probe", PROBE_WORKERS))
     status = "connected" if version.success else _failure_status(version.stderr)
-    await server_api.update_cluster_status(cluster_id, status=status, checked_at=datetime.now(timezone.utc))
+    if conn.fingerprint:
+        # 확인하는 사이 kubeconfig 가 바뀌었으면 server 가 409 CLUSTER_CHANGED 로 거절한다 — 옛 연결의 결과를 새 연결에
+        # 남기지도, 화면에 지금 결과처럼 보이지도 않는다 (DURO-125). server 문구는 대화용이라 연결 확인 문구로 바꿔 올린다
+        try:
+            await server_api.update_cluster_status(cluster_id, status=status, checked_at=datetime.now(timezone.utc),
+                                                   fingerprint=conn.fingerprint)
+        except server_api.ServerError as exc:
+            if exc.code == "CLUSTER_CHANGED":
+                raise _changed_during_test() from None
+            raise
+    else:
+        # server 가 늘 400(지문 필수)으로 거절할 호출이다 — 부르지 않되 상태가 남지 않는 것은 남긴다.
+        # server 는 지문을 늘 채워 주므로(NOT NULL 컬럼) 실제로는 생기지 않는 길이다
+        logger.warning("클러스터 %s 의 연결 확인 결과를 남기지 못했다: 연결 정보에 지문이 없다", cluster_id)
     recorded = await _record_gpu(conn, has_gpu)
     return {
         "status": status,
@@ -687,6 +701,11 @@ async def _gitops_apps(cluster_id: str, conn: server_api.ClusterConnection) -> d
 def _revision_body(repository: str, revision: browse.Revision, path: str) -> dict[str, Any]:
     return {"repository": repository, "ref": revision.ref, "sha": revision.sha,
             "default_branch": revision.default_branch, "path": path}
+
+
+def _changed_during_test() -> HTTPException:
+    return HTTPException(409, {"code": "CLUSTER_CHANGED",
+                               "message": "확인하는 사이 이 클러스터의 연결 정보가 바뀌었어요. 다시 확인해 주세요."})
 
 
 def _repo_not_connected(repository: str) -> HTTPException:
@@ -1258,7 +1277,7 @@ async def _record_gpu(conn: server_api.ClusterConnection, has_gpu: bool | None) 
     if has_gpu == conn.has_gpu:
         return True
     if not conn.fingerprint:
-        # server 가 늘 409 로 거절할 호출이다 — 부르지 않되 동기화가 멈춘 것은 남긴다
+        # server 가 늘 400(지문 필수)으로 거절할 호출이다 — 부르지 않되 동기화가 멈춘 것은 남긴다
         logger.warning("클러스터 %s 의 GPU 여부를 남기지 못했다: 연결 정보에 지문이 없다", conn.cluster_id)
         return False
     try:

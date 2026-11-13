@@ -138,7 +138,11 @@ def test_연결_확인은_server_값과_같으면_부르지_않고_그_값을_�
 
 
 def test_읽는_사이_kubeconfig가_바뀌었으면_GPU_여부를_남기지_않는다(client, fake_server, monkeypatch):
-    """노드를 읽은 연결의 지문을 같이 보낸다 — 그 사이 바뀌었으면 server 가 409 (kukie-server#82 리뷰)."""
+    """노드를 읽은 연결의 지문을 같이 보낸다 — 그 사이 바뀌었으면 server 가 409 (kukie-server#82 리뷰).
+
+    연결 확인 결과(status)도 같은 지문으로 먼저 남기므로(DURO-125) 연결 확인 전체가 409 CLUSTER_CHANGED 로 끝나고,
+    옛 연결로 읽은 GPU 여부는 보내지도 않는다.
+    """
     cluster = fake_server.add_cluster(namespace="web")
 
     def fake(args, **kwargs):
@@ -149,9 +153,10 @@ def test_읽는_사이_kubeconfig가_바뀌었으면_GPU_여부를_남기지_않
 
     monkeypatch.setattr("kukie_agent.clusters_api.run_kubectl", fake)
     r = client.post(f"/clusters/{cluster}/test", headers=USER)
-    assert r.json()["status"] == "connected" and r.json()["has_gpu"] is None
-    assert [body["fingerprint"] for body in _gpu_calls(fake_server)] == [f"fp-{cluster}"]
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "CLUSTER_CHANGED"
+    assert _gpu_calls(fake_server) == []
     assert fake_server.clusters[cluster]["hasGpu"] is None
+    assert fake_server.clusters[cluster]["lastCheckedAt"] is None
 
 
 def test_연결_정보에_지문이_없으면_GPU_여부를_남기지_않는다(client, fake_server, monkeypatch, caplog):
@@ -162,7 +167,7 @@ def test_연결_정보에_지문이_없으면_GPU_여부를_남기지_않는다(
                         lambda args, **k: _result(fixture("gpu_nodes.json")) if args == gpu.NODES_COMMAND
                         else _result("{}" if args[0] == "version" else "yes"))
     assert client.post(f"/clusters/{cluster}/test", headers=USER).json()["has_gpu"] is None
-    assert _gpu_calls(fake_server) == [] and "지문이 없다" in caplog.text
+    assert _gpu_calls(fake_server) == [] and "GPU 여부를 남기지 못했다: 연결 정보에 지문이 없다" in caplog.text
 
     fake_server.clusters[cluster]["hasGpu"] = True                         # server 값과 같으면 지문 없이도 그 값을 준다
     assert client.post(f"/clusters/{cluster}/test", headers=USER).json()["has_gpu"] is True
