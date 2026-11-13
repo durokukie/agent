@@ -456,8 +456,9 @@ def test_기동_정리가_실패해도_서버는_뜬다(fake_server, monkeypatch
 # ── 저장 실패 ──────────────────────────────────────────────
 
 def _failure_retry_run(fake_server, monkeypatch, *, down: int, status: str = "failed",
-                       error: ServerError | None = None) -> tuple[str, list[str]]:
-    """실패 표시가 처음 down 번 server 에 닿지 못할 때, 뒤에서 다시 남기기를 끝까지 돌린다. (방, 시도마다 결과)"""
+                       error: ServerError | None = None, closed_meanwhile: str | None = None) -> tuple[str, list[str]]:
+    """실패 표시가 처음 down 번 server 에 닿지 못할 때, 뒤에서 다시 남기기를 끝까지 돌린다. (방, 부를 때마다 결과)
+    closed_meanwhile 이면 server 가 돌아오기 전에 그 run 이 그 상태로 닫혀 있다 (다른 길이 닫았거나, 첫 저장이 들어갔다)."""
     from kukie_agent import conversations_api
 
     monkeypatch.setattr(conversations_api, "FAIL_RETRY_SECONDS", (0, 0, 0))
@@ -471,8 +472,10 @@ def _failure_retry_run(fake_server, monkeypatch, *, down: int, status: str = "fa
     async def flaky(run_id, **fields):
         if len(tries) < down:
             tries.append("down")
+            if len(tries) == down and closed_meanwhile:
+                fake_server.runs[run_id]["status"] = closed_meanwhile
             raise fail
-        tries.append("saved")
+        tries.append("read" if not fields else "saved")
         return await original(run_id, **fields)
 
     monkeypatch.setattr(server_api, "update_run", flaky)
@@ -495,9 +498,18 @@ def test_server_배포로_실패_표시를_못_남기면_돌아온_뒤_failed로
     """2026-11-13 dev: member 재배포(Recreate) 중 들어온 chat 이 실패 표시도 못 남겨 running 이 남았다.
     앱은 running 턴이 있으면 입력을 막아, 다음 chat 이 닫는 길에 닿지 못하고 방이 "처리 중" 에 갇혔다."""
     room, tries = _failure_retry_run(fake_server, monkeypatch, down=2)
-    assert tries == ["down", "down", "saved"]                 # 처음 한 번 + 뒤에서 한 번 더 실패, 그다음 남김
+    assert tries == ["down", "down", "read", "saved"]         # 처음 한 번 + 뒤에서 한 번 더 실패, 그다음 읽고 남김
     assert _statuses(fake_server, room) == ["failed"]
     assert fake_server.active_run_of(room) is None
+
+
+@pytest.mark.parametrize("closed", ["completed", "interrupted"])
+def test_server_가_돌아왔을_때_이미_닫힌_run은_덮어쓰지_않는다(fake_server, monkeypatch, closed):
+    """PR #153 리뷰: 결과 저장이 들어간 뒤 응답만 끊겼거나(completed), 같은 request_id 재전송이 닫은(interrupted) run 을
+    failed 로 덮으면 정상 결과가 사라지거나 같은 재전송에 다른 응답이 나간다."""
+    room, tries = _failure_retry_run(fake_server, monkeypatch, down=2, closed_meanwhile=closed)
+    assert tries == ["down", "down", "read"]                  # 읽고 그만둔다
+    assert _statuses(fake_server, room) == [closed]
 
 
 def test_뒤에서_다시_남기는_것은_종료_상태뿐이다(fake_server, monkeypatch):

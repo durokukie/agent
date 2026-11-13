@@ -310,9 +310,18 @@ def _unreachable(exc: Exception) -> bool:
 
 
 async def _save_failure_later(run_id: str, fields: dict[str, Any]) -> None:
+    """쓰기 전에 지금 상태를 다시 읽어 아직 running 일 때만 남긴다 (PR #153 리뷰). 닫힌 run 을 덮어쓰면 두 가지가 깨진다.
+      - 결과 저장(completed)이 server 에 들어간 뒤 응답만 끊긴 경우(ReadTimeout 도 SERVER_UNAVAILABLE) — 정상 결과가 failed 가 된다
+      - 같은 request_id 재전송이 interrupted 로 닫은 run — 같은 재전송에 다른 응답이 나간다
+    읽기는 빈 PATCH 다 — server 는 준 칸만 바꾸고 run 을 돌려준다. 읽기와 쓰기 사이의 틈은 남는다(server 에 조건부 갱신이 없다).
+    """
     for delay in FAIL_RETRY_SECONDS:
         await asyncio.sleep(delay)
         try:
+            current = (await server_api.update_run(run_id)).run
+            if current.status != "running":
+                logger.warning("뒤늦은 실패 표시를 그만둔다 — run 이 이미 %s 다 (run=%s)", current.status, run_id)
+                return
             await server_api.update_run(run_id, **fields)
         except Exception as exc:
             if _unreachable(exc):
