@@ -149,6 +149,11 @@ async def _call(
     raise _error_of(response)
 
 
+#: 내부 토큰이 server 와 다를 때의 문구. 앱에는 503 SERVER_UNAVAILABLE 로 같이 보이지만, 기다려도 풀리지 않아
+#: 다시 시도하는 곳(conversations_api 의 뒤늦은 실패 표시)이 이 문구로 가른다
+INTERNAL_AUTH_MISMATCH = "Kukie API 서버와의 내부 인증 설정이 맞지 않는다"
+
+
 def _error_of(response: httpx.Response) -> ServerError:
     try:
         body = response.json()
@@ -158,7 +163,7 @@ def _error_of(response: httpx.Response) -> ServerError:
     message = body.get("message") if isinstance(body, dict) else None
     if code == "INVALID_INTERNAL_TOKEN":
         logger.error("Kukie API 서버가 내부 토큰을 거절했다 — KUKIE_INTERNAL_TOKEN 이 server 와 다르다")
-        return ServerError(503, "SERVER_UNAVAILABLE", "Kukie API 서버와의 내부 인증 설정이 맞지 않는다")
+        return ServerError(503, "SERVER_UNAVAILABLE", INTERNAL_AUTH_MISMATCH)
     if isinstance(code, str) and code:
         return ServerError(response.status_code, code, str(message or ""))
     if response.status_code >= 500:

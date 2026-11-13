@@ -100,6 +100,18 @@ async def test_입구가_아닌_호출은_사용자_토큰을_싣지_않는다(s
 
 
 @pytest.mark.asyncio
+async def test_칸_없는_run_갱신은_빈_객체를_보내_지금_상태를_읽는다(server):
+    """뒤늦은 실패 표시가 쓰기 전에 상태를 읽는 길이다 (PR #153). server 의 UpdateRunRequest 는 칸이 모두 선택이고
+    UpdateRunService 는 준 칸만 바꾼다 — 본문이 없으면(빈 요청) @RequestBody 가 400 이므로 `{}` 를 실어야 한다."""
+    seen = server(lambda r: httpx.Response(200, json={"run": RUN, "closedPlans": []}))
+
+    update = await server_api.update_run("r-1")
+
+    assert seen[0].method == "PATCH" and seen[0].content == b"{}"
+    assert update.run.status == RUN["status"] and update.closed_plans == []
+
+
+@pytest.mark.asyncio
 async def test_run_시작과_request_id로_찾기(server):
     def respond(request):
         if request.method == "POST":

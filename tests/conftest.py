@@ -36,6 +36,15 @@ def _forget_readable_namespaces(monkeypatch):
     monkeypatch.setattr(clusters_api, "OVERVIEW_SHARE_TTL", 0)
 
 
+@pytest.fixture(autouse=True)
+def _no_failure_retry_by_default(monkeypatch):
+    """실패 표시를 뒤에서 다시 남기지 않는다 (PR #153 리뷰). 저장 장애를 흉내 내는 테스트가 2초 뒤 도는 작업을 남기면
+    루프가 닫힐 때 'Task was destroyed' 가 나고, monkeypatch 가 풀린 뒤 진짜 update_run 을 부를 수 있다.
+    다시 남기기를 보는 테스트(test_conversations.py)만 간격을 직접 준다."""
+    from kukie_agent import conversations_api
+    monkeypatch.setattr(conversations_api, "FAIL_RETRY_SECONDS", ())
+
+
 #: ArgoCD 가 없는 클러스터의 kubectl 답 — 리소스도 Application 도 못 읽는다
 NO_ARGOCD = KubectlResult(command="kubectl get", stdout="", success=False, exit_code=1,
                           stderr='error: the server doesn\'t have a resource type "applications"')
