@@ -402,9 +402,11 @@ def _project_denied(app: AppSource, target: Target, created: list[tuple[Key, dic
     if not outside:
         return None
     assert app.project_destinations is not None
-    allowed = argocd.allowed_namespaces(app.project_destinations, server=app.destination_server,
-                                        name=app.destination_name)
+    allowed, excluded = argocd.allowed_namespaces(app.project_destinations, server=app.destination_server,
+                                                  name=app.destination_name)
     where = ", ".join(allowed[:_SHOW_LIMIT]) or "없음"
+    if excluded:
+        where += f"(제외: {', '.join(excluded[:_SHOW_LIMIT])})"
     fix = (f"metadata.namespace 를 지우면 앱의 네임스페이스({target.namespace})에 만들어져요. "
            if target.namespace else "")
     return Refused(code="project_denied", retry=True, message=(

@@ -627,6 +627,14 @@ def test_프로젝트가_이_클러스터를_가리키지_않으면_판단하지
     assert "확인하지 못했어요" in risk["risk"]
 
 
+def test_제외_패턴으로_막으면_허락과_제외를_나눠_적는다(repo):
+    app = SANDBOX.model_copy(update={"project_destinations": [{"server": IN_CLUSTER, "namespace": "*"},
+                                                              {"server": IN_CLUSTER, "namespace": "!kube-system"}]})
+    manifest = SERVICE.replace("name: caddy\n", "name: caddy\n  namespace: kube-system\n")
+    result = refused(plan(repo, manifest, app=app, target=CADDY.model_copy(update={"kind": "Service"})), "project_denied")
+    assert "* (제외: kube-system)" not in result.message and "*(제외: kube-system) 네임스페이스" in result.message
+
+
 @needs_kustomize
 def test_kustomize는_렌더된_네임스페이스로_프로젝트를_본다(repo):
     app = PROD.model_copy(update={"project": "shop", "destination_server": IN_CLUSTER,

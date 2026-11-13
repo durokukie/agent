@@ -169,9 +169,12 @@ def destination_permitted(destinations: list[dict[str, Any]], *, server: str, na
     클러스터는 server 나 name 중 하나가 맞으면 된다. `!` 패턴은 거부다 — 거부에 걸리면 다른 항목이 허락해도 안 된다.
     어느 항목도 이 클러스터를 가리키지 않으면 None(판단 못 함) — 앱이 name 으로, 프로젝트가 server 로 적는 식이면 여기서
     둘을 이어 볼 수 없다. 이미 돌고 있는 앱이라 실제로는 허락된 클러스터일 것이므로 막지 않고 모른다고 둔다.
+    ArgoCD 는 판정 전에 server·name 을 둘 다 채우지만 여기선 앱이 적은 것만 안다. 앱이 적지 않은 칸의 거부 패턴은
+    걸리는지 알 수 없다 — 그것 때문에 막지 않고, 허락으로 보이더라도 None 으로 둔다 (agent#154 리뷰).
     """
     cluster_seen = False
     matched = False
+    unsure = False
     for item in destinations:
         if not isinstance(item, dict):
             continue
@@ -183,26 +186,33 @@ def destination_permitted(destinations: list[dict[str, Any]], *, server: str, na
         cluster_seen = cluster_seen or cluster_ok
         if cluster_ok and namespace_ok:
             matched = True
-        elif namespace_ok and ((not name_ok and _deny(p_name)) or (not server_ok and _deny(p_server))):
-            return False
-        elif not namespace_ok and _deny(p_namespace) and cluster_ok:
+            continue
+        if namespace_ok:
+            if (name and not name_ok and _deny(p_name)) or (server and not server_ok and _deny(p_server)):
+                return False
+            if (not name and _deny(p_name)) or (not server and _deny(p_server)):
+                unsure = True
+        elif _deny(p_namespace) and cluster_ok:
             return False
     if matched:
-        return True
+        return None if unsure else True
     return False if cluster_seen else None
 
 
-def allowed_namespaces(destinations: list[dict[str, Any]], *, server: str, name: str) -> list[str]:
-    """이 클러스터에 대해 허락된 namespace 패턴들 — 막을 때 문구에 싣는다."""
-    found: list[str] = []
+def allowed_namespaces(destinations: list[dict[str, Any]], *, server: str, name: str) -> tuple[list[str], list[str]]:
+    """이 클러스터에 대해 (허락 패턴들, 제외 패턴들) — 막을 때 문구에 싣는다. `!` 패턴은 허락 쪽에 섞지 않는다 (agent#154 리뷰)."""
+    allowed: list[str] = []
+    excluded: list[str] = []
     for item in destinations:
         if not isinstance(item, dict):
             continue
         p_server, p_name, p_namespace = (str(item.get(key) or "") for key in ("server", "name", "namespace"))
-        if ((name and p_name and _glob(p_name, name)) or (server and p_server and _glob(p_server, server))) \
-                and p_namespace not in found:
-            found.append(p_namespace)
-    return found
+        if not ((name and p_name and _glob(p_name, name)) or (server and p_server and _glob(p_server, server))):
+            continue
+        bucket, pattern = (excluded, p_namespace[1:]) if _deny(p_namespace) else (allowed, p_namespace)
+        if pattern not in bucket:
+            bucket.append(pattern)
+    return allowed, excluded
 
 
 def valid_ref(namespace: str, name: str) -> bool:

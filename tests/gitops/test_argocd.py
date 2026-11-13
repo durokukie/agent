@@ -787,6 +787,9 @@ IN_CLUSTER = "https://kubernetes.default.svc"
     ([{"server": IN_CLUSTER, "namespace": "*"}, {"server": IN_CLUSTER, "namespace": "!kube-system"}], "default", True),
     ([{"server": "!https://other", "namespace": "*"}], "default", True),
     ([], "default", None),
+    # 앱은 server 만 적었다 — name 칸 거부 패턴은 걸리는지 모른다 (agent#154 리뷰)
+    ([{"server": IN_CLUSTER, "namespace": "*"}, {"name": "!dev-*", "namespace": "*"}], "default", None),
+    ([{"server": IN_CLUSTER, "namespace": "sandbox-*"}, {"name": "!dev-*", "namespace": "*"}], "default", False),
 ])
 def test_프로젝트_destinations는_ArgoCD와_같은_규칙으로_본다(destinations, namespace, expected):
     assert argocd.destination_permitted(destinations, server=IN_CLUSTER, name="", namespace=namespace) is expected
@@ -795,4 +798,9 @@ def test_프로젝트_destinations는_ArgoCD와_같은_규칙으로_본다(desti
 def test_허락된_네임스페이스는_이_클러스터_것만_모은다():
     destinations = [{"server": IN_CLUSTER, "namespace": "sandbox-*"}, {"server": "https://other", "namespace": "prod"},
                     {"server": IN_CLUSTER, "namespace": "sandbox-*"}]
-    assert argocd.allowed_namespaces(destinations, server=IN_CLUSTER, name="") == ["sandbox-*"]
+    assert argocd.allowed_namespaces(destinations, server=IN_CLUSTER, name="") == (["sandbox-*"], [])
+
+
+def test_제외_패턴은_허락_목록에_섞지_않는다():
+    destinations = [{"server": IN_CLUSTER, "namespace": "*"}, {"server": IN_CLUSTER, "namespace": "!kube-system"}]
+    assert argocd.allowed_namespaces(destinations, server=IN_CLUSTER, name="") == (["*"], ["kube-system"])
