@@ -87,7 +87,7 @@ async def test_입구가_아닌_호출은_사용자_토큰을_싣지_않는다(s
     seen = server(lambda r: httpx.Response(200, json={"run": {**RUN, "status": "completed"}, "closedPlans": [PLAN]}))
 
     update = await server_api.update_run("r-1", status="completed", append_agent_messages=[{"m": 1}],
-                                         title_from="첫 마디")
+                                         title_from="첫 마디", title="첫 제목")
 
     request = seen[0]
     assert request.method == "PATCH" and request.url.path == "/internal/runs/r-1"
@@ -95,7 +95,7 @@ async def test_입구가_아닌_호출은_사용자_토큰을_싣지_않는다(s
     assert "Authorization" not in request.headers
     # 준 칸만 보낸다 (None = 그대로). 불투명 JSON 은 손대지 않는다
     assert _body(request) == {"status": "completed", "appendAgentMessages": [{"m": 1}],
-                              "titleFrom": "첫 마디"}
+                              "titleFrom": "첫 마디", "title": "첫 제목"}
     assert update.run.status == "completed" and update.closed_plans[0].id == PLAN["id"]
 
 

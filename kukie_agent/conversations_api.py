@@ -41,7 +41,7 @@ from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.tools import ToolApproved
 
 import kukie_agent.server as _server  # 순환 import: 이름은 호출 시점에만 쓴다
-from kukie_agent import progress, server_api
+from kukie_agent import progress, server_api, title
 from kukie_agent.auth import User, current_user
 from kukie_agent.clusters import access
 from kukie_agent.conversations import Conversation, registry
@@ -248,33 +248,42 @@ async def chat(
 
         _bind_run(session, run, user)
         before = list(session.history)   # 저장에 실패해 이 턴을 버릴 때 되돌릴 자리 (자동 리뷰 지적)
+        # 제목은 답과 동시에 모델로 짓는다 — 답이 끝날 즈음엔 대개 와 있어 기다림이 늘지 않는다
+        naming = (asyncio.create_task(title.suggest(body.text))
+                  if kind == "chat" and title.wanted(room.title, body.text) else None)
         try:
-            with _with_cluster(session, conn):
-                payload, result = await _server._chat_turn(session, body.text)
-        except HTTPException as exc:
-            await repo_link_memo.settle(session.deps, saved=False)
-            wrapped = _wrap(exc)
-            await _fail_run(run, wrapped)
-            raise wrapped
-        except Exception as exc:                 # 모델·툴 예외 — run 은 실패로 남기고 세션은 유지
-            await repo_link_memo.settle(session.deps, saved=False)
-            logger.exception("run 실패 (conversation=%s, run=%s)", conversation_id, run.id)
-            failed = _error(500, "RUN_FAILED", f"요청 처리에 실패했다 ({type(exc).__name__}) — 서버 로그 참고")
-            await _fail_run(run, failed)
-            raise failed from exc
+            try:
+                with _with_cluster(session, conn):
+                    payload, result = await _server._chat_turn(session, body.text)
+            except HTTPException as exc:
+                await repo_link_memo.settle(session.deps, saved=False)
+                wrapped = _wrap(exc)
+                await _fail_run(run, wrapped)
+                raise wrapped
+            except Exception as exc:                 # 모델·툴 예외 — run 은 실패로 남기고 세션은 유지
+                await repo_link_memo.settle(session.deps, saved=False)
+                logger.exception("run 실패 (conversation=%s, run=%s)", conversation_id, run.id)
+                failed = _error(500, "RUN_FAILED", f"요청 처리에 실패했다 ({type(exc).__name__}) — 서버 로그 참고")
+                await _fail_run(run, failed)
+                raise failed from exc
 
-        # 승인 카드면 run 은 열린 채(awaiting_approval) 남는다 — approve/resume 이 이어서 끝낸다 (문서 7절)
-        status = "awaiting_approval" if payload.get("kind") == "approval" else "completed"
-        # 첫 마디로 제목 짓기(#59)를 run 기록과 한 번에 보낸다 — server 가 한 트랜잭션에서 한다.
-        # 제목이 될 수 있는 마디인지, 첫 마디인지는 server 가 본다 (판정이 두 곳에 갈라지면 한쪽만 고쳐진다).
-        await _save_or_fail(
-            conversation_id, run, on_failure=_chat_store_failure(), failure_status="failed",
-            session=session, history_before=before, status=status, response_payload=payload,
-            append_agent_messages=_messages_json(result) if result is not None else None,
-            usage_summary=_usage_json(result) if result is not None else None,
-            title_from=body.text if kind == "chat" else None,
-        )
-        return payload
+            # 승인 카드면 run 은 열린 채(awaiting_approval) 남는다 — approve/resume 이 이어서 끝낸다 (문서 7절)
+            status = "awaiting_approval" if payload.get("kind") == "approval" else "completed"
+            # 첫 마디로 제목 짓기(#59)를 run 기록과 한 번에 보낸다 — server 가 한 트랜잭션에서 한다.
+            # 제목이 될 수 있는 마디인지, 첫 마디인지는 server 가 본다 (판정이 두 곳에 갈라지면 한쪽만 고쳐진다).
+            # 모델이 지은 제목(title)은 함께 보내는 후보일 뿐이다 — 못 쓰면 server 가 첫 마디로 짓는다.
+            await _save_or_fail(
+                conversation_id, run, on_failure=_chat_store_failure(), failure_status="failed",
+                session=session, history_before=before, status=status, response_payload=payload,
+                append_agent_messages=_messages_json(result) if result is not None else None,
+                usage_summary=_usage_json(result) if result is not None else None,
+                title_from=body.text if kind == "chat" else None,
+                title=await naming if naming is not None else None,
+            )
+            return payload
+        finally:
+            if naming is not None and not naming.done():
+                naming.cancel()                      # 답이 실패했거나 요청이 끊겼다 — 제목은 버린다
 
 
 async def _fail_run(run: server_api.Run, exc: HTTPException) -> None:

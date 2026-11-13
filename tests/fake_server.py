@@ -285,10 +285,10 @@ class FakeServer:
         return closed
 
     async def update_run(self, run_id: str, *, status=None, response_payload=None, append_agent_messages=None,
-                         usage_summary=None, title_from=None):
+                         usage_summary=None, title_from=None, title=None):
         fields = {k: v for k, v in dict(status=status, response_payload=response_payload,
                                         append_agent_messages=append_agent_messages, usage_summary=usage_summary,
-                                        title_from=title_from).items() if v is not None}
+                                        title_from=title_from, title=title).items() if v is not None}
         self.calls.append(("update_run", {"runId": run_id, **fields}))
         run = self.runs.get(run_id)
         if run is None:
@@ -312,7 +312,8 @@ class FakeServer:
             earlier = [r for r in self.runs_of(room["id"])
                        if r["kind"] == "chat" and r["seq"] < run["seq"] and _titleable(r["inputText"])]
             if run["kind"] == "chat" and not earlier:
-                room["title"] = " ".join(title_from.split())[:30].strip()
+                suggested = " ".join((title or "").split())[:30].strip()
+                room["title"] = suggested or " ".join(title_from.split())[:30].strip()
                 room["version"] += 1
         return server_api.RunUpdate(server_api.Run.from_json(self._run_json(run)),
                                     [server_api.Plan.from_json(self._plan_json(p)) for p in closed])
