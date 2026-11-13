@@ -293,7 +293,7 @@ def _already_in_app(docs: list[dict], before: dict[Key, dict]) -> Refused | None
             if (_group(key[0]), key[1], key[3]) == (_group(doc["apiVersion"]), doc["kind"], doc["metadata"]["name"]) and same_ns:
                 return Refused(code="resource_exists", retry=True, message=(
                     f"{compare.label(key)} 는 이미 이 앱에 있어요. 새로 만들지 말고 change 의 replicas·image_tag·resources·env 로, "
-                    f"그 밖의 칸은 plain YAML 앱이면 경로 지정 변경(patch)으로 고쳐 주세요. {_OR_GITHUB}"))
+                    f"그 밖의 칸은 경로 지정 변경(patch)으로 고쳐 주세요. {_OR_GITHUB}"))
     return None
 
 

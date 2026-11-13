@@ -66,6 +66,9 @@ def _named(items: list) -> dict[str, Any] | None:
     return dict(zip(names, items)) if len(set(names)) == len(names) else None
 
 
+named = _named
+
+
 def diff_paths(before: Any, after: Any, path: FieldPath = ()) -> list[FieldPath]:
     """두 값에서 다른 곳의 경로 — 가장 깊은 곳까지 내려가 적는다."""
     if isinstance(before, dict) and isinstance(after, dict):

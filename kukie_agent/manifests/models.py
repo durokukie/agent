@@ -134,7 +134,7 @@ class PatchOperation(BaseModel):
 
 
 class Patch(BaseModel):
-    """정해진 넷 밖의 칸을 경로로 바꾸는 요청 (DURO-249). 지금은 plain YAML(Directory) 앱만 — Kustomize 는 DURO-251."""
+    """정해진 넷 밖의 칸을 경로로 바꾸는 요청 (DURO-249 plain · DURO-251 Kustomize overlay patch)."""
     what: Literal["patch"] = "patch"
     operations: list[PatchOperation] = Field(min_length=1, max_length=PATCH_OPERATIONS)
 
