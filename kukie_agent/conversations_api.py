@@ -1,6 +1,6 @@
 """대화(채팅방) 단위 실행 엔드포인트 — kukie-electron docs/api-spec.md 1절.
 
-  POST /conversations/{id}/chat          한 턴. request_id 로 멱등
+  POST /conversations/{id}/chat          한 턴. request_id 로 멱등. 오래 걸리면 202 accepted 로 먼저 답한다 (DURO-258)
   POST /conversations/{id}/approve       승인 카드 결정. PR 머지 카드는 오래 걸리면 202 accepted 로 먼저 답한다 (_finish_locked)
   POST /conversations/{id}/resume        재개 실패 뒤 다시 시도
 
@@ -58,6 +58,9 @@ STALE_MESSAGE = "결과를 저장하지 못해 중단된 요청이다 — 새 �
 #: PR 머지 승인이 답을 기다리는 시간(초). 앞단(CloudFront origin_read_timeout 60초)이 끊기 전에 답한다 (DURO-158).
 #: 대개는 머지와 모델의 답까지 이 안에 끝난다 — 넘으면 일은 뒤에서 마저 하고 202 로 먼저 답한다
 APPROVE_WAIT = float(os.environ.get("KUKIE_GITOPS_APPROVE_WAIT") or 45)
+#: 채팅 한 턴이 답을 기다리는 시간(초). 같은 이유로 앞단 60초 전에 답한다 (DURO-258). 넘으면 run 은 뒤에서 끝까지 돌고
+#: 202 accepted 로 먼저 답한다 — 앱은 대화 기록을 다시 읽어 답을 받는다
+CHAT_WAIT = float(os.environ.get("KUKIE_CHAT_WAIT") or 45)
 #: 실패 표시(failed)를 Kukie API 서버에 못 남겼을 때 뒤에서 다시 남기는 간격(초). server 는 배포 때(Recreate, 1개)
 #: 1~2분 비어 약 5분을 기다린다. 그래도 못 남기면 running 이 남고 다음 chat·재전송·재시작 복원이 닫는다
 FAIL_RETRY_SECONDS: tuple[float, ...] = (2, 5, 10, 20, 30, 60, 60, 60, 60)
@@ -187,7 +190,13 @@ async def chat(
     conversation_id: str,
     body: ChatIn,
     user: User = Depends(current_user),
-) -> dict[str, Any]:
+) -> Any:
+    """한 턴. CHAT_WAIT 안에 끝나면 답(answer·approval)을, 넘으면 202 accepted 를 먼저 준다 (DURO-258).
+
+    답이 앞단 시간 제한(CloudFront 60초)을 넘으면 화면에는 504 만 남고 에이전트는 뒤에서 일을 끝낸다 — 그래서 run 을 요청과 떼어
+    돌린다. 넘어도 run·기록 저장은 그대로이고 잠금도 끝날 때까지 쥔다(그동안 새 chat 은 BUSY). 앱은 진행 상황(/progress)을
+    계속 보이고 대화 기록을 다시 읽어 답을 받는다.
+    """
     context, conversation = await _open(conversation_id, user, "chat")
     room = context.conversation
     session = conversation.session
@@ -225,7 +234,10 @@ async def chat(
     if session.pending is not None:
         raise _pending_error("awaiting_approval" if session.pending_ids else "recovery_required")
 
-    async with conversation.lock:
+    # 잠금은 locked() 검사 바로 뒤에 쥔다 (잠금 틈). 일을 요청과 떼어 돌리므로 async with 대신 쥐고, 일이 끝날 때 푼다 (_detach)
+    await conversation.lock.acquire()
+
+    async def work() -> dict[str, Any]:
         # 잠금을 쥔 지금 이 방에 실행 중인 run 은 없고, 여기까지 왔으면 메모리에 이어갈 티켓(session.pending)도 없다.
         # 그런데 server 에 활성 run(running / awaiting_approval / recovery_required)이 남아 있다면 결과 저장에 실패한 run 이다
         # (팀원 리뷰 3, 자동 리뷰 6차) — 그대로 두면 이 방은 영원히 BUSY 라, 중단으로 닫고 진행한다. 저장 실패 사정(error)은 남는다.
@@ -284,6 +296,12 @@ async def chat(
         finally:
             if naming is not None and not naming.done():
                 naming.cancel()                      # 답이 실패했거나 요청이 끊겼다 — 제목은 버린다
+
+    accepted = {
+        "kind": "accepted", "skill": session.skill.name, "plan_ids": [], "request_id": body.request_id,
+        "message": "요청은 받았고 처리는 계속돼요. 답이 오면 이 대화에 나타나요.",
+    }
+    return await _detach(conversation, work, CHAT_WAIT, accepted, what="채팅")
 
 
 async def _fail_run(run: server_api.Run, exc: HTTPException) -> None:
@@ -558,7 +576,7 @@ def _log_detached(task: asyncio.Task[dict[str, Any]]) -> None:
     error = task.exception()
     # HTTPException 은 run·기록에 이미 남았다 (_record_failure·_save_or_fail). 그 밖의 것은 받아 줄 요청이 없을 수 있다
     if error is not None and not isinstance(error, HTTPException):
-        logger.error("승인 처리 실패", exc_info=error)
+        logger.error("뒤에서 돈 요청(승인·채팅) 실패", exc_info=error)
 
 
 async def _finish_locked(
@@ -571,26 +589,39 @@ async def _finish_locked(
     앱은 Plan 과 대화 기록을 다시 읽어 결과와 답을 받는다. kubectl 길은 예전처럼 끝난 뒤 답한다.
     """
     session = conversation.session
+    if not detach:
+        try:
+            return await work()
+        finally:
+            conversation.lock.release()
+    return await _detach(conversation, work, APPROVE_WAIT, {
+        "kind": "accepted", "skill": session.skill.name, "plan_ids": plan_ids,
+        "message": "승인은 받았고 처리는 계속돼요. 결과는 승인 카드에 나타나요.",
+    }, what="승인")
 
+
+async def _detach(
+    conversation: Conversation, work: Callable[[], Awaitable[dict[str, Any]]], wait: float,
+    accepted: dict[str, Any], *, what: str,
+) -> dict[str, Any] | JSONResponse:
+    """이미 쥔 방 잠금 안에서 work 를 요청과 떼어 돌린다. wait 초 안에 끝나면 그 답(또는 오류)을, 넘으면 202 accepted 를 준다.
+
+    잠금은 work 가 끝날 때 푼다. 끌 때는 server 연결을 닫기 전에 이 일을 정리한다 (gitops_after_merge.stop).
+    """
     async def owned() -> dict[str, Any]:
         try:
             return await work()
         finally:
             conversation.lock.release()
 
-    if not detach:
-        return await owned()
     task = asyncio.create_task(owned())
     gitops_after_merge.keep_approval(task)      # 끌 때 server 연결을 닫기 전에 정리한다
     task.add_done_callback(_log_detached)
-    await asyncio.wait({task}, timeout=APPROVE_WAIT)
+    await asyncio.wait({task}, timeout=wait)
     if task.done():
         return task.result()
-    logger.warning("승인 처리가 %s초를 넘어 먼저 답한다 (conversation=%s, plan_ids=%s)", APPROVE_WAIT, conversation.id, plan_ids)
-    return JSONResponse(status_code=202, content={
-        "kind": "accepted", "skill": session.skill.name, "plan_ids": plan_ids,
-        "message": "승인은 받았고 처리는 계속돼요. 결과는 승인 카드에 나타나요.",
-    })
+    logger.warning("%s 처리가 %s초를 넘어 먼저 답한다 (conversation=%s)", what, wait, conversation.id)
+    return JSONResponse(status_code=202, content=accepted)
 
 
 def _open_run(context: server_api.ConversationContext) -> server_api.Run:
