@@ -6,6 +6,7 @@ TestModel 로 LLM 을 흉내 내고, kubectl 은 가짜 결과로 바꿔 돌린�
 import logging
 
 import pytest
+from pydantic import ValidationError
 from pydantic_ai.models.test import TestModel
 
 from kukie_agent import response as response_mod
@@ -14,7 +15,7 @@ from kukie_agent.deps import Deps
 from kukie_agent.glossary import explain_command
 from kukie_agent.kubectl import KubectlResult
 from kukie_agent.response import build_response_for
-from kukie_agent.skills import PRIVATE, SHARED, KukieResponse
+from kukie_agent.skills import CAUSE_CATEGORIES, PRIVATE, SHARED, Finding, KukieResponse
 from kukie_agent.tools import read as read_tools
 
 FAKE_COMMAND = "kubectl --context kind-dev get pods -n study -o wide"
@@ -220,10 +221,80 @@ def test_조립_함수는_응답_클래스마다_하나로_캐시된다():
 
 
 def test_앱이_그리는_JSON_모양은_예전_진단_응답과_같다():
-    """finding 칸 이름·모양이 바뀌면 앱의 원인 분석 블록이 사라진다."""
+    """finding 칸 이름·모양이 바뀌면 앱의 원인 분석 블록이 사라진다. 새 칸은 더해질 뿐 옛 칸은 그대로다 (DURO-264)."""
     dumped = KukieResponse(narration="x", finding={"cause": "a", "evidence": "b", "recommendation": "c"}).model_dump()
-    assert dumped["finding"] == {"cause": "a", "evidence": "b", "recommendation": "c"}
+    assert {k: dumped["finding"][k] for k in ("cause", "evidence", "recommendation")} == {
+        "cause": "a", "evidence": "b", "recommendation": "c"}
     assert set(dumped) == {"narration", "steps", "suggested_next_action", "finding"}
+
+
+# ── 5-1. 일치 채점용 구조 칸 (DURO-264) ──────────────────────────
+
+FULL_FINDING = {
+    "cause": "메모리 limit 이 너무 작아요",
+    "evidence": "Last State: Terminated, Reason: OOMKilled",
+    "recommendation": "limits.memory 를 올린다",
+    "cause_object": {"kind": "Deployment", "namespace": "study", "name": "web"},
+    "cause_category": "oom",
+    "fix_commands": ["kubectl set resources deployment/web -n study --limits=memory=256Mi"],
+}
+
+
+def test_새_칸은_그대로_직렬화된다():
+    dumped = KukieResponse(narration="x", finding=FULL_FINDING).model_dump()
+    assert dumped["finding"] == FULL_FINDING
+
+
+def test_클러스터_범위_원인은_namespace_가_없다():
+    finding = Finding(cause="a", evidence="b", recommendation="c",
+                      cause_object={"kind": "Node", "name": "worker-1"}, cause_category="unschedulable")
+    assert finding.model_dump()["cause_object"] == {"kind": "Node", "namespace": None, "name": "worker-1"}
+
+
+@pytest.mark.parametrize("blank", ["", "  "])
+def test_빈_namespace_는_null_과_같다(blank):
+    """모델이 null 대신 "" 를 보내도 채점에서 클러스터 범위로 읽혀야 한다."""
+    finding = Finding(cause="a", evidence="b", recommendation="c",
+                      cause_object={"kind": "Node", "namespace": blank, "name": "worker-1"})
+    assert finding.cause_object.namespace is None
+
+
+@pytest.mark.parametrize("bad", [
+    {"cause_category": "OOMKilled"},          # 목록에 없는 값
+    {"cause_category": "Oom"},                # 대소문자도 정확히
+    {"cause_object": {"kind": "Pod"}},        # 이름 빠짐
+    {"cause_object": {"kind": "", "name": "web"}},
+    {"fix_commands": "kubectl delete pod web"},   # 목록이 아닌 문자열
+])
+def test_잘못된_값은_거부한다(bad):
+    with pytest.raises(ValidationError):
+        Finding(cause="a", evidence="b", recommendation="c", **bad)
+
+
+def test_새_칸이_없는_예전_응답도_읽힌다():
+    """저장된 기록·예전 클라이언트가 보낸 finding 은 세 칸뿐이다."""
+    finding = KukieResponse.model_validate(
+        {"narration": "x", "finding": {"cause": "a", "evidence": "b", "recommendation": "c"}}).finding
+    assert finding.cause_object is None and finding.cause_category == "other" and finding.fix_commands == []
+
+
+def test_분류_목록은_한_곳에서_정한다():
+    assert CAUSE_CATEGORIES == (
+        "bad-command", "image-not-found", "oom", "probe-misconfig", "selector-mismatch", "missing-config",
+        "unschedulable", "quota", "rbac", "network-policy", "other", "healthy")
+    assert set(Finding.model_json_schema()["properties"]["cause_category"]["enum"]) == set(CAUSE_CATEGORIES)
+
+
+def test_LLM_스키마에서는_finding_의_모든_칸이_필수다(fake_kubectl):
+    """모델이 새 칸을 빼먹지 않게 — 파이썬 기본값은 예전 기록 호환용일 뿐이다."""
+    m = TestModel(call_tools=[], custom_output_args={"narration": "원인 찾았어요", "finding": FULL_FINDING})
+    result = _run(m, deps=_deps(PRIVATE), output_type=PRIVATE.output_fn)
+    schema = m.last_model_request_parameters.output_tools[0].parameters_json_schema
+    finding_schema = schema["$defs"]["Finding"]
+    assert set(finding_schema["required"]) == set(FULL_FINDING)
+    assert "실행하지 않는다" in finding_schema["properties"]["fix_commands"]["description"]
+    assert result.output.finding.cause_category == "oom"
+    assert result.output.finding.cause_object.name == "web"
 
 
 # ── 6. 사전 파서 단위 ──────────────────────────────────────────
