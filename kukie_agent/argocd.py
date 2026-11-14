@@ -32,6 +32,7 @@ from fnmatch import fnmatchcase
 import re
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -231,13 +232,78 @@ def kind_rules(spec: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     return rules
 
 
+@lru_cache(maxsize=256)
+def _go_pattern(pattern: str) -> re.Pattern[str] | None:
+    """Go filepath.Match 의 패턴을 정규식으로. 틀린 패턴(ErrBadPattern)이면 None — ArgoCD 는 그 항목을 안 맞는 것으로 본다.
+
+    fnmatch 와 다른 곳: 부정은 `[^…]` 다(`!` 은 글자 그대로), `\\` 는 다음 글자를 글자 그대로, `*`·`?` 는 `/` 를 넘지 않는다,
+    `[]`·`[-…]` 처럼 `]`·`-` 를 그냥 쓴 클래스는 틀린 패턴이다 (agent#163 리뷰)."""
+    out: list[str] = []
+    i, n = 0, len(pattern)
+
+    def escaped(at: int) -> tuple[str, int] | None:
+        if at >= n or pattern[at] in "-]":
+            return None
+        if pattern[at] == "\\":
+            at += 1
+            if at >= n:
+                return None
+        return pattern[at], at + 1
+
+    while i < n:
+        char = pattern[i]
+        if char == "*":
+            out.append("[^/]*")
+        elif char == "?":
+            out.append("[^/]")
+        elif char == "\\":
+            i += 1
+            if i >= n:
+                return None
+            out.append(re.escape(pattern[i]))
+        elif char == "[":
+            i += 1
+            negate = i < n and pattern[i] == "^"
+            i += negate
+            ranges: list[str] = []
+            first = True
+            while first or (i < n and pattern[i] != "]"):
+                first = False
+                low = escaped(i)
+                if low is None:
+                    return None
+                lo, i = low
+                hi = lo
+                if i < n and pattern[i] == "-":
+                    high = escaped(i + 1)
+                    if high is None:
+                        return None
+                    hi, i = high
+                if lo <= hi:                       # 거꾸로 된 범위는 Go 에서 아무것도 안 맞는다
+                    ranges.append(f"{re.escape(lo)}-{re.escape(hi)}")
+            if i >= n:
+                return None                        # `]` 로 닫히지 않았다
+            body = "".join(ranges)
+            out.append(f"[^{body}]" if negate and body else "[\\s\\S]" if negate else f"[{body}]" if body else "(?!)")
+        else:
+            out.append(re.escape(char))
+        i += 1
+    return re.compile("".join(out), re.DOTALL)
+
+
+def _go_match(pattern: str, value: str) -> bool:
+    found = _go_pattern(pattern)
+    return found is not None and found.fullmatch(value) is not None
+
+
 def _kind_in(entries: list[dict[str, Any]], group: str, kind: str, name: str) -> bool:
-    """ArgoCD isResourceInList — group·kind 는 glob(`*`)이다. name 칸(클러스터 범위 항목, 새 ArgoCD)이 있으면 이름도 맞춰 본다."""
+    """ArgoCD isResourceInList — group·kind 는 Go filepath.Match 패턴이다. name 칸(클러스터 범위 항목, 새 ArgoCD)이 있으면
+    이름도 맞춰 본다."""
     for entry in entries:
-        if not (fnmatchcase(kind, str(entry.get("kind") or "")) and fnmatchcase(group, str(entry.get("group") or ""))):
+        if not (_go_match(str(entry.get("kind") or ""), kind) and _go_match(str(entry.get("group") or ""), group)):
             continue
         pattern = entry.get("name")
-        if pattern and not fnmatchcase(name, str(pattern)):
+        if pattern and not _go_match(str(pattern), name):
             continue
         return True
     return False

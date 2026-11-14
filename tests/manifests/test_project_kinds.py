@@ -116,6 +116,24 @@ def test_클러스터_범위_항목의_name이_있으면_이름도_맞춰_본다
     assert not permitted(rules, "", "Namespace", namespaced=False, name="kube-system")
 
 
+@pytest.mark.parametrize(("pattern", "value", "expected"), [
+    ("team-[^x]*", "team-alice", True),     # Go 의 부정 클래스 (agent#163 리뷰 — fnmatch 는 거꾸로 판정했다)
+    ("team-[^x]*", "team-x", False),
+    ("team-[!x]*", "team-!y", True),        # `!` 는 글자 그대로
+    ("team-[!x]*", "team-alice", False),
+    ("[a-c]?", "b1", True),
+    ("a\\*", "a*", True),
+    ("a\\*", "ab", False),
+    ("*", "", True),
+    ("*", "a/b", False),                    # `*` 는 `/` 를 넘지 않는다
+    ("[]a]", "a", False),                   # 틀린 패턴은 아무것도 안 맞는다
+    ("[a", "a", False),
+    ("a\\", "a", False),
+])
+def test_glob은_Go_filepath_Match와_같다(pattern, value, expected):
+    assert argocd._go_match(pattern, value) is expected
+
+
 def test_범위를_모르는_커스텀_리소스는_두_범위_모두에서_막혀야_막는다():
     only_cluster = {"clusterResourceWhitelist": [{"group": "kyverno.io", "kind": "*"}],
                     "namespaceResourceWhitelist": [{"group": "apps", "kind": "Deployment"}]}
