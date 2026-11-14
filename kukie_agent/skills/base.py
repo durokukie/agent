@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal, get_args
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ── 공통 응답 뼈대 (모든 스킬 공유 — UI 일관성) ──────────────────
@@ -32,11 +32,56 @@ class ToolStep(BaseModel):
     explanations: list[FieldExplanation]
 
 
+# 원인 분류 — 평가표가 일치로 채점하는 값이다 (DURO-264). kukie-model 시나리오의 `diagnosis:` 도 이 목록을 쓴다.
+# 값을 고치거나 더하면 그 시나리오들과 채점기도 같이 고친다. 확실하지 않으면 other, 조사했는데 고장이 없으면 healthy.
+CauseCategory = Literal[
+    "bad-command",        # 틀린 컨테이너 명령·인자 → CrashLoopBackOff
+    "image-not-found",    # 없는 이미지·태그 → ImagePullBackOff
+    "oom",                # 메모리 limit 초과 → OOMKilled
+    "probe-misconfig",    # 틀린 probe 포트·경로 → 재시작 반복, Ready 안 됨
+    "selector-mismatch",  # Service selector 가 파드 레이블과 다름 → Endpoints 없음
+    "missing-config",     # 없는 ConfigMap·Secret 참조 → CreateContainerConfigError
+    "unschedulable",      # 너무 큰 request, 맞는 노드 없음 → Pending
+    "quota",              # 꽉 찬 ResourceQuota·LimitRange → 생성 거부
+    "rbac",               # 빠진 권한 → Forbidden
+    "network-policy",     # 막는 NetworkPolicy → 연결 시간 초과
+    "other",              # 목록에 없거나 확실하지 않음
+    "healthy",            # 조사했지만 고장이 없음
+]
+CAUSE_CATEGORIES: tuple[str, ...] = get_args(CauseCategory)
+
+
+class CauseObject(BaseModel):
+    """원인이 있는 쿠버네티스 오브젝트 하나. 증상이 보인 오브젝트가 아니라 고쳐야 할 오브젝트다."""
+    kind: str = Field(min_length=1, description="오브젝트 종류. 예: Deployment, Service, ConfigMap")
+    namespace: str | None = Field(default=None, description="네임스페이스. Node·ClusterRole 같은 클러스터 범위 리소스면 null")
+    name: str = Field(min_length=1, description="오브젝트 이름")
+
+
+def _all_required(schema: dict[str, Any]) -> None:
+    """LLM 에게 보이는 스키마에서는 모든 칸이 필수다 — 새 칸을 늘 채우게 한다.
+    파이썬 쪽은 기본값이 있어 새 칸이 없는 예전 응답·기록도 그대로 읽힌다."""
+    schema["required"] = list(schema.get("properties", {}))
+
+
 class Finding(BaseModel):
-    """원인 분석 결론 — (a)원인 (b)근거 (c)권장 조치를 구조로 강제."""
+    """원인 분석 결론 — (a)원인 (b)근거 (c)권장 조치를 구조로 강제.
+
+    cause·evidence·recommendation 은 화면이 그리는 칸이라 이름·모양을 바꾸지 않는다.
+    cause_object·cause_category·fix_commands 는 일치 채점용 구조 칸이다 (DURO-264).
+    """
+    model_config = ConfigDict(json_schema_extra=_all_required)
+
     cause: str
     evidence: str
     recommendation: str
+    cause_object: CauseObject | None = Field(
+        default=None, description="원인이 있는(고쳐야 할) 오브젝트. 하나를 고를 수 없으면 null")
+    cause_category: CauseCategory = Field(
+        default="other", description="원인 분류. 목록에서 하나만 고른다. 확실하지 않으면 other, 고장이 없으면 healthy")
+    fix_commands: list[str] = Field(
+        default_factory=list,
+        description="고치는 kubectl 명령. 제안만 하고 실행하지 않는다 — 사용자에게 보여 줄 뿐이다. 고칠 것이 없으면 빈 목록")
 
 
 class KukieResponse(BaseModel):
