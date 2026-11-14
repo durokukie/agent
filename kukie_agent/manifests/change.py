@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kukie_agent.manifests import compare, key_change, kustomize, patch, plain, risks
+from kukie_agent.manifests import compare, key_change, kustomize, patch, plain, project, risks
 from kukie_agent.manifests.compare import FieldPath, Key
 from kukie_agent.manifests.models import (
     AppSource, Change, Env, ImageTag, NewResource, Other, Patch, Ready, Refused, Replicas, Resources, RiskWarning,
@@ -370,6 +370,10 @@ def verify(ctx: Context, edits: dict[str, str | None]) -> Ready | Refused:
         refused = (key_change.compare_app if key_change.is_key_change(ctx.change) else _compare_app)(ctx, after)
         if refused:
             return refused
+        # 프로젝트가 막는 종류면 머지해도 sync 가 거부된다 (DURO-254). 고칠 곳을 다시 골라도 같아 retry 가 아니다
+        blocked = project.denied(ctx.app, project.changed(ctx.before, after))
+        if blocked:
+            return project.refusal(ctx.app, blocked, retry=False)
         if ctx.app.source_type == "Kustomize":
             try:
                 changed = other_environments(ctx.root, workdir, app_path)

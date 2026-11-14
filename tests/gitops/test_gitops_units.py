@@ -538,3 +538,43 @@ def test_이상한_targetRevision은_GitHub를_부르지_않고_없는_브랜치
             return await gh.branch_head("../../../user")
 
     assert sync(go()) is None and api[1] == []
+
+
+# ── 프로젝트 종류 허락 (DURO-254) ─────────────────────────────
+_KUKIE_APPS = {"clusterResourceWhitelist": [], "namespaceResourceWhitelist": [{"group": "apps", "kind": "Deployment"}]}
+
+
+def test_PR_길이면_프로젝트_종류_칸을_한_번만_읽어_넘긴다(monkeypatch):
+    allowed = [{"server": "https://kubernetes.default.svc", "namespace": "*"}]
+    cluster = FakeCluster(project_destinations=allowed, project_kinds=_KUKIE_APPS)
+    found = _decide(monkeypatch, cluster, change=MoveNamespace(to="other"))
+    assert found.path == "pr" and found.source.project_kinds == _KUKIE_APPS
+    assert sum(args[:2] == ["get", "appprojects.argoproj.io"] for args in cluster.seen) == 1
+    # 칸이 하나도 없는 프로젝트도 규칙이다(클러스터 범위 전부 거부) — 빈 dict 로 넘긴다
+    plain = _decide(monkeypatch, FakeCluster(project_destinations=allowed), change=Replicas(count=2))
+    assert plain.path == "pr" and plain.source.project_kinds == {}
+    # 프로젝트를 못 읽으면 None — 막지 않는다
+    unknown = _decide(monkeypatch, FakeCluster(), change=Replicas(count=2))
+    assert unknown.path == "pr" and unknown.source.project_kinds is None
+
+
+def test_PR_길이_아니면_프로젝트를_읽지_않는다(monkeypatch):
+    cluster = FakeCluster(project_kinds=_KUKIE_APPS)
+    found = _decide(monkeypatch, cluster, connected=(), change=Replicas(count=2))
+    assert found.path == "kubectl"
+    assert not any(args[:2] == ["get", "appprojects.argoproj.io"] for args in cluster.seen)
+
+
+def test_프로젝트가_그_종류를_막아_sync가_거부된_리소스는_PR을_열지_않고_까닭을_알린다(monkeypatch):
+    """DURO-254: Missing 리소스의 sync 가 종류 때문에 거부됐으면 값을 고치거나 옮겨도 다시 거부된다. 빼는 PR 만 연다."""
+    found = _decide_missing(monkeypatch, _cluster_with(_NGINX, project_kinds=_KUKIE_APPS))
+    assert found.path == "kubectl" and found.managed and found.known
+    assert "프로젝트 'default' 가 Pod 를 허락하지 않아 sync 가 거부돼요" in found.reason
+    assert "apps/Deployment" in found.reason and "what=delete" in found.reason
+    moved = _decide_missing(monkeypatch, _cluster_with(_NGINX, project_kinds=_KUKIE_APPS),
+                            change=MoveNamespace(to="sandbox-plain"))
+    assert moved.path == "kubectl" and "Pod 를 허락하지 않아" in moved.reason
+    deleted = _decide_missing(monkeypatch, _cluster_with(_NGINX, project_kinds=_KUKIE_APPS), change=Delete())
+    assert deleted.path == "pr"
+    allowed = _decide_missing(monkeypatch, _cluster_with(_NGINX, project_kinds={}))   # namespace 범위 전부 허락
+    assert allowed.path == "pr"

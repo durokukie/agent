@@ -216,6 +216,72 @@ def allowed_namespaces(destinations: list[dict[str, Any]], *, server: str, name:
     return allowed, excluded
 
 
+#: AppProject 의 리소스 종류 칸 (DURO-254). whitelist 가 없으면(None) namespace 범위는 전부 허락, 클러스터 범위는 전부 거부다
+KIND_RULES = ("namespaceResourceWhitelist", "namespaceResourceBlacklist",
+              "clusterResourceWhitelist", "clusterResourceBlacklist")
+
+
+def kind_rules(spec: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """AppProject spec 에서 종류 칸 넷 — 적힌 칸만 넣는다. 빈 목록(`[]`)과 없는 칸은 뜻이 다르다(whitelist 가 빈 목록이면 전부 거부)."""
+    rules: dict[str, list[dict[str, Any]]] = {}
+    for key in KIND_RULES:
+        value = spec.get(key)
+        if isinstance(value, list):
+            rules[key] = [entry for entry in value if isinstance(entry, dict)]
+    return rules
+
+
+def _kind_in(entries: list[dict[str, Any]], group: str, kind: str, name: str) -> bool:
+    """ArgoCD isResourceInList — group·kind 는 glob(`*`)이다. name 칸(클러스터 범위 항목, 새 ArgoCD)이 있으면 이름도 맞춰 본다."""
+    for entry in entries:
+        if not (fnmatchcase(kind, str(entry.get("kind") or "")) and fnmatchcase(group, str(entry.get("group") or ""))):
+            continue
+        pattern = entry.get("name")
+        if pattern and not fnmatchcase(name, str(pattern)):
+            continue
+        return True
+    return False
+
+
+def kind_permitted(rules: dict[str, list[dict[str, Any]]], *, group: str, kind: str, namespaced: bool,
+                   name: str = "") -> bool:
+    """AppProject 가 이 종류를 허락하나 (DURO-254). ArgoCD IsGroupKindPermitted 와 같은 규칙이다.
+
+    namespace 범위: whitelist 칸이 없으면 전부 허락, 있으면(빈 목록 포함) 그 안에 있어야 한다.
+    클러스터 범위: whitelist 안에 있어야 한다 — 없거나 빈 목록이면 전부 거부다.
+    blacklist 에 있으면 whitelist 와 상관없이 거부다.
+    """
+    prefix = "namespace" if namespaced else "cluster"
+    whitelist = rules.get(f"{prefix}ResourceWhitelist")
+    blacklist = rules.get(f"{prefix}ResourceBlacklist") or []
+    if namespaced and whitelist is None:
+        allowed = True
+    else:
+        allowed = _kind_in(whitelist or [], group, kind, name)
+    return allowed and not _kind_in(blacklist, group, kind, name)
+
+
+def allowed_kinds(rules: dict[str, list[dict[str, Any]]], *, namespaced: bool) -> str:
+    """막을 때 문구에 싣는 허락 종류 — `Deployment, apps/*` 처럼. blacklist 는 `(제외: …)` 로 붙인다."""
+    prefix = "namespace" if namespaced else "cluster"
+    whitelist = rules.get(f"{prefix}ResourceWhitelist")
+    blacklist = rules.get(f"{prefix}ResourceBlacklist") or []
+
+    def show(entries: list[dict[str, Any]]) -> str:
+        names = []
+        for entry in entries:
+            group, kind = str(entry.get("group") or ""), str(entry.get("kind") or "")
+            text = f"{group}/{kind}" if group else kind
+            if text not in names:
+                names.append(text)
+        return ", ".join(names[:8]) + (" …" if len(names) > 8 else "")
+
+    text = "전부" if namespaced and whitelist is None else (show(whitelist or []) or "없음")
+    if blacklist and text != "없음":
+        text += f"(제외: {show(blacklist)})"
+    return text
+
+
 def valid_ref(namespace: str, name: str) -> bool:
     """URL 의 namespace·이름이 쿠버네티스 이름 꼴인가 — 아니면 그런 Application 은 없다. `-` 로 시작하는 값이 kubectl 옵션이 되지 않게도 막는다."""
     return bool(_NAMESPACE.fullmatch(namespace) and _APP_NAME.fullmatch(name))

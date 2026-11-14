@@ -55,6 +55,9 @@ class AppSource(BaseModel):
     destination_namespace: str = ""      # spec.destination.namespace — namespace 가 없는 문서가 들어가는 곳
     #: 그 AppProject 의 spec.destinations (DURO-240). None 이면 읽지 않았거나 못 읽었다 — 새 리소스·네임스페이스 변경 길에서만 읽는다
     project_destinations: list[dict] | None = None
+    #: 그 AppProject 의 리소스 종류 칸(argocd.kind_rules, DURO-254). None 이면 읽지 않았거나 못 읽었다 — 막지 않는다.
+    #: PR 길이면 늘 읽는다 — 렌더 결과에 생기거나 바뀌는 객체마다 본다(change.verify · plan_new_resource)
+    project_kinds: dict[str, list[dict]] | None = None
     auto_sync: bool = False              # spec.syncPolicy.automated 가 있나 — 지운 리소스가 클러스터에서도 지워지는지 (DURO-252)
     prune: bool = False                  # spec.syncPolicy.automated.prune
     allow_empty: bool = False            # spec.syncPolicy.automated.allowEmpty — 꺼져 있으면 앱을 비우는 자동 prune 을 안 한다
@@ -198,7 +201,7 @@ RefuseCode = Literal[
     "overwrite",            # 새 파일 자리에 이미 파일이 있다
     "resource_exists",      # 새로 만들려는 리소스가 이미 앱에 있다
     "kustomize_config",     # 레포 밖을 끌어올 수 있는 Kustomize 설정을 새로 더하려 했다
-    "project_denied",       # 앱의 ArgoCD 프로젝트가 허락하지 않는 네임스페이스 — 머지해도 sync 가 실패한다 (DURO-240)
+    "project_denied",       # 앱의 ArgoCD 프로젝트가 허락하지 않는 네임스페이스·종류 — 머지해도 sync 가 실패한다 (DURO-240·254)
     "invalid_patch",        # 경로 지정 변경의 경로가 틀렸거나 그 리소스에 없다 — 경로를 고쳐 다시 (DURO-249)
     "guarded_field",        # 바꾸면 안 되는 칸 — 리소스 식별 · ArgoCD 추적 표시 · 만든 뒤 못 바꾸는 칸 (DURO-249)
     "patch_mismatch",       # 경로가 렌더 결과에는 맞는데 레포 파일 문서에는 안 맞는다 (DURO-249)

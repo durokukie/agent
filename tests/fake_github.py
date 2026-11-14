@@ -246,6 +246,8 @@ class FakeCluster:
     no_argocd: bool = False
     #: 앱의 AppProject(default) spec.destinations. None 이면 AppProject 를 못 찾는다 (DURO-240)
     project_destinations: list[dict[str, Any]] | None = None
+    #: AppProject 의 종류 칸(namespaceResourceWhitelist 등, DURO-254). 주면 AppProject 가 있다
+    project_kinds: dict[str, Any] | None = None
 
     def resource(self) -> dict[str, Any]:
         annotations = {"argocd.argoproj.io/tracking-id": "shop-web:apps/Deployment:shop/web"} if self.managed else {}
@@ -285,10 +287,12 @@ class FakeCluster:
                 other["metadata"]["namespace"] = self.same_name_in
                 return _ok({"items": [self.application(), *([other] if self.same_name_in else [])]})
             return _ok(self.application())
-        if args[:2] == ["get", "appprojects.argoproj.io"] and self.project_destinations is not None:
+        if args[:2] == ["get", "appprojects.argoproj.io"] and (self.project_destinations is not None
+                                                                or self.project_kinds is not None):
+            spec = {**({"destinations": self.project_destinations} if self.project_destinations is not None else {}),
+                    **(self.project_kinds or {})}
             return _ok({"apiVersion": "argoproj.io/v1alpha1", "kind": "AppProject",
-                        "metadata": {"name": args[2], "namespace": "argocd"},
-                        "spec": {"destinations": self.project_destinations}})
+                        "metadata": {"name": args[2], "namespace": "argocd"}, "spec": spec})
         if args[:2] == ["get", "horizontalpodautoscalers"]:
             items = [{"metadata": {"name": self.hpa}, "spec": {"scaleTargetRef": {"kind": "Deployment", "name": "web"}}}]
             return _ok({"items": items if self.hpa else []})
