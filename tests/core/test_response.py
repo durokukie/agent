@@ -304,6 +304,8 @@ def test_분류마다_설명이_스키마로_간다():
     ("bad-command", {"missing-config"}),
     ("missing-config", {"bad-command", "volume-permission"}),
     ("admission-rejected", {"quota", "rbac"}),
+    ("rbac", {"admission-rejected"}),
+    ("quota", {"admission-rejected"}),
     ("volume-permission", {"missing-config"}),
     ("port-conflict", {"probe-misconfig"}),
     ("unschedulable", {"port-conflict"}),

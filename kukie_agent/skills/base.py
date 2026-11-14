@@ -57,7 +57,8 @@ CAUSE_CATEGORY_GUIDE: dict[str, str] = {
                       "있는 설정의 값이 틀려 명령이 실패하면 bad-command, 파일은 있는데 쓰기 권한이 없으면 volume-permission",
     "unschedulable": "request 가 너무 크거나 nodeSelector·affinity·taint 에 맞는 노드가 없어 Pending 이다 (FailedScheduling). "
                      "hostPort 가 겹쳐 Pending 이면 port-conflict",
-    "quota": "ResourceQuota 가 꽉 찼거나 LimitRange 범위를 벗어나 생성이 거부된다 (exceeded quota, LimitRange 위반)",
+    "quota": "ResourceQuota 가 꽉 찼거나 LimitRange 범위를 벗어나 생성이 거부된다 (exceeded quota, LimitRange 위반). "
+             "정책·webhook 이 내용을 보고 거부하면 admission-rejected",
     "rbac": "요청한 사용자·ServiceAccount 에 Role·RoleBinding 권한이 없어 Forbidden 이다 (... cannot <동사> resource ...). "
             "권한은 있는데 정책이 내용을 보고 거부하면 admission-rejected",
     "network-policy": "NetworkPolicy 가 트래픽을 막아 연결이 시간 초과된다. Endpoints 가 비어 있으면 selector-mismatch",
