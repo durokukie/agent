@@ -251,6 +251,14 @@ def test_클러스터_범위_원인은_namespace_가_없다():
     assert finding.model_dump()["cause_object"] == {"kind": "Node", "namespace": None, "name": "worker-1"}
 
 
+@pytest.mark.parametrize("blank", ["", "  "])
+def test_빈_namespace_는_null_과_같다(blank):
+    """모델이 null 대신 "" 를 보내도 채점에서 클러스터 범위로 읽혀야 한다."""
+    finding = Finding(cause="a", evidence="b", recommendation="c",
+                      cause_object={"kind": "Node", "namespace": blank, "name": "worker-1"})
+    assert finding.cause_object.namespace is None
+
+
 @pytest.mark.parametrize("bad", [
     {"cause_category": "OOMKilled"},          # 목록에 없는 값
     {"cause_category": "Oom"},                # 대소문자도 정확히

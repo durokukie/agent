@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # ── 공통 응답 뼈대 (모든 스킬 공유 — UI 일관성) ──────────────────
@@ -56,6 +56,12 @@ class CauseObject(BaseModel):
     kind: str = Field(min_length=1, description="오브젝트 종류. 예: Deployment, Service, ConfigMap")
     namespace: str | None = Field(default=None, description="네임스페이스. Node·ClusterRole 같은 클러스터 범위 리소스면 null")
     name: str = Field(min_length=1, description="오브젝트 이름")
+
+    @field_validator("namespace", mode="before")
+    @classmethod
+    def _blank_namespace_is_none(cls, value: Any) -> Any:
+        """클러스터 범위에 null 대신 "" 를 보내도 같은 답이다 — 거부하면 답 전체가 형식 재시도에 걸리고, 그대로 두면 채점에서 null 과 달라진다."""
+        return None if isinstance(value, str) and not value.strip() else value
 
 
 def _all_required(schema: dict[str, Any]) -> None:
