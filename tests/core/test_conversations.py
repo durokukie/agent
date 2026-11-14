@@ -297,6 +297,103 @@ def test_같은_request_id_재전송은_실행_없이_저장된_응답을_준다
     assert len(fake_server.turns(room)) == 1
 
 
+def _slow_run_agent(monkeypatch, narration="늦은 답", fail=False):
+    """release 할 때까지 끝나지 않는 _run_agent. 앞단 시간 제한을 넘기는 긴 턴 흉내 (DURO-258)."""
+    import threading
+
+    release = threading.Event()
+
+    async def fake_run(session, **kwargs):
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+        if fail:
+            raise RuntimeError("모델 오류")
+        return _fake(KukieResponse(narration=narration))
+
+    monkeypatch.setattr(server, "_run_agent", fake_run)
+    return release
+
+
+@pytest.fixture
+def live_client(dev_auth, fake_server, kubectl_ok, plan_dir):
+    """with: 요청이 끝나도 이벤트 루프가 살아 있어야 뒤에서 도는 run 이 끝까지 간다."""
+    with TestClient(server.app) as test_client:
+        yield test_client
+
+
+def _wait_until(check, what, seconds=5.0):
+    import time
+
+    deadline = time.monotonic() + seconds
+    while not check():
+        assert time.monotonic() < deadline, f"시간 안에 안 됐다: {what}"
+        time.sleep(0.01)
+
+
+def test_채팅이_시간을_넘으면_202로_먼저_답하고_답은_기록에_남는다(live_client, fake_server, monkeypatch):
+    """CloudFront 가 60초에 끊기 전에 먼저 답한다 (DURO-258). run 은 뒤에서 끝까지 돌고 앱은 기록을 다시 읽는다."""
+    from kukie_agent import conversations_api
+
+    monkeypatch.setattr(conversations_api, "CHAT_WAIT", 0.05)
+    room = new_room(fake_server)
+    release = _slow_run_agent(monkeypatch)
+
+    first = _say(live_client, room, "readinessProbe 추가해줘", request_id="req-long")
+    assert first.status_code == 202
+    body = first.json()
+    assert body["kind"] == "accepted" and body["request_id"] == "req-long" and body["plan_ids"] == []
+    assert _statuses(fake_server, room) == ["running"]
+
+    # 도는 동안 새 chat 은 BUSY, 같은 request_id 재전송도 실행 없이 BUSY
+    other = _say(live_client, room, "다른 말")
+    assert other.status_code == 409 and other.json()["detail"]["code"] == "BUSY"
+    again = _say(live_client, room, "readinessProbe 추가해줘", request_id="req-long")
+    assert again.status_code == 409 and again.json()["detail"]["code"] == "BUSY"
+
+    release.set()
+    _wait_until(lambda: _statuses(fake_server, room) == ["completed"], "run 이 끝난다")
+    run = fake_server.runs_of(room)[-1]
+    assert run["responsePayload"]["kind"] == "answer"
+    assert run["responsePayload"]["response"]["narration"] == "늦은 답"
+    _wait_until(lambda: not conversations.registry.get(room).lock.locked(), "잠금이 풀린다")
+
+    # 끝난 뒤 같은 request_id 재전송은 저장된 답을 그대로 준다 — 응답을 잃은 앱의 재시도 규약
+    replay = _say(live_client, room, "readinessProbe 추가해줘", request_id="req-long")
+    assert replay.status_code == 200 and replay.json()["response"]["narration"] == "늦은 답"
+
+
+def test_시간을_넘긴_채팅이_실패하면_run_은_failed_로_남고_방은_다시_쓸_수_있다(live_client, fake_server, monkeypatch):
+    from kukie_agent import conversations_api
+
+    monkeypatch.setattr(conversations_api, "CHAT_WAIT", 0.05)
+    room = new_room(fake_server)
+    real_run_agent = server._run_agent
+    release = _slow_run_agent(monkeypatch, fail=True)
+
+    assert _say(live_client, room, "x").status_code == 202
+    release.set()
+    _wait_until(lambda: _statuses(fake_server, room) == ["failed"], "run 이 실패로 남는다")
+    _wait_until(lambda: not conversations.registry.get(room).lock.locked(), "잠금이 풀린다")
+    assert fake_server.runs_of(room)[-1]["responsePayload"]["code"] == "RUN_FAILED"
+
+    monkeypatch.setattr(conversations_api, "CHAT_WAIT", 45)
+    monkeypatch.setattr(server, "_run_agent", real_run_agent)
+    with agent.override(model=chat_model("다시 됨", call_tools=())):
+        r = _say(live_client, room, "다시")
+    assert r.status_code == 200 and r.json()["response"]["narration"] == "다시 됨"
+
+
+def test_시간_안에_끝난_채팅은_예전처럼_답을_바로_준다(client, fake_server, monkeypatch):
+    from kukie_agent import conversations_api
+
+    monkeypatch.setattr(conversations_api, "CHAT_WAIT", 5)
+    room = new_room(fake_server)
+    with agent.override(model=chat_model("바로", call_tools=())):
+        r = _say(client, room, "x")
+    assert r.status_code == 200 and r.json()["kind"] == "answer"
+    assert not conversations.registry.get(room).lock.locked()
+
+
 def test_같은_request_id에_다른_입력은_409_REQUEST_MISMATCH(client, fake_server):
     room = new_room(fake_server)
     with agent.override(model=chat_model()):
@@ -1101,7 +1198,7 @@ async def test_잠금_검사와_획득_사이에_await_가_없다():
     from kukie_agent import conversations_api
 
     source = inspect.getsource(conversations_api)
-    # 승인·재개는 잠금을 요청 밖까지 쥐므로 acquire 를 직접 부른다 (conversations_api._finish_locked)
+    # 채팅·승인·재개는 잠금을 요청 밖까지 쥐므로 acquire 를 직접 부른다 (conversations_api._detach)
     blocks = re.findall(
         r"if conversation\.lock\.locked\(\):(.*?)(?:async with conversation\.lock:|await conversation\.lock\.acquire\(\))",
         source, re.S,
