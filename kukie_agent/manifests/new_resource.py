@@ -25,7 +25,7 @@ from pathlib import Path, PurePosixPath
 import yaml
 
 from kukie_agent import argocd
-from kukie_agent.manifests import compare, kustomize
+from kukie_agent.manifests import compare, kustomize, project
 from kukie_agent.manifests.change import _SHOW_LIMIT, busy, other_environments
 from kukie_agent.manifests.compare import Key
 from kukie_agent.manifests.models import (
@@ -138,6 +138,11 @@ def plan_new_resource(repo: Path, app: AppSource, target: Target, request: NewRe
     denied = _project_denied(app, target, created)
     if denied is not None:
         return denied
+    blocked = project.denied(app, [key for key, _ in created])
+    if blocked:
+        # 만들어지는 것 전부를 본다 — 한 YAML 에 여럿이면 하나만 막혀도 sync 전체가 거부된다 (DURO-254)
+        return project.refusal(app, blocked, retry=True,
+                               fix="허락된 종류만으로 다시 제안하거나, 그 종류를 허락하는 프로젝트의 앱을 고르세요. ")
 
     resources = []
     risks = []
@@ -359,8 +364,8 @@ def _permitted(app: AppSource, namespace: str) -> bool | None:
 
 
 def _project_denied(app: AppSource, target: Target, created: list[tuple[Key, dict]]) -> Refused | None:
-    """렌더된 새 리소스 중 프로젝트가 허락하지 않는 네임스페이스가 있으면 막는다. 클러스터 범위 리소스는 보지 않는다 —
-    clusterResourceWhitelist 는 아직 읽지 않고 cluster_scoped 경고로 둔다."""
+    """렌더된 새 리소스 중 프로젝트가 허락하지 않는 네임스페이스가 있으면 막는다. 클러스터 범위 리소스는 네임스페이스가 없어
+    여기서 보지 않는다 — 종류 허락(clusterResourceWhitelist 등)은 project.denied 가 본다 (DURO-254)."""
     outside = []
     for key, _ in created:
         if key[1] in CLUSTER_SCOPED:

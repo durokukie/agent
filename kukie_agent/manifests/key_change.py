@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from kukie_agent import argocd
-from kukie_agent.manifests import compare, risks
+from kukie_agent.manifests import compare, project, risks
 from kukie_agent.manifests.compare import Key
 from kukie_agent.manifests.models import Delete, MoveNamespace, Refused, RiskWarning
 from kukie_agent.manifests.render import kustomization_file, plain_files, resolve_inside
@@ -446,6 +446,11 @@ def _removal(ctx: Context, file: str) -> RiskWarning:
         return risks.risk("git_only", file, label, None, None,
                           f"{head}클러스터에 없어요(sync 가 안 됐어요) — git 에서만 빠지고 클러스터에서 지울 것은 없어요.",
                           "")
+    if project.denied(app, [ctx.key]):
+        # ArgoCD 는 프로젝트가 막은 종류의 클러스터 객체를 앱에서 빼고 본다 — prune 할 것으로도 보지 않는다 (DURO-254)
+        return risks.risk("project_kind_denied", file, label, "kind", ctx.key[1],
+                          f"{head}Git 에서만 빠지고 클러스터엔 남아요 — ArgoCD 프로젝트 '{app.project}' 가 {ctx.key[1]} 를 "
+                          "허락하지 않아 ArgoCD 가 이 리소스를 관리하지 않아요.", leftover.strip())
     if "Prune=false" in options:
         code, text, tail = "prune_disabled", f"{head}Git 에서만 빠지고 클러스터엔 남아요 — 리소스에 {SYNC_OPTIONS}: " \
                                              "Prune=false 가 있어 ArgoCD 가 지우지 않아요.", leftover

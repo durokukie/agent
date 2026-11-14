@@ -32,6 +32,7 @@ from fnmatch import fnmatchcase
 import re
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -214,6 +215,137 @@ def allowed_namespaces(destinations: list[dict[str, Any]], *, server: str, name:
         if pattern not in bucket:
             bucket.append(pattern)
     return allowed, excluded
+
+
+#: AppProject 의 리소스 종류 칸 (DURO-254). whitelist 가 없으면(None) namespace 범위는 전부 허락, 클러스터 범위는 전부 거부다
+KIND_RULES = ("namespaceResourceWhitelist", "namespaceResourceBlacklist",
+              "clusterResourceWhitelist", "clusterResourceBlacklist")
+
+
+def kind_rules(spec: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """AppProject spec 에서 종류 칸 넷 — 적힌 칸만 넣는다. 빈 목록(`[]`)과 없는 칸은 뜻이 다르다(whitelist 가 빈 목록이면 전부 거부)."""
+    rules: dict[str, list[dict[str, Any]]] = {}
+    for key in KIND_RULES:
+        value = spec.get(key)
+        if isinstance(value, list):
+            rules[key] = [entry for entry in value if isinstance(entry, dict)]
+    return rules
+
+
+@lru_cache(maxsize=256)
+def _go_pattern(pattern: str) -> re.Pattern[str] | None:
+    """Go filepath.Match 의 패턴을 정규식으로. 틀린 패턴(ErrBadPattern)이면 None — ArgoCD 는 그 항목을 안 맞는 것으로 본다.
+
+    fnmatch 와 다른 곳: 부정은 `[^…]` 다(`!` 은 글자 그대로), `\\` 는 다음 글자를 글자 그대로, `*`·`?` 는 `/` 를 넘지 않는다,
+    `[]`·`[-…]` 처럼 `]`·`-` 를 그냥 쓴 클래스는 틀린 패턴이다 (agent#163 리뷰)."""
+    out: list[str] = []
+    i, n = 0, len(pattern)
+
+    def escaped(at: int) -> tuple[str, int] | None:
+        if at >= n or pattern[at] in "-]":
+            return None
+        if pattern[at] == "\\":
+            at += 1
+            if at >= n:
+                return None
+        return pattern[at], at + 1
+
+    while i < n:
+        char = pattern[i]
+        if char == "*":
+            out.append("[^/]*")
+        elif char == "?":
+            out.append("[^/]")
+        elif char == "\\":
+            i += 1
+            if i >= n:
+                return None
+            out.append(re.escape(pattern[i]))
+        elif char == "[":
+            i += 1
+            negate = i < n and pattern[i] == "^"
+            i += negate
+            ranges: list[str] = []
+            first = True
+            while first or (i < n and pattern[i] != "]"):
+                first = False
+                low = escaped(i)
+                if low is None:
+                    return None
+                lo, i = low
+                hi = lo
+                if i < n and pattern[i] == "-":
+                    high = escaped(i + 1)
+                    if high is None:
+                        return None
+                    hi, i = high
+                if lo <= hi:                       # 거꾸로 된 범위는 Go 에서 아무것도 안 맞는다
+                    ranges.append(f"{re.escape(lo)}-{re.escape(hi)}")
+            if i >= n:
+                return None                        # `]` 로 닫히지 않았다
+            body = "".join(ranges)
+            out.append(f"[^{body}]" if negate and body else "[\\s\\S]" if negate else f"[{body}]" if body else "(?!)")
+        else:
+            out.append(re.escape(char))
+        i += 1
+    return re.compile("".join(out), re.DOTALL)
+
+
+def _go_match(pattern: str, value: str) -> bool:
+    found = _go_pattern(pattern)
+    return found is not None and found.fullmatch(value) is not None
+
+
+def _kind_in(entries: list[dict[str, Any]], group: str, kind: str, name: str) -> bool:
+    """ArgoCD isResourceInList — group·kind 는 Go filepath.Match 패턴이다. name 칸(클러스터 범위 항목, 새 ArgoCD)이 있으면
+    이름도 맞춰 본다."""
+    for entry in entries:
+        if not (_go_match(str(entry.get("kind") or ""), kind) and _go_match(str(entry.get("group") or ""), group)):
+            continue
+        pattern = entry.get("name")
+        if pattern and not _go_match(str(pattern), name):
+            continue
+        return True
+    return False
+
+
+def kind_permitted(rules: dict[str, list[dict[str, Any]]], *, group: str, kind: str, namespaced: bool,
+                   name: str = "") -> bool:
+    """AppProject 가 이 종류를 허락하나 (DURO-254). ArgoCD IsGroupKindPermitted 와 같은 규칙이다.
+
+    namespace 범위: whitelist 칸이 없으면 전부 허락, 있으면(빈 목록 포함) 그 안에 있어야 한다.
+    클러스터 범위: whitelist 안에 있어야 한다 — 없거나 빈 목록이면 전부 거부다.
+    blacklist 에 있으면 whitelist 와 상관없이 거부다.
+    """
+    prefix = "namespace" if namespaced else "cluster"
+    whitelist = rules.get(f"{prefix}ResourceWhitelist")
+    blacklist = rules.get(f"{prefix}ResourceBlacklist") or []
+    if namespaced and whitelist is None:
+        allowed = True
+    else:
+        allowed = _kind_in(whitelist or [], group, kind, name)
+    return allowed and not _kind_in(blacklist, group, kind, name)
+
+
+def allowed_kinds(rules: dict[str, list[dict[str, Any]]], *, namespaced: bool) -> str:
+    """막을 때 문구에 싣는 허락 종류 — `Deployment, apps/*` 처럼. blacklist 는 `(제외: …)` 로 붙인다."""
+    prefix = "namespace" if namespaced else "cluster"
+    whitelist = rules.get(f"{prefix}ResourceWhitelist")
+    blacklist = rules.get(f"{prefix}ResourceBlacklist") or []
+
+    def show(entries: list[dict[str, Any]]) -> str:
+        names = []
+        for entry in entries:
+            group, kind = str(entry.get("group") or ""), str(entry.get("kind") or "")
+            text = f"{group}/{kind}" if group else kind
+            if text not in names:
+                names.append(text)
+        return ", ".join(names[:8]) + (" …" if len(names) > 8 else "")
+
+    text = "전부" if namespaced and whitelist is None else (show(whitelist or []) or "없음")
+    if blacklist and text != "없음":
+        text += f"(제외: {show(blacklist)})"
+    return text
 
 
 def valid_ref(namespace: str, name: str) -> bool:
