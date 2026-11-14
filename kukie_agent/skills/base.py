@@ -35,20 +35,49 @@ class ToolStep(BaseModel):
 # 원인 분류 — 평가표가 일치로 채점하는 값이다 (DURO-264). kukie-model 시나리오의 `diagnosis:` 도 이 목록을 쓴다.
 # 값을 고치거나 더하면 그 시나리오들과 채점기도 같이 고친다. 확실하지 않으면 other, 조사했는데 고장이 없으면 healthy.
 CauseCategory = Literal[
-    "bad-command",        # 틀린 컨테이너 명령·인자 → CrashLoopBackOff
-    "image-not-found",    # 없는 이미지·태그 → ImagePullBackOff
-    "oom",                # 메모리 limit 초과 → OOMKilled
-    "probe-misconfig",    # 틀린 probe 포트·경로 → 재시작 반복, Ready 안 됨
-    "selector-mismatch",  # Service selector 가 파드 레이블과 다름 → Endpoints 없음
-    "missing-config",     # 없는 ConfigMap·Secret 참조 → CreateContainerConfigError
-    "unschedulable",      # 너무 큰 request, 맞는 노드 없음 → Pending
-    "quota",              # 꽉 찬 ResourceQuota·LimitRange → 생성 거부
-    "rbac",               # 빠진 권한 → Forbidden
-    "network-policy",     # 막는 NetworkPolicy → 연결 시간 초과
-    "other",              # 목록에 없거나 확실하지 않음
-    "healthy",            # 조사했지만 고장이 없음
+    "bad-command", "image-not-found", "oom", "probe-misconfig", "selector-mismatch", "missing-config",
+    "unschedulable", "quota", "rbac", "network-policy",
+    "volume-permission", "port-conflict", "admission-rejected",   # DURO-268
+    "other", "healthy",
 ]
 CAUSE_CATEGORIES: tuple[str, ...] = get_args(CauseCategory)
+
+# 분류마다 뜻과 가까운 분류와의 경계 — 스키마의 cause_category 설명으로 모델에게 그대로 간다 (DURO-268).
+# enum 값만 보내면 모델은 이름만 보고 고른다. 일반적인 증상만 적고, 평가 시나리오의 이름·정답 문구는 넣지 않는다.
+CAUSE_CATEGORY_GUIDE: dict[str, str] = {
+    "bad-command": "컨테이너 command·args·entrypoint 가 틀려 프로세스가 곧바로 끝난다 (CrashLoopBackOff, 로그에 실행 파일 없음·인자 오류). "
+                   "명령 자체가 틀린 경우다. 참조한 ConfigMap·Secret 이나 키가 없어 컨테이너가 뜨지 못하면 missing-config",
+    "image-not-found": "없는 이미지·태그·레지스트리 주소라 이미지를 받지 못한다 (ErrImagePull, ImagePullBackOff). "
+                       "이미지는 받았는데 실행 명령이 틀리면 bad-command",
+    "oom": "메모리 limit 을 넘어 컨테이너가 죽는다 (OOMKilled, exit code 137)",
+    "probe-misconfig": "liveness·readiness·startup probe 의 포트·경로·시간이 틀려 재시작이 반복되거나 Ready 가 되지 않는다. "
+                       "앱은 정상인데 probe 만 실패하는 경우다. 앱이 스스로 죽으면 bad-command",
+    "selector-mismatch": "Service selector 가 파드 레이블과 달라 Endpoints 가 비어 있다",
+    "missing-config": "파드가 참조하는 ConfigMap·Secret 이나 그 안의 키가 없다 (CreateContainerConfigError, 마운트 실패). "
+                      "있는 설정의 값이 틀려 명령이 실패하면 bad-command, 파일은 있는데 쓰기 권한이 없으면 volume-permission",
+    "unschedulable": "request 가 너무 크거나 nodeSelector·affinity·taint 에 맞는 노드가 없어 Pending 이다 (FailedScheduling). "
+                     "hostPort 가 겹쳐 Pending 이면 port-conflict",
+    "quota": "ResourceQuota 가 꽉 찼거나 LimitRange 범위를 벗어나 생성이 거부된다 (exceeded quota, LimitRange 위반)",
+    "rbac": "요청한 사용자·ServiceAccount 에 Role·RoleBinding 권한이 없어 Forbidden 이다 (... cannot <동사> resource ...). "
+            "권한은 있는데 정책이 내용을 보고 거부하면 admission-rejected",
+    "network-policy": "NetworkPolicy 가 트래픽을 막아 연결이 시간 초과된다. Endpoints 가 비어 있으면 selector-mismatch",
+    "volume-permission": "볼륨·파일 권한이 맞지 않아 쓰거나 읽지 못한다 (fsGroup·파일 소유자·runAsUser 불일치, Permission denied). "
+                         "볼륨·ConfigMap·Secret 자체가 없으면 missing-config",
+    "port-conflict": "같은 파드 안 컨테이너끼리 같은 포트를 쓰거나 hostPort 가 같은 노드에서 겹친다 "
+                     "(address already in use, 노드에 빈 포트 없음). probe 가 틀린 포트를 보면 probe-misconfig",
+    "admission-rejected": "admission 정책·webhook(Pod Security Admission, ValidatingAdmissionPolicy, Gatekeeper·Kyverno 등)이 "
+                          "생성·수정을 거부한다 (admission webhook denied, violates PodSecurity). "
+                          "ResourceQuota·LimitRange 초과는 quota, 주체에 권한이 없어 Forbidden 이면 rbac",
+    "other": "위 목록에 맞는 것이 없거나 확실하지 않다",
+    "healthy": "조사했지만 고장이 없다",
+}
+if tuple(CAUSE_CATEGORY_GUIDE) != CAUSE_CATEGORIES:   # python -O 에서도 걸리게 assert 대신 쓴다
+    raise RuntimeError("CauseCategory 와 CAUSE_CATEGORY_GUIDE 의 분류 목록이 어긋났다")
+
+_CAUSE_CATEGORY_DESCRIPTION = (
+    "원인 분류. 아래 목록에서 하나만 고른다. 확실하지 않으면 other, 고장이 없으면 healthy.\n"
+    + "\n".join(f"- {name}: {text}" for name, text in CAUSE_CATEGORY_GUIDE.items())
+)
 
 
 class CauseObject(BaseModel):
@@ -84,7 +113,7 @@ class Finding(BaseModel):
     cause_object: CauseObject | None = Field(
         default=None, description="원인이 있는(고쳐야 할) 오브젝트. 하나를 고를 수 없으면 null")
     cause_category: CauseCategory = Field(
-        default="other", description="원인 분류. 목록에서 하나만 고른다. 확실하지 않으면 other, 고장이 없으면 healthy")
+        default="other", description=_CAUSE_CATEGORY_DESCRIPTION)
     fix_commands: list[str] = Field(
         default_factory=list,
         description="고치는 kubectl 명령. 제안만 하고 실행하지 않는다 — 사용자에게 보여 줄 뿐이다. 고칠 것이 없으면 빈 목록")

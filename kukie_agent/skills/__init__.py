@@ -6,7 +6,7 @@ Private 대화는 읽기(kubectl 5종 + 레포 3종)만, Shared 대화는 읽기
 사전검토 스킬은 Issue #43에서 현재 가드레일 정책을 기준으로 후속 설계한다.
 """
 from kukie_agent.skills import private, shared
-from kukie_agent.skills.base import CAUSE_CATEGORIES, COMMON_TOOLS, CauseObject, Finding, KukieResponse, Skill
+from kukie_agent.skills.base import CAUSE_CATEGORIES, CAUSE_CATEGORY_GUIDE, COMMON_TOOLS, CauseObject, Finding, KukieResponse, Skill
 
 PRIVATE = private.SKILL
 SHARED = shared.SKILL
@@ -18,5 +18,5 @@ def skill_for(is_shared: bool) -> Skill:
 
 
 __all__ = [
-    "PRIVATE", "SHARED", "skill_for", "Skill", "KukieResponse", "Finding", "CauseObject", "CAUSE_CATEGORIES", "COMMON_TOOLS",
+    "PRIVATE", "SHARED", "skill_for", "Skill", "KukieResponse", "Finding", "CauseObject", "CAUSE_CATEGORIES", "CAUSE_CATEGORY_GUIDE", "COMMON_TOOLS",
 ]

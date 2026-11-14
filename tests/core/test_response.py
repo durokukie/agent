@@ -15,7 +15,7 @@ from kukie_agent.deps import Deps
 from kukie_agent.glossary import explain_command
 from kukie_agent.kubectl import KubectlResult
 from kukie_agent.response import build_response_for
-from kukie_agent.skills import CAUSE_CATEGORIES, PRIVATE, SHARED, Finding, KukieResponse
+from kukie_agent.skills import CAUSE_CATEGORIES, CAUSE_CATEGORY_GUIDE, PRIVATE, SHARED, Finding, KukieResponse
 from kukie_agent.tools import read as read_tools
 
 FAKE_COMMAND = "kubectl --context kind-dev get pods -n study -o wide"
@@ -281,8 +281,35 @@ def test_새_칸이_없는_예전_응답도_읽힌다():
 def test_분류_목록은_한_곳에서_정한다():
     assert CAUSE_CATEGORIES == (
         "bad-command", "image-not-found", "oom", "probe-misconfig", "selector-mismatch", "missing-config",
-        "unschedulable", "quota", "rbac", "network-policy", "other", "healthy")
+        "unschedulable", "quota", "rbac", "network-policy",
+        "volume-permission", "port-conflict", "admission-rejected", "other", "healthy")
     assert set(Finding.model_json_schema()["properties"]["cause_category"]["enum"]) == set(CAUSE_CATEGORIES)
+
+
+@pytest.mark.parametrize("category", ["volume-permission", "port-conflict", "admission-rejected"])
+def test_DURO_268_분류도_받는다(category):
+    assert Finding(cause="a", evidence="b", recommendation="c", cause_category=category).cause_category == category
+
+
+def test_분류마다_설명이_스키마로_간다():
+    """enum 값만 보내면 모델은 이름만 보고 고른다 — 뜻과 경계가 스키마 설명에 같이 가야 한다 (DURO-268)."""
+    assert tuple(CAUSE_CATEGORY_GUIDE) == CAUSE_CATEGORIES
+    description = Finding.model_json_schema()["properties"]["cause_category"]["description"]
+    for name, text in CAUSE_CATEGORY_GUIDE.items():
+        assert text.strip()
+        assert f"- {name}: {text}" in description
+
+
+@pytest.mark.parametrize("category,neighbors", [
+    ("bad-command", {"missing-config"}),
+    ("missing-config", {"bad-command", "volume-permission"}),
+    ("admission-rejected", {"quota", "rbac"}),
+    ("volume-permission", {"missing-config"}),
+    ("port-conflict", {"probe-misconfig"}),
+    ("unschedulable", {"port-conflict"}),
+])
+def test_헷갈리는_분류는_경계를_적는다(category, neighbors):
+    assert all(n in CAUSE_CATEGORY_GUIDE[category] for n in neighbors)
 
 
 def test_LLM_스키마에서는_finding_의_모든_칸이_필수다(fake_kubectl):
@@ -293,6 +320,7 @@ def test_LLM_스키마에서는_finding_의_모든_칸이_필수다(fake_kubectl
     finding_schema = schema["$defs"]["Finding"]
     assert set(finding_schema["required"]) == set(FULL_FINDING)
     assert "실행하지 않는다" in finding_schema["properties"]["fix_commands"]["description"]
+    assert "admission-rejected: " in finding_schema["properties"]["cause_category"]["description"]
     assert result.output.finding.cause_category == "oom"
     assert result.output.finding.cause_object.name == "web"
 
