@@ -46,10 +46,14 @@ def setup() -> bool:
     try:
         import logfire
 
+        from kukie_agent import prompts
+
         logfire.configure(
             service_name="kukie",
             # 토큰이 없으면 SaaS 로 보내지 않는다 — OTLP 엔드포인트만 쓰는 구성 지원
             send_to_logfire=bool(os.environ.get("LOGFIRE_TOKEN")),
+            # 모든 span 의 resource 에 프롬프트 버전(kukie.prompt.version)과 파일별 지문(kukie.prompt.files) — prompts 모듈
+            resource_attributes=prompts.resource_attributes(),
         )
         logfire.instrument_pydantic_ai(
             include_content=os.environ.get("KUKIE_TRACE_CONTENT") == "1",

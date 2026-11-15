@@ -40,8 +40,8 @@ LLM 이 delete_resource(...) 호출
   └─ ⑦ 결과 기록 ─ APPLIED / FAILED / UNKNOWN 을 Plan 에 남김
 ```
 
-ArgoCD 가 관리하고 매니페스트 레포가 연결된 리소스는 kubectl 대신 **PR 길**로 간다 (`propose_git_change`, DURO-134).
-같은 틀에서 ③ dry-run 자리가 "고칠 곳 찾기 + 렌더 비교 + 승인 전 PR 열기" 로, ⑥ 실행이 "PR 머지 → ArgoCD sync·health 지켜보기" 로
+ArgoCD 가 관리하고 매니페스트 레포가 연결된 리소스는 kubectl 대신 **PR 길**로 간다 (`propose_git_change`, DURO-134). 새 리소스도 고른 ArgoCD 앱의 폴더에 새 파일로 더해 PR 로 올린다 (`change.what = new_resource`, DURO-154).
+같은 틀에서 ③ dry-run 자리가 "고칠 곳 찾기 + 렌더 비교 + 승인 전 PR 열기" 로, ⑥ 실행이 "PR 머지, 그 뒤 요청과 떼어 ArgoCD sync·health 지켜보기" 로
 바뀐다. 승인 순간 길을 다시 판단해 레포 연결·Application·PR 이 바뀌었으면 실행하지 않고 STALE 로 닫는다.
 레포 연결이 대화 도중 바뀌어도 AI 가 옛 답변을 따라가지 않게, 틀린 길의 호출은 훅이 `ModelRetry` 로 돌려보내고
 연결이 바뀐 때만 기록 끝에 메모 한 줄을 넣는다 (DURO-135, `kukie_agent/gitops/memo.py`). instructions·툴 목록은 그대로다.
@@ -93,7 +93,7 @@ agent 에 남은 공개 API 는 `POST /conversations/{id}/chat`·`/approve`·`/r
 | Kukie API 서버 내부 API 클라이언트 (저장·권한 판단, fail-closed) | `kukie_agent/server_api.py` |
 | 실행 직전 임시 kubeconfig, 개요 응답 정리 | `kukie_agent/clusters/` |
 | ArgoCD 관리 리소스 판별 (가드레일 경고·describe·앱 목록 API) | `kukie_agent/argocd.py` |
-| GitOps PR 길 — 길 판단 · GitHub(브랜치·커밋·PR·머지) · sync 지켜보기, 승인 훅 | `kukie_agent/gitops/`, `kukie_agent/guardrail/gitops_hook.py` |
+| GitOps PR 길 — 길 판단 · GitHub(브랜치·커밋·PR·머지) · sync 지켜보기, 승인 훅 · 머지 뒤 지켜보기와 재시작 복구 | `kukie_agent/gitops/`, `kukie_agent/guardrail/gitops_hook.py`, `kukie_agent/guardrail/gitops_after_merge.py` |
 | 매니페스트 레포 고칠 곳 찾기 · 렌더 비교 | `kukie_agent/manifests/` |
 | 인증 (kukie-server `/users/me`, fail-closed) | `kukie_agent/auth.py` |
 
@@ -119,10 +119,11 @@ kind 클러스터 E2E: `KUKIE_E2E_CONTEXT=kind-<name> python -m pytest -m e2e` �
 | 변수 | 뜻 |
 |---|---|
 | `KUKIE_SERVER_URL` | Kukie API 서버 주소 (예 `http://spring:8080`, 끝 `/` 는 뗀다). 토큰 검증(`/users/me`)과 내부 API 가 같은 주소를 쓴다 |
+| `KUKIE_HELM_RENDER_URL` | Helm 렌더링 전용 파드 주소 (예 `http://helm-render:8000`, `helm_render/README.md`). 없거나 닿지 않으면 Helm 렌더링은 "렌더링 실패"로 돌아오고 대화는 이어진다 |
 | `KUKIE_INTERNAL_TOKEN` | 내부 API 토큰 — kukie-server 의 `KUKIE_INTERNAL_TOKEN` 과 같은 값. 위 둘 중 하나라도 없으면 대화 경로는 503 |
 | `KUKIE_DEV_AUTH`, `KUKIE_DEV_USER` | server 없이 로컬 개발 — flat 엔드포인트(`/session` `/chat` `/approve` `/resume`)만 열린다. 계획은 `~/.kukie/plans` 의 `.md` 로만 남는다 |
 | `KUKIE_ACCESS_COOKIE` | 웹 access 쿠키 이름 (기본 `kukie_access`, kukie-server 와 같아야 한다) |
-| `KUKIE_MODEL`, `KUKIE_GUIDANCE_MODEL`, 각 제공사 API 키 | 메인 에이전트·판단 가이드 모델 |
+| `KUKIE_MODEL`, `KUKIE_GUIDANCE_MODEL`, `KUKIE_TITLE_MODEL`, 각 제공사 API 키 | 메인 에이전트·판단 가이드·대화 제목 모델 (제목은 비우면 판단 가이드 모델) |
 
 없어진 변수: `KUKIE_DATABASE_URL`(agent 에 DB 가 없다), `KUKIE_SECRET_KEY`·`KUKIE_ALLOW_LOCAL_CLUSTER`(자격증명 암호화와 kubeconfig 검사가 kukie-server 로 옮겨 가 그쪽 `KUKIE_CREDENTIAL_KEY`·`KUKIE_ALLOW_LOCAL_CLUSTER` 가 됐다), `KUKIE_MEMBER_URL`(`KUKIE_SERVER_URL` 이 대신한다).
 

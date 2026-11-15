@@ -8,12 +8,12 @@ PR #41 / Issue #28은 최신 `develop`의 승인 구현을 유지하고 검증�
 
 | 경로 | 검증 위치 |
 |---|---|
-| 승인 DTO, 여러 카드의 승인·거절, 중복 결정, 동시 요청 차단 | `tests/test_server.py` |
-| 네 mutation tool의 Hook 연결 및 승인 전 실행 차단 | `tests/test_agent.py` |
-| DESTRUCTIVE 단일 승인·거절 및 Plan 최종 상태 | `tests/test_guardrail_integration.py` |
-| dry-run 실패, 설명 오류, risk 누락 → 승인·실행 차단 | `tests/test_guardrail_integration.py` |
-| dry-run 미지원·guidance 실패 → 원인 표시 후 승인, 보호 namespace의 risk 유지 | `tests/test_guardrail_integration.py` |
-| mutation 성공·실패 후 모델 응답 실패 → HTTP 재개 → 저장 결과 반환, 실행 1회 | `tests/test_guardrail_integration.py` |
+| 승인 DTO, 여러 카드의 승인·거절, 중복 결정, 동시 요청 차단 | `tests/core/test_server.py` |
+| 네 mutation tool의 Hook 연결 및 승인 전 실행 차단 | `tests/core/test_agent.py` |
+| DESTRUCTIVE 단일 승인·거절 및 Plan 최종 상태 | `tests/guardrail/test_guardrail_integration.py` |
+| dry-run 실패, 설명 오류, risk 누락 → 승인·실행 차단 | `tests/guardrail/test_guardrail_integration.py` |
+| dry-run 미지원·guidance 실패 → 원인 표시 후 승인, 보호 namespace의 risk 유지 | `tests/guardrail/test_guardrail_integration.py` |
+| mutation 성공·실패 후 모델 응답 실패 → HTTP 재개 → 저장 결과 반환, 실행 1회 | `tests/guardrail/test_guardrail_integration.py` |
 | 실제 클러스터의 apply·scale·restart·delete 승인/거절, Plan과 상태 일치 | `tests/e2e/test_guardrail_cluster.py` |
 | apply의 명시 namespace 우선 적용·기본 namespace 미변경, dry-run/실행 stdin 일치 | `tests/e2e/test_guardrail_cluster.py` |
 

@@ -9,7 +9,7 @@
 
 원본은 계획이 어디서 생겼는지에 따라 둘 중 하나다.
 - **대화 경로 (run_id 있음)**: Kukie API 서버(kukie-server)의 tbl_action_plan (DURO-113). agent 는 DB 가 없으므로
-  상태가 바뀔 때마다 내부 API 의 plan 동작(create·dry-run·offer·decision·start·result·fail·unknown)을 부르고,
+  상태가 바뀔 때마다 내부 API 의 plan 동작(create·dry-run·offer·decision·start·result·sync-result·fail·unknown)을 부르고,
   **다음 상태는 server 가 정한다** — 허용되지 않는 전이·승인한 호출과 다른 실행은 server 가 409 로 거절한다.
   메모리의 객체는 그 응답으로 맞춘다. id 는 server 가 만든 UUID(승인 카드의 plan_id)이고,
   화면에 보이는 id 는 code(`ap-YYMMDD-HHMM-<tool>[-N]`)다. .md 사본은 만들지 않는다 — 상세 Markdown 은 server 가 그린다.
@@ -427,9 +427,15 @@ class ActionPlan:
             if exc.code in PLAN_CONFLICTS:
                 raise ValueError(f"ActionPlan {action} rejected ({exc.code}): {exc.message}") from None
             raise
-        fresh = type(self).from_response(updated)
+        self._adopt(type(self).from_response(updated))
+
+    def _adopt(self, fresh: "ActionPlan") -> None:
         for item in dataclasses.fields(self):
             setattr(self, item.name, getattr(fresh, item.name))
+
+    async def reload(self) -> None:
+        """원본을 다시 읽어 이 객체를 맞춘다 — 기록은 닿았는데 응답만 잃었는지 볼 때."""
+        self._adopt(type(self).from_response(await server_api.get_plan(self.id)) if self.remote else self.load(self.path))
 
     def _update_fields(self, **changes: object) -> None:
         """파일 계획의 상태를 바꾼다. .md 가 원본이라 쓰지 못하면 객체를 원래대로 되돌리고 던진다."""
@@ -646,6 +652,25 @@ class ActionPlan:
             failure_reason=None if applied else "EXECUTION_FAILED",
             status="APPLIED" if applied else "FAILED",
         )
+
+    async def record_sync(self, sync_result: dict[str, Any]) -> None:
+        """머지를 먼저 기록해 둔 계획에 지켜본 sync 결과를 얹는다 (DURO-158). 상태는 APPLIED 그대로다 — 머지가 곧 적용이고,
+        sync 가 실패해도 머지가 사라지지는 않는다. 지켜보는 중(syncing)이 아니면 ValueError. 같은 값을 다시 보내면 그대로 성공한다."""
+        if self.remote:
+            await self._act("sync-result", {"syncResult": sync_result})
+            return
+        result = self.execution_result or {}
+        current = result.get("sync_result")
+        if self.status == "APPLIED" and current == sync_result:
+            return
+        if (
+            self.status != "APPLIED"
+            or not result.get("merge_commit")
+            or not isinstance(current, dict)
+            or current.get("status") != "syncing"
+        ):
+            raise ValueError("ActionPlan is not waiting for a sync result")
+        self._update_fields(execution_result={**result, "sync_result": sync_result})
 
     async def reject(self, user_id: str | None = None) -> None:
         """거절을 기록한다. **다시 불러도 성공한다** — 안내가 "같은 카드를 다시 결정하라" 이기 때문이다.

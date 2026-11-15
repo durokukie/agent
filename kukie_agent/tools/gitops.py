@@ -1,7 +1,7 @@
-"""PR 길 변경 툴 — ArgoCD 가 관리하는 리소스를 매니페스트 레포 PR 로 바꾼다 (DURO-134).
+"""PR 길 변경 툴 — ArgoCD 가 관리하는 리소스를 매니페스트 레포 PR 로 바꾼다 (DURO-134). 새 리소스도 더한다 (DURO-154).
 
 기존 변경 4종(tools/mutate.py)처럼 Shared 대화에만 열린다. 승인 전 준비(고칠 곳 찾기·렌더 비교·브랜치·커밋·PR)와
-승인 뒤 실행(머지·sync 지켜보기)은 전부 guardrail/gitops_hook.py 가 한다 — 툴 본체는 훅 없이 불리면 거절한다(fail-closed).
+승인 뒤 실행(머지)은 전부 guardrail/gitops_hook.py 가 한다 — 툴 본체는 훅 없이 불리면 거절한다(fail-closed).
 kubectl 툴과 달리 본체가 실행하지 않는 이유: 머지에는 승인 전에 만든 PR(번호·승인한 파일 내용)이 필요하고, 그건 툴 인자가
 아니라 Plan 에 있다.
 """
@@ -24,7 +24,7 @@ class GitOpsResult(KubectlResult):
     """
     pull_request: dict | None = None        # {number, url}
     merge_commit: str | None = None
-    sync_result: dict | None = None         # gitops/watch.py 의 결과 모양
+    sync_result: dict | None = None         # gitops/watch.py 의 결과 모양. 머지 직후에는 status 가 syncing 이다
 
 
 def propose_git_change(ctx: RunContext[Deps], kind: str, name: str, change: Change,
@@ -33,12 +33,38 @@ def propose_git_change(ctx: RunContext[Deps], kind: str, name: str, change: Chan
     """ArgoCD 가 관리하는 리소스를 클러스터에 직접 쓰지 않고, ArgoCD 가 보는 GitHub 레포에 PR 을 올려 바꾼다.
 
     리소스 조회 결과에 "변경은 PR 길" 이라고 나온 리소스(ArgoCD 관리 + 레포 연결됨)를 바꿀 때 kubectl 변경 툴 대신 쓴다.
-    바꿀 수 있는 것은 넷이다 — change 의 what 으로 고른다:
+    change 의 what 으로 고른다. 자주 쓰는 넷은 전용이다:
       replicas(count) · image_tag(tag, container) · resources(container, requests, limits) · env(container, values, remove)
+    그 밖의 칸(포트 · probe · command/args · 라벨·어노테이션 · 볼륨 · nodeSelector · Service 포트 …)은 경로 지정 변경으로 한다:
+      patch(operations=[{op: "set", path, value} | {op: "remove", path}, …])
+      - path 는 리소스 기준이다. 키는 점으로 잇고, 이름(name) 있는 목록 항목은 [이름], 점·슬래시가 든 키는 ["키"]:
+          spec.template.spec.containers[web].readinessProbe · metadata.labels["app.kubernetes.io/part-of"]
+      - 목록을 번호로 가리키지 않는다. 이름 없는 목록(args · ports · tolerations …)은 그 목록 전체를 set 한다
+      - 위 칸이 없으면 위 칸부터 통째로 set 한다. value 는 JSON 값(문자열 · 숫자 · 참거짓 · 맵 · 목록)이다
+      - apiVersion · kind · metadata.name · metadata.namespace 는 못 바꾼다(다른 리소스가 된다). metadata 아래는 labels · annotations 만
+      - plain YAML 앱은 그 문서를, Kustomize 앱은 overlay 에 Kukie patch 파일을 고친다(base 는 안 고친다). overlay 의
+        replicas: · images: 가 정하는 칸은 그 항목을 고치고, commonLabels 등 overlay 전체에 붙는 칸은 거절한다
+      - privileged · hostPath · 서비스 계정 같은 위험해 보이는 값은 막지 않고 승인 카드에 경고로 올린다
+    리소스를 지우거나 다른 네임스페이스로 옮길 때는 전용 둘을 쓴다 (plain YAML · Kustomize 앱 모두):
+      delete() — 그 리소스를 레포에서 뺀다. 클러스터에서도 지워지는지는 앱의 prune 설정이 정하고 승인 카드에 나온다
+      namespace(to) — metadata.namespace 를 to 로 바꾼다. 옛 것을 지우고 새로 만드는 것이다(Service 주소·PVC 데이터가 바뀐다).
+        to 를 앱의 ArgoCD 프로젝트가 허락해야 한다. 앱 기본 네임스페이스로 옮기면 namespace 줄을 지운다
+      Kustomize 에서 리소스가 base 에서 오거나 overlay patch 가 그 리소스를 가리키면 못 한다(옮기기는 `namespace:` 가 정하는 앱도) —
+      이유를 사용자에게 알리고 GitHub 에서 직접 고치게 한다. kubectl 로 지우거나 옮기면 ArgoCD 가 되돌린다
     그 밖의 변경, ArgoCD 가 관리하지 않는 리소스, 레포가 연결되지 않은 리소스는 kubectl 변경 툴로 한다 —
     잘못 부르면 시스템이 이유와 함께 다시 하라고 알려 준다.
-    시스템이 고칠 파일을 찾아 렌더링으로 확인하고 PR 을 연 뒤 승인 카드를 띄운다. 승인하면 PR 을 머지하고
-    ArgoCD sync 가 끝날 때까지 지켜본 결과를 돌려준다 — 클러스터는 머지 뒤 ArgoCD 가 sync 해야 바뀐다.
+
+    새 리소스를 git 으로 남기며 만들 때는 what 을 new_resource 로 한다 — 이미 있는 ArgoCD 앱의 폴더에 새 파일을 더한다:
+      new_resource(application, manifest_yaml, file_name, application_namespace)
+    application 은 대상 ArgoCD 앱이다(모르면 앱 목록을 보고 사용자에게 고르게 하거나 제안한다). manifest_yaml 은 만들 리소스 전체로,
+    Deployment 와 Service 처럼 여러 문서(---)여도 된다. file_name 은 비워도 된다. kind·name 에는 그중 대표 리소스 하나를 적는다.
+    기존 파일·기존 리소스는 건드리지 않고, 값이 든 Secret 과 Kustomization 은 못 넣는다. 막히면 이유와 다음 방법을 알려 준다.
+    위험해 보이는 설정(클러스터 범위·privileged·latest 이미지 등)은 막지 않고 승인 카드에 경고로 올린다.
+    앱의 ArgoCD 프로젝트가 허락하지 않는 네임스페이스면 막는다 — 머지해도 sync 가 실패한다. 사용자가 그 네임스페이스를 말했어도
+    metadata.namespace 를 지워 앱의 네임스페이스로 다시 제안할지 먼저 묻는다.
+
+    시스템이 고칠 파일을 찾아 렌더링으로 확인하고 PR 을 연 뒤 승인 카드를 띄운다. 승인하면 PR 을 머지한 결과를 돌려주고,
+    ArgoCD sync 는 시스템이 뒤에서 지켜봐 승인 카드에 보여 준다 — 클러스터는 머지 뒤 ArgoCD 가 sync 해야 바뀐다.
     intent/expected_effects/side_effects 는 사용자가 이해할 수 있는 말로 채운다 — 승인 카드와 PR 본문에 실린다.
     """
     raise RuntimeError("propose_git_change 는 가드레일 훅(guardrail/gitops_hook.py)을 거쳐서만 실행된다")

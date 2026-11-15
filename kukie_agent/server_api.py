@@ -149,6 +149,11 @@ async def _call(
     raise _error_of(response)
 
 
+#: 내부 토큰이 server 와 다를 때의 문구. 앱에는 503 SERVER_UNAVAILABLE 로 같이 보이지만, 기다려도 풀리지 않아
+#: 다시 시도하는 곳(conversations_api 의 뒤늦은 실패 표시)이 이 문구로 가른다
+INTERNAL_AUTH_MISMATCH = "Kukie API 서버와의 내부 인증 설정이 맞지 않는다"
+
+
 def _error_of(response: httpx.Response) -> ServerError:
     try:
         body = response.json()
@@ -158,7 +163,7 @@ def _error_of(response: httpx.Response) -> ServerError:
     message = body.get("message") if isinstance(body, dict) else None
     if code == "INVALID_INTERNAL_TOKEN":
         logger.error("Kukie API 서버가 내부 토큰을 거절했다 — KUKIE_INTERNAL_TOKEN 이 server 와 다르다")
-        return ServerError(503, "SERVER_UNAVAILABLE", "Kukie API 서버와의 내부 인증 설정이 맞지 않는다")
+        return ServerError(503, "SERVER_UNAVAILABLE", INTERNAL_AUTH_MISMATCH)
     if isinstance(code, str) and code:
         return ServerError(response.status_code, code, str(message or ""))
     if response.status_code >= 500:
@@ -377,18 +382,19 @@ async def start_run(
 async def update_run(
     run_id: str, *, status: str | None = None, response_payload: dict[str, Any] | None = None,
     append_agent_messages: list[Any] | None = None, usage_summary: dict[str, Any] | None = None,
-    title_from: str | None = None,
+    title_from: str | None = None, title: str | None = None,
 ) -> RunUpdate:
     """run 갱신 한 번. 준 칸만 바꾼다 (None = 그대로).
 
     server 가 한 트랜잭션에서 한다: 종료 상태면 finishedAt + 열린 plan 마감(결정 있고 결과 없음 → UNKNOWN,
-    나머지 → EXPIRED), title_from 이면 첫 마디로 제목 짓기 (기본 제목일 때만).
+    나머지 → EXPIRED), title_from 이면 첫 마디로 제목 짓기 (기본 제목일 때만). title 은 모델이 지은 후보로,
+    server 가 쓸 만하면 title_from 대신 쓴다 (title_from 과 함께일 때만 본다).
     agent_messages 는 기존 배열 뒤에 **이어 붙인다** — 승인·재개가 같은 run 을 이어 쓰기 때문이다.
     """
     body: dict[str, Any] = {}
     for key, value in (
         ("status", status), ("responsePayload", response_payload), ("appendAgentMessages", append_agent_messages),
-        ("usageSummary", usage_summary), ("titleFrom", title_from),
+        ("usageSummary", usage_summary), ("titleFrom", title_from), ("title", title),
     ):
         if value is not None:
             body[key] = value
@@ -423,10 +429,17 @@ async def cluster_connection(
     return ClusterConnection.from_json(data)
 
 
-async def update_cluster_status(cluster_id: str, *, status: str, checked_at: datetime) -> dict[str, Any]:
-    """연결 확인 결과. 시각은 server 응답과 같은 오프셋 없는 UTC ISO 로 보낸다."""
+async def update_cluster_status(
+    cluster_id: str, *, status: str, checked_at: datetime, fingerprint: str,
+) -> dict[str, Any]:
+    """연결 확인 결과. 시각은 server 응답과 같은 오프셋 없는 UTC ISO 로 보낸다.
+
+    fingerprint 는 확인할 때 쓴 연결 정보의 지문이다 — 그 사이 kubeconfig 가 바뀌었으면 server 가 409 CLUSTER_CHANGED
+    (DURO-125, update_cluster_gpu 와 같은 규칙).
+    """
     at = checked_at.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
-    return await _call("PATCH", _path("clusters", cluster_id, "status"), body={"status": status, "checkedAt": at})
+    return await _call("PATCH", _path("clusters", cluster_id, "status"),
+                       body={"status": status, "checkedAt": at, "fingerprint": fingerprint})
 
 
 async def update_cluster_gpu(cluster_id: str, *, has_gpu: bool, fingerprint: str) -> dict[str, Any]:
@@ -463,8 +476,9 @@ async def get_plan(plan_id: str) -> Plan:
 
 #: plan 동작 이름 — `POST /internal/plans/{id}/<action>`. 허용 안 되는 상태면 409 PLAN_STATE_CONFLICT,
 #: 승인한 호출과 실행하려는 호출이 다르면 409 PLAN_CALL_MISMATCH.
-#: stale 은 승인 순간 전제가 깨졌다는 알림이다 (기획 08, GitOps 의 PR 길이 바뀜 — DURO-134). 결정 전 계획만 받는다
-PLAN_ACTIONS = frozenset({"dry-run", "offer", "decision", "start", "result", "fail", "unknown", "stale"})
+#: stale 은 승인 순간 전제가 깨졌다는 알림이다 (기획 08, GitOps 의 PR 길이 바뀜 — DURO-134). 결정 전 계획만 받는다.
+#: sync-result 는 머지를 먼저 기록해 둔 PR 길 계획에 지켜본 sync 결과를 얹는다 (DURO-158). 지켜보는 중(syncing)인 계획만 받는다
+PLAN_ACTIONS = frozenset({"dry-run", "offer", "decision", "start", "result", "sync-result", "fail", "unknown", "stale"})
 
 
 async def plan_action(plan_id: str, action: str, body: dict[str, Any] | None = None) -> Plan:
@@ -472,6 +486,22 @@ async def plan_action(plan_id: str, action: str, body: dict[str, Any] | None = N
     if action not in PLAN_ACTIONS:
         raise ValueError(f"unknown plan action: {action}")
     return Plan.from_json(await _call("POST", _path("plans", plan_id, action), body=body or {}))
+
+
+@dataclass(frozen=True)
+class UnsettledPlan:
+    """끝나지 않은 계획 하나와, 재시작 복구가 그 계획을 닫는 데 필요한 것 (DURO-158)."""
+
+    plan: Plan
+    cluster_id: str
+    run_active: bool
+
+
+async def unsettled_plans(tool_name: str) -> list[UnsettledPlan]:
+    """그 도구의 계획 중 결과 없이 APPROVED·EXECUTING 이거나, APPLIED 인데 sync 를 아직 지켜보는 중인 것."""
+    data = await _call("GET", _path("plans", "unsettled"), params={"toolName": tool_name})
+    return [UnsettledPlan(Plan.from_json(item["plan"]), str(item["clusterId"]), bool(item.get("runActive")))
+            for item in data or []]
 
 
 # ── GitOps 매니페스트 레포 (DURO-131) ─────────────────────────
@@ -541,6 +571,6 @@ async def update_repo_link_state(conversation_id: str, state: dict[str, Any]) ->
 #: 테스트의 메모리 가짜가 같은 이름으로 바꿔 끼우는 함수들 (tests/fake_server.py).
 API = (
     "conversation_context", "find_run", "start_run", "update_run", "interrupt", "interrupt_orphaned",
-    "cluster_connection", "update_cluster_status", "update_cluster_gpu", "create_plan", "run_plans", "get_plan", "plan_action",
+    "cluster_connection", "update_cluster_status", "update_cluster_gpu", "create_plan", "run_plans", "get_plan", "plan_action", "unsettled_plans",
     "manifest_repos", "repo_token", "repo_link_state", "update_repo_link_state",
 )

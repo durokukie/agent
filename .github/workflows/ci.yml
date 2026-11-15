@@ -15,7 +15,31 @@ env:
   SETUP_UV_VERSION: "0.12.23"
 
 jobs:
+  # PR 이 바꾼 경로로 아래 test · e2e 를 돌릴지 정한다. 문서만 바뀌면 둘 다, GPU 개요처럼 e2e 가 지나지 않는 코드면 e2e 만 건너뛴다.
+  # push 는 늘 둘 다 돌린다. 이 job 이 실패하면 값이 비어 둘 다 돌고, image 는 건너뛰어 굽지 않는다
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      test: ${{ steps.scope.outputs.test }}
+      e2e: ${{ steps.scope.outputs.e2e }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2   # PR 머지 커밋과 그 부모를 비교한다
+      # CI 설정을 고친 PR 은 고친 스크립트의 판정을 믿지 않고 전부 돌린다
+      - id: scope
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && git diff --name-only --no-renames HEAD^1 HEAD | grep -qE '^\.github/(scripts/|workflows/ci\.yml$)'; then
+            printf 'test=true\ne2e=true\n' >> "$GITHUB_OUTPUT"
+          else
+            python3 .github/scripts/ci_scope.py
+          fi
+
   test:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.test != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -23,7 +47,7 @@ jobs:
         with:
           version: ${{ env.SETUP_UV_VERSION }}
       - run: uv sync --locked
-      # 렌더 비교 테스트(tests/test_manifests.py)가 진짜 kustomize build 를 돌린다. 버전·sha256 은 Dockerfile 과 같다 (ArgoCD v3.5.3 에 맞춘 값).
+      # 렌더 비교 테스트(tests/manifests/test_manifests.py)가 진짜 kustomize build 를 돌린다. 버전·sha256 은 Dockerfile 과 같다 (ArgoCD v3.5.3 에 맞춘 값).
       # 러너에 깔려 있는 kustomize 는 버전이 따로 놀아 덮어쓴다. CI 에서는 kustomize 가 없으면 그 테스트가 건너뛰지 않고 실패한다
       - name: Install kustomize
         env:
@@ -37,6 +61,8 @@ jobs:
       - run: uv run python -m pytest
 
   e2e:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.e2e != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -56,7 +82,7 @@ jobs:
           sha256sum -c kind-linux-amd64.sha256sum
           sudo install -m 0755 kind-linux-amd64 /usr/local/bin/kind
       - run: kind create cluster --name kukie-e2e --wait 120s
-      - run: uv run python -m pytest -q -m e2e
+      - run: uv run python -m pytest -q -m e2e tests/e2e   # e2e 범위를 경로로 고르므로 이 폴더 것만 돈다
       - if: always()
         run: kind delete cluster --name kukie-e2e
 
@@ -66,7 +92,7 @@ jobs:
   # 버전은 kukie-manifest envs/dev/kustomization.yaml 의 digest 로 올린다 — 아래 알림 단계가 kukie-manifest 에 이 digest 를 알린다.
   image:
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
-    needs: [test, e2e]
+    needs: [changes, test, e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

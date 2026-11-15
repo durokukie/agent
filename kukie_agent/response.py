@@ -16,16 +16,20 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic_ai import RunContext
-from pydantic_ai.messages import ModelMessage, ModelRequest, ToolReturnPart, UserPromptPart
+from pydantic import Field
+from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai.messages import ModelMessage, ModelRequest, RetryPromptPart, ToolReturnPart, UserPromptPart
 
 from kukie_agent.deps import Deps
 from kukie_agent.gitops.memo import is_memo
 from kukie_agent.glossary import explain_command
 from kukie_agent.kubectl import KubectlResult
 from kukie_agent.skills.base import KukieResponse, ToolStep
+from kukie_agent.tools.gitops import TOOL_NAME as GITOPS_TOOL_NAME
+from kukie_agent.tools.gitops import GitOpsResult
+from kukie_agent.tools.mutate import MUTATING_TOOLS
 from kukie_agent.tools.read import READ_TOOLS
 from kukie_agent.tools.repo import REPO_TOOLS
 from kukie_agent.validators import log_unregistered_flags
@@ -34,6 +38,8 @@ from kukie_agent.validators import log_unregistered_flags
 # 안전 표시는 보수적으로 (DURO-44 결정 · fail-closed): 틀렸을 때 "읽기"로 잘못 표시하면
 # 사용자가 안심하고 넘기지만, "변경"으로 잘못 표시하면 한 번 더 확인할 뿐이다.
 READ_TOOL_NAMES: frozenset[str] = frozenset(tool.__name__ for tool in [*READ_TOOLS, *REPO_TOOLS])
+#: 클러스터나 레포를 바꾸는 툴. 답 양식(출력 툴)의 형식 재시도 같은 것은 "다른 변경의 실패" 가 아니다
+CHANGE_TOOL_NAMES: frozenset[str] = frozenset(MUTATING_TOOLS) | {GITOPS_TOOL_NAME}
 
 # 화면 블록 제목 — 툴 이름을 사람 말로. 미등록 툴은 이름 그대로.
 STEP_LABELS: dict[str, str] = {
@@ -85,6 +91,83 @@ def collect_steps(ctx: RunContext[Deps]) -> list[ToolStep]:
     return steps
 
 
+def _is_waiting_merge(part: ToolReturnPart | RetryPromptPart) -> bool:
+    """머지까지 끝났고 sync 는 뒤에서 지켜보는 중인 PR 툴 결과인가.
+
+    stderr 가 있으면 기록을 못 한 머지다 — 지켜보기가 돌지 않아 카드에 결과가 뜨지 않으므로 "카드에서 보라" 고 하면 안 된다.
+    """
+    result = part.content
+    return (isinstance(result, GitOpsResult) and result.success and not result.stderr
+            and (result.sync_result or {}).get("status") == "syncing"
+            and bool((result.pull_request or {}).get("number")))
+
+
+def merged_reply(ctx: RunContext[Deps]) -> str | None:
+    """이번 턴의 변경이 'PR 을 머지했고 반영을 기다리는 중' 뿐이면 코드가 쓸 답. 아니면 None — 답은 LLM 몫이다.
+
+    답은 한 번 쓰면 그대로 남고 카드만 sync 결과로 바뀐다. 머지 직후의 "아직 4개예요" 는 2분 뒤에 틀린 말로 읽힌다.
+    머지 실패, 거절, kubectl 변경이 같은 턴에 있으면 설명할 것이 있으므로 LLM 에게 맡긴다. 머지 앞의 ModelRetry 만 보지 않는다 —
+    잘못 고른 툴을 돌려보낸 뒤 PR 로 온 정상 흐름이다.
+    """
+    numbers: list[Any] = []
+    for msg in _current_turn(ctx.messages):
+        parts = [part for part in getattr(msg, "parts", ())
+                 if isinstance(part, ToolReturnPart | RetryPromptPart) and part.tool_name in CHANGE_TOOL_NAMES]
+        merged = [part.content for part in parts if _is_waiting_merge(part)]
+        if numbers or merged:
+            if len(merged) != len(parts):
+                return None
+            numbers += [result.pull_request["number"] for result in merged]
+        elif any(isinstance(part, ToolReturnPart) for part in parts):
+            return None
+    if not numbers:
+        return None
+    pulls = ", ".join(f"PR #{number}" for number in numbers)
+    return f"{pulls} 머지가 끝났어요. 반영 결과는 위 카드에서 볼 수 있어요."     # GitHub 에서 먼저 머지된 PR 도 맞는 말이어야 한다
+
+
+# 진단 조사로 보는 툴 — base 프롬프트 4번의 describe → events → logs. 목록 조회(list_resources)는 넣지 않는다:
+# "파드 보여줘" 같은 단순 조회마다 되묻는 호출이 붙는다
+DIAGNOSIS_TOOL_NAMES: frozenset[str] = frozenset({"describe_resource", "get_events", "get_logs"})
+
+#: 되묻기 문구의 첫머리 — 같은 턴에 이미 한 번 되물었는지 이 문구로 찾는다
+FINDING_RETRY_MARK = "finding 이 비어 있어요."
+FINDING_RETRY_MESSAGE = (
+    f"{FINDING_RETRY_MARK} 클러스터를 조사했으니 결론을 finding 에 담아 다시 답해 주세요. "
+    "원인을 찾았으면 그 원인을, 확실하지 않으면 cause_category=other 를, 조사했는데 고장이 없으면 cause_category=healthy 를 적어요. "
+    "근거 없이 원인을 지어내지는 마세요. 진단이 아닌 답(단순 조회·개념 설명)이었다면 같은 답을 finding=null 로 다시 보내면 돼요."
+)
+
+
+def _texts(part: RetryPromptPart) -> str:
+    return part.content if isinstance(part.content, str) else str(part.content)
+
+
+def needs_finding_retry(ctx: RunContext[Deps], finding: Any) -> bool:
+    """finding 이 빈 답을 한 번 되물을까.
+
+    이번 턴에 진단 툴(describe·events·logs)이 하나라도 성공했고, 클러스터·레포 변경이 없고, 아직 되묻지 않았을 때만.
+    되묻기는 턴마다 한 번이다 — 진단이 아니었다면 모델이 null 로 다시 보내 끝낼 수 있어야 하고(억지 원인 금지),
+    응답 형식 재시도 횟수(retries output)를 다 써서 run 이 실패하면 안 된다.
+    """
+    if finding is not None:
+        return False
+    if ctx.max_retries is not None and ctx.retry >= ctx.max_retries:
+        return False
+    investigated = False
+    for msg in _current_turn(ctx.messages):
+        for part in getattr(msg, "parts", ()):
+            if isinstance(part, RetryPromptPart) and _texts(part).startswith(FINDING_RETRY_MARK):
+                return False
+            if isinstance(part, ToolReturnPart | RetryPromptPart) and part.tool_name in CHANGE_TOOL_NAMES:
+                return False
+            # 실패한 조회(시간 초과·Forbidden 등 success=False)는 조사로 치지 않는다 — "조회를 못 했다" 는 답에 원인을 요구하면 안 된다
+            if (isinstance(part, ToolReturnPart) and part.tool_name in DIAGNOSIS_TOOL_NAMES
+                    and isinstance(part.content, KubectlResult) and part.content.success):
+                investigated = True
+    return investigated
+
+
 _cache: dict[type[KukieResponse], Callable[..., KukieResponse]] = {}
 
 
@@ -100,6 +183,11 @@ def build_response_for(response_cls: type[KukieResponse]) -> Callable[..., Kukie
     llm_fields = {name: f for name, f in response_cls.model_fields.items() if name != "steps"}
 
     def build(ctx: RunContext[Deps], **llm_values: Any) -> KukieResponse:
+        reply = merged_reply(ctx)
+        if reply:
+            llm_values |= {"narration": reply, "suggested_next_action": None, "finding": None}
+        elif "finding" in llm_fields and needs_finding_retry(ctx, llm_values.get("finding")):
+            raise ModelRetry(FINDING_RETRY_MESSAGE)
         return response_cls(steps=collect_steps(ctx), **llm_values)
 
     # pydantic-ai 는 함수 시그니처에서 LLM 스키마를 만든다 — 여기서 steps 가 빠진 시그니처를 박는다.
@@ -107,10 +195,13 @@ def build_response_for(response_cls: type[KukieResponse]) -> Callable[..., Kukie
                                 annotation=RunContext[Deps])]
     annotations: dict[str, Any] = {"ctx": RunContext[Deps], "return": response_cls}
     for name, f in llm_fields.items():
-        default = inspect.Parameter.empty if f.is_required() else f.default
+        # LLM_REQUIRED 칸은 기본값을 빼서 키를 꼭 보내게 한다 (값은 null 이어도 된다)
+        required = f.is_required() or name in response_cls.LLM_REQUIRED
+        default = inspect.Parameter.empty if required else f.default
+        annotation = Annotated[f.annotation, Field(description=f.description)] if f.description else f.annotation
         params.append(inspect.Parameter(name, inspect.Parameter.KEYWORD_ONLY,
-                                        annotation=f.annotation, default=default))
-        annotations[name] = f.annotation
+                                        annotation=annotation, default=default))
+        annotations[name] = annotation
     build.__signature__ = inspect.Signature(params, return_annotation=response_cls)  # type: ignore[attr-defined]
     build.__annotations__ = annotations
     build.__name__ = f"build_{response_cls.__name__}"

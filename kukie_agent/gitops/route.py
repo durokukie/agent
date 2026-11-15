@@ -4,11 +4,23 @@
 | ArgoCD 관리 + 레포 연결됨 + 지원 형식·요청       | PR              |
 | ArgoCD 관리 + 레포 미연결, 또는 지원 안 하는 것   | kubectl + 경고  |
 | ArgoCD 관리 아님                                 | kubectl         |
+| 새 리소스 — 고른 앱 + 레포 연결됨 + 지원 형식     | PR              |
+| 새 리소스 — 앱 없음·레포 미연결·Helm 등           | 이유와 다른 길   |
+| 클러스터에 없음 — 앱 하나의 status.resources 에 있음 | 그 앱으로 위 규칙 |
+| 클러스터에 없음 — 어느 앱에도 없음·여러 앱        | kubectl         |
+| 클러스터에 없음 — 프로젝트가 막은 네임스페이스     | kubectl(안내). 삭제·허락된 곳으로 옮기기는 PR |
+| 클러스터에 없음 — 프로젝트가 막은 종류           | kubectl(안내). 삭제는 PR |
+
+새 리소스(DURO-154)는 아직 클러스터에 없어 추적 표시로 길을 못 정한다. 요청이 고른 ArgoCD 앱을 읽어 같은 규칙으로 판단한다.
+git 에는 있는데 sync 가 실패해 클러스터에 없는 리소스(DURO-248)도 추적 표시가 없다. Application 의 status.resources 에서 찾는다.
 
 클러스터 설정은 없다 — 레포 연결이 끊기거나 새로 생기면 다음 판단부터 달라질 뿐이다. 그래서 승인 순간에도 다시 부른다
 (gitops_hook — 길이 바뀌었으면 STALE). kubectl 조회와 kukie-server 의 연결 목록으로만 판단한다. ArgoCD API 토큰은 쓰지 않는다.
 
-지원 형식은 plain YAML(Directory)·Kustomize, 요청은 manifests 의 넷(레플리카·이미지 태그·resources·환경변수)이다.
+지원 형식은 plain YAML(Directory)·Kustomize, 요청은 manifests 의 넷(레플리카·이미지 태그·resources·환경변수)과
+경로 지정 변경(patch — plain YAML 은 문서를 고치고 Kustomize 는 overlay 에 patch 파일을 건다, DURO-249·251),
+삭제(delete)·네임스페이스 옮기기(namespace, DURO-252)다. 옮기기는 옮겨 갈 곳을 프로젝트가 허락하는지 보려고 AppProject 를 읽는다.
+PR 길이면 AppProject 의 종류 칸(namespaceResourceWhitelist 등)도 읽어 넘긴다 — 렌더 비교가 생기거나 바뀌는 객체마다 본다 (DURO-254).
 targetRevision 이 브랜치인지(태그·커밋이면 PR 길이 없다)는 GitHub 에 물어야 알아서 여기서 보지 않는다 — PR 을 만들 때 본다.
 """
 from __future__ import annotations
@@ -16,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal
@@ -26,7 +38,9 @@ from anyio import to_thread
 from kukie_agent import argocd, server_api
 from kukie_agent.gitops.repo import repo_name
 from kukie_agent.kubectl import KubectlResult, run_kubectl, thread_limiter
-from kukie_agent.manifests import AppSource, Change, Other, Target
+from kukie_agent.manifests import AppSource, Change, Delete, MoveNamespace, NewResource, Other, Target
+from kukie_agent.manifests import project as manifest_project
+from kukie_agent.manifests.models import KIND_SHAPE, NAME_SHAPE
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +49,10 @@ SUPPORTED_SOURCES = ("Directory", "Kustomize")
 LOOKUP_TIMEOUT = 10
 #: 동시에 도는 판단 조회 상한 — argocd 판별(ARGOCD_LOOKUP_WORKERS)과 같은 이유로 따로 묶는다
 LOOKUP_WORKERS = 8
+#: 앱을 찾지 못했을 때 문구에 싣는 앱 이름 수 · 새 리소스가 클러스터에 이미 있는지 보는 수·전체 시간(초)
+SHOW_APPS = 20
+LIVE_CHECKS = 20
+LIVE_BUDGET = 10
 
 RoutePath = Literal["pr", "kubectl"]
 
@@ -60,6 +78,14 @@ class Route:
         meta = self.application.get("metadata") or {}
         return {"name": str(meta.get("name") or ""), "namespace": str(meta.get("namespace") or "")}
 
+    @property
+    def destination_key(self) -> dict[str, str] | None:
+        """spec.destination 전체 — 네임스페이스만 보면 다른 클러스터로 바뀐 것을 놓친다 (agent#132 리뷰)."""
+        if self.application is None:
+            return None
+        destination = (self.application.get("spec") or {}).get("destination") or {}
+        return {key: str(destination.get(key) or "") for key in ("server", "name", "namespace")}
+
     def fingerprint(self) -> dict[str, Any]:
         """승인 순간에 다시 판단한 것과 맞춰 볼 칸 — 하나라도 다르면 승인한 전제가 깨졌다 (STALE)."""
         return {
@@ -69,6 +95,7 @@ class Route:
             "source_path": self.source.path if self.source else None,
             "source_type": self.source.source_type if self.source else None,
             "revision": self.revision,
+            "destination": self.destination_key,
         }
 
 
@@ -116,14 +143,25 @@ def app_source(item: dict[str, Any], source: dict[str, Any]) -> AppSource:
     spec = item.get("spec") or {}
     options = ((spec.get("syncPolicy") or {}).get("syncOptions") or [])
     source_type = str(status.get("sourceType") or ("Helm" if source.get("chart") else ""))
+    destination = spec.get("destination") or {}
+    auto_sync, _, prune = argocd.sync_policy(item)
     return AppSource(
         source_type=source_type,
         path=str(source.get("path") or ""),
         directory_recurse=bool((source.get("directory") or {}).get("recurse")),
+        directory_filtered=bool((source.get("directory") or {}).get("include")
+                                or (source.get("directory") or {}).get("exclude")),
         ignore_differences=[entry for entry in spec.get("ignoreDifferences") or [] if isinstance(entry, dict)],
         respect_ignore_differences=any(
             isinstance(option, str) and option.replace(" ", "") == "RespectIgnoreDifferences=true" for option in options
         ),
+        project=str(spec.get("project") or "default"),
+        destination_server=str(destination.get("server") or ""),
+        destination_name=str(destination.get("name") or ""),
+        destination_namespace=str(destination.get("namespace") or ""),
+        auto_sync=auto_sync,
+        prune=prune,
+        allow_empty=auto_sync and ((spec.get("syncPolicy") or {}).get("automated") or {}).get("allowEmpty") is True,
     )
 
 
@@ -159,8 +197,12 @@ async def decide(
     """그 리소스를 지금 어느 길로 바꿀지. 어떤 실패도 올리지 않는다 — 모르면 kubectl 길(지금과 같음)이다.
 
     budget 을 주면 kubectl 조회 전체를 그 초 안에 끝낸다(남은 시간으로 한 번의 제한을 줄인다). 넘으면 모름(known=False).
+    change 가 새 리소스면 리소스 대신 그 요청이 고른 앱으로 판단한다.
     """
     deadline = time.monotonic() + budget if budget is not None else None
+    if isinstance(change, NewResource):
+        return await _decide_new(change, kind=kind, name=name, context=context, kubeconfig=kubeconfig,
+                                 cluster_id=cluster_id, connected=connected, deadline=deadline)
     try:
         resource, tracking, item, why = await to_thread.run_sync(
             partial(_locate, kind, name, namespace, context=context, kubeconfig=kubeconfig, deadline=deadline),
@@ -172,7 +214,8 @@ async def decide(
     label = f"{kind} {namespace + '/' if namespace else ''}{name}"
     if resource is None:
         if why == "missing":
-            return Route("kubectl", f"{label} 가 클러스터에 없어요.")
+            return await _decide_missing(kind, name, namespace, label, context=context, kubeconfig=kubeconfig,
+                                         cluster_id=cluster_id, change=change, connected=connected, deadline=deadline)
         return Route("kubectl", f"{label} 를 클러스터에서 읽지 못했어요.", known=False)
     if tracking is None:
         return Route("kubectl", f"{label} 는 ArgoCD 가 관리하지 않아요.")
@@ -184,16 +227,31 @@ async def decide(
         return Route("kubectl", f"{label} 를 관리하는 ArgoCD 앱({tracking.app})을 이 클러스터에서 찾지 못했어요.",
                      managed=True)
 
+    target = Target(api_version=str(resource.get("apiVersion") or ""), kind=str(resource.get("kind") or kind),
+                    name=name, namespace=(resource.get("metadata") or {}).get("namespace") or namespace, in_cluster=True)
+    project = _Project(item, context=context, kubeconfig=kubeconfig, deadline=deadline)
+    destinations = None
+    if isinstance(change, MoveNamespace):
+        # 옮겨 갈 곳을 프로젝트가 허락하는지는 manifests 가 본다 (DURO-252) — 못 읽으면 None, 막지 않고 카드에 경고한다
+        destinations = await project.destinations()
+    return await _route_of_app(item, target, cluster_id=cluster_id, change=change, connected=connected,
+                               project=project, project_destinations=destinations)
+
+
+async def _route_of_app(item: dict[str, Any], target: Target, *, cluster_id: str | None, change: Change | None,
+                        connected: set[str] | None, project: _Project | None,
+                        project_destinations: list[dict] | None = None) -> Route:
+    """이 앱의 레포·형식으로 PR 길인지. project_destinations 는 새 리소스(DURO-240)·네임스페이스 옮기기(DURO-252) 길에서만
+    읽어 넘긴다. 프로젝트의 종류 칸(DURO-254)은 PR 길일 때만 읽어 source.project_kinds 에 싣는다 — 렌더 비교가 본다."""
     meta = item.get("metadata") or {}
     app_label = f"ArgoCD 앱 {meta.get('name')}"
-    target = Target(api_version=str(resource.get("apiVersion") or ""), kind=str(resource.get("kind") or kind),
-                    name=name, namespace=(resource.get("metadata") or {}).get("namespace") or namespace)
     source, refused = _source_of(item)
     if source is None:
         return Route("kubectl", refused or "", managed=True, application=item, target=target)
     repository = repo_name(source.get("repoURL"))
     common = dict(managed=True, repository=repository, application=item, target=target,
-                  source=app_source(item, source), revision=str(source.get("targetRevision") or ""))
+                  source=app_source(item, source).model_copy(update={"project_destinations": project_destinations}),
+                  revision=str(source.get("targetRevision") or ""))
     if repository is None:
         return Route("kubectl", f"{app_label} 의 소스가 GitHub 레포가 아니라 PR 로 못 바꿔요.", **common)
 
@@ -214,8 +272,279 @@ async def decide(
                                 "plain YAML 과 Kustomize 만 돼요.", **common)
     if isinstance(change, Other):
         return Route("kubectl", f"'{change.description}' 은 PR 로 못 바꿔요. PR 로는 레플리카 수 · 이미지 태그 · "
-                                "CPU·메모리 · 환경변수만 바꿔요.", **common)
+                                "CPU·메모리 · 환경변수를 바꾸고, 그 밖의 칸은 경로 지정 변경"
+                                "(what=patch)으로 바꿔요. 리소스 삭제(what=delete)와 네임스페이스 옮기기(what=namespace)도 "
+                                "PR 로 해요.", **common)
+    if project is not None:
+        common["source"] = common["source"].model_copy(update={"project_kinds": await project.kinds()})
     return Route("pr", f"{app_label} 이 관리하고 레포 {repository} 가 연결돼 있어요 — 변경은 PR 로 올려요.", **common)
+
+
+def _list_applications(*, context: str, kubeconfig: Path | None,
+                       deadline: float | None) -> tuple[list[dict[str, Any]] | None, str]:
+    """(이 클러스터의 ArgoCD 앱들, 못 읽은 이유). 블로킹 — 스레드에서 돈다."""
+    listed = _kubectl(argocd.LIST_COMMAND, context=context, kubeconfig=kubeconfig, deadline=deadline)
+    if not listed.success:
+        return None, argocd.failure_kind(listed.stderr or listed.stdout)
+    try:
+        return argocd.parse_applications(listed.stdout), ""
+    except ValueError:
+        return None, "error"
+
+
+#: kubectl 짧은 이름 → kind. 요청한 kind 가 이 모양이어도 status.resources 의 kind 와 맞춰 본다 (DURO-248)
+_SHORT_KINDS = {
+    "po": "pod", "deploy": "deployment", "rs": "replicaset", "sts": "statefulset", "ds": "daemonset",
+    "svc": "service", "cm": "configmap", "pvc": "persistentvolumeclaim", "sa": "serviceaccount",
+    "ing": "ingress", "hpa": "horizontalpodautoscaler", "cj": "cronjob", "ns": "namespace",
+}
+
+
+def _same_kind(entry_kind: str, requested: str) -> bool:
+    """status.resources 의 kind(`Deployment`)와 요청의 kind(`deployment`·`deployments`·`deploy`)가 같은가."""
+    want = requested.lower()
+    want = _SHORT_KINDS.get(want, want)
+    have = entry_kind.lower()
+    return want in (have, f"{have}s", f"{have}es") or (have.endswith("y") and want == f"{have[:-1]}ies")
+
+
+def _missing_entry(entry: Any, kind: str, name: str, namespace: str | None) -> bool:
+    """git 에는 있는데 클러스터에 없는 항목 — sync 가 실패했거나 아직 안 됐다.
+
+    ArgoCD 는 이런 항목에 health `Missing` 을 달기도 하고, sync 가 거부되면(프로젝트가 막은 네임스페이스 등) health 없이
+    status `OutOfSync` 만 남긴다 (kukie-gitops-test sandbox-plain, 2026-11-13). 클러스터에 없다는 건 kubectl 이 이미 확인했다.
+    """
+    if not isinstance(entry, dict) or entry.get("name") != name or not _same_kind(str(entry.get("kind") or ""), kind):
+        return False
+    if namespace and (entry.get("namespace") or "") not in ("", namespace):
+        return False
+    if entry.get("requiresPruning"):
+        return False                               # 반대로 클러스터에만 있고 git 에는 없는 항목이다 (agent#155 리뷰)
+    health = entry.get("health") if isinstance(entry.get("health"), dict) else {}
+    return health.get("status") == "Missing" or entry.get("status") == "OutOfSync"
+
+
+#: 이 클러스터를 가리키는 Application destination — ArgoCD 가 자기 클러스터에 배포할 때 쓰는 값
+IN_CLUSTER_SERVER = "https://kubernetes.default.svc"
+IN_CLUSTER_NAME = "in-cluster"
+
+
+def _in_cluster(item: dict[str, Any]) -> bool:
+    """앱이 지금 보는 클러스터에 배포하나. 다른 클러스터로 배포하는 앱의 같은 이름 리소스를 고르면 엉뚱한 환경의 레포를
+    고친다 (agent#155 리뷰). 클러스터 객체의 추적 표시가 없는 길이라 destination 으로만 잇는다 — 모르면 후보가 아니다."""
+    destination = (item.get("spec") or {}).get("destination") or {}
+    return destination.get("server") == IN_CLUSTER_SERVER or destination.get("name") == IN_CLUSTER_NAME
+
+
+def _api_version(entry: dict[str, Any]) -> str:
+    group, version = str(entry.get("group") or ""), str(entry.get("version") or "")
+    return f"{group}/{version}" if group else version
+
+
+async def _decide_missing(kind: str, name: str, namespace: str | None, label: str, *, context: str,
+                          kubeconfig: Path | None, cluster_id: str | None, change: Change | None,
+                          connected: set[str] | None, deadline: float | None) -> Route:
+    """클러스터에 없는 리소스 — git 에만 있는(sync 가 실패한) ArgoCD 리소스면 그 앱으로 판단한다 (DURO-248).
+
+    추적 표시는 클러스터 객체에 붙으므로 sync 가 한 번도 안 된 리소스에는 없다. 대신 Application 의 status.resources 가
+    git 에서 렌더한 리소스를 모두 갖고 있어 거기서 찾는다. 고칠 곳 찾기(manifests.change.prepare)는 원래 클러스터가 아니라
+    렌더 결과에서 대상을 찾으므로 그대로 쓴다.
+    """
+    absent = Route("kubectl", f"{label} 가 클러스터에 없어요.")
+    try:
+        items, why = await to_thread.run_sync(
+            partial(_list_applications, context=context, kubeconfig=kubeconfig, deadline=deadline),
+            limiter=thread_limiter("gitops_route", LOOKUP_WORKERS),
+        )
+    except Exception:
+        logger.exception("클러스터에 없는 리소스의 ArgoCD 앱 조회를 건너뛴다")
+        items, why = None, "error"
+    if items is None:
+        if why == "absent":
+            return absent                          # ArgoCD 가 없다 — git 에만 있을 수가 없다
+        # 정하지 못했다 — 승인 순간 다시 판단할 때 STALE 이 아니라 다시 시도하게 (Route.known)
+        return Route("kubectl", f"{label} 가 클러스터에 없어요. ArgoCD 앱 목록을 읽지 못해 git 에만 있는 리소스인지 "
+                                "확인하지 못했어요.", known=False)
+    found = [(item, entry) for item in items if _in_cluster(item)
+             for entry in (item.get("status") or {}).get("resources") or []
+             if _missing_entry(entry, kind, name, namespace)]
+    if not found:
+        return Route("kubectl", f"{label} 가 클러스터에 없고, 이 리소스를 가진 ArgoCD 앱도 없어요.")
+    if len(found) > 1:
+        where = ", ".join(sorted({
+            f"{(item.get('metadata') or {}).get('name')}({entry.get('namespace') or '-'})" for item, entry in found
+        }))
+        return Route("kubectl", f"{label} 가 클러스터에 없고, 여러 ArgoCD 앱·네임스페이스에 같은 리소스가 있어요({where}) — "
+                                "어느 것인지 정할 수 없어요. namespace 를 알려 주세요.", managed=True)
+    item, entry = found[0]
+    target = Target(api_version=_api_version(entry), kind=str(entry.get("kind") or kind), name=name,
+                    namespace=str(entry.get("namespace") or "") or namespace, in_cluster=False)
+    app = (item.get("metadata") or {}).get("name")
+    if not namespace and target.namespace:
+        # 처음 조회는 namespace 없이(context 기본 ns) 했다 — 앱이 적은 ns 에 실제로 있으면 git 에만 있는 게 아니다
+        # (drift 로 OutOfSync 인 리소스). 그 ns 로 다시 본다 (agent#155 리뷰)
+        try:
+            live = await to_thread.run_sync(
+                partial(_read, ["get", target.kind, name, "-o", "json", "-n", target.namespace],
+                        context=context, kubeconfig=kubeconfig, deadline=deadline),
+                limiter=thread_limiter("gitops_route", LOOKUP_WORKERS),
+            )
+        except Exception:
+            logger.exception("다른 namespace 의 리소스를 다시 보지 못했다")
+            live = None
+        if live is None:
+            return Route("kubectl", f"{target.label()} 를 클러스터에서 읽지 못했어요.", known=False)
+        if live:
+            return Route("kubectl", f"{label} 는 {target.namespace} 네임스페이스에 있어요 — namespace 를 알려 주세요.",
+                         managed=True)
+    project = _Project(item, context=context, kubeconfig=kubeconfig, deadline=deadline)
+    destinations = None
+    if target.namespace or isinstance(change, MoveNamespace):
+        destinations = await project.destinations()
+    if not isinstance(change, Delete):
+        kinds = await project.kinds()
+        if kinds is not None and manifest_project.kind_denied(kinds, api_version=target.api_version, kind=target.kind,
+                                                              namespace=target.namespace or "", name=name):
+            # 종류가 막혀 sync 가 거부된 것이다 — 값을 고쳐도, 다른 네임스페이스로 옮겨도 다시 거부된다 (DURO-254).
+            # git 에서 빼는 PR(what=delete)만 그 거부를 푼다
+            project_name = str((item.get("spec") or {}).get("project") or "default")
+            return Route("kubectl", f"{target.label()} 는 클러스터에 없고 git 에만 있어요. ArgoCD 앱 {app} 의 프로젝트 "
+                                    f"'{project_name}' 가 {target.kind} 를 허락하지 않아 sync 가 거부돼요 — 고치는 PR 을 "
+                                    "머지해도 반영되지 않아요. 프로젝트가 허락하는 종류는 네임스페이스 범위 "
+                                    f"{argocd.allowed_kinds(kinds, namespaced=True)}, 클러스터 범위 "
+                                    f"{argocd.allowed_kinds(kinds, namespaced=False)} 예요. git 에서 빼는 PR(what=delete)을 "
+                                    "올리거나, 프로젝트 설정을 바꿔야 해요.",
+                         managed=True, application=item, target=target)
+    denied = _project_denies(item, target, destinations)
+    if denied and not isinstance(change, Delete | MoveNamespace):
+        # sync 가 거부된 까닭이 바로 이것이면, 값을 고치는 PR 을 머지해도 다시 거부돼 반영되지 않는다 (agent#155 리뷰).
+        # 그 리소스를 git 에서 빼거나(delete) 허락된 곳으로 옮기는(namespace) 것은 바로 그 거부를 푸는 변경이라 PR 길로 둔다 (DURO-252)
+        default = ((item.get("spec") or {}).get("destination") or {}).get("namespace")
+        return Route("kubectl", f"{target.label()} 는 클러스터에 없고 git 에만 있어요. ArgoCD 앱 {app} 의 프로젝트 "
+                                f"'{denied}' 가 {target.namespace} 네임스페이스를 허락하지 않아 sync 가 거부돼요 — 값을 고치는 PR 을 "
+                                "머지해도 반영되지 않아요. 프로젝트가 허락하는 네임스페이스"
+                                + (f"(앱 기본은 {default})" if default else "")
+                                + "로 옮기는 PR(what=namespace)이나 git 에서 빼는 PR(what=delete)을 먼저 올리거나, "
+                                "프로젝트 설정을 바꿔야 해요.",
+                     managed=True, application=item, target=target)
+    route = await _route_of_app(item, target, cluster_id=cluster_id, change=change, connected=connected, project=project,
+                                project_destinations=destinations if isinstance(change, MoveNamespace) else None)
+    # 사람과 AI 가 "왜 클러스터에 없는데 PR 인가" 를 알게 — sync 실패의 까닭은 앱 상태(conditions)에 있다
+    return replace(route, reason=f"{target.label()} 는 클러스터에 없고 git 에만 있어요 — ArgoCD 앱 {app} 의 "
+                                 f"sync 가 실패했거나 아직이에요. {route.reason}")
+
+
+class _Project:
+    """앱의 AppProject — 한 판단에서 한 번만 읽는다(네임스페이스 허락과 종류 허락이 같은 객체를 본다). 못 읽으면 None —
+    막지 않는다 (_project_spec)."""
+
+    def __init__(self, item: dict[str, Any], *, context: str, kubeconfig: Path | None, deadline: float | None) -> None:
+        self._read = partial(_project_spec, item, context=context, kubeconfig=kubeconfig, deadline=deadline)
+        self._done = False
+        self._spec: dict[str, Any] | None = None
+
+    async def spec(self) -> dict[str, Any] | None:
+        if not self._done:
+            self._done = True
+            try:
+                self._spec = await to_thread.run_sync(self._read, limiter=thread_limiter("gitops_route", LOOKUP_WORKERS))
+            except Exception:
+                logger.exception("ArgoCD 프로젝트를 읽지 못해 프로젝트 허락을 건너뛴다")
+        return self._spec
+
+    async def destinations(self) -> list[dict] | None:
+        """spec.destinations (DURO-240). 칸이 없으면 None."""
+        destinations = (await self.spec() or {}).get("destinations")
+        if not isinstance(destinations, list):
+            return None
+        return [entry for entry in destinations if isinstance(entry, dict)]
+
+    async def kinds(self) -> dict[str, list[dict]] | None:
+        """종류 칸 넷 (DURO-254). 칸이 하나도 없어도 빈 dict 다 — 그것도 규칙이다(클러스터 범위 전부 거부)."""
+        spec = await self.spec()
+        return None if spec is None else argocd.kind_rules(spec)
+
+
+def _project_denies(item: dict[str, Any], target: Target, destinations: list[dict] | None) -> str | None:
+    """앱의 ArgoCD 프로젝트가 target 의 네임스페이스를 막으면 그 프로젝트 이름. 허락하거나 모르면 None —
+    새 리소스 길(DURO-240)처럼 프로젝트를 못 읽으면 막지 않는다."""
+    if not target.namespace or destinations is None:
+        return None
+    destination = (item.get("spec") or {}).get("destination") or {}
+    permitted = argocd.destination_permitted(destinations, server=str(destination.get("server") or ""),
+                                             name=str(destination.get("name") or ""), namespace=target.namespace)
+    return str((item.get("spec") or {}).get("project") or "default") if permitted is False else None
+
+
+async def _decide_new(change: NewResource, *, kind: str, name: str, context: str, kubeconfig: Path | None,
+                      cluster_id: str | None, connected: set[str] | None, deadline: float | None) -> Route:
+    """새 리소스를 더할 앱으로 길을 정한다. 어떤 실패도 올리지 않는다 — decide 와 같다."""
+    try:
+        items, why = await to_thread.run_sync(
+            partial(_list_applications, context=context, kubeconfig=kubeconfig, deadline=deadline),
+            limiter=thread_limiter("gitops_route", LOOKUP_WORKERS),
+        )
+    except Exception:
+        logger.exception("새 리소스의 ArgoCD 앱 조회를 건너뛴다")
+        return Route("kubectl", "ArgoCD 앱 목록을 읽지 못해 PR 길을 정할 수 없어요.", known=False)
+    if items is None:
+        if why == "absent":
+            return Route("kubectl", "이 클러스터에 ArgoCD 가 없어요.")
+        if why == "forbidden":
+            return Route("kubectl", "ArgoCD 앱을 읽을 권한이 없어 PR 길을 정할 수 없어요.", known=False)
+        return Route("kubectl", "ArgoCD 앱 목록을 읽지 못해 PR 길을 정할 수 없어요.", known=False)
+
+    def meta(item: dict[str, Any]) -> dict[str, Any]:
+        return item.get("metadata") or {}
+
+    same_name = [item for item in items if meta(item).get("name") == change.application]
+    found = [item for item in same_name
+             if not change.application_namespace or meta(item).get("namespace") == change.application_namespace]
+    if not found:
+        names = ", ".join(str(meta(item).get("name")) for item in items[:SHOW_APPS]) or "없음"
+        return Route("kubectl", f"ArgoCD 앱 '{change.application}' 를 이 클러스터에서 찾지 못했어요. 있는 앱: {names}.")
+    if len(found) > 1:
+        places = ", ".join(str(meta(item).get("namespace")) for item in found)
+        return Route("kubectl", f"ArgoCD 앱 '{change.application}' 이 여러 네임스페이스({places})에 있어요 — "
+                                "application_namespace 를 알려 주세요.")
+    item = found[0]
+    destination = ((item.get("spec") or {}).get("destination") or {}).get("namespace") or None
+    target = Target(api_version="", kind=kind, name=name, namespace=destination)
+    project = _Project(item, context=context, kubeconfig=kubeconfig, deadline=deadline)
+    return await _route_of_app(item, target, cluster_id=cluster_id, change=change, connected=connected,
+                               project=project, project_destinations=await project.destinations())
+
+
+def _project_spec(item: dict[str, Any], *, context: str, kubeconfig: Path | None,
+                  deadline: float | None) -> dict[str, Any] | None:
+    """앱이 속한 AppProject 의 spec. 못 읽으면(없음·권한·시간) None — 막지 않고 경고만 한다 (DURO-240·254). 블로킹이다.
+
+    AppProject 는 ArgoCD 제어 namespace 에 있다. 보통 Application 과 같은 namespace(argocd)다 — "apps in any namespace" 로
+    다른 namespace 에 둔 앱이면 거기엔 없어 None 이 된다(모름).
+    """
+    meta = item.get("metadata") or {}
+    project = str((item.get("spec") or {}).get("project") or "default")
+    namespace = str(meta.get("namespace") or "argocd")
+    if not argocd.valid_ref(namespace, project):
+        return None
+    data = _read(argocd.project_command(namespace, project), context=context, kubeconfig=kubeconfig, deadline=deadline)
+    spec = (data or {}).get("spec")
+    return spec if isinstance(spec, dict) else None
+
+
+def live_resources(resources: list[dict[str, str]], *, context: str, kubeconfig: Path | None) -> list[dict[str, str]]:
+    """새로 만들려는 것 중 클러스터에 이미 있는 것. 못 읽으면 없는 셈 치고 경고만 빠진다 — 블로킹이라 스레드에서 돈다."""
+    deadline = time.monotonic() + LIVE_BUDGET
+    found = []
+    for resource in resources[:LIVE_CHECKS]:
+        namespace = resource["namespace"]
+        if not (KIND_SHAPE.match(resource["kind"]) and NAME_SHAPE.match(resource["name"])
+                and (not namespace or NAME_SHAPE.match(namespace))):
+            continue
+        args = ["get", resource["kind"], resource["name"], "-o", "json", *(["-n", namespace] if namespace else [])]
+        if _read(args, context=context, kubeconfig=kubeconfig, deadline=deadline):
+            found.append(resource)
+    return found
 
 
 def find_hpa(kind: str, name: str, namespace: str | None, *, context: str, kubeconfig: Path | None) -> str | None:

@@ -1,0 +1,2 @@
+# 프롬프트 지문(kukie_agent/prompts)이 git blob ID 와 같으려면 작업 트리도 LF 여야 한다 — autocrlf 체크아웃에서도
+kukie_agent/prompts/*.md text eol=lf

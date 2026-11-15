@@ -1,7 +1,7 @@
 """대화(채팅방) 단위 실행 엔드포인트 — kukie-electron docs/api-spec.md 1절.
 
-  POST /conversations/{id}/chat          한 턴. request_id 로 멱등
-  POST /conversations/{id}/approve       승인 카드 결정
+  POST /conversations/{id}/chat          한 턴. request_id 로 멱등. 오래 걸리면 202 accepted 로 먼저 답한다 (DURO-258)
+  POST /conversations/{id}/approve       승인 카드 결정. PR 머지 카드는 오래 걸리면 202 accepted 로 먼저 답한다 (_finish_locked)
   POST /conversations/{id}/resume        재개 실패 뒤 다시 시도
 
 채팅방 만들기·목록·조회는 Kukie API 서버(kukie-server)의 공개 API 다 (DURO-113). agent 는 DB 를 갖지 않고,
@@ -26,24 +26,28 @@ private 방의 변경은 툴 목록이 막는다 — private 방 스킬에는 �
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
+import os
 import uuid
-from contextlib import contextmanager
-from typing import Any, Iterator
+from contextlib import contextmanager, nullcontext
+from typing import Any, Awaitable, Callable, Iterator
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.tools import ToolApproved
 
 import kukie_agent.server as _server  # 순환 import: 이름은 호출 시점에만 쓴다
-from kukie_agent import progress, server_api
+from kukie_agent import progress, server_api, title
 from kukie_agent.auth import User, current_user
 from kukie_agent.clusters import access
 from kukie_agent.conversations import Conversation, registry
 from kukie_agent.gitops import memo as repo_link_memo
+from kukie_agent.guardrail import gitops_after_merge
+from kukie_agent.tools.gitops import TOOL_NAME as GITOPS_TOOL
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +55,16 @@ router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 #: 결과를 저장하지 못하고 활성으로 남은 run 을 닫을 때 남기는 안내
 STALE_MESSAGE = "결과를 저장하지 못해 중단된 요청이다 — 새 요청으로 보내라"
+#: PR 머지 승인이 답을 기다리는 시간(초). 앞단(CloudFront origin_read_timeout 60초)이 끊기 전에 답한다 (DURO-158).
+#: 대개는 머지와 모델의 답까지 이 안에 끝난다 — 넘으면 일은 뒤에서 마저 하고 202 로 먼저 답한다
+APPROVE_WAIT = float(os.environ.get("KUKIE_GITOPS_APPROVE_WAIT") or 45)
+#: 채팅 한 턴이 답을 기다리는 시간(초). 같은 이유로 앞단 60초 전에 답한다 (DURO-258). 넘으면 run 은 뒤에서 끝까지 돌고
+#: 202 accepted 로 먼저 답한다 — 앱은 대화 기록을 다시 읽어 답을 받는다
+CHAT_WAIT = float(os.environ.get("KUKIE_CHAT_WAIT") or 45)
+#: 실패 표시(failed)를 Kukie API 서버에 못 남겼을 때 뒤에서 다시 남기는 간격(초). server 는 배포 때(Recreate, 1개)
+#: 1~2분 비어 약 5분을 기다린다. 그래도 못 남기면 running 이 남고 다음 chat·재전송·재시작 복원이 닫는다
+FAIL_RETRY_SECONDS: tuple[float, ...] = (2, 5, 10, 20, 30, 60, 60, 60, 60)
+_fail_retries: set[asyncio.Task[None]] = set()
 
 
 # ── 요청 본문 ──────────────────────────────────────────────
@@ -127,12 +141,12 @@ def _usage_json(result: Any) -> dict[str, Any] | None:
 def _with_cluster(session: Any, conn: server_api.ClusterConnection) -> Iterator[None]:
     """실행 동안만 임시 kubeconfig 를 연다 (기획 04 §8). 블록을 벗어나면 파일이 지워진다."""
     with access.kubeconfig(conn) as path:
-        session.deps = dataclasses.replace(session.deps, kubeconfig=path)
+        session.deps = dataclasses.replace(session.deps, kubeconfig=path, connection=conn)
         try:
             yield
         finally:
             # 파일은 곧 사라진다 — 경로를 세션에 남기면 다음 요청이 없는 파일을 가리킨다
-            session.deps = dataclasses.replace(session.deps, kubeconfig=None)
+            session.deps = dataclasses.replace(session.deps, kubeconfig=None, connection=None)
 
 
 def _bind_run(session: Any, run: server_api.Run, user: User) -> None:
@@ -176,7 +190,13 @@ async def chat(
     conversation_id: str,
     body: ChatIn,
     user: User = Depends(current_user),
-) -> dict[str, Any]:
+) -> Any:
+    """한 턴. CHAT_WAIT 안에 끝나면 답(answer·approval)을, 넘으면 202 accepted 를 먼저 준다 (DURO-258).
+
+    답이 앞단 시간 제한(CloudFront 60초)을 넘으면 화면에는 504 만 남고 에이전트는 뒤에서 일을 끝낸다 — 그래서 run 을 요청과 떼어
+    돌린다. 넘어도 run·기록 저장은 그대로이고 잠금도 끝날 때까지 쥔다(그동안 새 chat 은 BUSY). 앱은 진행 상황(/progress)을
+    계속 보이고 대화 기록을 다시 읽어 답을 받는다.
+    """
     context, conversation = await _open(conversation_id, user, "chat")
     room = context.conversation
     session = conversation.session
@@ -214,7 +234,10 @@ async def chat(
     if session.pending is not None:
         raise _pending_error("awaiting_approval" if session.pending_ids else "recovery_required")
 
-    async with conversation.lock:
+    # 잠금은 locked() 검사 바로 뒤에 쥔다 (잠금 틈). 일을 요청과 떼어 돌리므로 async with 대신 쥐고, 일이 끝날 때 푼다 (_detach)
+    await conversation.lock.acquire()
+
+    async def work() -> dict[str, Any]:
         # 잠금을 쥔 지금 이 방에 실행 중인 run 은 없고, 여기까지 왔으면 메모리에 이어갈 티켓(session.pending)도 없다.
         # 그런데 server 에 활성 run(running / awaiting_approval / recovery_required)이 남아 있다면 결과 저장에 실패한 run 이다
         # (팀원 리뷰 3, 자동 리뷰 6차) — 그대로 두면 이 방은 영원히 BUSY 라, 중단으로 닫고 진행한다. 저장 실패 사정(error)은 남는다.
@@ -237,42 +260,119 @@ async def chat(
 
         _bind_run(session, run, user)
         before = list(session.history)   # 저장에 실패해 이 턴을 버릴 때 되돌릴 자리 (자동 리뷰 지적)
+        # 제목은 답과 동시에 모델로 짓는다 — 답이 끝날 즈음엔 대개 와 있어 기다림이 늘지 않는다
+        naming = (asyncio.create_task(title.suggest(body.text))
+                  if kind == "chat" and title.wanted(room.title, body.text) else None)
         try:
-            with _with_cluster(session, conn):
-                payload, result = await _server._chat_turn(session, body.text)
-        except HTTPException as exc:
-            await repo_link_memo.settle(session.deps, saved=False)
-            wrapped = _wrap(exc)
-            await _fail_run(run, wrapped)
-            raise wrapped
-        except Exception as exc:                 # 모델·툴 예외 — run 은 실패로 남기고 세션은 유지
-            await repo_link_memo.settle(session.deps, saved=False)
-            logger.exception("run 실패 (conversation=%s, run=%s)", conversation_id, run.id)
-            failed = _error(500, "RUN_FAILED", f"요청 처리에 실패했다 ({type(exc).__name__}) — 서버 로그 참고")
-            await _fail_run(run, failed)
-            raise failed from exc
+            try:
+                with _with_cluster(session, conn):
+                    payload, result = await _server._chat_turn(session, body.text)
+            except HTTPException as exc:
+                await repo_link_memo.settle(session.deps, saved=False)
+                wrapped = _wrap(exc)
+                await _fail_run(run, wrapped)
+                raise wrapped
+            except Exception as exc:                 # 모델·툴 예외 — run 은 실패로 남기고 세션은 유지
+                await repo_link_memo.settle(session.deps, saved=False)
+                logger.exception("run 실패 (conversation=%s, run=%s)", conversation_id, run.id)
+                failed = _error(500, "RUN_FAILED", f"요청 처리에 실패했다 ({type(exc).__name__}) — 서버 로그 참고")
+                await _fail_run(run, failed)
+                raise failed from exc
 
-        # 승인 카드면 run 은 열린 채(awaiting_approval) 남는다 — approve/resume 이 이어서 끝낸다 (문서 7절)
-        status = "awaiting_approval" if payload.get("kind") == "approval" else "completed"
-        # 첫 마디로 제목 짓기(#59)를 run 기록과 한 번에 보낸다 — server 가 한 트랜잭션에서 한다.
-        # 제목이 될 수 있는 마디인지, 첫 마디인지는 server 가 본다 (판정이 두 곳에 갈라지면 한쪽만 고쳐진다).
-        await _save_or_fail(
-            conversation_id, run, on_failure=_chat_store_failure(), failure_status="failed",
-            session=session, history_before=before, status=status, response_payload=payload,
-            append_agent_messages=_messages_json(result) if result is not None else None,
-            usage_summary=_usage_json(result) if result is not None else None,
-            title_from=body.text if kind == "chat" else None,
-        )
-        return payload
+            # 승인 카드면 run 은 열린 채(awaiting_approval) 남는다 — approve/resume 이 이어서 끝낸다 (문서 7절)
+            status = "awaiting_approval" if payload.get("kind") == "approval" else "completed"
+            # 첫 마디로 제목 짓기(#59)를 run 기록과 한 번에 보낸다 — server 가 한 트랜잭션에서 한다.
+            # 제목이 될 수 있는 마디인지, 첫 마디인지는 server 가 본다 (판정이 두 곳에 갈라지면 한쪽만 고쳐진다).
+            # 모델이 지은 제목(title)은 함께 보내는 후보일 뿐이다 — 못 쓰면 server 가 첫 마디로 짓는다.
+            await _save_or_fail(
+                conversation_id, run, on_failure=_chat_store_failure(), failure_status="failed",
+                session=session, history_before=before, status=status, response_payload=payload,
+                append_agent_messages=_messages_json(result) if result is not None else None,
+                usage_summary=_usage_json(result) if result is not None else None,
+                title_from=body.text if kind == "chat" else None,
+                title=await naming if naming is not None else None,
+            )
+            return payload
+        finally:
+            if naming is not None and not naming.done():
+                naming.cancel()                      # 답이 실패했거나 요청이 끊겼다 — 제목은 버린다
+
+    accepted = {
+        "kind": "accepted", "skill": session.skill.name, "plan_ids": [], "request_id": body.request_id,
+        "message": "요청은 받았고 처리는 계속돼요. 답이 오면 이 대화에 나타나요.",
+    }
+    return await _detach(conversation, work, CHAT_WAIT, accepted, what="채팅")
 
 
 async def _fail_run(run: server_api.Run, exc: HTTPException) -> None:
     """실행이 실패한 run 을 failed 로 남긴다. 이것마저 못 남기면 로그만 — 원래 오류를 덮지 않는다.
     running 으로 남은 run 은 다음 chat(잠금 안의 정리)이나 같은 request_id 재전송이 닫는다."""
+    fields = dict(status="failed", response_payload=_error_record(exc))
     try:
-        await server_api.update_run(run.id, status="failed", response_payload=_error_record(exc))
-    except Exception:
+        await server_api.update_run(run.id, **fields)
+    except Exception as failure:
         logger.exception("실패 기록도 저장하지 못했다 (run=%s)", run.id)
+        _retry_failure_later(run, fields, failure)
+
+
+def _retry_failure_later(run: server_api.Run, fields: dict[str, Any], exc: Exception) -> None:
+    """실패 표시를 Kukie API 서버가 돌아올 때까지 뒤에서 다시 남긴다.
+
+    앱은 기록에 running 턴이 있으면 입력을 막는다. 그래서 server 배포로 잠깐 닿지 못해 running 이 남으면, 다음 chat 이
+    남은 run 을 닫는 길에 사용자가 닿지 못하고 방이 "처리 중" 에 갇힌다 (2026-11-13 dev member 재배포).
+
+    종료 상태만 다시 쓴다. server 는 상태 전이를 막지 않아, 그 사이 다른 길(다음 chat·재전송·재시작 복원)이 닫은
+    run 을 활성(awaiting_approval·recovery_required)으로 되살리면 안 된다. 종료 → 종료(interrupted → failed)는 방을 잠그지 않는다.
+    """
+    if not FAIL_RETRY_SECONDS or fields.get("status") in server_api.RUN_ACTIVE or not _unreachable(exc):
+        return
+    task = asyncio.create_task(_save_failure_later(run, fields))
+    _fail_retries.add(task)
+    task.add_done_callback(_fail_retries.discard)
+
+
+def _unreachable(exc: Exception) -> bool:
+    """server 에 닿지 못했거나 server 가 5xx 로 답했다 — 기다리면 될 수 있다. 4xx 는 다시 해도 같다.
+    내부 토큰 거절도 503 SERVER_UNAVAILABLE 로 오지만 설정 오류라 기다려도 바뀌지 않는다 (PR #153 리뷰)."""
+    return (isinstance(exc, server_api.ServerError)
+            and (exc.code == "SERVER_UNAVAILABLE" or exc.status_code >= 500)
+            and exc.message != server_api.INTERNAL_AUTH_MISMATCH)
+
+
+async def _save_failure_later(run: server_api.Run, fields: dict[str, Any]) -> None:
+    """쓰기 전에 지금 상태를 다시 읽어 아직 running 일 때만 남긴다 (PR #153 리뷰). 닫힌 run 을 덮어쓰면 두 가지가 깨진다.
+      - 결과 저장(completed)이 server 에 들어간 뒤 응답만 끊긴 경우(ReadTimeout 도 SERVER_UNAVAILABLE) — 정상 결과가 failed 가 된다
+      - 같은 request_id 재전송이 interrupted 로 닫은 run — 같은 재전송에 다른 응답이 나간다
+    읽기는 빈 PATCH 다 — server 는 준 칸만 바꾸고 run 을 돌려준다. 읽기와 쓰기는 이 방의 잠금 안에서 한다. 이 run 을 닫는
+    다른 길(다음 chat·재전송)도 같은 잠금을 쥐고, replica 가 하나라 그 사이에 끼어들 수 없다. 방이 메모리에 없으면 잠글 것도
+    없다 — 닫는 길이 먼저 방을 복원해야 하고, 재시작이면 이 작업도 함께 사라진다.
+    """
+    run_id = run.id
+    for delay in FAIL_RETRY_SECONDS:
+        await asyncio.sleep(delay)
+        live = registry.get(run.conversation_id)
+        try:
+            async with live.lock if live is not None else nullcontext():
+                current = (await server_api.update_run(run_id)).run
+                if current.status != "running":
+                    logger.warning("뒤늦은 실패 표시를 그만둔다 — run 이 이미 %s 다 (run=%s)", current.status, run_id)
+                    return
+                await server_api.update_run(run_id, **fields)
+        except Exception as exc:
+            if _unreachable(exc):
+                continue
+            logger.exception("실패 표시를 뒤늦게 남기다 그만뒀다 (run=%s)", run_id)
+            return
+        logger.warning("server 가 돌아와 실패 표시를 뒤늦게 남겼다 (run=%s)", run_id)
+        return
+    logger.error("실패 표시를 끝내 남기지 못했다 (run=%s) — 다음 chat·재전송·재시작 복원이 닫는다", run_id)
+
+
+async def stop_failure_retries() -> None:
+    """끌 때 기다리던 다시 남기기를 멈춘다. 남은 running 은 다음 기동의 interrupt-orphaned 가 닫는다."""
+    for task in list(_fail_retries):
+        task.cancel()
+    await asyncio.gather(*_fail_retries, return_exceptions=True)
 
 
 async def _save_or_fail(
@@ -304,13 +404,13 @@ async def _save_or_fail(
         logger.exception("실행 결과 저장 실패 (conversation=%s, run=%s)", conversation_id, run.id)
         if session is not None:
             await repo_link_memo.settle(session.deps, saved=False)   # 메모가 든 기록이 저장되지 않았다 — 칸도 그대로
+        failure = (dict(status=failure_status) if keep_payload
+                   else dict(status=failure_status, response_payload=_error_record(on_failure)))
         try:
-            if keep_payload:
-                await server_api.update_run(run.id, status=failure_status)
-            else:
-                await server_api.update_run(run.id, status=failure_status, response_payload=_error_record(on_failure))
-        except Exception:
+            await server_api.update_run(run.id, **failure)
+        except Exception as unsaved:
             logger.exception("실패 표시도 저장하지 못했다 (run=%s)", run.id)
+            _retry_failure_later(run, failure, unsaved)
         # failed 는 종료 상태다 — 메모리의 승인 티켓과 그 턴의 기록도 함께 버린다 (팀원 리뷰 + 자동 리뷰).
         # "server 가 닫았으면 나머지도 닫는다" 하나다. recovery_required·awaiting_approval 은 활성이라 나중에 interrupt 가 지나간다.
         if failure_status not in server_api.RUN_ACTIVE and session is not None:
@@ -324,12 +424,16 @@ async def _save_or_fail(
         await repo_link_memo.settle(session.deps, saved=True)
 
 
+def _approved_call_ids(session: Any) -> set[str]:
+    return {call_id for call_id, decision in session.decisions.items() if isinstance(decision, ToolApproved)}
+
+
 def _approved_plan_ids(session: Any, also_approved: str | None = None) -> list[str]:
     """티켓 중 **승인한** 카드의 Plan id 만 — "적용됐을 수 있는 변경" 목록에 거절한 카드가 섞이면 안 된다.
     also_approved 는 지금 처리 중인 결정(아직 session.decisions 에 없다)."""
     if session.pending is None:
         return []
-    approved = {cid for cid, d in session.decisions.items() if isinstance(d, ToolApproved)}
+    approved = _approved_call_ids(session)
     if also_approved:
         approved.add(also_approved)
     return [
@@ -398,17 +502,21 @@ async def approve(
     conversation_id: str,
     body: ApproveIn,
     user: User = Depends(current_user),
-) -> dict[str, Any]:
+) -> Any:
     context, conversation = await _open(conversation_id, user, "approve")   # 승인 권한은 server 가 본다
     session = conversation.session
     conn = await _connection(context.conversation, user)   # 잠금 검사보다 먼저 — 그 사이에 await 가 있으면 안 된다
     if conversation.lock.locked():
         raise _busy()
     run = _open_run(context)
-    async with conversation.lock:
+    # 재개가 돌면 _to_payload 가 티켓을 지우므로, 저장 실패 안내에 실을 Plan id(승인한 카드만)는 여기서 미리 뽑는다
+    plan_ids = _approved_plan_ids(session, body.call_id if body.approved else None)
+    # 이 요청에서 함께 돌 승인 카드로 본다 — 먼저 승인한 kubectl 카드가 있거나 지금이 kubectl 승인·PR 거절이면 예전처럼 끝난 뒤 답한다
+    detach = body.approved and _only_merge_cards(session, _approved_call_ids(session) | {body.call_id})
+    await conversation.lock.acquire()
+
+    async def work() -> dict[str, Any]:
         _bind_run(session, run, user)
-        # 재개가 돌면 _to_payload 가 티켓을 지우므로, 저장 실패 안내에 실을 Plan id(승인한 카드만)는 여기서 미리 뽑는다
-        plan_ids = _approved_plan_ids(session, body.call_id if body.approved else None)
         # 결정 검사·기록은 server._approve 가 한다 (문자열 detail). 여기서는 코드 객체로 감싼다.
         try:
             with _with_cluster(session, conn):
@@ -418,12 +526,14 @@ async def approve(
             raise await _record_failure(run, _wrap(exc))
         return await _continue_run(conversation, run, outcome, result, plan_ids)
 
+    return await _finish_locked(conversation, work, plan_ids, detach=detach)
+
 
 @router.post("/{conversation_id}/resume")
 async def resume(
     conversation_id: str,
     user: User = Depends(current_user),
-) -> dict[str, Any]:
+) -> Any:
     context, conversation = await _open(conversation_id, user, "approve")   # 재개도 승인과 같은 권한
     session = conversation.session
     conn = await _connection(context.conversation, user)   # 잠금 검사보다 먼저 — 그 사이에 await 가 있으면 안 된다
@@ -434,9 +544,13 @@ async def resume(
     if session.pending_ids:
         raise _error(409, "PENDING_APPROVAL", f"아직 결정하지 않은 승인 건이 있다: {session.pending_ids}")
     run = _open_run(context)
-    async with conversation.lock:
+    plan_ids = _approved_plan_ids(session)
+    # 새 결정이 없다 — 승인해 둔 카드로 본다. kubectl 카드까지 함께 돌면 그 동작을 바꾸지 않게 끝난 뒤 답한다
+    detach = _only_merge_cards(session, _approved_call_ids(session))
+    await conversation.lock.acquire()
+
+    async def work() -> dict[str, Any]:
         _bind_run(session, run, user)
-        plan_ids = _approved_plan_ids(session)
         try:
             with _with_cluster(session, conn):
                 outcome, result = await _server._resume(session)
@@ -444,6 +558,70 @@ async def resume(
             await repo_link_memo.settle(session.deps, saved=False)
             raise await _record_failure(run, _wrap(exc))
         return await _continue_run(conversation, run, outcome, result, plan_ids)
+
+    return await _finish_locked(conversation, work, plan_ids, detach=detach)
+
+
+def _only_merge_cards(session: Any, call_ids: set[str]) -> bool:
+    """이 카드들이 있고 전부 PR 머지 카드인가."""
+    if session.pending is None:
+        return False
+    calls = [call for call in session.pending.approvals if call.tool_call_id in call_ids]
+    return bool(calls) and all(call.tool_name == GITOPS_TOOL for call in calls)
+
+
+def _log_detached(task: asyncio.Task[dict[str, Any]]) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    # HTTPException 은 run·기록에 이미 남았다 (_record_failure·_save_or_fail). 그 밖의 것은 받아 줄 요청이 없을 수 있다
+    if error is not None and not isinstance(error, HTTPException):
+        logger.error("뒤에서 돈 요청(승인·채팅) 실패", exc_info=error)
+
+
+async def _finish_locked(
+    conversation: Conversation, work: Callable[[], Awaitable[dict[str, Any]]], plan_ids: list[str], *, detach: bool,
+) -> dict[str, Any] | JSONResponse:
+    """이미 쥔 방 잠금 안에서 승인·재개를 돌리고 잠금을 푼다. detach(PR 머지 승인)면 요청과 떼어 돌려 APPROVE_WAIT 를 넘으면 먼저 답한다 (DURO-158).
+
+    머지 자체보다 그 앞뒤가 길 수 있다 — 길 다시 판단·GitHub 다시 보기·모델의 답(툴을 더 부르면 끝이 없다). 답을 앞단이 끊으면 앱은
+    실패로 읽으므로 먼저 202 accepted 로 답한다. 일은 멈추지 않고 run·Plan 에 그대로 남고, 잠금도 끝날 때까지 쥔다(재클릭은 BUSY).
+    앱은 Plan 과 대화 기록을 다시 읽어 결과와 답을 받는다. kubectl 길은 예전처럼 끝난 뒤 답한다.
+    """
+    session = conversation.session
+    if not detach:
+        try:
+            return await work()
+        finally:
+            conversation.lock.release()
+    return await _detach(conversation, work, APPROVE_WAIT, {
+        "kind": "accepted", "skill": session.skill.name, "plan_ids": plan_ids,
+        "message": "승인은 받았고 처리는 계속돼요. 결과는 승인 카드에 나타나요.",
+    }, what="승인")
+
+
+async def _detach(
+    conversation: Conversation, work: Callable[[], Awaitable[dict[str, Any]]], wait: float,
+    accepted: dict[str, Any], *, what: str,
+) -> dict[str, Any] | JSONResponse:
+    """이미 쥔 방 잠금 안에서 work 를 요청과 떼어 돌린다. wait 초 안에 끝나면 그 답(또는 오류)을, 넘으면 202 accepted 를 준다.
+
+    잠금은 work 가 끝날 때 푼다. 끌 때는 server 연결을 닫기 전에 이 일을 정리한다 (gitops_after_merge.stop).
+    """
+    async def owned() -> dict[str, Any]:
+        try:
+            return await work()
+        finally:
+            conversation.lock.release()
+
+    task = asyncio.create_task(owned())
+    gitops_after_merge.keep_approval(task)      # 끌 때 server 연결을 닫기 전에 정리한다
+    task.add_done_callback(_log_detached)
+    await asyncio.wait({task}, timeout=wait)
+    if task.done():
+        return task.result()
+    logger.warning("%s 처리가 %s초를 넘어 먼저 답한다 (conversation=%s)", what, wait, conversation.id)
+    return JSONResponse(status_code=202, content=accepted)
 
 
 def _open_run(context: server_api.ConversationContext) -> server_api.Run:

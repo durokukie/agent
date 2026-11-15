@@ -6,7 +6,7 @@ server_api 의 함수들을 이 객체의 메서드로 바꿔 끼운다.
 
 계약(kukie-server 와 맞춘 scratchpad contract.md 3절)의 규칙 중 agent 가 기대는 것만 옮겼다.
   - run: 같은 requestId 재전송·REQUEST_MISMATCH·ACTIVE_RUN_EXISTS, 종료 시 열린 plan 마감, 첫 마디 제목
-  - plan: 상태 머신 (dry-run·offer·decision·start·result·fail·unknown), 허용 안 되면 409 PLAN_STATE_CONFLICT,
+  - plan: 상태 머신 (dry-run·offer·decision·start·result·sync-result·fail·unknown), 허용 안 되면 409 PLAN_STATE_CONFLICT,
     승인한 호출과 다르면 409 PLAN_CALL_MISMATCH, 같은 toolCallId 생성은 기존 plan
   - 권한: 대화 읽기·승인, 클러스터 읽기 (contract 2절 권한 규칙)
 응답은 camelCase JSON 을 만들어 server_api 의 from_json 으로 바꿔 준다 — 진짜 server 의 응답을 읽는 길도 같이 탄다.
@@ -40,6 +40,12 @@ def _at() -> str:
 
 def _not_found(what: str) -> ServerError:
     return ServerError(404, "NOT_FOUND", f"없다: {what}")
+
+
+def _same_fingerprint(cluster: dict[str, Any], fingerprint: str) -> None:
+    """server 의 지문 대조 (연결 정보·status·gpu 공통) — 다르면 409 CLUSTER_CHANGED. 문구는 server 와 같다."""
+    if cluster["fingerprint"] != fingerprint:
+        raise ServerError(409, "CLUSTER_CHANGED", "이 대화가 쓰던 클러스터의 접속 대상이 바뀌었습니다. 새 대화를 시작해 주세요.")
 
 
 def _conflict(code: str = "PLAN_STATE_CONFLICT", message: str = "지금 상태에서는 할 수 없다") -> ServerError:
@@ -279,10 +285,10 @@ class FakeServer:
         return closed
 
     async def update_run(self, run_id: str, *, status=None, response_payload=None, append_agent_messages=None,
-                         usage_summary=None, title_from=None):
+                         usage_summary=None, title_from=None, title=None):
         fields = {k: v for k, v in dict(status=status, response_payload=response_payload,
                                         append_agent_messages=append_agent_messages, usage_summary=usage_summary,
-                                        title_from=title_from).items() if v is not None}
+                                        title_from=title_from, title=title).items() if v is not None}
         self.calls.append(("update_run", {"runId": run_id, **fields}))
         run = self.runs.get(run_id)
         if run is None:
@@ -306,7 +312,8 @@ class FakeServer:
             earlier = [r for r in self.runs_of(room["id"])
                        if r["kind"] == "chat" and r["seq"] < run["seq"] and _titleable(r["inputText"])]
             if run["kind"] == "chat" and not earlier:
-                room["title"] = " ".join(title_from.split())[:30].strip()
+                suggested = " ".join((title or "").split())[:30].strip()
+                room["title"] = suggested or " ".join(title_from.split())[:30].strip()
                 room["version"] += 1
         return server_api.RunUpdate(server_api.Run.from_json(self._run_json(run)),
                                     [server_api.Plan.from_json(self._plan_json(p)) for p in closed])
@@ -341,19 +348,20 @@ class FakeServer:
         cluster = self.clusters.get(cluster_id)
         if cluster is None or not self._readable_cluster(cluster, user.id):
             raise _not_found(cluster_id)
-        if expected_fingerprint and cluster["fingerprint"] != expected_fingerprint:
-            raise ServerError(409, "CLUSTER_CHANGED", "이 대화가 쓰던 클러스터의 접속 대상이 바뀌었다")
+        if expected_fingerprint:
+            _same_fingerprint(cluster, expected_fingerprint)
         return server_api.ClusterConnection.from_json({
             "clusterId": cluster_id, **{k: cluster[k] for k in (
                 "name", "apiServer", "caData", "insecure", "contextName", "namespace", "fingerprint", "credential",
                 "hasGpu")},
         })
 
-    async def update_cluster_status(self, cluster_id: str, *, status: str, checked_at: datetime):
-        self.calls.append(("update_cluster_status", {"id": cluster_id, "status": status}))
+    async def update_cluster_status(self, cluster_id: str, *, status: str, checked_at: datetime, fingerprint: str):
+        self.calls.append(("update_cluster_status", {"id": cluster_id, "status": status, "fingerprint": fingerprint}))
         cluster = self.clusters.get(cluster_id)
         if cluster is None:
             raise _not_found(cluster_id)
+        _same_fingerprint(cluster, fingerprint)
         cluster["status"] = status
         cluster["lastCheckedAt"] = checked_at.isoformat()
         return {k: v for k, v in cluster.items() if k != "credential"}
@@ -363,8 +371,7 @@ class FakeServer:
         cluster = self.clusters.get(cluster_id)
         if cluster is None:
             raise _not_found(cluster_id)
-        if cluster["fingerprint"] != fingerprint:
-            raise ServerError(409, "CLUSTER_CHANGED", "이 대화가 쓰던 클러스터의 접속 대상이 바뀌었다")
+        _same_fingerprint(cluster, fingerprint)
         cluster["hasGpu"] = has_gpu
         return {k: v for k, v in cluster.items() if k != "credential"}
 
@@ -435,6 +442,20 @@ class FakeServer:
         if plan is None:
             raise _not_found(plan_id)
         return server_api.Plan.from_json(self._plan_json(plan))
+
+    async def unsettled_plans(self, tool_name: str):
+        self.calls.append(("unsettled_plans", {"toolName": tool_name}))
+        found = []
+        for plan in sorted(self.plans.values(), key=lambda p: p["_order"]):
+            sync = (plan["executionResult"] or {}).get("sync_result") or {}
+            if plan["toolName"] == tool_name and (
+                    plan["status"] in ("APPROVED", "EXECUTING")
+                    or (plan["status"] == "APPLIED" and sync.get("status") == "syncing")):
+                run = self.runs[plan["runId"]]
+                found.append(server_api.UnsettledPlan(
+                    server_api.Plan.from_json(self._plan_json(plan)),
+                    self.conversations[run["conversationId"]]["clusterId"], run["status"] in server_api.RUN_ACTIVE))
+        return found
 
     async def plan_action(self, plan_id: str, action: str, body: dict[str, Any] | None = None):
         body = body or {}
@@ -508,6 +529,16 @@ class FakeServer:
             plan["status"], plan["appliedAt"] = "APPLIED", at.removesuffix("Z")
         else:
             plan["status"], plan["failureReason"] = "FAILED", "EXECUTION_FAILED"
+
+    def _sync_result(self, plan: dict[str, Any], body: dict[str, Any]) -> None:
+        """머지를 먼저 기록한 계획에 sync 결과를 얹는다 (ActionPlan.recordSyncResult 와 같은 규칙, DURO-158)."""
+        result = plan["executionResult"] or {}
+        current = result.get("sync_result")
+        if plan["status"] == "APPLIED" and current is not None and _same(current, body["syncResult"]):
+            return
+        if plan["status"] != "APPLIED" or not result.get("merge_commit") or (current or {}).get("status") != "syncing":
+            raise _conflict()
+        result["sync_result"] = copy.deepcopy(body["syncResult"])
 
     def _fail(self, plan: dict[str, Any], body: dict[str, Any]) -> None:
         if plan["status"] not in PLAN_OPEN:

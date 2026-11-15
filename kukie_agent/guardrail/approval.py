@@ -257,7 +257,8 @@ class ApprovalRequest(BaseModel):
 
 #: 승인 카드에 싣는 Plan 의 gitops 칸 — 여기 없는 칸(base_sha·route·merge_methods·conflict_keys 같은 승인 순간 다시 볼 때
 #: 쓰는 내부 값)은 카드로 나가지 않는다. 칸을 더하는 쪽이 카드에 싣겠다고 명시해야 한다 (fail-closed, agent#126 리뷰)
-_GITOPS_CARD = ("repository", "base", "branch", "application", "file_diff", "render_diff", "warnings", "notice")
+_GITOPS_CARD = ("repository", "base", "branch", "application", "file_diff", "render_diff", "warnings", "notice",
+                "risk_warnings", "new_resources")
 
 
 def gitops_card(plan: ActionPlan) -> dict[str, Any] | None:
@@ -269,6 +270,10 @@ def gitops_card(plan: ActionPlan) -> dict[str, Any] | None:
                          auto_sync, self_heal, prune},
          "files": ["apps/api/deployment.yaml", …], "file_diff": "git diff", "render_diff": "클러스터에서 바뀔 것",
          "warnings": [...], "notice": "승인하면 Kukie 가 이 PR 을 머지해요. …"}
+
+    새 리소스 요청(DURO-154)이면 칸이 둘 더 있다. warnings 에는 risk_warnings 의 text 도 같이 든다 (옛 앱도 경고를 보게).
+        "new_resources": [{"api_version", "kind", "name", "namespace", "file"}, …],
+        "risk_warnings": [{"code", "location": {"file", "resource", "field", "value"}, "risk", "suggestion", "text"}, …]
     """
     if plan.gitops is None:
         return None

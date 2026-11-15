@@ -160,15 +160,18 @@ class FakeGitHub:
     async def pull_files(self, number: int) -> dict[str, str]:
         p = self.pulls[number]
         base, head = self.commits[p["base_sha"]], self.commits[p["head_sha"]]
-        return {path: blob_sha(content) for path, content in head.items() if base.get(path) != content}
+        changed = {path: blob_sha(content) for path, content in head.items() if base.get(path) != content}
+        return {**changed, **{path: "" for path in base if path not in head}}   # GitHub 처럼 지운 파일은 빈 문자열
 
     async def open_kukie_pulls(self) -> list[PullRequest]:
         return [self._pull(n) for n, p in self.pulls.items() if p["state"] == "open"
                 and p["head_ref"].startswith(BRANCH_PREFIX)]
 
-    async def create_branch_commit(self, *, base_sha: str, branch: str, files: dict[str, str], message: str) -> str:
+    async def create_branch_commit(self, *, base_sha: str, branch: str, files: dict[str, str | None],
+                                   message: str) -> str:
         assert branch.startswith(BRANCH_PREFIX) and branch not in self.branches, branch
         merged = {**self.commits[base_sha], **files}
+        merged = {path: content for path, content in merged.items() if content is not None}   # None 은 지운다
         sha = hashlib.sha1(json.dumps(merged, sort_keys=True).encode()).hexdigest()
         self.commits[sha] = merged
         self.branches[branch] = sha
@@ -231,6 +234,20 @@ class FakeCluster:
     app_status: dict[str, Any] | None = None
     seen: list[list[str]] = field(default_factory=list)
     merged_revision: str = ""
+    destination: str = "shop"
+    destination_server: str = "https://kubernetes.default.svc"
+    #: spec.source.directory (recurse·include·exclude)
+    directory: dict[str, Any] | None = None
+    #: 클러스터에 이미 있는 다른 리소스 이름 (새 리소스 경고, DURO-154)
+    live: set[str] = field(default_factory=set)
+    #: 같은 이름의 앱이 또 있는 네임스페이스
+    same_name_in: str | None = None
+    #: True 면 ArgoCD 가 깔려 있지 않다
+    no_argocd: bool = False
+    #: 앱의 AppProject(default) spec.destinations. None 이면 AppProject 를 못 찾는다 (DURO-240)
+    project_destinations: list[dict[str, Any]] | None = None
+    #: AppProject 의 종류 칸(namespaceResourceWhitelist 등, DURO-254). 주면 AppProject 가 있다
+    project_kinds: dict[str, Any] | None = None
 
     def resource(self) -> dict[str, Any]:
         annotations = {"argocd.argoproj.io/tracking-id": "shop-web:apps/Deployment:shop/web"} if self.managed else {}
@@ -249,8 +266,10 @@ class FakeCluster:
         return {
             "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
             "metadata": {"name": "shop-web", "namespace": "argocd"},
-            "spec": {"project": "default", "destination": {"namespace": "shop"}, "syncPolicy": policy,
-                     "source": {"repoURL": self.repo_url, "path": self.path, "targetRevision": self.revision}},
+            "spec": {"project": "default", "syncPolicy": policy,
+                     "destination": {"server": self.destination_server, "namespace": self.destination},
+                     "source": {"repoURL": self.repo_url, "path": self.path, "targetRevision": self.revision,
+                                **({"directory": self.directory} if self.directory else {})}},
             "status": status,
         }
 
@@ -260,12 +279,25 @@ class FakeCluster:
             return KubectlResult(command="kubectl get", stdout="", success=False, exit_code=1,
                                  stderr="Unable to connect to the server: dial tcp: i/o timeout")
         if args[:2] == ["get", "applications.argoproj.io"]:
+            if self.no_argocd:
+                return KubectlResult(command="kubectl get", stdout="", success=False, exit_code=1,
+                                     stderr='error: the server doesn\'t have a resource type "applications"')
             if "-A" in args:
-                return _ok({"items": [self.application()]})
+                other = copy.deepcopy(self.application())
+                other["metadata"]["namespace"] = self.same_name_in
+                return _ok({"items": [self.application(), *([other] if self.same_name_in else [])]})
             return _ok(self.application())
+        if args[:2] == ["get", "appprojects.argoproj.io"] and (self.project_destinations is not None
+                                                                or self.project_kinds is not None):
+            spec = {**({"destinations": self.project_destinations} if self.project_destinations is not None else {}),
+                    **(self.project_kinds or {})}
+            return _ok({"apiVersion": "argoproj.io/v1alpha1", "kind": "AppProject",
+                        "metadata": {"name": args[2], "namespace": "argocd"}, "spec": spec})
         if args[:2] == ["get", "horizontalpodautoscalers"]:
             items = [{"metadata": {"name": self.hpa}, "spec": {"scaleTargetRef": {"kind": "Deployment", "name": "web"}}}]
             return _ok({"items": items if self.hpa else []})
         if args[:3] in (["get", "deployment", "web"], ["get", "Deployment", "web"]):
             return _ok(self.resource())
+        if args[0] == "get" and len(args) > 2 and args[2] in self.live:
+            return _ok({"metadata": {"name": args[2]}})
         return _missing(" ".join(args[1:3]))

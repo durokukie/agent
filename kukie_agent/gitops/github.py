@@ -242,13 +242,16 @@ class GitHub:
 
     # ── 쓰기 ──────────────────────────────────────────────
 
-    async def create_branch_commit(self, *, base_sha: str, branch: str, files: dict[str, str], message: str) -> str:
-        """base_sha 위에 files 를 고친 커밋 하나를 만들고 새 브랜치 branch 로 가리킨다. 커밋 id 를 돌려준다."""
+    async def create_branch_commit(self, *, base_sha: str, branch: str, files: dict[str, str | None],
+                                   message: str) -> str:
+        """base_sha 위에 files 를 고친 커밋 하나를 만들고 새 브랜치 branch 로 가리킨다. 커밋 id 를 돌려준다.
+        내용이 None 인 파일은 지운다 — Git Data API 트리에서 sha 를 null 로 주면 base_tree 에서 빠진다 (DURO-252)."""
         _safe_branch(branch)
         base = await self._request("GET", self._repo_path("git", "commits", base_sha))
         tree = await self._request("POST", self._repo_path("git", "trees"), body={
             "base_tree": base["tree"]["sha"],
-            "tree": [{"path": path, "mode": "100644", "type": "blob", "content": content}
+            "tree": [{"path": path, "mode": "100644", "type": "blob",
+                      **({"sha": None} if content is None else {"content": content})}
                      for path, content in sorted(files.items())],
         })
         commit = await self._request("POST", self._repo_path("git", "commits"), body={

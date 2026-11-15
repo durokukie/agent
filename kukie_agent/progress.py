@@ -1,6 +1,7 @@
 """대화의 진행 상황 — run 이 도는 동안 "지금 무엇을 하는지" 를 화면에 흘려 보낸다.
 
-`POST /chat`·`/approve`·`/resume` 은 그대로 끝난 뒤 한 번에 답한다 (request_id 재전송·run 상태 규칙을 건드리지 않는다).
+`POST /chat`·`/approve`·`/resume` 은 그대로 끝난 뒤 한 번에 답한다 (request_id 재전송·run 상태 규칙을 건드리지 않는다). PR 머지 승인만 오래 걸리면 202 로 먼저 답한다.
+머지 뒤 sync 결과는 run 밖의 일이라 여기로 오지 않는다 — Plan 의 executionResult.sync_result 를 읽는다 (DURO-158).
 화면은 기다리는 동안 따로 `GET /conversations/{id}/progress` 를 열어 단계를 받는다. 이 모듈은 그 사이의 우체통이다.
 
 - 단계는 도구 실행 훅에서 만든다 (`agent.run(capabilities=[hub.capability(방)])`).
@@ -31,6 +32,8 @@ from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry
 from pydantic_ai.messages import AgentStreamEvent, PartDeltaEvent, PartStartEvent, ToolCallPart, ToolCallPartDelta
 from pydantic_ai.tools import ToolDefinition
 from pydantic_core import from_json
+
+from kukie_agent.response import merged_reply
 
 logger = logging.getLogger(__name__)
 
@@ -199,9 +202,10 @@ class ProgressHub:
         그리면 맞다. 미리보기일 뿐이고 진짜 답은 POST 응답이다.
         """
 
-        async def handle(_: RunContext[Any], events: AsyncIterable[AgentStreamEvent]) -> None:
+        async def handle(ctx: RunContext[Any], events: AsyncIterable[AgentStreamEvent]) -> None:
             args: dict[int, str | dict[str, Any]] = {}   # 응답 조각 번호 → 지금까지 모인 args (문자열 조각 또는 dict)
             latest = sent = ""
+            fixed = _merged_reply(ctx)
             last = 0.0
             async for event in events:
                 # 미리보기는 없어도 되는 덤이다 — 여기서 터져 진짜 답(run)이 죽으면 안 된다 (리뷰). 이벤트는 끝까지 소비한다
@@ -209,7 +213,7 @@ class ProgressHub:
                     text = _collect(args, event)
                     if text is None:
                         continue
-                    latest = text
+                    latest = fixed or text
                     now = time.monotonic()
                     if latest == sent or now - last < ANSWER_INTERVAL_SECONDS:
                         continue
@@ -279,6 +283,15 @@ _NOT_RUN = (ApprovalRequired, CallDeferred, ModelRetry)
 
 #: 답 미리보기를 이보다 자주 보내지 않는다 — 조각마다 미완성 JSON 을 다시 읽어 답이 길수록 일이 는다
 ANSWER_INTERVAL_SECONDS = 0.05
+
+
+def _merged_reply(ctx: RunContext[Any] | None) -> str | None:
+    """코드가 답을 쓸 턴이면 그 답 — 미리보기에 LLM 의 글이 잠깐 보였다 바뀌지 않게 한다. 미리보기가 run 을 죽이면 안 된다."""
+    try:
+        return merged_reply(ctx) if ctx is not None else None
+    except Exception:
+        logger.warning("머지 답을 만들지 못했다", exc_info=True)
+        return None
 
 
 def answer_streaming_enabled() -> bool:

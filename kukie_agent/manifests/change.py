@@ -12,17 +12,17 @@ Kustomize 는 레포의 다른 kustomization 폴더(base · 다른 overlay)도 �
 from __future__ import annotations
 
 import copy
-import re
 import shutil
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kukie_agent.manifests import compare, kustomize, plain
+from kukie_agent.manifests import compare, key_change, kustomize, patch, plain, project, risks
 from kukie_agent.manifests.compare import FieldPath, Key
 from kukie_agent.manifests.models import (
-    AppSource, Change, Env, ImageTag, Other, Ready, Refused, Replicas, Resources, Target,
+    AppSource, Change, Env, ImageTag, NewResource, Other, Patch, Ready, Refused, Replicas, Resources, RiskWarning,
+    Target,
 )
 from kukie_agent.manifests.render import (
     RenderError, RenderTimeout, kustomization_file, kustomize_roots, render, resolve_inside,
@@ -31,8 +31,7 @@ from kukie_agent.manifests.workload import (
     POD_SPEC, SCALABLE, container, containers, dig, split_image, with_tag,
 )
 
-# 값이 비밀번호·키처럼 보이는 환경변수 이름 — git 에 평문으로 남기지 않는다
-_SECRETISH = re.compile(r"PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|CREDENTIAL", re.I)
+_SECRETISH = risks.SECRETISH
 _SHOW_LIMIT = 5
 
 
@@ -49,13 +48,14 @@ class Context:
     container: str | None      # 컨테이너 칸을 고치는 요청이면 그 이름
     allowed: FieldPath         # 요청이 고치는 칸의 뿌리 — ignoreDifferences 와 겹치는지 볼 때 쓴다 (렌더 비교는 expected_after)
     warnings: list[str] = field(default_factory=list)
+    patched: patch.Applied | None = None   # 경로 지정 변경이면 prepare 가 읽은 경로와 기대값 — verify·propose 가 다시 계산하지 않는다
 
     def relative(self, path: Path) -> str:
         return path.relative_to(self.root.resolve()).as_posix()
 
 
 # 형식별로 고칠 파일을 고르는 곳. Helm(DURO-137)은 여기와 render.render 에 한 줄씩 더한다
-Proposer = Callable[[Context], "dict[str, str] | Refused"]
+Proposer = Callable[[Context], "dict[str, str | None] | Refused"]
 PROPOSERS: dict[str, Proposer] = {"Directory": plain.propose, "Kustomize": kustomize.propose}
 
 
@@ -68,14 +68,18 @@ def plan_change(repo: Path, app: AppSource, target: Target, change: Change, *,
     ctx = prepare(repo, app, target, change, hpa=hpa)
     if isinstance(ctx, Refused):
         return ctx
-    edits = PROPOSERS[app.source_type](ctx)
+    # 삭제·네임스페이스 변경(DURO-252)은 형식마다 고치는 법이 달라 key_change 가 고른다
+    edits = (key_change.propose if key_change.is_key_change(change) else PROPOSERS[app.source_type])(ctx)
     if isinstance(edits, Refused):
         return edits
-    return verify(ctx, edits)
+    result = verify(ctx, edits)
+    if isinstance(result, Refused) and app.source_type == "Kustomize":
+        return kustomize.explain(ctx, result)
+    return result
 
 
 def verify_change(repo: Path, app: AppSource, target: Target, change: Change,
-                  edits: dict[str, str], *, hpa: str | None = None) -> Ready | Refused:
+                  edits: dict[str, str | None], *, hpa: str | None = None) -> Ready | Refused:
     """누가 골랐든 고친 파일(레포 루트 기준 경로 → 새 내용)이 요청한 것만 바꾸는지 렌더 비교로 확인한다."""
     ctx = prepare(repo, app, target, change, hpa=hpa)
     if isinstance(ctx, Refused):
@@ -98,7 +102,11 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
     if isinstance(change, Other):
         return Refused(code="unsupported_change",
                        message=f"'{change.description}' 은 아직 PR 로 못 해요. "
-                               "PR 로는 레플리카 수 · 이미지 태그 · CPU·메모리 · 환경변수만 바꿔요.")
+                               "PR 로는 레플리카 수 · 이미지 태그 · CPU·메모리 · 환경변수를 바꾸고, "
+                               "그 밖의 칸은 경로 지정 변경(what=patch)으로 바꿔요. 리소스 삭제(what=delete)와 "
+                               "네임스페이스 옮기기(what=namespace)도 PR 로 해요.")
+    if isinstance(change, NewResource):
+        return Refused(code="unsupported_change", message="새 리소스는 plan_new_resource 로 만들어요.")
     if target.kind == "Secret":
         return _secret()
 
@@ -111,7 +119,7 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
     try:
         before = compare.index(render(app.source_type, app_dir, root=repo, recurse=app.directory_recurse))
     except RenderTimeout as exc:
-        return _busy(exc)
+        return busy(exc)
     except RenderError as exc:
         return Refused(code="render_failed", message=f"지금 레포를 렌더링하지 못했어요. {exc}")
 
@@ -127,14 +135,17 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
     key = keys[0]
     obj = before[key]
 
+    if key_change.is_key_change(change):
+        return key_change.prepare(Context(repo, app, app_dir, target, change, before, key, obj, None, ()))
+    if isinstance(change, Patch):
+        return _prepare_patch(Context(repo, app, app_dir, target, change, before, key, obj, None, ()), hpa)
+
     if isinstance(change, Replicas):
         if target.kind not in SCALABLE:
             return Refused(code="unsupported_change", message=f"{target.kind} 는 레플리카 수가 없어요.")
         scaler = hpa or _scaler_in_git(before, key)
         if scaler:
-            return Refused(code="hpa",
-                           message=f"{target.label()} 의 레플리카 수는 HPA({scaler})가 정해요. "
-                                   "git 의 replicas 를 바꿔도 HPA 가 되돌려요 — HPA 의 최소·최대값을 바꿔야 해요.")
+            return _hpa(target, scaler)
         current = dig(obj, ("spec", "replicas"))
         if (1 if current is None else current) == change.count:   # 비어 있으면 쿠버네티스 기본값 1
             return _no_change(target, f"레플리카가 이미 {change.count} 예요.")
@@ -174,10 +185,61 @@ def prepare(repo: Path, app: AppSource, target: Target, change: Change, *,
     return _check_ignored(ctx)
 
 
+def _prepare_patch(ctx: Context, hpa: str | None) -> Context | Refused:
+    """경로 지정 변경(DURO-249) — 경로가 이 리소스에 맞는지·바꾸면 안 되는 칸인지를 렌더 결과에 먼저 적용해 본다."""
+    assert isinstance(ctx.change, Patch)
+    label = compare.label(ctx.key)
+    try:
+        applied = patch.prepare(ctx.obj, ctx.change)
+    except patch.PathError as exc:
+        return Refused(code="invalid_patch", retry=True, message=f"{label}: {exc}.")
+    want = applied.want
+    why = patch.guarded(ctx.target.kind, ctx.obj, want)
+    if why:
+        # 경로를 바꿔 다시 해도 풀리지 않고, kubectl 로 해도 실패하거나(만든 뒤 못 바꾸는 칸) ArgoCD 를 깨뜨린다 — 툴 실패로 끝낸다
+        return Refused(code="guarded_field", message=f"{label}: {why}.")
+    if not compare.diff_paths(ctx.obj, want):
+        return _no_change(ctx.target, "그 칸들이 이미 그 값이에요.")
+    if _plaintext_secret(ctx.obj, want):
+        return _secret()
+    if ctx.target.kind in SCALABLE and dig(ctx.obj, ("spec", "replicas")) != dig(want, ("spec", "replicas")):
+        scaler = hpa or _scaler_in_git(ctx.before, ctx.key)
+        if scaler:
+            return _hpa(ctx.target, scaler)
+    ctx.patched = applied
+    for _, parts in applied.parsed:
+        ctx.allowed = patch.field_path(parts)
+        checked = _check_ignored(ctx)
+        if isinstance(checked, Refused):
+            return checked
+    ctx.warnings = list(dict.fromkeys(ctx.warnings))
+    return ctx
+
+
+def _plaintext_secret(before: dict, after: dict) -> bool:
+    """평문 비밀이 새로 들어가는지 — 모든 컨테이너 목록(init · ephemeral)과 종류(Pod · 커스텀 리소스)를 본다.
+    비밀처럼 보이는 이름에 평문 값이 새로 생기거나, Secret 에서 가져오던 항목이 평문 값(value)으로 바뀌면 막는다.
+    그 항목을 지우거나 다른 Secret 을 가리키게 하는 것은 평문이 git 에 남지 않아 막지 않는다 (컨테이너 지우기 등)."""
+    old = risks.plaintext_env(before)
+    if any(old.get(path) != value for path, value in risks.plaintext_env(after).items()):
+        return True
+    for path in risks.secret_refs(before):
+        item = compare.value_at(after, path)
+        if isinstance(item, dict) and item.get("value") not in (None, ""):
+            return True
+    return False
+
+
 def _secret() -> Refused:
     return Refused(code="secret",
                    message="Secret 값은 PR 에 넣지 않아요 — git 에 평문으로 남아요. "
                            "Sealed Secrets 나 External Secrets 로 바꿔 주세요.")
+
+
+def _hpa(target: Target, scaler: str) -> Refused:
+    return Refused(code="hpa",
+                   message=f"{target.label()} 의 레플리카 수는 HPA({scaler})가 정해요. "
+                           "git 의 replicas 를 바꿔도 HPA 가 되돌려요 — HPA 의 최소·최대값을 바꿔야 해요.")
 
 
 def _no_change(target: Target, why: str) -> Refused:
@@ -272,12 +334,13 @@ def _check_ignored(ctx: Context) -> Context | Refused:
 # ── 고친 뒤 ───────────────────────────────────────────────
 
 
-def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
-    files: dict[str, str] = {}
+def verify(ctx: Context, edits: dict[str, str | None]) -> Ready | Refused:
+    """edits 의 값이 None 이면 그 파일을 지운다 (삭제 요청, DURO-252)."""
+    files: dict[str, str | None] = {}
     originals: dict[str, str | None] = {}
     for path, content in edits.items():
         found = resolve_inside(ctx.root, path)
-        if found is None or found.is_dir():
+        if found is None or found.is_dir() or (content is None and not found.is_file()):
             return Refused(code="invalid_path", retry=True, message=f"'{path}' 는 레포 안 파일이 아니에요.")
         relative = ctx.relative(found)
         original = found.read_text(encoding="utf-8") if found.is_file() else None
@@ -290,6 +353,9 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
         workdir = Path(tmp) / "repo"
         shutil.copytree(ctx.root, workdir, symlinks=True, ignore=shutil.ignore_patterns(".git"))
         for relative, content in files.items():
+            if content is None:
+                (workdir / relative).unlink()
+                continue
             (workdir / relative).parent.mkdir(parents=True, exist_ok=True)
             (workdir / relative).write_text(content, encoding="utf-8")
         app_path = ctx.relative(ctx.app_dir)
@@ -297,19 +363,23 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
             after = compare.index(render(ctx.app.source_type, workdir / app_path, root=workdir,
                                          recurse=ctx.app.directory_recurse))
         except RenderTimeout as exc:
-            return _busy(exc)
+            return busy(exc)
         except RenderError as exc:
             return Refused(code="render_failed", retry=True, message=f"고친 뒤 렌더링이 안 돼요. {exc}")
 
-        refused = _compare_app(ctx, after)
+        refused = (key_change.compare_app if key_change.is_key_change(ctx.change) else _compare_app)(ctx, after)
         if refused:
             return refused
+        # 프로젝트가 막는 종류면 머지해도 sync 가 거부된다 (DURO-254). 고칠 곳을 다시 골라도 같아 retry 가 아니다
+        blocked = project.denied(ctx.app, project.changed(ctx.before, after))
+        if blocked:
+            return project.refusal(ctx.app, blocked, retry=False)
         if ctx.app.source_type == "Kustomize":
             try:
-                changed = _other_environments(ctx, workdir, app_path)
+                changed = other_environments(ctx.root, workdir, app_path)
             except RenderTimeout as exc:
                 # 한쪽만 시간이 넘으면 "다른 환경도 바뀐다" 로 잘못 읽힌다 — 비교를 포기하고 그렇다고 알린다 (agent#128 리뷰)
-                return _busy(exc, "다른 환경과 비교하다 ")
+                return busy(exc, "다른 환경과 비교하다 ")
             if changed:
                 return Refused(code="render_mismatch", retry=True,
                                message="다른 환경도 같이 바뀌어요: " + ", ".join(changed[:_SHOW_LIMIT])
@@ -322,15 +392,36 @@ def verify(ctx: Context, edits: dict[str, str]) -> Ready | Refused:
                                "그 폴더 안에서만 고쳐 주세요.")
 
     label = compare.label(ctx.key)
+    if key_change.is_key_change(ctx.change):
+        introduced = key_change.risk_warnings(ctx, sorted(files)[0])
+        rendered = key_change.render_diff(ctx, after)
+    else:
+        introduced = _patch_risks(ctx, after[ctx.key], sorted(files)[0]) if isinstance(ctx.change, Patch) else []
+        rendered = compare.unified(compare.dump(ctx.obj), compare.dump(after[ctx.key]),
+                                   f"{label} (지금)", f"{label} (머지 후)")
     return Ready(
         files=files,
-        file_diff="".join(
-            compare.unified(originals[p], files[p], f"a/{p}" if originals[p] is not None else "/dev/null", f"b/{p}")
-            for p in sorted(files)),
-        render_diff=compare.unified(compare.dump(ctx.obj), compare.dump(after[ctx.key]),
-                                    f"{label} (지금)", f"{label} (머지 후)"),
-        warnings=ctx.warnings,
+        file_diff="".join(_file_diff(p, originals[p], files[p]) for p in sorted(files)),
+        render_diff=rendered,
+        warnings=[*ctx.warnings, *(risk.text for risk in introduced)],
+        risk_warnings=introduced,
     )
+
+
+def _file_diff(path: str, original: str | None, content: str | None) -> str:
+    """git diff 모양 — 새 파일은 /dev/null 에서, 지운 파일(None)은 /dev/null 로."""
+    return compare.unified(original, content or "", f"a/{path}" if original is not None else "/dev/null",
+                           f"b/{path}" if content is not None else "/dev/null")
+
+
+def _patch_risks(ctx: Context, after: dict, file: str) -> list[RiskWarning]:
+    """경로 지정 변경이 새로 들인 위험 — 새 리소스와 같은 목록(risks.py)으로 고친 뒤를 보고, 고치기 전에도 있던 것은 뺀다.
+    막지 않고 승인 카드에 올린다 (patch.py 머리말)."""
+    def seen(obj: dict) -> list[RiskWarning]:
+        return risks.resource_risks(obj, ctx.key, file, None)
+
+    old = {(r.code, r.location.field, r.location.value) for r in seen(ctx.obj)}
+    return [r for r in seen(after) if (r.code, r.location.field, r.location.value) not in old]
 
 
 def _compare_app(ctx: Context, after: dict[Key, dict]) -> Refused | None:
@@ -356,8 +447,8 @@ def _compare_app(ctx: Context, after: dict[Key, dict]) -> Refused | None:
     if stray:
         return Refused(code="render_mismatch", retry=True,
                        message="고친 뒤 결과가 요청과 달라요: "
-                               + ", ".join(f"{compare.show(p)} (요청대로면 {_brief(compare.value_at(expected, p))}, "
-                                           f"고친 뒤 {_brief(compare.value_at(got, p))})" for p in stray[:_SHOW_LIMIT])
+                               + ", ".join(f"{compare.show(p)} (요청대로면 {compare.brief(compare.value_at(expected, p))}, "
+                                           f"고친 뒤 {compare.brief(compare.value_at(got, p))})" for p in stray[:_SHOW_LIMIT])
                                + ". 요청한 칸만 요청한 값으로 바뀌게 고쳐 주세요.")
     return None
 
@@ -372,8 +463,11 @@ def _describe(key: Key, before: dict[Key, dict], after: dict[Key, dict]) -> str:
 
 def expected_after(ctx: Context) -> dict:
     """지금 렌더 결과에 요청만 그대로 적용한 것 — 고친 뒤 렌더 결과가 이것과 같아야 한다."""
-    obj = copy.deepcopy(ctx.obj)
     change = ctx.change
+    if isinstance(change, Patch):
+        assert ctx.patched is not None
+        return copy.deepcopy(ctx.patched.want)
+    obj = copy.deepcopy(ctx.obj)
     if isinstance(change, Replicas):
         _child(obj, "spec")["replicas"] = change.count
         return obj
@@ -410,32 +504,29 @@ def _child(parent: dict, key: str) -> dict:
 def _normalized(obj: dict, kind: str) -> dict:
     """빈 env 목록은 없는 것과 같다 — plain 은 `env: []` 로, Kustomize 는 칸을 지워 남길 수 있다."""
     obj = copy.deepcopy(obj)
+    if kind not in POD_SPEC:            # 경로 지정 변경은 컨테이너 없는 종류(Service …)도 고친다
+        return obj
     for item in containers(obj, kind):
         if item.get("env") == []:
             del item["env"]
     return obj
 
 
-def _brief(value: object) -> str:
-    text = "없음" if value is compare.MISSING else str(value)
-    return text if len(text) <= 60 else text[:57] + "..."
-
-
-def _busy(exc: RenderTimeout, doing: str = "") -> Refused:
+def busy(exc: RenderTimeout, doing: str = "") -> Refused:
     """레포 검사 시간이 넘었다 — 레포가 틀린 게 아니라 지금 못 한 것이다. kubectl 길로도, 고칠 곳 다시 고르기로도 보내지 않는다."""
     return Refused(code="busy", message=f"{doing}{exc} 잠시 뒤 다시 해 주세요.")
 
 
-def _other_environments(ctx: Context, workdir: Path, app_path: str) -> list[str]:
+def other_environments(root: Path, workdir: Path, app_path: str) -> list[str]:
     """레포의 다른 kustomization 폴더 중 고친 뒤 렌더 결과가 달라지는 곳 (전·후 모두 렌더링이 안 되는 곳은 뺀다)."""
     changed = []
-    for root in kustomize_roots(ctx.root):
-        if root == app_path:
+    for folder in kustomize_roots(root):
+        if folder == app_path:
             continue
         results = []
-        for base in (ctx.root, workdir):
+        for base in (root, workdir):
             try:
-                results.append(compare.index(render("Kustomize", base / root, root=base)))
+                results.append(compare.index(render("Kustomize", base / folder, root=base)))
             except RenderTimeout:
                 raise                                       # 렌더가 안 되는 것과 다르다 — 부르는 쪽이 비교를 포기한다
             except RenderError:
@@ -443,5 +534,5 @@ def _other_environments(ctx: Context, workdir: Path, app_path: str) -> list[str]
         if results[0] is None and results[1] is None:
             continue
         if results[0] != results[1]:
-            changed.append(root)
+            changed.append(folder)
     return changed
