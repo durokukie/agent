@@ -450,13 +450,32 @@ def _ret(tool, content=None):
     ([[_ret("describe_resource")]], 0, True),
     ([[_ret("get_logs")]], 1, True),
     ([[_ret("describe_resource")]], 2, False),                          # 형식 재시도 횟수를 다 썼다 — run 을 실패시키지 않는다
-    ([[_ret("describe_resource", content="권한 없음")]], 0, False),       # 실패한 조회는 조사로 치지 않는다
+    ([[_ret("describe_resource", content="권한 없음")]], 0, False),       # 거부된 호출(KubectlResult 가 아님)
+    ([[_ret("describe_resource", content=KubectlResult(command=FAKE_COMMAND, stdout="", success=False,
+                                                       stderr="Error from server (Forbidden)"))]], 0, False),   # 실패한 조회
+    ([[_ret("get_events", content=KubectlResult(command=FAKE_COMMAND, stdout="", stderr="timeout", success=False)),
+       _ret("get_logs")]], 0, True),                                     # 하나라도 성공하면 조사다
     ([[_ret("describe_resource")], [_ret("scale_resource")]], 0, False),   # 변경이 있는 턴은 변경 결과를 말하는 답이다
     ([[_ret("describe_resource")],
       [RetryPromptPart(content=response_mod.FINDING_RETRY_MESSAGE, tool_name="final_result")]], 1, False),   # 이미 되물었다
-], ids=["describe", "logs", "재시도소진", "실패한조회", "변경턴", "이미되물음"])
+], ids=["describe", "logs", "재시도소진", "거부된호출", "실패한조회", "일부성공", "변경턴", "이미되물음"])
 def test_되묻기_조건(parts, retry, expected):
     assert response_mod.needs_finding_retry(_ctx(parts, retry), None) is expected
+
+
+def test_형식_재시도가_없는_설정이면_되묻지_않는다():
+    """max_retries 0 은 falsy 지만 '재시도 없음' 이다 — 되물으면 그대로 run 이 실패한다 (리뷰)."""
+    assert response_mod.needs_finding_retry(_ctx([[_ret("describe_resource")]], retry=0, max_retries=0), None) is False
+
+
+def test_조회가_모두_실패하면_null_답을_바로_받는다(monkeypatch):
+    def failing(args, **kwargs):
+        return KubectlResult(command=FAKE_COMMAND, stdout="", stderr="Unable to connect to the server", success=False)
+
+    monkeypatch.setattr(read_tools, "run_kubectl", failing)
+    script = Script([DESCRIBE], [{"narration": "클러스터에 닿지 못했어요", "finding": None}])
+    result = _script_run(script)
+    assert result.output.finding is None and script.retries == []
 
 
 def test_finding이_있으면_되묻지_않는다():

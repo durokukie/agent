@@ -146,13 +146,13 @@ def _texts(part: RetryPromptPart) -> str:
 def needs_finding_retry(ctx: RunContext[Deps], finding: Any) -> bool:
     """finding 이 빈 답을 한 번 되물을까.
 
-    이번 턴에 진단 툴(describe·events·logs)을 성공적으로 돌렸고, 클러스터·레포 변경이 없고, 아직 되묻지 않았을 때만.
+    이번 턴에 진단 툴(describe·events·logs)이 하나라도 성공했고, 클러스터·레포 변경이 없고, 아직 되묻지 않았을 때만.
     되묻기는 턴마다 한 번이다 — 진단이 아니었다면 모델이 null 로 다시 보내 끝낼 수 있어야 하고(억지 원인 금지),
     응답 형식 재시도 횟수(retries output)를 다 써서 run 이 실패하면 안 된다.
     """
     if finding is not None:
         return False
-    if ctx.max_retries and ctx.retry >= ctx.max_retries:
+    if ctx.max_retries is not None and ctx.retry >= ctx.max_retries:
         return False
     investigated = False
     for msg in _current_turn(ctx.messages):
@@ -161,8 +161,9 @@ def needs_finding_retry(ctx: RunContext[Deps], finding: Any) -> bool:
                 return False
             if isinstance(part, ToolReturnPart | RetryPromptPart) and part.tool_name in CHANGE_TOOL_NAMES:
                 return False
+            # 실패한 조회(시간 초과·Forbidden 등 success=False)는 조사로 치지 않는다 — "조회를 못 했다" 는 답에 원인을 요구하면 안 된다
             if (isinstance(part, ToolReturnPart) and part.tool_name in DIAGNOSIS_TOOL_NAMES
-                    and isinstance(part.content, KubectlResult)):
+                    and isinstance(part.content, KubectlResult) and part.content.success):
                 investigated = True
     return investigated
 
