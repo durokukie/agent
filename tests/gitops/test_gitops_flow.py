@@ -83,7 +83,7 @@ def _model(args=None, seen=None):
             if seen is not None:
                 seen.extend(parts)
             return ModelResponse(parts=[ToolCallPart(tool_name="final_result",
-                                                     args={"narration": "알겠습니다."}, tool_call_id="out")])
+                                                     args={"finding": None, "narration": "알겠습니다."}, tool_call_id="out")])
         return ModelResponse(parts=[ToolCallPart(tool_name="propose_git_change", args=dict(args or CHANGE_ARGS),
                                                  tool_call_id="call-1")])
     return FunctionModel(call)
@@ -404,7 +404,7 @@ def test_PR_길이_아닌데_propose_git_change를_고집해도_run이_실패하
         if calls < 2:
             return ModelResponse(parts=[ToolCallPart(tool_name="propose_git_change", args=dict(CHANGE_ARGS),
                                                      tool_call_id=f"call-{calls}")])
-        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"narration": "네."})])
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"finding": None, "narration": "네."})])
 
     with agent.override(model=FunctionModel(stubborn)):
         r = client.post(f"/conversations/{room}/chat", json={"text": "web 3개로"}, headers=USER)

@@ -47,7 +47,7 @@ def _run(model, deps=None, **kw):
 # ── 1. 사실 칸은 실행 기록 그대로 ───────────────────────────────
 
 def test_steps는_실제_실행된_명령과_결과를_그대로_담는다(fake_kubectl):
-    m = TestModel(call_tools=["list_resources"], custom_output_args={"narration": "파드 하나 떠 있어요"})
+    m = TestModel(call_tools=["list_resources"], custom_output_args={"finding": None, "narration": "파드 하나 떠 있어요"})
     result = _run(m)
     assert len(result.output.steps) == 1 == len(fake_kubectl)
     step = result.output.steps[0]
@@ -59,7 +59,7 @@ def test_steps는_실제_실행된_명령과_결과를_그대로_담는다(fake_
 
 
 def test_툴을_안_부르면_steps는_비어있다(fake_kubectl):
-    m = TestModel(call_tools=[], custom_output_args={"narration": "개념 설명이에요"})
+    m = TestModel(call_tools=[], custom_output_args={"finding": None, "narration": "개념 설명이에요"})
     result = _run(m)
     assert result.output.steps == []
     assert fake_kubectl == []
@@ -74,12 +74,15 @@ def test_툴을_안_부르면_steps는_비어있다(fake_kubectl):
     {"suggested_next_action": "컨테이너 로그를 확인해 보세요."},
 ])
 def test_두_스킬의_응답_스키마와_다음_행동_값(skill, values):
-    """Private·Shared 는 같은 응답 스키마 — finding 은 늘 있는 선택 칸이다 (DURO-100)."""
-    m = TestModel(call_tools=[], custom_output_args={"narration": "설명", **values})
+    """Private·Shared 는 같은 응답 스키마 — finding 은 null 을 허용하는 필수 칸이다 (DURO-100, 관문 R2)."""
+    m = TestModel(call_tools=[], custom_output_args={"finding": None, "narration": "설명", **values})
     result = _run(m, deps=_deps(skill), output_type=skill.output_fn)
     schema = m.last_model_request_parameters.output_tools[0].parameters_json_schema
     assert set(schema["properties"]) == {"narration", "suggested_next_action", "finding"}
-    assert "finding" not in schema.get("required", [])
+    assert set(schema["required"]) == {"narration", "finding"}       # 키는 꼭 보내고
+    finding = schema["properties"]["finding"]
+    assert {"type": "null"} in finding["anyOf"] and "default" not in finding   # 값은 null 이어도 된다
+    assert "healthy" in finding["description"] and "지어내지 않는다" in finding["description"]
     assert result.output.finding is None
     field = schema["properties"]["suggested_next_action"]
     assert {item["type"] for item in field["anyOf"]} == {"string", "null"}
@@ -92,7 +95,7 @@ def test_두_스킬의_응답_스키마와_다음_행동_값(skill, values):
 # ── 3. explanations 는 사전에서 ─────────────────────────────────
 
 def test_explanations는_사전에서_채워진다(fake_kubectl):
-    m = TestModel(call_tools=["list_resources"], custom_output_args={"narration": "x"})
+    m = TestModel(call_tools=["list_resources"], custom_output_args={"finding": None, "narration": "x"})
     result = _run(m)
     fields = {e.field for e in result.output.steps[0].explanations}
     assert {"--context kind-dev", "get", "-n study", "-o wide"} <= fields
@@ -105,7 +108,7 @@ def test_사전_미등록_플래그는_로그만_남기고_응답은_그대로_�
         return KubectlResult(command="kubectl --context kind-dev get pods --weird-flag -n study",
                              stdout="ok", stderr="", success=True)
     monkeypatch.setattr(read_tools, "run_kubectl", fake)
-    m = TestModel(call_tools=["list_resources"], custom_output_args={"narration": "x"})
+    m = TestModel(call_tools=["list_resources"], custom_output_args={"finding": None, "narration": "x"})
     with caplog.at_level(logging.WARNING, logger="kukie_agent.validators"):
         result = _run(m)
     assert len(result.output.steps) == 1                      # 반려 안 함
@@ -139,7 +142,7 @@ def test_collect_steps는_마지막_사용자_발화_이후의_호출만_담는�
 
 
 def test_이어지는_턴에서도_steps는_그_턴의_실행_기록과_일치한다(fake_kubectl):
-    m = TestModel(call_tools=["list_resources"], custom_output_args={"narration": "x"})
+    m = TestModel(call_tools=["list_resources"], custom_output_args={"finding": None, "narration": "x"})
     first = _run(m)
     calls_before = len(fake_kubectl)
     second = _run(m, message_history=first.all_messages())
@@ -316,7 +319,7 @@ def test_헷갈리는_분류는_경계를_적는다(category, neighbors):
 
 def test_LLM_스키마에서는_finding_의_모든_칸이_필수다(fake_kubectl):
     """모델이 새 칸을 빼먹지 않게 — 파이썬 기본값은 예전 기록 호환용일 뿐이다."""
-    m = TestModel(call_tools=[], custom_output_args={"narration": "원인 찾았어요", "finding": FULL_FINDING})
+    m = TestModel(call_tools=[], custom_output_args={"finding": None, "narration": "원인 찾았어요", "finding": FULL_FINDING})
     result = _run(m, deps=_deps(PRIVATE), output_type=PRIVATE.output_fn)
     schema = m.last_model_request_parameters.output_tools[0].parameters_json_schema
     finding_schema = schema["$defs"]["Finding"]
@@ -343,3 +346,137 @@ def test_explain_command_파서(command, expected_fields, expected_unknown):
     assert {e.field for e in explanations} == expected_fields
     assert unknown == expected_unknown
     assert all(e.meaning for e in explanations)
+
+
+# ── 7. finding 누락 막기 (관문 R2) ─────────────────────────────
+# 큰 오픈 모델이 원인을 narration 에만 쓰고 finding 키를 빼던 실패. 키 누락은 형식 재시도, 진단 조사 뒤의 null 은 한 번 되묻는다.
+
+from pydantic_ai import ModelResponse  # noqa: E402
+from pydantic_ai.messages import RetryPromptPart, ToolCallPart  # noqa: E402
+from pydantic_ai.models.function import FunctionModel  # noqa: E402
+
+HEALTHY_FINDING = {
+    "cause": "고장 없음", "evidence": "파드 1/1 Running, 경고 이벤트 없음", "recommendation": "할 일 없음",
+    "cause_object": None, "cause_category": "healthy", "fix_commands": [],
+}
+
+
+class Script:
+    """툴을 차례로 부른 뒤 answers 를 차례로 final 답으로 낸다. 모델이 받은 재시도 문구(retries)를 모은다."""
+
+    def __init__(self, tools: list[tuple[str, dict]], answers: list[dict]):
+        self.tools, self.answers = list(tools), list(answers)
+        self.retries: list[str] = []
+        self.calls = 0
+
+    def __call__(self, messages, info):
+        self.calls += 1
+        self.retries += [p.content if isinstance(p.content, str) else str(p.content)
+                         for p in messages[-1].parts if isinstance(p, RetryPromptPart)]
+        if self.tools:
+            name, args = self.tools.pop(0)
+            return ModelResponse(parts=[ToolCallPart(tool_name=name, args=args, tool_call_id=f"t{self.calls}")])
+        args = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        return ModelResponse(parts=[ToolCallPart(tool_name=info.output_tools[0].name, args=args,
+                                                 tool_call_id=f"o{self.calls}")])
+
+
+DESCRIBE = ("describe_resource", {"kind": "pod", "name": "web"})
+CAUSE_IN_NARRATION = {"narration": "web 파드가 OOMKilled 로 죽어요. limit 을 올리세요."}
+
+
+def _script_run(script, skill=PRIVATE):
+    return _run(FunctionModel(script), deps=_deps(skill), output_type=skill.output_fn)
+
+
+@pytest.mark.parametrize("skill", [PRIVATE, SHARED], ids=["Private", "Shared"])
+def test_finding_키를_빼면_형식_재시도가_되고_다시_보낸_finding을_받는다(fake_kubectl, skill):
+    script = Script([DESCRIBE], [CAUSE_IN_NARRATION, {**CAUSE_IN_NARRATION, "finding": FULL_FINDING}])
+    result = _script_run(script, skill)
+    assert result.output.finding.cause_category == "oom"
+    assert len(script.retries) == 1 and "finding" in script.retries[0]
+
+
+def test_진단_조사_뒤_finding이_null이면_한_번_되묻는다(fake_kubectl):
+    script = Script([DESCRIBE], [{**CAUSE_IN_NARRATION, "finding": None},
+                                 {**CAUSE_IN_NARRATION, "finding": FULL_FINDING}])
+    result = _script_run(script)
+    assert result.output.finding.cause == FULL_FINDING["cause"]
+    assert len(script.retries) == 1 and script.retries[0].startswith(response_mod.FINDING_RETRY_MARK)
+    assert "healthy" in script.retries[0] and "지어내지는 마세요" in script.retries[0]   # 억지 원인을 요구하지 않는다
+    assert result.output.steps[0].command == FAKE_COMMAND
+
+
+def test_키를_빼고_다시_null로_보내도_되묻기는_한_번이고_결국_null로_통과한다(fake_kubectl):
+    """진단이 아니었다면 null 로 끝낼 수 있어야 한다 — 되묻기가 반복되면 형식 재시도 횟수를 다 써서 run 이 실패한다."""
+    script = Script([DESCRIBE, ("get_logs", {"pod": "web"})],
+                    [{"narration": "로그예요"}, {"narration": "로그예요", "finding": None}])
+    result = _script_run(script)
+    assert result.output.finding is None
+    assert result.output.narration == "로그예요"
+    assert sum(r.startswith(response_mod.FINDING_RETRY_MARK) for r in script.retries) == 1
+
+
+@pytest.mark.parametrize("tools", [[], [("list_resources", {"kind": "pods"})], [("explain_command", {"resource_or_field": "pod"})]],
+                         ids=["툴없음", "목록조회", "개념설명"])
+def test_진단이_아닌_답은_finding_null로_바로_통과한다(fake_kubectl, tools):
+    script = Script(tools, [{"narration": "설명이에요", "finding": None}])
+    result = _script_run(script)
+    assert result.output.finding is None and script.retries == []
+
+
+def test_조사했는데_고장이_없으면_healthy_finding으로_바로_통과한다(fake_kubectl):
+    script = Script([DESCRIBE, ("get_events", {})], [{"narration": "문제없어요", "finding": HEALTHY_FINDING}])
+    result = _script_run(script)
+    assert result.output.finding.cause_category == "healthy" and result.output.finding.cause_object is None
+    assert script.retries == []
+
+
+def _ctx(parts_per_request, retry=0, max_retries=2):
+    from types import SimpleNamespace
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+    messages = [ModelRequest(parts=[UserPromptPart(content="왜 안 떠?")])]
+    messages += [ModelRequest(parts=parts) for parts in parts_per_request]
+    return SimpleNamespace(messages=messages, retry=retry, max_retries=max_retries)
+
+
+def _ret(tool, content=None):
+    from pydantic_ai.messages import ToolReturnPart
+    content = content or KubectlResult(command=FAKE_COMMAND, stdout="x", stderr="", success=True)
+    return ToolReturnPart(tool_name=tool, content=content, tool_call_id=f"c-{tool}")
+
+
+@pytest.mark.parametrize("parts,retry,expected", [
+    ([[_ret("describe_resource")]], 0, True),
+    ([[_ret("get_logs")]], 1, True),
+    ([[_ret("describe_resource")]], 2, False),                          # 형식 재시도 횟수를 다 썼다 — run 을 실패시키지 않는다
+    ([[_ret("describe_resource", content="권한 없음")]], 0, False),       # 거부된 호출(KubectlResult 가 아님)
+    ([[_ret("describe_resource", content=KubectlResult(command=FAKE_COMMAND, stdout="", success=False,
+                                                       stderr="Error from server (Forbidden)"))]], 0, False),   # 실패한 조회
+    ([[_ret("get_events", content=KubectlResult(command=FAKE_COMMAND, stdout="", stderr="timeout", success=False)),
+       _ret("get_logs")]], 0, True),                                     # 하나라도 성공하면 조사다
+    ([[_ret("describe_resource")], [_ret("scale_resource")]], 0, False),   # 변경이 있는 턴은 변경 결과를 말하는 답이다
+    ([[_ret("describe_resource")],
+      [RetryPromptPart(content=response_mod.FINDING_RETRY_MESSAGE, tool_name="final_result")]], 1, False),   # 이미 되물었다
+], ids=["describe", "logs", "재시도소진", "거부된호출", "실패한조회", "일부성공", "변경턴", "이미되물음"])
+def test_되묻기_조건(parts, retry, expected):
+    assert response_mod.needs_finding_retry(_ctx(parts, retry), None) is expected
+
+
+def test_형식_재시도가_없는_설정이면_되묻지_않는다():
+    """max_retries 0 은 falsy 지만 '재시도 없음' 이다 — 되물으면 그대로 run 이 실패한다 (리뷰)."""
+    assert response_mod.needs_finding_retry(_ctx([[_ret("describe_resource")]], retry=0, max_retries=0), None) is False
+
+
+def test_조회가_모두_실패하면_null_답을_바로_받는다(monkeypatch):
+    def failing(args, **kwargs):
+        return KubectlResult(command=FAKE_COMMAND, stdout="", stderr="Unable to connect to the server", success=False)
+
+    monkeypatch.setattr(read_tools, "run_kubectl", failing)
+    script = Script([DESCRIBE], [{"narration": "클러스터에 닿지 못했어요", "finding": None}])
+    result = _script_run(script)
+    assert result.output.finding is None and script.retries == []
+
+
+def test_finding이_있으면_되묻지_않는다():
+    assert response_mod.needs_finding_retry(_ctx([[_ret("describe_resource")]]), FULL_FINDING) is False

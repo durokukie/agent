@@ -84,6 +84,7 @@ def test_다음_행동은_HTTP로_전달되고_스킬을_바꾸지_않는다(cli
     suggestion = "컨테이너 로그를 확인해 보세요."
     model = TestModel(call_tools=[], custom_output_args={
         "narration": "추가 로그 확인이 필요합니다.",
+        "finding": None,
         "suggested_next_action": suggestion,
     })
     with agent.override(model=model):
@@ -420,7 +421,7 @@ def test_여러_승인을_모은뒤_승인과_거절을_한번만_재개한다(
             ])
         return ModelResponse(parts=[ToolCallPart(
             tool_name=info.output_tools[0].name,
-            args={"narration": "결정을 반영했습니다."},
+            args={"finding": None, "narration": "결정을 반영했습니다."},
             tool_call_id="final",
         )])
 

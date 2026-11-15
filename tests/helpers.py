@@ -31,7 +31,7 @@ def sync(coroutine):
 
 
 def chat_model(narration="답", call_tools=("list_resources",)) -> TestModel:
-    return TestModel(call_tools=list(call_tools), custom_output_args={"narration": narration})
+    return TestModel(call_tools=list(call_tools), custom_output_args={"finding": None, "narration": narration})
 
 
 def answer_model(narration="결정을 반영했습니다.") -> TestModel:

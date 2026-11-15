@@ -83,7 +83,7 @@ def _tool_model(tool_name, args, call_id):
         if requested:
             return ModelResponse(parts=[ToolCallPart(
                 tool_name=info.output_tools[0].name,
-                args={"narration": "변경을 실행하지 못했습니다."},
+                args={"finding": None, "narration": "변경을 실행하지 못했습니다."},
             )])
         requested = True
         return ModelResponse(parts=[ToolCallPart(

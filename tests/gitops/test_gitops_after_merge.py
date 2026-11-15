@@ -276,7 +276,7 @@ def test_머지_뒤_모델이_실패해_다시_시도해도_머지와_지켜보�
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("모델 장애")
-        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"narration": "머지했어요."}, tool_call_id="o")])
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"finding": None, "narration": "머지했어요."}, tool_call_id="o")])
 
     with agent.override(model=FunctionModel(fails_once)):
         failed = client.post(f"/conversations/{room}/approve", json={"call_id": "call-1", "approved": True}, headers=USER)
@@ -438,7 +438,7 @@ class _SlowModel:
             self.called.set()
             while not self.release.is_set():
                 await asyncio.sleep(0.01)
-            return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"narration": "늦은 답"}, tool_call_id="o")])
+            return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"finding": None, "narration": "늦은 답"}, tool_call_id="o")])
 
         async def stream(messages, info):       # 쓰이지 않는다 — 답 미리보기는 꺼져 있다
             raise NotImplementedError
