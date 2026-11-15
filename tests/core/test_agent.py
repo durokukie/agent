@@ -39,6 +39,7 @@ def _deps(shared: bool = False) -> Deps:
 # LLM이 채우는 칸만 — steps 는 스키마에 없다 (코드가 채움)
 GOOD_RESPONSE = {
     "narration": "결과입니다.",
+    "finding": None,
     "suggested_next_action": None,
 }
 

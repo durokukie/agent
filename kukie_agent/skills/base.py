@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, get_args
+from typing import Any, ClassVar, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -120,12 +120,24 @@ class Finding(BaseModel):
         description="고치는 kubectl 명령. 제안만 하고 실행하지 않는다 — 사용자에게 보여 줄 뿐이다. 고칠 것이 없으면 빈 목록")
 
 
+FINDING_DESCRIPTION = (
+    "진단 결론. 클러스터를 조사해 상태·원인을 답했으면 늘 채운다 — 원인은 narration 에만 쓰지 말고 여기에 담는다. "
+    "원인을 찾았으면 그 원인을, 확실하지 않으면 cause_category=other 를, 조사했는데 고장이 없으면 cause_category=healthy 를 적는다. "
+    "근거 없이 원인을 지어내지 않는다. 개념 설명·단순 조회·변경 요청처럼 진단이 아닌 답이면 null"
+)
+
+
 class KukieResponse(BaseModel):
     """공통 응답 뼈대. Private·Shared 가 같은 스키마를 쓴다 — 대화마다 출력 스키마가 같아야 캐시가 맞는다 (DURO-100)."""
     narration: str
     steps: list[ToolStep] = []
     suggested_next_action: str | None = None   # 답변·실행 결과에 근거한 다음 행동 안내
-    finding: Finding | None = None             # "왜 안 돼요?" 에 원인을 찾았을 때만. 앱이 이 칸을 그린다
+    # 앱이 이 칸을 그린다. 파이썬 기본값은 예전 기록 호환용이고, LLM 스키마에서는 null 을 허용하는 필수 칸이다 (LLM_REQUIRED)
+    finding: Finding | None = Field(default=None, description=FINDING_DESCRIPTION)
+
+    #: 기본값이 있어도 LLM 스키마에서는 필수인 칸 — 키를 빠뜨리면 형식 재시도가 된다.
+    #: 모델이 finding 키를 아예 보내지 않고 narration 에만 원인을 쓰던 실패를 막는다 (관문 R2). null 은 그대로 받는다
+    LLM_REQUIRED: ClassVar[frozenset[str]] = frozenset({"finding"})
 
 
 # ── 스킬 정의 ────────────────────────────────────────────────

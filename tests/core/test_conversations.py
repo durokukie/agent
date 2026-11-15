@@ -225,7 +225,7 @@ def _capture_turns(seen: list[dict]):
         })
         return ModelResponse(parts=[ToolCallPart(
             tool_name=info.output_tools[0].name,
-            args={"narration": "답변입니다.", "suggested_next_action": None},
+            args={"finding": None, "narration": "답변입니다.", "suggested_next_action": None},
         )])
     return FunctionModel(capture)
 

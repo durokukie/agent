@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic_ai import RunContext
+from pydantic import Field
+from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.messages import ModelMessage, ModelRequest, RetryPromptPart, ToolReturnPart, UserPromptPart
 
 from kukie_agent.deps import Deps
@@ -125,6 +126,47 @@ def merged_reply(ctx: RunContext[Deps]) -> str | None:
     return f"{pulls} 머지가 끝났어요. 반영 결과는 위 카드에서 볼 수 있어요."     # GitHub 에서 먼저 머지된 PR 도 맞는 말이어야 한다
 
 
+# 진단 조사로 보는 툴 — base 프롬프트 4번의 describe → events → logs. 목록 조회(list_resources)는 넣지 않는다:
+# "파드 보여줘" 같은 단순 조회마다 되묻는 호출이 붙는다
+DIAGNOSIS_TOOL_NAMES: frozenset[str] = frozenset({"describe_resource", "get_events", "get_logs"})
+
+#: 되묻기 문구의 첫머리 — 같은 턴에 이미 한 번 되물었는지 이 문구로 찾는다
+FINDING_RETRY_MARK = "finding 이 비어 있어요."
+FINDING_RETRY_MESSAGE = (
+    f"{FINDING_RETRY_MARK} 클러스터를 조사했으니 결론을 finding 에 담아 다시 답해 주세요. "
+    "원인을 찾았으면 그 원인을, 확실하지 않으면 cause_category=other 를, 조사했는데 고장이 없으면 cause_category=healthy 를 적어요. "
+    "근거 없이 원인을 지어내지는 마세요. 진단이 아닌 답(단순 조회·개념 설명)이었다면 같은 답을 finding=null 로 다시 보내면 돼요."
+)
+
+
+def _texts(part: RetryPromptPart) -> str:
+    return part.content if isinstance(part.content, str) else str(part.content)
+
+
+def needs_finding_retry(ctx: RunContext[Deps], finding: Any) -> bool:
+    """finding 이 빈 답을 한 번 되물을까.
+
+    이번 턴에 진단 툴(describe·events·logs)을 성공적으로 돌렸고, 클러스터·레포 변경이 없고, 아직 되묻지 않았을 때만.
+    되묻기는 턴마다 한 번이다 — 진단이 아니었다면 모델이 null 로 다시 보내 끝낼 수 있어야 하고(억지 원인 금지),
+    응답 형식 재시도 횟수(retries output)를 다 써서 run 이 실패하면 안 된다.
+    """
+    if finding is not None:
+        return False
+    if ctx.max_retries and ctx.retry >= ctx.max_retries:
+        return False
+    investigated = False
+    for msg in _current_turn(ctx.messages):
+        for part in getattr(msg, "parts", ()):
+            if isinstance(part, RetryPromptPart) and _texts(part).startswith(FINDING_RETRY_MARK):
+                return False
+            if isinstance(part, ToolReturnPart | RetryPromptPart) and part.tool_name in CHANGE_TOOL_NAMES:
+                return False
+            if (isinstance(part, ToolReturnPart) and part.tool_name in DIAGNOSIS_TOOL_NAMES
+                    and isinstance(part.content, KubectlResult)):
+                investigated = True
+    return investigated
+
+
 _cache: dict[type[KukieResponse], Callable[..., KukieResponse]] = {}
 
 
@@ -143,6 +185,8 @@ def build_response_for(response_cls: type[KukieResponse]) -> Callable[..., Kukie
         reply = merged_reply(ctx)
         if reply:
             llm_values |= {"narration": reply, "suggested_next_action": None, "finding": None}
+        elif "finding" in llm_fields and needs_finding_retry(ctx, llm_values.get("finding")):
+            raise ModelRetry(FINDING_RETRY_MESSAGE)
         return response_cls(steps=collect_steps(ctx), **llm_values)
 
     # pydantic-ai 는 함수 시그니처에서 LLM 스키마를 만든다 — 여기서 steps 가 빠진 시그니처를 박는다.
@@ -150,10 +194,13 @@ def build_response_for(response_cls: type[KukieResponse]) -> Callable[..., Kukie
                                 annotation=RunContext[Deps])]
     annotations: dict[str, Any] = {"ctx": RunContext[Deps], "return": response_cls}
     for name, f in llm_fields.items():
-        default = inspect.Parameter.empty if f.is_required() else f.default
+        # LLM_REQUIRED 칸은 기본값을 빼서 키를 꼭 보내게 한다 (값은 null 이어도 된다)
+        required = f.is_required() or name in response_cls.LLM_REQUIRED
+        default = inspect.Parameter.empty if required else f.default
+        annotation = Annotated[f.annotation, Field(description=f.description)] if f.description else f.annotation
         params.append(inspect.Parameter(name, inspect.Parameter.KEYWORD_ONLY,
-                                        annotation=f.annotation, default=default))
-        annotations[name] = f.annotation
+                                        annotation=annotation, default=default))
+        annotations[name] = annotation
     build.__signature__ = inspect.Signature(params, return_annotation=response_cls)  # type: ignore[attr-defined]
     build.__annotations__ = annotations
     build.__name__ = f"build_{response_cls.__name__}"

@@ -85,7 +85,7 @@ class Script:
             name, args = self.tools[self.step]
             self.step += 1
             return ModelResponse(parts=[ToolCallPart(tool_name=name, args=dict(args), tool_call_id=f"call-{self.step}")])
-        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"narration": "네."}, tool_call_id="out")])
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"finding": None, "narration": "네."}, tool_call_id="out")])
 
 
 def _chat(client, room, script, text="안녕"):
@@ -120,7 +120,7 @@ def test_연결됨_끊김_끊김_세_턴에_메모는_끊긴_턴에_한_번만_�
 def test_한_턴에_툴을_여러_번_불러도_메모는_한_줄이다(client, fake_server, room, cluster):
     fake_server.repo_link_states[room] = {"repos": []}                 # 지난번엔 연결이 없었다
     script = Script(("list_resources", {"kind": "pods"}), ("list_resources", {"kind": "svc"}),
-                    ("get_events", {}))
+                    ("list_resources", {"kind": "deploy"}))   # 진단 툴이면 finding 되묻기로 AI 호출이 하나 늘어난다
     body = _chat(client, room, script)
 
     assert len(script.views) == 4                                       # AI 호출 4번 = 처리기 4번
@@ -150,7 +150,7 @@ def test_instructions와_툴_목록은_연결_상태와_상관없이_같다(clie
         seen.append(([t.name for t in info.function_tools],
                      [p.content for m in messages for p in getattr(m, "parts", []) if p.part_kind == "system-prompt"],
                      getattr(messages[0], "instructions", None)))
-        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"narration": "네."})])
+        return ModelResponse(parts=[ToolCallPart(tool_name="final_result", args={"finding": None, "narration": "네."})])
 
     with agent.override(model=FunctionModel(capture)):
         client.post(f"/conversations/{room}/chat", json={"text": "a"}, headers=USER)
