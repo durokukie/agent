@@ -30,7 +30,7 @@ except ImportError:                          # pydantic-ai 2.3x — httpx2 전�
     httpx2 = None                            # type: ignore[assignment]
     AsyncHTTPX2TenacityTransport = None      # type: ignore[assignment,misc]
 
-from kukie_agent import prompts
+from kukie_agent import budget, prompts
 from kukie_agent.deps import Deps
 from kukie_agent.gitops import memo as repo_link_memo
 from kukie_agent.guardrail import gitops_hook  # noqa: F401 — propose_git_change 훅을 같은 hooks 에 등록한다
@@ -141,7 +141,8 @@ agent = Agent(
     instructions=BASE_PROMPT,
     toolsets=[toolset],               # 스킬 필터를 거친 툴 목록
     # 가드레일 훅 + 레포 연결이 바뀐 때만 기록 끝에 메모 (DURO-135, gitops/memo.py — instructions·툴 목록은 그대로)
-    capabilities=[guardrail_hooks, repo_link_memo.capability],
+    # KUKIE_REQUEST_BUDGET=N 이면 요청 N번째에 도구를 빼고 답을 강제한다 (budget.py). 비어 있으면 꺼짐(기본)
+    capabilities=[guardrail_hooks, repo_link_memo.capability, *budget.from_env()],
 )
 
 

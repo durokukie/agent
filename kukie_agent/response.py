@@ -22,6 +22,7 @@ from pydantic import Field
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.messages import ModelMessage, ModelRequest, RetryPromptPart, ToolReturnPart, UserPromptPart
 
+from kukie_agent import budget
 from kukie_agent.deps import Deps
 from kukie_agent.gitops.memo import is_memo
 from kukie_agent.glossary import explain_command
@@ -63,8 +64,8 @@ def _current_turn(messages: Sequence[ModelMessage]) -> Sequence[ModelMessage]:
     """이번 턴의 메시지만 — 마지막 사용자 발화부터. 이전 턴의 툴 기록이 steps 에 섞이지 않게."""
     start = 0
     for i, msg in enumerate(messages):
-        # 레포 연결 메모(DURO-135)도 UserPromptPart 지만 새 질문이 아니다 — 툴 결과 요청에 붙어도 턴을 끊지 않는다
-        if isinstance(msg, ModelRequest) and any(
+        # 레포 연결 메모(DURO-135)와 요청 예산의 강제 답 문장(budget.py)도 UserPromptPart 지만 새 질문이 아니다 — 턴을 끊지 않는다
+        if isinstance(msg, ModelRequest) and not budget.is_forced_request(msg) and any(
             isinstance(p, UserPromptPart) and not is_memo(p) for p in msg.parts
         ):
             start = i
@@ -186,6 +187,10 @@ def build_response_for(response_cls: type[KukieResponse]) -> Callable[..., Kukie
         reply = merged_reply(ctx)
         if reply:
             llm_values |= {"narration": reply, "suggested_next_action": None, "finding": None}
+        elif ("finding" in llm_fields and llm_values.get("finding") is None
+              and budget.forced_answer_given(_current_turn(ctx.messages))):
+            # 요청 예산의 강제 답 턴 — 되물을 요청이 남지 않았다. 빈 finding 으로 "답했다" 고 끝내지 않는다 (budget.py)
+            raise budget.ForcedAnswerFailed("요청 예산의 강제 답 턴에서 finding 이 비었다")
         elif "finding" in llm_fields and needs_finding_retry(ctx, llm_values.get("finding")):
             raise ModelRetry(FINDING_RETRY_MESSAGE)
         return response_cls(steps=collect_steps(ctx), **llm_values)

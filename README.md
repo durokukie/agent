@@ -124,6 +124,7 @@ kind 클러스터 E2E: `KUKIE_E2E_CONTEXT=kind-<name> python -m pytest -m e2e` �
 | `KUKIE_DEV_AUTH`, `KUKIE_DEV_USER` | server 없이 로컬 개발 — flat 엔드포인트(`/session` `/chat` `/approve` `/resume`)만 열린다. 계획은 `~/.kukie/plans` 의 `.md` 로만 남는다 |
 | `KUKIE_ACCESS_COOKIE` | 웹 access 쿠키 이름 (기본 `kukie_access`, kukie-server 와 같아야 한다) |
 | `KUKIE_MODEL`, `KUKIE_GUIDANCE_MODEL`, `KUKIE_TITLE_MODEL`, 각 제공사 API 키 | 메인 에이전트·판단 가이드·대화 제목 모델 (제목은 비우면 판단 가이드 모델) |
+| `KUKIE_REQUEST_BUDGET` | 요청 예산 N (2~50). 비우면 꺼짐(기본). 켜면 한 질문의 모델 요청 N번째에 도구를 빼고 답 양식만 줘 답을 강제하고, 그 답에 finding 이 없으면 실패로 끝낸다 (`kukie_agent/budget.py`) |
 
 없어진 변수: `KUKIE_DATABASE_URL`(agent 에 DB 가 없다), `KUKIE_SECRET_KEY`·`KUKIE_ALLOW_LOCAL_CLUSTER`(자격증명 암호화와 kubeconfig 검사가 kukie-server 로 옮겨 가 그쪽 `KUKIE_CREDENTIAL_KEY`·`KUKIE_ALLOW_LOCAL_CLUSTER` 가 됐다), `KUKIE_MEMBER_URL`(`KUKIE_SERVER_URL` 이 대신한다).
 
