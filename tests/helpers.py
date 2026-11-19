@@ -40,7 +40,7 @@ def answer_model(narration="결정을 반영했습니다.") -> TestModel:
 
 
 def new_room(fake, user: str = "u-1", **fields: Any) -> str:
-    """Kukie API 서버에 채팅방 하나 (POST /member/conversations 와 같은 결과). 만들기는 이제 server 몫이다."""
+    """Kukie API 서버에 채팅방 하나 (POST /api/conversations 와 같은 결과). 만들기는 이제 server 몫이다."""
     return fake.add_conversation(owner=user, **fields)
 
 

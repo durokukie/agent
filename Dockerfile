@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Kukie 에이전트 컨테이너 (DURO-107 4단계). 리버스 프록시 뒤에서 /api/* 가 /api 를 떼고 여기 8000 으로 온다.
+# Kukie 에이전트 컨테이너 (DURO-107 4단계). 리버스 프록시 뒤에서 /agent/* 가 /agent 를 떼고 여기 8000 으로 온다.
 # 띄우는 법은 kukie-electron/deploy/README.md — 도커 컴포즈가 이 파일을 빌드한다.
 
 # 두 단계가 같은 베이스를 쓴다 — 2단계는 1단계가 만든 .venv 를 그대로 옮겨 오므로 Python 이 같아야 한다
