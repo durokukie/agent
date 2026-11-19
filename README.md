@@ -66,11 +66,11 @@ ArgoCD 가 관리하고 매니페스트 레포가 연결된 리소스는 kubectl
 ## 구조
 
 ```
-kukie-electron (앱·웹) ──/member/*──▶ kukie-server (Kukie API 서버, Spring) ──▶ PostgreSQL (DB 는 이것 하나)
+kukie-electron (앱·웹) ──/api/*─────▶ kukie-server (Kukie API 서버, Spring) ──▶ PostgreSQL (DB 는 이것 하나)
         │                                   ▲
         │                                   │ /users/me   토큰 검증 (Bearer 헤더 · 웹은 kukie_access 쿠키)
         │                                   │ /internal/* 저장·조회·권한 판단 (내부 토큰 + 입구에서만 사용자 Bearer)
-        └──/api/*────▶ kukie agent (이 레포) ─┘
+        └──/agent/*──▶ kukie agent (이 레포) ─┘
                               └──subprocess──▶ kubectl ──▶ 클러스터
 ```
 

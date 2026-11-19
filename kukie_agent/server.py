@@ -247,7 +247,7 @@ app = FastAPI(title="Kukie local server", lifespan=_lifespan)
 async def health() -> dict[str, str]:
     """배포 확인용 (DURO-107). 인증 없음, 상태를 바꾸지 않는다 — server 모드에서도 열려 있다 (아래 dev 전용 4개와 다르다).
 
-    리버스 프록시 뒤에서는 /api/health. 컨테이너 HEALTHCHECK 와 `curl https://<도메인>/api/health` 가 이걸 본다.
+    리버스 프록시 뒤에서는 /agent/health. 컨테이너 HEALTHCHECK 와 `curl https://<도메인>/agent/health` 가 이걸 본다.
     async def: 동기 def 면 kubectl 과 같은 스레드풀에 줄 서서, 가장 바쁠 때 헬스체크가 늦어 unhealthy 로 찍힌다 (PR #82 리뷰)."""
     return {"status": "ok"}
 

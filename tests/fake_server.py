@@ -99,7 +99,7 @@ class FakeServer:
         self, *, owner: str = "u-1", shared: bool = False, cluster_id: str | None = None,
         team_id: str | None = None, title: str = DEFAULT_TITLE, namespace: str | None = None,
     ) -> str:
-        """POST /member/conversations 와 같은 결과 — 클러스터의 context·지문을 방에 복사한다."""
+        """POST /api/conversations 와 같은 결과 — 클러스터의 context·지문을 방에 복사한다."""
         if cluster_id is None:
             cluster_id = self.add_cluster(owner=owner, team_id=team_id)
         cluster = self.clusters[cluster_id]
@@ -126,7 +126,7 @@ class FakeServer:
                       key=lambda r: r["seq"])
 
     def turns(self, conversation_id: str) -> list[dict[str, Any]]:
-        """공개 API 의 TurnResponse 모양 (GET /member/conversations/{id} 의 turns) — 앱이 보는 기록."""
+        """공개 API 의 TurnResponse 모양 (GET /api/conversations/{id} 의 turns) — 앱이 보는 기록."""
         out = []
         for run in self.runs_of(conversation_id):
             payload, error = run["responsePayload"], None
